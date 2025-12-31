@@ -15,7 +15,6 @@ It reads from stdin, sends to an LLM, and outputs plain text to stdout. Perfect 
 ### Prerequisites
 
 - `libcurl`
-- `jsmn` (minimal JSON parser)
 - A C compiler (gcc/clang)
 
 On Ubuntu/Debian:
@@ -25,7 +24,7 @@ sudo apt install libcurl4-openssl-dev
 
 On macOS:
 ```bash
-brew install curl jsmn
+brew install curl 
 ```
 
 ### Build
@@ -36,7 +35,7 @@ git clone https://github.com/yourusername/infer.git
 cd infer
 gcc -o infer infer.c -lcurl
 
-# Install system-wide (classic Unix fashion)
+# Install system-wide 
 sudo cp infer /usr/local/bin/
 sudo chmod +x /usr/local/bin/infer
 ```
