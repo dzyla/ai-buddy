@@ -1,6 +1,6 @@
 # infer
 
-A minimal CLI tool for piping anything into an LLM. written in pure C with minimal dependencies. The goal is to be as minimal as possible.
+A minimal CLI tool for piping anything into an LLM, written in pure C with minimal dependencies. The goal is to be as minimal as possible.
 
 ```bash
 ps aux | infer "what's eating memory"
@@ -15,6 +15,7 @@ It reads from stdin, sends to an LLM, and outputs plain text to stdout. Perfect 
 ### Prerequisites
 
 - `libcurl`
+- `jsmn` (minimal JSON parser)
 - A C compiler (gcc/clang)
 
 On Ubuntu/Debian:
@@ -24,7 +25,7 @@ sudo apt install libcurl4-openssl-dev
 
 On macOS:
 ```bash
-brew install curl 
+brew install curl jsmn
 ```
 
 ### Build
@@ -35,7 +36,7 @@ git clone https://github.com/yourusername/infer.git
 cd infer
 gcc -o infer infer.c -lcurl
 
-# Install system-wide 
+# Install system-wide (classic Unix fashion)
 sudo cp infer /usr/local/bin/
 sudo chmod +x /usr/local/bin/infer
 ```
@@ -68,6 +69,27 @@ Basic syntax:
 ```bash
 infer "your question"              # Ask a question
 command | infer "your question"    # Analyze command output
+```
+
+### Arguments & Shell Expansion
+
+You can pass arguments without quotes, and `infer` will join them with spaces:
+
+```bash
+infer how do I exit vim
+# equivalent to:
+infer "how do I exit vim"
+```
+
+**Be careful with shell special characters like `*`, `?`, `|`, `>`, etc. The shell expands these *before* passing them to the program.
+
+```bash
+# BAD: The shell expands '*' to all files in the current directory
+infer explain what does * do in C? 
+# logic: infer "explain" "what" "does" "file1.txt" "file2.c" ... "do" "in" "C?"
+
+# GOOD: Quote special characters to prevent expansion
+infer "explain what does * do in C?"
 ```
 
 ### Examples
