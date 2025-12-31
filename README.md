@@ -15,7 +15,6 @@ It reads from stdin, sends to an LLM, and outputs plain text to stdout. Perfect 
 ### Prerequisites
 
 - `libcurl`
-- `jsmn` (minimal JSON parser)
 - A C compiler (gcc/clang)
 
 On Ubuntu/Debian:
@@ -36,7 +35,7 @@ git clone https://github.com/yourusername/infer.git
 cd infer
 gcc -o infer infer.c -lcurl
 
-# Install system-wide (classic Unix fashion)
+# Install system-wide
 sudo cp infer /usr/local/bin/
 sudo chmod +x /usr/local/bin/infer
 ```
@@ -81,7 +80,7 @@ infer how do I exit vim
 infer "how do I exit vim"
 ```
 
-**Be careful with shell special characters like `*`, `?`, `|`, `>`, etc. The shell expands these *before* passing them to the program.
+Be careful with shell special characters like `*`, `?`, `|`, `>`, etc. The shell expands these *before* passing them to the program.
 
 ```bash
 # BAD: The shell expands '*' to all files in the current directory
