@@ -1,6 +1,6 @@
 # infer
 
-A minimal CLI tool for piping anything into an LLM.
+A minimal CLI tool for piping anything into an LLM. written in pure C with minimal dependencies. The goal is to be as minimal as possible.
 
 ```bash
 ps aux | infer "what's eating memory"
