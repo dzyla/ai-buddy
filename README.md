@@ -1,43 +1,60 @@
-# infer
+# ai 🤖
 
-A minimal CLI tool for piping anything into an LLM, written in pure C with minimal dependencies. The goal is to be as minimal as possible.
+A minimal, agentic CLI tool for piping anything into an LLM and executing terminal work, written in pure C and Python with zero external library dependencies.
 
 ```bash
-ps aux | infer "what's eating memory"
-dmesg | infer "any hardware errors?"
-git log --oneline -20 | infer "summarize recent changes"
+ps aux | ai "what's eating memory"
+ai "tell me what is taking most space"
+ai "what are the coldest and hottest places in US right now?"
 ```
 
-It reads from stdin, sends to an LLM, and outputs plain text to stdout. Perfect for shell pipelines.
+It reads from stdin, sends to an LLM, runs tools dynamically (such as shell commands, web searches, webpage crawling, or delegating tasks to sub-agents), maintains persistent memory, and outputs beautifully formatted markdown text directly in your terminal.
+
+---
+
+## Features
+
+- **Agentic Loop**: The CLI executes tools dynamically (multiple calls in parallel or sequence) based on what the LLM requests.
+- **Native Web Search**: Scrapes web results from DuckDuckGo Lite natively without requiring any third-party APIs or search tokens.
+- **Webpage Fetching**: Downloads, cleans, and converts HTML pages into readable text so the model can inspect details on URLs.
+- **Persistent Memory**: Automatically stores key preferences, facts, or context across invocations in `~/.config/ai/memory.txt`.
+- **Recursive Agent Delegation**: Can spawn separate, independent sub-agents (running separate child processes of `ai`) to handle sub-tasks and compile findings.
+- **Rich Terminal Rendering**: Renders standard markdown output (bold, italic, list bullets, code blocks, and colored headers) directly in the terminal using ANSI escape codes.
+- **Multimodal Support**: Simply pass an image path (`.png`, `.jpg`, `.jpeg`, `.webp`) in the arguments; `ai` base64-encodes it and sends it directly to the model alongside your text.
+
+---
 
 ## Installation
 
 ### Prerequisites
 
 - `libcurl`
-- A C compiler (gcc/clang)
+- A C compiler (`gcc`/`clang`)
+- Python 3
 
 On Ubuntu/Debian:
 ```bash
-sudo apt install libcurl4-openssl-dev
+sudo apt install libcurl4-openssl-dev python3
 ```
 
 On macOS:
 ```bash
-brew install curl
+brew install curl python
 ```
 
-### Build
+### Build & Install
 
 ```bash
 # Clone and build
-git clone https://github.com/chethanreddy1/infer.git
-cd infer
-gcc -o infer infer.c -lcurl
+git clone https://github.com/<your-username>/ai.git
+cd ai
+gcc -o ai ai.c -lcurl
 
 # Install system-wide
-sudo cp infer /usr/local/bin/
-sudo chmod +x /usr/local/bin/infer
+sudo cp ai /usr/local/bin/
+sudo cp ai_mcp.py /usr/local/bin/
+sudo chmod +x /usr/local/bin/ai
+sudo chmod +x /usr/local/bin/ai_mcp.py
 ```
 
 ### Configuration
@@ -45,152 +62,69 @@ sudo chmod +x /usr/local/bin/infer
 Set environment variables in your shell profile (`~/.bashrc`, `~/.zshrc`, etc):
 
 ```bash
-export INFER_BASE_URL="https://api.openai.com/v1/"
-export INFER_API_KEY="sk-your-api-key-here"
-export INFER_MODEL="gpt-4"
-```
-
-Works with any OpenAI-compatible API (OpenAI, Anthropic, local llama.cpp servers, etc).
-`INFER_BASE_URL` should point to the `/v1/` base; `infer` appends `chat/completions`.
-
-
-For local llama.cpp:
-```bash
 export INFER_BASE_URL="http://localhost:8080/v1/"
 export INFER_API_KEY="not-needed"
-export INFER_MODEL="llama-3.2"
+export INFER_MODEL="gemma4"
 ```
 
 Reload your shell or run `source ~/.bashrc` to apply changes.
 
+---
+
 ## Usage
 
-Basic syntax:
+### Basic Queries
 ```bash
-infer "your question"              # Ask a question
-command | infer "your question"    # Analyze command output
+ai "what's the tar command to extract .tar.gz?"
+ai how do I exit vim
 ```
 
-### Arguments & Shell Expansion
-
-You can pass arguments without quotes, and `infer` will join them with spaces:
-
+### Command Outputs & Logs
 ```bash
-infer how do I exit vim
-# equivalent to:
-infer "how do I exit vim"
+# Analyze memory hogs
+ps aux | head -n 20 | ai "what's using the most memory?"
+
+# Analyze disk space
+df -h | ai "am I running out of space anywhere?"
+
+# Git review
+git diff | ai "summarize my changes"
 ```
 
-Be careful with shell special characters like `*`, `?`, `|`, `>`, etc. The shell expands these *before* passing them to the program.
-
+### Real-Time Web Queries
 ```bash
-# BAD: The shell expands '*' to all files in the current directory
-infer explain what does * do in C? 
-# logic: infer "explain" "what" "does" "file1.txt" "file2.c" ... "do" "in" "C?"
-
-# GOOD: Quote special characters to prevent expansion
-infer "explain what does * do in C?"
+# Search and fetch actual content automatically
+ai "who won the latest Formula 1 race?"
 ```
 
-### Examples
-
-**System diagnostics:**
+### Multimodal Queries (Images)
 ```bash
-# Check memory hogs
-ps aux | head -n 20 | infer "what's using the most memory"
-
-# Analyze disk usage
-df -h | infer "am I running out of space anywhere?"
-
-# Check for errors in kernel logs
-dmesg | tail -100 | infer "any hardware issues?"
+# Describe an image
+ai "what is in this picture?" path/to/image.png
 ```
 
-**Log analysis:**
+### Persistent Memory
 ```bash
-# Apache/Nginx logs
-tail -100 /var/log/nginx/error.log | infer "summarize errors"
+# Set preference
+ai "remember my name is Bob and I use Ubuntu. Save to memory."
 
-# Journal logs
-journalctl -n 200 | infer "anything concerning?"
-
-# Application logs
-tail -50 app.log | infer "what's causing the failures?"
+# Query it later
+ai "what is my name?"
 ```
 
-**Git workflows:**
-```bash
-# Summarize recent work
-git log --oneline -20 | infer "summarize recent changes"
-
-# Review uncommitted changes
-git diff | infer "what did I change?"
-
-# Explain a complex diff
-git show abc123 | infer "explain this commit"
-```
-
-**File analysis:**
-```bash
-# Analyze configs
-cat nginx.conf | infer "any security issues?"
-
-# Quick code review
-cat script.py | infer "any bugs or improvements?"
-
-# Parse structured data
-cat data.json | infer "extract all email addresses"
-```
-
-**Quick references:**
-```bash
-# No pipe needed - just ask
-infer "what's the tar command to extract .tar.gz?"
-infer "how do I attach to a tmux session by name?"
-infer "regex to match email addresses?"
-```
-
-**Network debugging:**
-```bash
-# Check connections
-netstat -tuln | infer "any suspicious ports open?"
-
-# Analyze traffic
-tcpdump -c 50 | infer "summarize network activity"
-```
-
-**Chaining with other tools:**
-```bash
-# Find and analyze large files
-find . -type f -size +100M | infer "what are these files?"
-
-# Complex pipeline
-docker ps | infer "any containers using too much memory?" | tee report.txt
-```
-
-## Tips
-
-- The tool outputs plain text, so you can pipe it further: `command | infer "question" | grep important`
-- For long outputs, use `head` or `tail` to limit context: `journalctl | tail -500 | infer "issues?"`
-- Works great in scripts: `#!/bin/bash\nps aux | infer "memory usage summary" > report.txt`
-
-- Switch models on the fly: `INFER_MODEL="gpt-3.5-turbo" infer "quick question"`
+---
 
 ## Configuration Lookup
 
-`infer` reads configuration from environment variables:
-- `INFER_BASE_URL` - Base API URL (ends with `/v1/`; `infer` appends `chat/completions`)
+`ai` reads configuration from environment variables:
+- `INFER_BASE_URL` - Base API URL (ends with `/v1/`; `ai` appends `chat/completions`)
 - `INFER_API_KEY` - Your API key  
 - `INFER_MODEL` - Model name
 
-You can override them per-command:
-```bash
-INFER_MODEL="claude-opus-4" infer "complex analysis task"
-```
-
-
-## Contributing
-
-PRs welcome! Keep it minimal and Unix-y.
+You can register standard Model Context Protocol (MCP) servers in `~/.config/ai/mcp.json` to extend the toolset further.
 
 ---
+
+## License
+
+MIT
