@@ -13,6 +13,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 
 #define MAX_LINE 1024
 #define MAX_VAL  512
@@ -23,11 +24,13 @@ static char api_key[MAX_VAL];
 static char model[MAX_VAL];
 
 static const char *SYSTEM_PROMPT = 
-    "You are a CLI tool with tool-calling capabilities. Output your final response using clean, simple markdown. "
-    "Use bold text, bullet points, headers, or code blocks where it improves readability. Keep the output concise. "
-    "If you search the web and the search snippets do not contain the answer, you MUST use the fetch_webpage tool to visit the relevant URLs and read their content to find the answer. "
-    "Always answer the user's question directly using the retrieved data. Never tell the user to check a website or search themselves. "
-    "If the user's request is complex, requires multiple steps, or can be broken down into parallel investigations, use the delegate_task tool to spawn helper agents to do sub-tasks and gather data for you.";
+    "You are a fully autonomous CLI agent with tool-calling capabilities. Output your response in clean markdown. "
+    "Your goal is to solve tasks independently and deliver verified results. Follow these strict directives:\n"
+    "1. AUTOMATIC VERIFICATION: When writing scripts (Python, Bash, JS, etc.) or generating data/plots, you MUST write the code to a file (using write_file) and immediately run it (using execute_command) to verify it runs successfully. Never just present the code and tell the user to run it themselves.\n"
+    "2. ITERATIVE TROUBLESHOOTING: If a command fails (you will see '[Command Failed with exit status X]' in the tool output), read the output/stderr carefully, modify the code to fix the root cause, re-run the verification command, and repeat this loop (up to 5-10 rounds) until it succeeds. Do not give up or ask the user to do it.\n"
+    "3. INDEPENDENCE & PIVOTING: If a library is missing, install it (e.g. using pip install). If a data source/API is deprecated, blocked, or fails, search the web and pivot to alternative libraries/APIs or scraping strategies immediately.\n"
+    "4. DELEGATION: For complex, parallelizable, or hard tasks, use the delegate_task tool to spawn helper agents to investigate or perform sub-tasks.\n"
+    "5. If you search the web and snippets lack the answer, use fetch_webpage to read URLs. Never tell the user to check a website or search themselves.";
 
 static char* get_system_context() {
     char cwd[1024] = "Unknown";
@@ -101,6 +104,73 @@ static void log_job(const char *prompt, const char *pipe_writer, const char *res
     free(esc_writer);
     free(esc_resp);
     fclose(fp);
+}
+
+static char* load_skills_from_dir(const char *base_dir) {
+    DIR *dir = opendir(base_dir);
+    if (!dir) return NULL;
+    
+    struct dirent *entry;
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        char skill_path[1024];
+        snprintf(skill_path, sizeof(skill_path), "%s/%s/SKILL.md", base_dir, entry->d_name);
+        
+        FILE *fp = fopen(skill_path, "r");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long size = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (size > 0) {
+                char *file_buf = malloc(size + 1);
+                size_t read_bytes = fread(file_buf, 1, size, fp);
+                file_buf[read_bytes] = '\0';
+                
+                if (len + read_bytes + 256 >= cap) {
+                    cap = cap * 2 + read_bytes + 256;
+                    buf = realloc(buf, cap);
+                }
+                
+                len += sprintf(buf + len, "\n\nSkill [%s]:\n%s", entry->d_name, file_buf);
+                free(file_buf);
+            }
+            fclose(fp);
+        }
+    }
+    closedir(dir);
+    return buf;
+}
+
+static char* load_all_skills() {
+    char *global_skills = NULL;
+    char *home = getenv("HOME");
+    if (home) {
+        char global_path[1024];
+        snprintf(global_path, sizeof(global_path), "%s/.config/ai/skills", home);
+        global_skills = load_skills_from_dir(global_path);
+    }
+    
+    char *local_skills = load_skills_from_dir("./.agents/skills");
+    
+    size_t total_len = (global_skills ? strlen(global_skills) : 0) + (local_skills ? strlen(local_skills) : 0) + 1;
+    char *res = malloc(total_len);
+    res[0] = '\0';
+    
+    if (global_skills) {
+        strcat(res, global_skills);
+        free(global_skills);
+    }
+    if (local_skills) {
+        strcat(res, local_skills);
+        free(local_skills);
+    }
+    return res;
 }
 
 /* ---------------- HELPERS ---------------- */
@@ -408,9 +478,10 @@ static char* shell_escape(const char *src) {
     return dest;
 }
 
-static char* run_shell_command(const char *cmd) {
+static char* run_shell_command(const char *cmd, int *exit_status) {
     FILE *fp = popen(cmd, "r");
     if (!fp) {
+        if (exit_status) *exit_status = -1;
         return strdup("Error: failed to run command");
     }
     
@@ -419,6 +490,7 @@ static char* run_shell_command(const char *cmd) {
     char *buf = malloc(size);
     if (!buf) {
         pclose(fp);
+        if (exit_status) *exit_status = -1;
         return NULL;
     }
     buf[0] = '\0';
@@ -432,6 +504,7 @@ static char* run_shell_command(const char *cmd) {
             if (!new_buf) {
                 free(buf);
                 pclose(fp);
+                if (exit_status) *exit_status = -1;
                 return NULL;
             }
             buf = new_buf;
@@ -440,7 +513,14 @@ static char* run_shell_command(const char *cmd) {
         len += tmp_len;
     }
     
-    pclose(fp);
+    int status = pclose(fp);
+    if (exit_status) {
+        if (status == -1) {
+            *exit_status = -1;
+        } else {
+            *exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : status;
+        }
+    }
     return buf;
 }
 
@@ -596,6 +676,26 @@ int main(int argc, char **argv) {
     int is_stdin_tty = isatty(STDIN_FILENO);
     int interactive_mode = 0;
     int auto_approve = 0;
+    int quiet_mode = 0;
+
+    // Parse help flags first
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: ai [options] [\"prompt\"] [path/to/image.png]\n\n");
+            printf("A minimal, agentic CLI tool for piping anything into an LLM and executing terminal work.\n\n");
+            printf("Options:\n");
+            printf("  -i, --interactive    Start an interactive multi-turn chat session.\n");
+            printf("  -y, --yes            Auto-approve all command execution requests without prompting.\n");
+            printf("  -q, --quiet          Suppress think tool reasoning output.\n");
+            printf("  -h, --help           Display this help screen.\n\n");
+            printf("Examples:\n");
+            printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
+            printf("  ps aux | head -n 20 | ai \"what's eating memory?\"\n");
+            printf("  ai -i \"let's look at this project\"\n");
+            printf("  ai -y \"backup ~/.bashrc\"\n");
+            return 0;
+        }
+    }
 
     // Load from Environment Variables
     char *env_url = getenv("INFER_BASE_URL");
@@ -618,11 +718,19 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
             auto_approve = 1;
         }
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
+            quiet_mode = 1;
+        }
     }
 
     char *env_approve = getenv("INFER_AUTO_APPROVE");
     if (env_approve && (strcmp(env_approve, "1") == 0 || strcasecmp(env_approve, "true") == 0)) {
         auto_approve = 1;
+    }
+
+    char *env_quiet = getenv("INFER_QUIET");
+    if (env_quiet && (strcmp(env_quiet, "1") == 0 || strcasecmp(env_quiet, "true") == 0)) {
+        quiet_mode = 1;
     }
 
     if (argc < 2 && is_stdin_tty) {
@@ -644,7 +752,7 @@ int main(int argc, char **argv) {
     
     char tools_cmd[1024];
     snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
-    char *tools_json = run_shell_command(tools_cmd);
+    char *tools_json = run_shell_command(tools_cmd, NULL);
     if (tools_json && (strncmp(tools_json, "Error", 5) == 0 || strlen(tools_json) < 5)) {
         free(tools_json);
         tools_json = NULL;
@@ -661,6 +769,7 @@ int main(int argc, char **argv) {
             for (int i = 1; i < argc; i++) {
                 if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
                 if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+                if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
                 has_prompt_args = 1;
                 break;
             }
@@ -680,6 +789,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (is_image_file(argv[i])) {
             image_path = argv[i];
             break;
@@ -690,16 +800,18 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         prompt_len += strlen(argv[i]) + 1;
     }
-    
+
     char *prompt = malloc(prompt_len + 1);
     prompt[0] = '\0';
     int added = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         if (added) strcat(prompt, " ");
         strcat(prompt, argv[i]);
@@ -725,26 +837,45 @@ int main(int argc, char **argv) {
     char *messages_json = malloc(4096);
     strcpy(messages_json, "[]");
 
-    // Add System Prompt, Context & Memory Context
+    // Add System Prompt, Context, Memory & Skills
     char *memory = read_memory_file();
     char *sys_ctx = get_system_context();
+    char *skills = load_all_skills();
+
     char *safe_system = json_escape(SYSTEM_PROMPT);
     char *safe_ctx = json_escape(sys_ctx);
+    char *safe_skills = skills ? json_escape(skills) : strdup("");
     char *sys_msg = NULL;
-    if (memory) {
-        char *safe_mem = json_escape(memory);
-        size_t mlen = strlen(safe_system) + strlen(safe_ctx) + strlen(safe_mem) + 256;
-        sys_msg = malloc(mlen);
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}", safe_system, safe_ctx, safe_mem);
-        free(safe_mem);
-        free(memory);
+
+    size_t mlen = strlen(safe_system) + strlen(safe_ctx) + strlen(safe_skills) + (memory ? strlen(memory) * 6 : 0) + 512;
+    sys_msg = malloc(mlen);
+
+    char *safe_mem = memory ? json_escape(memory) : NULL;
+
+    if (safe_mem && strlen(safe_mem) > 0 && strlen(safe_skills) > 0) {
+        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nSkills/Guidelines:\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}", 
+                safe_system, safe_ctx, safe_skills, safe_mem);
+    } else if (safe_mem && strlen(safe_mem) > 0) {
+        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}", 
+                safe_system, safe_ctx, safe_mem);
+    } else if (strlen(safe_skills) > 0) {
+        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nSkills/Guidelines:\\n%s\"}", 
+                safe_system, safe_ctx, safe_skills);
     } else {
-        size_t mlen = strlen(safe_system) + strlen(safe_ctx) + 128;
-        sys_msg = malloc(mlen);
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\"}", safe_system, safe_ctx);
+        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\"}", 
+                safe_system, safe_ctx);
     }
+
     messages_json = append_message(messages_json, sys_msg);
-    free(safe_system); free(sys_msg);
+
+    if (safe_mem) free(safe_mem);
+    if (memory) free(memory);
+    free(skills);
+    free(sys_ctx);
+    free(safe_system);
+    free(safe_ctx);
+    free(safe_skills);
+    free(sys_msg);
 
     // Add User Prompt
     char *safe_prompt = json_escape(prompt);
@@ -916,6 +1047,7 @@ int main(int argc, char **argv) {
                 int message_tok = -1;
                 int tool_calls_tok = -1;
 
+                int error_tok = -1;
                 for (int i = 1; i < r; i++) {
                     if (tok[i].type == JSMN_STRING) {
                         int len = tok[i].end - tok[i].start;
@@ -925,8 +1057,38 @@ int main(int argc, char **argv) {
                             message_tok = i + 1;
                         } else if (len == 10 && strncmp(chunk.data + tok[i].start, "tool_calls", 10) == 0) {
                             tool_calls_tok = i + 1;
+                        } else if (len == 5 && strncmp(chunk.data + tok[i].start, "error", 5) == 0) {
+                            error_tok = i + 1;
                         }
                     }
+                }
+
+                if (error_tok != -1) {
+                    char *err_msg = NULL;
+                    if (tok[error_tok].type == JSMN_OBJECT) {
+                        int err_end = tok[error_tok].end;
+                        int k = error_tok + 1;
+                        while (k < r && tok[k].start < err_end) {
+                            if (tok[k].type == JSMN_STRING) {
+                                int len = tok[k].end - tok[k].start;
+                                if (len == 7 && strncmp(chunk.data + tok[k].start, "message", 7) == 0) {
+                                    err_msg = unescape_json_string(chunk.data + tok[k + 1].start, tok[k + 1].end - tok[k + 1].start);
+                                    break;
+                                }
+                            }
+                            k = json_skip_token(tok, r, k + 1);
+                        }
+                    }
+                    if (err_msg) {
+                        fprintf(stderr, "\n\033[1;31m[ai Error]\033[0m %s\n", err_msg);
+                        free(err_msg);
+                    } else {
+                        fprintf(stderr, "\n\033[1;31m[ai Error]\033[0m Unknown server error.\n");
+                    }
+                    has_more = 0;
+                    free(payload);
+                    free(chunk.data);
+                    break;
                 }
 
                 if (message_tok != -1) {
@@ -1039,8 +1201,22 @@ int main(int argc, char **argv) {
                                           size_t cmd_len = strlen(cmd_val);
                                           char *cmd_with_stderr = malloc(cmd_len + 16);
                                           sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
-                                          tool_output = run_shell_command(cmd_with_stderr);
+                                          int exit_code = 0;
+                                          char *raw_output = run_shell_command(cmd_with_stderr, &exit_code);
                                           free(cmd_with_stderr);
+                                          
+                                          if (raw_output) {
+                                              size_t out_len = strlen(raw_output);
+                                              tool_output = malloc(out_len + 128);
+                                              if (exit_code == 0) {
+                                                  sprintf(tool_output, "[Command Success]\n%s", raw_output);
+                                              } else {
+                                                  sprintf(tool_output, "[Command Failed with exit status %d]\n%s", exit_code, raw_output);
+                                              }
+                                              free(raw_output);
+                                          } else {
+                                              tool_output = strdup("Error: failed to run command");
+                                          }
                                       } else {
                                           fprintf(stderr, "[ai] command execution cancelled.\n");
                                           tool_output = strdup("Error: Command execution was cancelled/denied by the user.");
@@ -1064,7 +1240,7 @@ int main(int argc, char **argv) {
                                   char *escaped_args_shell = shell_escape(unescaped_args);
                                   char call_cmd[4096 + strlen(escaped_args_shell)];
                                   snprintf(call_cmd, sizeof(call_cmd), "python3 %s call-tool %s %s %s", mcp_script, server_name, mcp_tool_name, escaped_args_shell);
-                                  tool_output = run_shell_command(call_cmd);
+                                  tool_output = run_shell_command(call_cmd, NULL);
 
                                   free(server_name);
                                   free(escaped_args_shell);
@@ -1137,7 +1313,7 @@ int main(int argc, char **argv) {
                           
                           char render_cmd[4096 + strlen(escaped_content)];
                           snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_content);
-                          char *rendered_output = run_shell_command(render_cmd);
+                          char *rendered_output = run_shell_command(render_cmd, NULL);
                           
                           if (rendered_output) {
                               printf("%s", rendered_output);
