@@ -26,14 +26,16 @@ static char model[MAX_VAL];
 static const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
     "TOOL USE:\n"
-    "- Use think before any task requiring more than one tool call.\n"
-    "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n"
-    "- Only call task_complete when you have verified the result yourself using tools.\n"
+    "- For facts you already know (e.g. definitions, formulas, capitals), call task_complete directly.\n"
+    "- Use web_search only when you need current data (prices, news, live stats) or genuinely don't know.\n"
     "- After web_search, you MUST call fetch_webpage on at least one result URL before task_complete.\n"
-    "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n\n"
+    "- If fetch_webpage returns noisy or incomplete data, try execute_command with a Python/curl script to get the data programmatically.\n"
+    "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n"
+    "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
     "FAILURE RECOVERY:\n"
-    "- If execute_command fails, read the error output, fix the root cause, and retry. Make at least 3 attempts before giving up.\n"
-    "- If a library is missing, install it. If an API is blocked, find an alternative.\n\n"
+    "- If execute_command fails, read the error, fix the root cause, and retry. At least 3 attempts before giving up.\n"
+    "- If a library is missing, install it with pip/apt. If a web source is blocked or noisy, find an alternative.\n"
+    "- Never tell the user to 'visit a link' or 'run a command themselves' — do it yourself.\n\n"
     "DELEGATION:\n"
     "- For tasks with independent parallel sub-tasks, use delegate_task to run them concurrently.\n"
     "- delegate_task agents have full tool access. Give them specific, self-contained instructions.";
@@ -828,7 +830,7 @@ int main(int argc, char **argv) {
     if (strlen(prompt) == 0) {
         if (pipe_in && strlen(pipe_in) > 0) {
             free(prompt);
-            prompt = strdup("Analyze this input.");
+            prompt = strdup("Answer or help with the following:");
         } else if (!interactive_mode) {
             fprintf(stderr, "Usage: %s [-i|--interactive] [-y|--yes] [\"prompt\"] [path/to/image.png]\n", argv[0]);
             free(prompt);
