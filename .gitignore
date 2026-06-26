@@ -1,0 +1,18 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+
+# System/IDE generated files
+.DS_Store
+.idea/
+.vscode/
+
+# Build artifacts and temporary files
+build/
+dist/
+*.log
+*.tmp
+
+# Local machine specific temporary files
+~lock.CLAUDE.md#
