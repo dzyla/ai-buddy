@@ -21,6 +21,7 @@ It reads from stdin, sends to an LLM, runs tools dynamically (such as shell comm
 - **Recursive Agent Delegation**: Can spawn separate, independent sub-agents (running separate child processes of `ai`) to handle sub-tasks and compile findings.
 - **Rich Terminal Rendering**: Renders standard markdown output (bold, italic, list bullets, code blocks, and colored headers) directly in the terminal using ANSI escape codes.
 - **Multimodal Support**: Simply pass an image path (`.png`, `.jpg`, `.jpeg`, `.webp`) in the arguments; `ai` base64-encodes it and sends it directly to the model alongside your text.
+- **File Modification & Creation**: Safely write new files (automatically creating parent directories) or apply precise search-and-replace text edits to existing files using dedicated native tools.
 
 ---
 
@@ -122,6 +123,10 @@ ai "what is my name?"
 - `INFER_MODEL` - Model name
 
 You can register standard Model Context Protocol (MCP) servers in `~/.config/ai/mcp.json` to extend the toolset further.
+
+## Acknowledgements
+
+This project is a fork of the original [infer](https://github.com/chethanreddy1/infer) repository created by [chethanreddy1](https://github.com/chethanreddy1). The original was a minimal C-based CLI tool for piping content to LLMs. This fork expands on it by adding tool calling capabilities, recursive sub-agents, terminal markdown rendering, persistent memory, and multimodal image input.
 
 ---
 
