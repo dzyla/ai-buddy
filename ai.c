@@ -1004,14 +1004,14 @@ int main(int argc, char **argv) {
             int loop_count = 0;
             int has_more = 1;
             
-            while (has_more && loop_count < 20) {
+            while (has_more && loop_count < 30) {
                 loop_count++;
                 
                 char *payload = NULL;
                 size_t plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 256;
                 payload = malloc(plen);
                 if (tools_json && strlen(tools_json) > 10) {
-                    sprintf(payload, "{\"model\":\"%s\",\"stream\":false,\"messages\":%s,\"tools\":%s}", model, messages_json, tools_json);
+                    sprintf(payload, "{\"model\":\"%s\",\"stream\":false,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"required\"}", model, messages_json, tools_json);
                 } else {
                     sprintf(payload, "{\"model\":\"%s\",\"stream\":false,\"messages\":%s}", model, messages_json);
                 }
