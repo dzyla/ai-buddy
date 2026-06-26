@@ -232,6 +232,144 @@ def save_memory(content):
     except Exception as e:
         return f"Error saving memory: {e}"
 
+def extract_text_from_pdf(path):
+    # Try pdftotext first (very common on Linux via poppler-utils)
+    try:
+        proc = subprocess.run(["pdftotext", path, "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode == 0:
+            return proc.stdout
+    except Exception:
+        pass
+    
+    # Try pypdf Python library
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        if text:
+            return text
+    except Exception:
+        pass
+
+    # Try pdfplumber Python library
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as pdf:
+            text = ""
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+            if text:
+                return text
+    except Exception:
+        pass
+
+    return "Error: Could not parse PDF. Please ensure the 'pdftotext' command-line utility or 'pypdf' Python library is installed."
+
+def list_directory(path="."):
+    try:
+        abs_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(abs_path):
+            return f"Error: directory {path} does not exist."
+        if not os.path.isdir(abs_path):
+            return f"Error: path {path} is not a directory."
+        
+        items = os.listdir(abs_path)
+        if not items:
+            return f"Directory {path} is empty."
+            
+        lines = []
+        for item in sorted(items):
+            item_path = os.path.join(abs_path, item)
+            is_dir = os.path.isdir(item_path)
+            prefix = "[DIR] " if is_dir else "      "
+            size_str = ""
+            if not is_dir:
+                try:
+                    size = os.path.getsize(item_path)
+                    if size < 1024:
+                        size_str = f" ({size} B)"
+                    elif size < 1024 * 1024:
+                        size_str = f" ({size / 1024:.1f} KB)"
+                    else:
+                        size_str = f" ({size / (1024*1024):.1f} MB)"
+                except:
+                    pass
+            lines.append(f"{prefix}{item}{size_str}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing directory: {e}"
+
+def highlight_line(line, lang):
+    if not lang:
+        return f"  \033[36m{line}\033[0m"
+        
+    stripped = line.strip()
+    if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('/*') or stripped.endswith('*/'):
+        return f"  \033[90m{line}\033[0m"
+        
+    string_placeholder = "___STR_PLACEHOLDER_{}___"
+    strings = []
+    
+    def repl_str(match):
+        strings.append(match.group(0))
+        return string_placeholder.format(len(strings) - 1)
+        
+    temp_line = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\'', repl_str, line)
+    
+    keywords = [
+        "def", "class", "return", "if", "elif", "else", "for", "while", "break", "continue", 
+        "import", "from", "as", "try", "except", "finally", "raise", "assert", "with", "in", 
+        "is", "not", "and", "or", "lambda", "global", "nonlocal", "pass", "yield", "del",
+        "int", "char", "float", "double", "void", "struct", "union", "enum", "typedef", 
+        "const", "static", "extern", "volatile", "inline", "switch", "case", "default", 
+        "do", "goto", "sizeof", "alignof", "then", "fi", "done", "esac", "local", "export", 
+        "function", "let", "var", "fn", "impl", "pub", "use", "mod"
+    ]
+    keyword_re = r'\b(' + '|'.join(keywords) + r')\b'
+    temp_line = re.sub(keyword_re, r'\033[1;33m\1\033[0m', temp_line)
+    
+    constants = ["True", "False", "None", "true", "false", "null", "NULL", "self"]
+    const_re = r'\b(' + '|'.join(constants) + r')\b'
+    temp_line = re.sub(const_re, r'\033[35m\1\033[0m', temp_line)
+    
+    temp_line = re.sub(r'\b(\d+)\b', r'\033[35m\1\033[0m', temp_line)
+    
+    for idx, s in enumerate(strings):
+        temp_line = temp_line.replace(string_placeholder.format(idx), f"\033[32m{s}\033[0m")
+        
+    return f"  {temp_line}"
+
+def read_file(path):
+    try:
+        abs_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(abs_path):
+            return f"Error: file {path} does not exist."
+            
+        ext = os.path.splitext(abs_path)[1].lower()
+        
+        # If it's an image, return a special tag that the C binary intercepts to load base64
+        if ext in ['.png', '.jpg', '.jpeg', '.webp']:
+            return f"[IMAGE_DATA_SUCCESS:{abs_path}]"
+            
+        # If PDF
+        if ext == '.pdf':
+            return extract_text_from_pdf(abs_path)
+            
+        # Otherwise, treat as text file
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            if len(content) > 12000:
+                content = content[:12000] + "\n... (truncated to 12KB)"
+            return content
+        except Exception as e:
+            return f"Error reading text file: {e}"
+            
+    except Exception as e:
+        return f"Error opening file: {e}"
+
 def write_file(path, content):
     try:
         abs_path = os.path.abspath(os.path.expanduser(path))
@@ -262,22 +400,168 @@ def render_markdown(text):
     lines = text.splitlines()
     rendered = []
     in_code_block = False
-    for line in lines:
-        if line.startswith("```"):
-            in_code_block = not in_code_block
-            rendered.append("\033[90m" + "─" * 45 + "\033[0m")
-            continue
+    
+    # Helper to check if a line is a table row
+    def is_table_row(line):
+        return '|' in line
+
+    # Helper to check if a line is a table separator
+    def is_table_separator(line):
+        if '|' not in line:
+            return False
+        cleaned = line.replace('|', '').replace(':', '').replace('-', '').strip()
+        return len(cleaned) == 0
+
+    # Helper to parse a markdown table row into cells
+    def parse_row(row):
+        parts = row.split('|')
+        if parts[0].strip() == '':
+            parts = parts[1:]
+        if len(parts) > 0 and parts[-1].strip() == '':
+            parts = parts[:-1]
+        return [cell.strip() for cell in parts]
+
+    # Helper to strip ANSI codes to get visible length
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    def visible_len(t):
+        return len(ansi_escape.sub('', t))
+
+    # Helper to format inline markdown inside a cell
+    def format_cell(cell, is_header=False):
+        cell = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', r'\033[1m\1\2\033[22m', cell)
+        cell = re.sub(r'\*(.*?)\*|_(.*?)_', r'\033[3m\1\2\033[23m', cell)
+        cell = re.sub(r'`(.*?)`', r'\033[33m\1\033[39m', cell)
+        if is_header:
+            return f"\033[1;36m{cell}\033[0m"
+        return cell
+
+    # Helper to pad a cell based on alignment and visible width
+    def pad_cell(cell, width, align):
+        vis_len = visible_len(cell)
+        padding = width - vis_len
+        if padding <= 0:
+            return cell
+        if align == 'center':
+            left = padding // 2
+            right = padding - left
+            return ' ' * left + cell + ' ' * right
+        elif align == 'right':
+            return ' ' * padding + cell
+        else:
+            return cell + ' ' * padding
+
+    # Helper to render a table block
+    def render_table(table_rows):
+        if len(table_rows) < 2:
+            return table_rows
+            
+        header_cells = parse_row(table_rows[0])
+        # Parse alignment from separator row
+        alignments = []
+        sep_cells = parse_row(table_rows[1])
+        for cell in sep_cells:
+            if cell.startswith(':') and cell.endswith(':'):
+                alignments.append('center')
+            elif cell.endswith(':'):
+                alignments.append('right')
+            else:
+                alignments.append('left')
+                
+        body_rows = [parse_row(r) for r in table_rows[2:]]
+        num_cols = len(header_cells)
         
-        if in_code_block:
-            rendered.append(f"  \033[36m{line}\033[0m")
+        # Align column counts for body rows
+        aligned_body = []
+        for r in body_rows:
+            if len(r) < num_cols:
+                r = r + [''] * (num_cols - len(r))
+            elif len(r) > num_cols:
+                r = r[:num_cols]
+            aligned_body.append(r)
+            
+        if len(alignments) < num_cols:
+            alignments = alignments + ['left'] * (num_cols - len(alignments))
+        alignments = alignments[:num_cols]
+        
+        # Format the header and body cells
+        f_header = [format_cell(c, is_header=True) for c in header_cells]
+        f_body = [[format_cell(c) for c in r] for r in aligned_body]
+        
+        # Calculate max column widths
+        col_widths = [0] * num_cols
+        for col_idx in range(num_cols):
+            w = visible_len(f_header[col_idx])
+            for row in f_body:
+                w = max(w, visible_len(row[col_idx]))
+            col_widths[col_idx] = w
+            
+        # Draw top line
+        top_parts = ['─' * (w + 2) for w in col_widths]
+        top_line = '\033[90m┌' + '┬'.join(top_parts) + '┐\033[0m'
+        
+        # Draw header row
+        header_parts = []
+        for idx, cell in enumerate(f_header):
+            padded = pad_cell(cell, col_widths[idx], alignments[idx])
+            header_parts.append(f" {padded} ")
+        header_line = '\033[90m│\033[0m' + '\033[90m│\033[0m'.join(header_parts) + '\033[90m│\033[0m'
+        
+        # Draw separator line
+        sep_parts = ['─' * (w + 2) for w in col_widths]
+        sep_line = '\033[90m├' + '┼'.join(sep_parts) + '┤\033[0m'
+        
+        # Draw body lines
+        body_lines = []
+        for row in f_body:
+            row_parts = []
+            for idx, cell in enumerate(row):
+                padded = pad_cell(cell, col_widths[idx], alignments[idx])
+                row_parts.append(f" {padded} ")
+            body_lines.append('\033[90m│\033[0m' + '\033[90m│\033[0m'.join(row_parts) + '\033[90m│\033[0m')
+            
+        # Draw bottom line
+        bottom_parts = ['─' * (w + 2) for w in col_widths]
+        bottom_line = '\033[90m└' + '┴'.join(bottom_parts) + '┘\033[0m'
+        
+        return [top_line, header_line, sep_line] + body_lines + [bottom_line]
+
+    i = 0
+    in_code_block = False
+    lang = ""
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            if not in_code_block:
+                in_code_block = True
+                lang = line[3:].strip().lower()
+            else:
+                in_code_block = False
+                lang = ""
+            rendered.append("\033[90m" + "─" * 45 + "\033[0m")
+            i += 1
             continue
             
+        if in_code_block:
+            rendered.append(highlight_line(line, lang))
+            i += 1
+            continue
+            
+        # Handle markdown tables
+        if not in_code_block and is_table_row(line) and i + 1 < len(lines) and is_table_separator(lines[i + 1]):
+            table_rows = []
+            while i < len(lines) and is_table_row(lines[i]):
+                table_rows.append(lines[i])
+                i += 1
+            rendered.extend(render_table(table_rows))
+            continue
+
         h_match = re.match(r'^(#{1,6})\s+(.*)', line)
         if h_match:
             level = len(h_match.group(1))
             content = h_match.group(2)
             color = "35" if level == 1 else ("34" if level == 2 else "36")
             rendered.append(f"\n\033[1;{color}m{content}\033[0m")
+            i += 1
             continue
             
         list_match = re.match(r'^(\s*[-*+])\s+(.*)', line)
@@ -297,6 +581,7 @@ def render_markdown(text):
         line = re.sub(r'`(.*?)`', r'\033[33m\1\033[39m', line)
         
         rendered.append(line)
+        i += 1
         
     return "\n".join(rendered)
 
@@ -317,6 +602,24 @@ def main():
 
     if action == "list-tools":
         openai_tools = []
+
+        # Native list_directory
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "List the contents of a directory (files and subdirectories) on the host system to explore the project structure.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the directory to list. Defaults to the current working directory '.' if not specified."
+                        }
+                    }
+                }
+            }
+        })
         
         # Native execute_command
         openai_tools.append({
@@ -413,6 +716,25 @@ def main():
             }
         })
 
+        # Native read_file
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file. Supports text files, PDFs (extracts text content), and image files (PNG, JPG, JPEG, WEBP) which are rendered directly into your vision model context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the file to read."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        })
+
         # Native write_file
         openai_tools.append({
             "type": "function",
@@ -496,7 +818,11 @@ def main():
             sys.exit(1)
 
         # Route custom tools
-        if tool_name == "web_search" or server_name == "web_search":
+        if tool_name == "list_directory" or server_name == "list_directory":
+            path = arguments.get("path", ".")
+            result = list_directory(path)
+            print(result)
+        elif tool_name == "web_search" or server_name == "web_search":
             query = arguments.get("query", "")
             result = ddg_lite_search(query)
             print(result)
@@ -507,6 +833,10 @@ def main():
         elif tool_name == "save_memory" or server_name == "save_memory":
             content = arguments.get("content", "")
             result = save_memory(content)
+            print(result)
+        elif tool_name == "read_file" or server_name == "read_file":
+            path = arguments.get("path", "")
+            result = read_file(path)
             print(result)
         elif tool_name == "write_file" or server_name == "write_file":
             path = arguments.get("path", "")
