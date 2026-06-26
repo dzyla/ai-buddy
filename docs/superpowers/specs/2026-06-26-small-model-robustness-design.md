@@ -89,13 +89,17 @@ Before appending any tool response to `messages_json`, truncate the content stri
 
 Implementation: after `tool_output` is produced and before `json_escape(tool_output)`, check `strlen(tool_output)` and `realloc`/truncate as needed.
 
-### 3b. Turn-based stub compression
+### 3b. Total-size guard on new additions
 
-Track the index of the first tool-result message added in the current loop iteration. After turn 8 of the inner loop, messages added before turn 5 have their `content` field replaced with `[result from <tool_name> — truncated after 8 turns]`.
+Before appending any new tool result to `messages_json`, check `strlen(messages_json)`. If it already exceeds **40,000 bytes**, write a stub instead of the actual content:
 
-Implementation: maintain a `message_turn_idx[]` array parallel to the messages in the conversation, recording which inner-loop turn each message was added. Before building each API payload, scan `messages_json` and stub out old tool-result content in-place.
+```
+[context limit reached — result omitted to preserve model focus]
+```
 
-**Note:** This is the hardest part of the implementation because `messages_json` is a hand-built string. The cleanest approach is to switch the turn-tracking to a small parallel array of `{char* content_start, int content_len, int turn}` pointers into `messages_json`, then overwrite at send time.
+This never modifies anything already written to `messages_json` and never parses existing JSON — it only controls what gets appended next. Combined with the 3000-char per-result cap (3a), worst-case context from tool results is bounded at ~40KB.
+
+Implementation: one `strlen` check + one branch before the `json_escape(tool_output)` call, ~5 lines of C.
 
 ---
 
