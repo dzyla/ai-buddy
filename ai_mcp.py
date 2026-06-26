@@ -341,6 +341,20 @@ def highlight_line(line, lang):
         
     return f"  {temp_line}"
 
+def is_binary_file(filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            chunk = f.read(1024)
+            if b'\x00' in chunk:
+                return True
+            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
+            non_text = sum(1 for c in chunk if c not in text_chars)
+            if len(chunk) > 0 and (non_text / len(chunk)) > 0.30:
+                return True
+        return False
+    except:
+        return False
+
 def read_file(path):
     try:
         abs_path = os.path.abspath(os.path.expanduser(path))
@@ -348,6 +362,8 @@ def read_file(path):
             return f"Error: file {path} does not exist."
             
         ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in ['.png', '.jpg', '.jpeg', '.webp', '.pdf'] and is_binary_file(abs_path):
+            return f"Error: Cannot read binary file '{path}'. This file appears to be a compiled binary or non-text file."
         
         # If it's an image, return a special tag that the C binary intercepts to load base64
         if ext in ['.png', '.jpg', '.jpeg', '.webp']:
@@ -395,6 +411,65 @@ def edit_file(path, search_content, replace_content):
         return f"File successfully edited at {path}"
     except Exception as e:
         return f"Error editing file: {e}"
+
+def render_math(text):
+    latex_symbols = {
+        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ', 
+        r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+        r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ', 
+        r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ', 
+        r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ', 
+        r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'omega',
+        r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ', r'\Pi': 'Π', 
+        r'\Sigma': 'Σ', r'\Phi': 'Φ', r'\Psi': 'Ψ', r'\Omega': 'Ω',
+        r'\infty': '∞', r'\times': '×', r'\div': '÷', r'\pm': '±',
+        r'\cdot': '·', r'\neq': '≠', r'\ne': '≠', r'\leq': '≤', 
+        r'\le': '≤', r'\geq': '≥', r'\ge': '≥', r'\approx': '≈', 
+        r'\propto': '∝', r'\partial': '∂', r'\nabla': '∇', 
+        r'\sum': '∑', r'\prod': '∏', r'\int': '∫', r'\oint': '∮',
+        r'\sqrt': '√', r'\sim': '~', r'\forall': '∀', r'\exists': '∃', 
+        r'\in': '∈', r'\notin': '∉', r'\ni': '∋', r'\emptyset': '∅', 
+        r'\cap': '∩', r'\cup': '∪', r'\subset': '⊂', r'\supset': '⊃',
+        r'\subseteq': '⊆', r'\supseteq': '⊇', r'\rightarrow': '→', 
+        r'\leftarrow': '←', r'\uparrow': '↑', r'\downarrow': '↓', 
+        r'\leftrightarrow': '↔', r'\Rightarrow': '⇒', r'\Leftarrow': '⇐',
+        r'\hbar': 'ħ', r'\degree': '°'
+    }
+    
+    text = text.replace('$$', '').replace('$', '')
+    for latex, unicode_char in latex_symbols.items():
+        text = text.replace(latex, unicode_char)
+        
+    superscripts = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ'}
+    subscripts = {'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎', 'i': 'ᵢ', 'j': 'ⱼ', 'k': 'ₖ', 'x': 'ₓ'}
+    
+    def repl_super(match):
+        val = match.group(1) or match.group(2)
+        return "".join(superscripts.get(c, c) for c in val)
+        
+    text = re.sub(r'\^\{([^}]+)\}|\^([0-9+\-nix])', repl_super, text)
+    
+    def repl_sub(match):
+        val = match.group(1) or match.group(2)
+        return "".join(subscripts.get(c, c) for c in val)
+        
+    text = re.sub(r'\_\{([^}]+)\}|\_([0-9+\-ijkx])', repl_sub, text)
+    text = re.sub(r'√\{([^}]+)\}', r'√\1', text)
+    return text
+
+def render_math_safely(line):
+    code_placeholder = "___CODE_PLACEHOLDER_{}___"
+    codes = []
+    
+    def repl_code(match):
+        codes.append(match.group(0))
+        return code_placeholder.format(len(codes) - 1)
+        
+    temp_line = re.sub(r'`[^`\n]+`', repl_code, line)
+    temp_line = render_math(temp_line)
+    for idx, c in enumerate(codes):
+        temp_line = temp_line.replace(code_placeholder.format(idx), c)
+    return temp_line
 
 def render_markdown(text):
     lines = text.splitlines()
@@ -579,6 +654,8 @@ def render_markdown(text):
         line = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', r'\033[1m\1\2\033[22m', line)
         line = re.sub(r'\*(.*?)\*|_(.*?)_', r'\033[3m\1\2\033[23m', line)
         line = re.sub(r'`(.*?)`', r'\033[33m\1\033[39m', line)
+        
+        line = render_math_safely(line)
         
         rendered.append(line)
         i += 1
@@ -882,7 +959,7 @@ def main():
             if not cfg:
                 # Try matching clean server name
                 for k in mcp_servers.keys():
-                    clean_k = "".join(c if c.isalnum() or c == "_" else "_" for k in k)
+                    clean_k = "".join(c if c.isalnum() or c == "_" else "_" for c in k)
                     if clean_k == server_name:
                         cfg = mcp_servers[k]
                         break
