@@ -14,6 +14,13 @@ It reads from stdin, sends to an LLM, runs tools dynamically (such as shell comm
 
 ## Features
 
+- **Interactive Chat/REPL**: Run `ai` with no arguments, or with `-i` / `--interactive`, to start an interactive multi-turn conversation shell where chat history is preserved.
+- **Safety Confirmations**: Protects your machine by prompting for confirmation before running any shell command natively.
+- **Auto-Approve Flag**: Bypass safety prompts for automated scripts or trusted tasks using `-y` / `--yes` or setting `INFER_AUTO_APPROVE=1`.
+- **System-Context Awareness**: Automatically collects and provides OS, current directory, shell, user, and local time info to the LLM for high-accuracy local context.
+- **Native Directory Listing**: Safe directory navigation using a native tool (`list_directory`) to explore the project layout without running shell processes.
+- **Code Syntax Highlighting**: Terminal output code blocks are dynamically syntax-highlighted in real time for common programming languages.
+- **Automatic Job History Logging**: Automatically appends execution histories, prompts, and final responses to a local cache file at `~/.cache/ai/history.jsonl` for audits and references.
 - **Agentic Loop**: The CLI executes tools dynamically (multiple calls in parallel or sequence) based on what the LLM requests.
 - **Native Web Search**: Scrapes web results from DuckDuckGo Lite natively without requiring any third-party APIs or search tokens.
 - **Webpage Fetching**: Downloads, cleans, and converts HTML pages into readable text so the model can inspect details on URLs.
@@ -78,6 +85,24 @@ Reload your shell or run `source ~/.bashrc` to apply changes.
 ```bash
 ai "what's the tar command to extract .tar.gz?"
 ai how do I exit vim
+```
+
+### Interactive REPL
+```bash
+# Start an interactive conversation shell
+ai
+
+# Start with an initial query and stay interactive
+ai -i "let's look at this project"
+```
+
+### Command Approval & Flags
+```bash
+# Safely prompt before executing shell commands (default)
+ai "what kernel version is running?"
+
+# Auto-approve commands for script usage
+ai -y "create a backup of my ~/.bashrc"
 ```
 
 ### Command Outputs & Logs
