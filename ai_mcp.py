@@ -680,30 +680,31 @@ def main():
     if action == "list-tools":
         openai_tools = []
 
-        # Native list_directory
+        # 1. think — first so small models see it first
         openai_tools.append({
             "type": "function",
             "function": {
-                "name": "list_directory",
-                "description": "List the contents of a directory (files and subdirectories) on the host system to explore the project structure.",
+                "name": "think",
+                "description": "Use before any task requiring more than one tool call. Write your plan: what you know, what you need to find, and which tools you will call in order. This reasoning is shown to the user.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {
+                        "reasoning": {
                             "type": "string",
-                            "description": "The path to the directory to list. Defaults to the current working directory '.' if not specified."
+                            "description": "Your step-by-step plan for completing the task."
                         }
-                    }
+                    },
+                    "required": ["reasoning"]
                 }
             }
         })
-        
-        # Native execute_command
+
+        # 2. execute_command
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": "execute_command",
-                "description": "Run a shell command on the host system and return its stdout/stderr. Use this to inspect files, check disk space, list directories, run diagnostics, or perform tasks.",
+                "description": "Run a shell command on the host system and return its stdout and stderr. Use for any system task, file inspection, running scripts, installing packages, or verification. Prefer this over describing commands to the user.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -717,12 +718,12 @@ def main():
             }
         })
 
-        # Native web_search
+        # 3. web_search
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web using DuckDuckGo Lite to find information, news, code examples, documentation, or facts. No API key needed.",
+                "description": "Search the web using DuckDuckGo to find current information, prices, news, documentation, or facts you don't know. Always follow with fetch_webpage on at least one result URL before calling task_complete.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -736,12 +737,12 @@ def main():
             }
         })
 
-        # Native fetch_webpage
+        # 4. fetch_webpage
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": "fetch_webpage",
-                "description": "Download and read the text/markdown content of a website/URL to gather detailed information. No API key needed.",
+                "description": "Download and read the text content of a URL. Use after web_search to read actual page content. Required before task_complete if search returned URLs — never present links without reading them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -755,50 +756,12 @@ def main():
             }
         })
 
-        # Native save_memory
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": "save_memory",
-                "description": "Save key facts, user preferences, configurations, or context to persistent memory. This memory is automatically loaded as context in subsequent runs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "The exact content to store in memory. Keep it concise."
-                        }
-                    },
-                    "required": ["content"]
-                }
-            }
-        })
-
-        # Native delegate_task
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": "delegate_task",
-                "description": "Delegate a sub-task or investigation to a new helper AI agent. The agent runs independently with full system access and returns a summary. Use this to parallelize work or break down complex tasks.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task": {
-                            "type": "string",
-                            "description": "The detailed instructions/task for the helper agent."
-                        }
-                    },
-                    "required": ["task"]
-                }
-            }
-        })
-
-        # Native read_file
+        # 5. read_file
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file. Supports text files, PDFs (extracts text content), and image files (PNG, JPG, JPEG, WEBP) which are rendered directly into your vision model context.",
+                "description": "Read the contents of a file. Supports text files, PDFs (extracts text), and image files (PNG, JPG, JPEG, WEBP) which are shown directly in context.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -812,12 +775,12 @@ def main():
             }
         })
 
-        # Native write_file
+        # 6. write_file
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write new content to a file (creates parent directories if needed).",
+                "description": "Write content to a file, creating it and any parent directories if needed. After writing a script, always run it with execute_command to verify it works.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -835,12 +798,12 @@ def main():
             }
         })
 
-        # Native edit_file
+        # 7. edit_file
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Apply search-and-replace text edits to an existing file.",
+                "description": "Apply a search-and-replace edit to an existing file. The search_content must match exactly including whitespace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -858,6 +821,81 @@ def main():
                         }
                     },
                     "required": ["path", "search_content", "replace_content"]
+                }
+            }
+        })
+
+        # 8. list_directory
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "List the contents of a directory on the host system. Use to explore project structure before reading specific files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the directory to list. Defaults to '.' if not specified."
+                        }
+                    }
+                }
+            }
+        })
+
+        # 9. save_memory
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "save_memory",
+                "description": "Save key facts, user preferences, or context to persistent memory. This memory is automatically loaded in subsequent runs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The exact content to store in memory. Keep it concise."
+                        }
+                    },
+                    "required": ["content"]
+                }
+            }
+        })
+
+        # 10. delegate_task
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "description": "Run a self-contained sub-task in a parallel helper agent that has full tool access. Use for independent parallel work. Give complete, standalone instructions — the agent has no memory of this conversation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The detailed, self-contained instructions for the helper agent."
+                        }
+                    },
+                    "required": ["task"]
+                }
+            }
+        })
+
+        # 11. task_complete — last so model only sees it as exit
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "task_complete",
+                "description": "Call this ONLY when you have the verified answer from tools. Write the full result in summary — this is the only output the user sees. Do not call this if you still have URLs to fetch, commands to run, or scripts to verify.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "The complete answer or result for the user, in markdown. Include all relevant data you gathered from tools."
+                        }
+                    },
+                    "required": ["summary"]
                 }
             }
         })
@@ -895,7 +933,13 @@ def main():
             sys.exit(1)
 
         # Route custom tools
-        if tool_name == "list_directory" or server_name == "list_directory":
+        if tool_name == "think" or server_name == "think":
+            # Handled natively in C; this is a safety fallback
+            print('{"ok": true}')
+        elif tool_name == "task_complete" or server_name == "task_complete":
+            # Handled natively in C; this is a safety fallback
+            print('{"ok": true}')
+        elif tool_name == "list_directory" or server_name == "list_directory":
             path = arguments.get("path", ".")
             result = list_directory(path)
             print(result)
