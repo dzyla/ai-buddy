@@ -1311,6 +1311,15 @@ int main(int argc, char **argv) {
                                   tool_output = strdup("Error: failed to execute tool");
                               }
 
+                              /* Cap individual tool output to prevent context blowup */
+                              if (strlen(tool_output) > 3000) {
+                                  char *capped = malloc(3020);
+                                  memcpy(capped, tool_output, 3000);
+                                  strcpy(capped + 3000, "\n... [truncated]");
+                                  free(tool_output);
+                                  tool_output = capped;
+                              }
+
                               char *safe_output = json_escape(tool_output);
                               size_t tool_resp_len = strlen(safe_output) + strlen(unescaped_id) + strlen(unescaped_name) + 256;
                               char *tool_resp = malloc(tool_resp_len);
