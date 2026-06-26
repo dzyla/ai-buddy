@@ -1320,6 +1320,12 @@ int main(int argc, char **argv) {
                                   tool_output = capped;
                               }
 
+                              /* If total context is already large, stub this result */
+                              if (strlen(messages_json) > 40000) {
+                                  free(tool_output);
+                                  tool_output = strdup("[context limit reached \xe2\x80\x94 result omitted to preserve model focus]");
+                              }
+
                               char *safe_output = json_escape(tool_output);
                               size_t tool_resp_len = strlen(safe_output) + strlen(unescaped_id) + strlen(unescaped_name) + 256;
                               char *tool_resp = malloc(tool_resp_len);
