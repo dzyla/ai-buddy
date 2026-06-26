@@ -21,6 +21,7 @@ It reads from stdin, sends to an LLM, runs tools dynamically (such as shell comm
 - **Native Directory Listing**: Safe directory navigation using a native tool (`list_directory`) to explore the project layout without running shell processes.
 - **Code Syntax Highlighting**: Terminal output code blocks are dynamically syntax-highlighted in real time for common programming languages.
 - **Automatic Job History Logging**: Automatically appends execution histories, prompts, and final responses to a local cache file at `~/.cache/ai/history.jsonl` for audits and references.
+- **Automatic Skill Loading**: Automatically scans and loads local workspace rules from `./.agents/skills/` and global guidelines from `~/.config/ai/skills/` directly into the LLM system prompt context.
 - **Agentic Loop**: The CLI executes tools dynamically (multiple calls in parallel or sequence) based on what the LLM requests.
 - **Native Web Search**: Scrapes web results from DuckDuckGo Lite natively without requiring any third-party APIs or search tokens.
 - **Webpage Fetching**: Downloads, cleans, and converts HTML pages into readable text so the model can inspect details on URLs.
