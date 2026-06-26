@@ -7,6 +7,8 @@
 #include "jsmn.h"
 
 #include <strings.h>
+#include <dirent.h>
+#include <fcntl.h>
 
 #define MAX_LINE 1024
 #define MAX_VAL  512
@@ -50,6 +52,88 @@ static char* json_escape(const char *src) {
     }
     *p = 0;
     return dest;
+}
+
+// Finds the command line of the process writing to our stdin pipe, if any
+static char* find_pipe_writer() {
+    if (isatty(STDIN_FILENO)) return NULL;
+
+    char pipe_target[256];
+    ssize_t r = readlink("/proc/self/fd/0", pipe_target, sizeof(pipe_target) - 1);
+    if (r <= 0) return NULL;
+    pipe_target[r] = '\0';
+
+    if (strncmp(pipe_target, "pipe:[", 6) != 0) return NULL;
+
+    pid_t my_pid = getpid();
+    DIR *proc_dir = opendir("/proc");
+    if (!proc_dir) return NULL;
+
+    struct dirent *proc_entry;
+    char *cmdline_res = NULL;
+
+    while ((proc_entry = readdir(proc_dir)) != NULL) {
+        // Check if directory name is numeric
+        char *endptr;
+        long pid = strtol(proc_entry->d_name, &endptr, 10);
+        if (*endptr != '\0' || pid == my_pid) continue;
+
+        char fd_dir_path[512];
+        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%ld/fd", pid);
+        DIR *fd_dir = opendir(fd_dir_path);
+        if (!fd_dir) continue;
+
+        struct dirent *fd_entry;
+        int found_match = 0;
+        while ((fd_entry = readdir(fd_dir)) != NULL) {
+            if (fd_entry->d_name[0] == '.') continue;
+
+            char fd_link_path[1024];
+            snprintf(fd_link_path, sizeof(fd_link_path), "/proc/%ld/fd/%s", pid, fd_entry->d_name);
+
+            char fd_target[256];
+            ssize_t lr = readlink(fd_link_path, fd_target, sizeof(fd_target) - 1);
+            if (lr > 0) {
+                fd_target[lr] = '\0';
+                if (strcmp(fd_target, pipe_target) == 0) {
+                    found_match = 1;
+                    break;
+                }
+            }
+        }
+        closedir(fd_dir);
+
+        if (found_match) {
+            char cmd_path[512];
+            snprintf(cmd_path, sizeof(cmd_path), "/proc/%ld/cmdline", pid);
+            int fd = open(cmd_path, O_RDONLY);
+            if (fd >= 0) {
+                char buf[4096];
+                ssize_t bytes = read(fd, buf, sizeof(buf) - 1);
+                close(fd);
+                if (bytes > 0) {
+                    buf[bytes] = '\0';
+                    // Reconstruct command line by replacing null bytes with spaces
+                    for (ssize_t i = 0; i < bytes - 1; i++) {
+                        if (buf[i] == '\0') {
+                            buf[i] = ' ';
+                        }
+                    }
+                    // Trim trailing spaces / nulls
+                    while (bytes > 0 && (buf[bytes - 1] == '\0' || buf[bytes - 1] == ' ' || buf[bytes - 1] == '\n')) {
+                        buf[bytes - 1] = '\0';
+                        bytes--;
+                    }
+                    if (strlen(buf) > 0) {
+                        cmdline_res = strdup(buf);
+                    }
+                }
+            }
+            break; // Found the writer
+        }
+    }
+    closedir(proc_dir);
+    return cmdline_res;
 }
 
 // Reads stdin into a dynamically allocated string
@@ -468,6 +552,7 @@ int main(int argc, char **argv) {
     }
 
     // 1. Prepare Inputs
+    char *pipe_writer = find_pipe_writer();
     char *pipe_in = read_stdin();
 
     // Check if any argument is an image file
@@ -519,12 +604,29 @@ int main(int argc, char **argv) {
 
     // Add User Prompt
     char *safe_prompt = json_escape(prompt);
-    char *safe_pipe = pipe_in ? json_escape(pipe_in) : NULL;
     char *user_content = NULL;
-    if (safe_pipe && *safe_pipe) {
-        size_t len = strlen(safe_prompt) + strlen(safe_pipe) + 128;
+    if (pipe_in && strlen(pipe_in) > 0) {
+        char *safe_pipe = json_escape(pipe_in);
+        if (pipe_writer) {
+            char *safe_writer = json_escape(pipe_writer);
+            size_t len = strlen(safe_prompt) + strlen(safe_pipe) + strlen(safe_writer) + 256;
+            user_content = malloc(len);
+            sprintf(user_content, "%s\\n\\nContext (output of command `%s`):\\n%s", safe_prompt, safe_writer, safe_pipe);
+            free(safe_writer);
+        } else {
+            size_t len = strlen(safe_prompt) + strlen(safe_pipe) + 128;
+            user_content = malloc(len);
+            sprintf(user_content, "%s\\n\\nContext:\\n%s", safe_prompt, safe_pipe);
+        }
+        free(safe_pipe);
+    } else if (pipe_writer) {
+        // Print warning to stderr so the user knows the tool is intercepting and handling the empty pipe
+        fprintf(stderr, "[ai] Warning: Piped command '%s' returned no stdout. The agent will execute it to inspect stderr.\n", pipe_writer);
+        char *safe_writer = json_escape(pipe_writer);
+        size_t len = strlen(safe_prompt) + strlen(safe_writer) + 512;
         user_content = malloc(len);
-        sprintf(user_content, "%s\\n\\nContext:\\n%s", safe_prompt, safe_pipe);
+        sprintf(user_content, "%s\\n\\nContext:\\nThe user ran the command `%s` in their terminal, but its stdout was empty. It might have failed and written to stderr. You should run this command using the execute_command tool to inspect its output/errors.", safe_prompt, safe_writer);
+        free(safe_writer);
     } else {
         user_content = strdup(safe_prompt);
     }
@@ -548,7 +650,7 @@ int main(int argc, char **argv) {
     }
 
     messages_json = append_message(messages_json, user_msg);
-    free(safe_prompt); if(safe_pipe) free(safe_pipe);
+    free(safe_prompt);
     free(user_content); free(user_msg);
 
     // 2. Setup Curl
@@ -806,6 +908,7 @@ int main(int argc, char **argv) {
     }
 
     free(pipe_in);
+    if (pipe_writer) free(pipe_writer);
     free(prompt);
     free(messages_json);
     if (tools_json) free(tools_json);
