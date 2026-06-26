@@ -232,6 +232,32 @@ def save_memory(content):
     except Exception as e:
         return f"Error saving memory: {e}"
 
+def write_file(path, content):
+    try:
+        abs_path = os.path.abspath(os.path.expanduser(path))
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w") as f:
+            f.write(content)
+        return f"File successfully written to {path}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+def edit_file(path, search_content, replace_content):
+    try:
+        abs_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(abs_path):
+            return f"Error: file {path} does not exist."
+        with open(abs_path, "r") as f:
+            content = f.read()
+        if search_content not in content:
+            return f"Error: search content not found in {path}. Make sure the search block matches exactly including whitespace."
+        new_content = content.replace(search_content, replace_content)
+        with open(abs_path, "w") as f:
+            f.write(new_content)
+        return f"File successfully edited at {path}"
+    except Exception as e:
+        return f"Error editing file: {e}"
+
 def render_markdown(text):
     lines = text.splitlines()
     rendered = []
@@ -387,6 +413,56 @@ def main():
             }
         })
 
+        # Native write_file
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write new content to a file (creates parent directories if needed).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the file to write to."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The exact content to write to the file."
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        })
+
+        # Native edit_file
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Apply search-and-replace text edits to an existing file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the file to edit."
+                        },
+                        "search_content": {
+                            "type": "string",
+                            "description": "The exact text block to search for and replace."
+                        },
+                        "replace_content": {
+                            "type": "string",
+                            "description": "The replacement text block."
+                        }
+                    },
+                    "required": ["path", "search_content", "replace_content"]
+                }
+            }
+        })
+
         for server_name, cfg in mcp_servers.items():
             tools = list_tools(server_name, cfg)
             for t in tools:
@@ -431,6 +507,17 @@ def main():
         elif tool_name == "save_memory" or server_name == "save_memory":
             content = arguments.get("content", "")
             result = save_memory(content)
+            print(result)
+        elif tool_name == "write_file" or server_name == "write_file":
+            path = arguments.get("path", "")
+            content = arguments.get("content", "")
+            result = write_file(path, content)
+            print(result)
+        elif tool_name == "edit_file" or server_name == "edit_file":
+            path = arguments.get("path", "")
+            search_content = arguments.get("search_content", "")
+            replace_content = arguments.get("replace_content", "")
+            result = edit_file(path, search_content, replace_content)
             print(result)
         elif tool_name == "delegate_task" or server_name == "delegate_task":
             task = arguments.get("task", "")
