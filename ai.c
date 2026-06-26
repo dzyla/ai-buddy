@@ -1119,6 +1119,7 @@ int main(int argc, char **argv) {
                     int num_calls = tok[tool_calls_tok].size;
                     int current_tok = tool_calls_tok + 1;
 
+                    int task_done = 0;
                     for (int tc = 0; tc < num_calls; tc++) {
                         if (tok[current_tok].type != JSMN_OBJECT) break;
 
@@ -1164,7 +1165,61 @@ int main(int argc, char **argv) {
 
                               char *tool_output = NULL;
 
-                              if (strcmp(unescaped_name, "execute_command") == 0) {
+                              if (strcmp(unescaped_name, "think") == 0) {
+                                  jsmn_parser arg_parser;
+                                  jsmntok_t arg_toks[32];
+                                  jsmn_init(&arg_parser);
+                                  int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 32);
+                                  char *reasoning = NULL;
+                                  for (int a = 1; a < arg_r; a++) {
+                                      if (arg_toks[a].type == JSMN_STRING &&
+                                          arg_toks[a].end - arg_toks[a].start == 9 &&
+                                          strncmp(unescaped_args + arg_toks[a].start, "reasoning", 9) == 0) {
+                                          reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                           arg_toks[a+1].end - arg_toks[a+1].start);
+                                          break;
+                                      }
+                                  }
+                                  if (!quiet_mode && reasoning) {
+                                      fprintf(stdout, "\033[2m[thinking] %s\033[0m\n", reasoning);
+                                      fflush(stdout);
+                                  }
+                                  if (reasoning) free(reasoning);
+                                  tool_output = strdup("{\"ok\":true}");
+                              } else if (strcmp(unescaped_name, "task_complete") == 0) {
+                                  jsmn_parser arg_parser;
+                                  jsmntok_t arg_toks[32];
+                                  jsmn_init(&arg_parser);
+                                  int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 32);
+                                  char *summary = NULL;
+                                  for (int a = 1; a < arg_r; a++) {
+                                      if (arg_toks[a].type == JSMN_STRING &&
+                                          arg_toks[a].end - arg_toks[a].start == 7 &&
+                                          strncmp(unescaped_args + arg_toks[a].start, "summary", 7) == 0) {
+                                          summary = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                         arg_toks[a+1].end - arg_toks[a+1].start);
+                                          break;
+                                      }
+                                  }
+                                  if (summary) {
+                                      log_job(current_prompt, pipe_writer, summary, interactive_mode);
+                                      char *escaped_summary = shell_escape(summary);
+                                      char render_cmd[4096 + strlen(escaped_summary)];
+                                      snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_summary);
+                                      char *rendered = run_shell_command(render_cmd, NULL);
+                                      if (rendered) {
+                                          printf("%s\n", rendered);
+                                          free(rendered);
+                                      } else {
+                                          printf("%s\n", summary);
+                                      }
+                                      free(escaped_summary);
+                                      free(summary);
+                                  }
+                                  tool_output = strdup("{\"ok\":true}");
+                                  has_more = 0;
+                                  task_done = 1;
+                              } else if (strcmp(unescaped_name, "execute_command") == 0) {
                                   jsmn_parser arg_parser;
                                   jsmntok_t arg_toks[64];
                                   jsmn_init(&arg_parser);
@@ -1290,6 +1345,7 @@ int main(int argc, char **argv) {
                               free(tool_output);
                               free(safe_output);
                               free(tool_resp);
+                              if (task_done) break;
                           }
 
                           current_tok = json_skip_token(tok, r, current_tok);
