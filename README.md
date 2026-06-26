@@ -47,7 +47,7 @@ brew install curl python
 
 ```bash
 # Clone and build
-git clone https://github.com/<your-username>/ai.git
+git clone https://github.com/dzyla/ai.git
 cd ai
 gcc -o ai ai.c -lcurl
 
