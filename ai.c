@@ -19,19 +19,29 @@
 #define MAX_VAL  512
 
 // Config globals
-static char api_url[MAX_VAL];
-static char api_key[MAX_VAL];
-static char model[MAX_VAL];
+static char  api_url[MAX_VAL];
+static char  api_key[MAX_VAL];
+static char  model[MAX_VAL];
+static float temperature_val  = -1.0f;
+static int   max_tokens_val   = -1;
+static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
 
 static const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
+    "SPEED RULE (highest priority):\n"
+    "- Single-step tasks (list files, read a file, run one command, check disk/memory, look up a fact you know) must complete in ONE tool call followed immediately by task_complete. Do NOT use think first. Do NOT make extra tool calls.\n"
+    "- Only use think when the task genuinely requires planning across 3+ tool calls.\n\n"
     "TOOL USE:\n"
-    "- For facts you already know (e.g. definitions, formulas, capitals), call task_complete directly.\n"
+    "- For facts you already know (e.g. definitions, formulas, capitals), call task_complete directly — no tools needed.\n"
     "- Use web_search only when you need current data (prices, news, live stats) or genuinely don't know.\n"
     "- After web_search, you MUST call fetch_webpage on at least one result URL before task_complete.\n"
-    "- If fetch_webpage returns noisy or incomplete data, try execute_command with a Python/curl script to get the data programmatically.\n"
+    "- If fetch_webpage returns noisy or incomplete data, try execute_command with a Python/curl script.\n"
     "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n"
     "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
+    "CITATIONS:\n"
+    "- fetch_webpage and read_file (PDF) results begin with a [Source: ...] line. Track every source whose content you use.\n"
+    "- In your task_complete summary, always end with a '## Sources' section listing each [Source: ...] URL or file path you drew from.\n"
+    "- Do not list sources you fetched but did not use in the answer.\n\n"
     "FAILURE RECOVERY:\n"
     "- If execute_command fails, read the error, fix the root cause, and retry. At least 3 attempts before giving up.\n"
     "- If a library is missing, install it with pip/apt. If a web source is blocked or noisy, find an alternative.\n"
@@ -532,6 +542,26 @@ static char* run_shell_command(const char *cmd, int *exit_status) {
     return buf;
 }
 
+/* Extract the string value of a key from a flat JSON object string. */
+static char* json_get_string(const char *json_str, const char *key) {
+    jsmn_parser p;
+    jsmntok_t tok[64];
+    jsmn_init(&p);
+    int r = jsmn_parse(&p, json_str, strlen(json_str), tok, 64);
+    if (r < 0) return NULL;
+    int klen = (int)strlen(key);
+    for (int i = 1; i < r - 1; i++) {
+        if (tok[i].type == JSMN_STRING &&
+            tok[i].end - tok[i].start == klen &&
+            strncmp(json_str + tok[i].start, key, klen) == 0 &&
+            tok[i+1].type == JSMN_STRING) {
+            return unescape_json_string(json_str + tok[i+1].start,
+                                        tok[i+1].end - tok[i+1].start);
+        }
+    }
+    return NULL;
+}
+
 static int json_skip_token(jsmntok_t *tokens, int r, int start_idx) {
     if (start_idx >= r) return r;
     int end = tokens[start_idx - 1].end;
@@ -680,6 +710,28 @@ static char* read_memory_file() {
     return buf;
 }
 
+/* Write messages_json to a temp file, ask Python to trim it, return trimmed version.
+   Keeps: messages[0] (system), messages[1] (first user), last 20 messages. */
+static char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
+    if (strlen(messages_json) <= 35000) return messages_json;
+    char tmpfile[128];
+    snprintf(tmpfile, sizeof(tmpfile), "/tmp/ai_msgs_%d.json", (int)getpid());
+    FILE *fp = fopen(tmpfile, "w");
+    if (!fp) return messages_json;
+    fputs(messages_json, fp);
+    fclose(fp);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s", mcp_script, tmpfile);
+    char *trimmed = run_shell_command(cmd, NULL);
+    unlink(tmpfile);
+    if (trimmed && strlen(trimmed) > 5 && trimmed[0] == '[') {
+        free(messages_json);
+        return trimmed;
+    }
+    if (trimmed) free(trimmed);
+    return messages_json;
+}
+
 int main(int argc, char **argv) {
     int is_stdin_tty = isatty(STDIN_FILENO);
     int interactive_mode = 0;
@@ -740,6 +792,13 @@ int main(int argc, char **argv) {
     if (env_quiet && (strcmp(env_quiet, "1") == 0 || strcasecmp(env_quiet, "true") == 0)) {
         quiet_mode = 1;
     }
+
+    char *env_temp = getenv("INFER_TEMPERATURE");
+    if (env_temp && *env_temp) temperature_val = (float)atof(env_temp);
+    char *env_maxtok = getenv("INFER_MAX_TOKENS");
+    if (env_maxtok && *env_maxtok) max_tokens_val = atoi(env_maxtok);
+    char *env_ctxwin = getenv("INFER_CONTEXT_WINDOW");
+    if (env_ctxwin && *env_ctxwin) context_window = atoi(env_ctxwin);
 
     if (argc < 2 && is_stdin_tty) {
         interactive_mode = 1;
@@ -1009,13 +1068,27 @@ int main(int argc, char **argv) {
             while (has_more && loop_count < 30) {
                 loop_count++;
                 
+                messages_json = maybe_trim_messages(messages_json, mcp_script);
+
+                /* Build optional parameter fields */
+                char opt_fields[128] = "";
+                int opt_len = 0;
+                if (temperature_val >= 0.0f)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"temperature\":%.2f", temperature_val);
+                if (max_tokens_val > 0)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"max_tokens\":%d", max_tokens_val);
+
                 char *payload = NULL;
-                size_t plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 256;
+                size_t plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
                 payload = malloc(plen);
                 if (tools_json && strlen(tools_json) > 10) {
-                    sprintf(payload, "{\"model\":\"%s\",\"stream\":false,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"required\"}", model, messages_json, tools_json);
+                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"auto\"}",
+                             model, opt_fields, messages_json, tools_json);
                 } else {
-                    sprintf(payload, "{\"model\":\"%s\",\"stream\":false,\"messages\":%s}", model, messages_json);
+                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
+                             model, opt_fields, messages_json);
                 }
 
                 if (debug_mode) {
@@ -1026,7 +1099,12 @@ int main(int argc, char **argv) {
                 curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
                 curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&chunk);
 
+                struct timespec t_req_start, t_req_end;
+                clock_gettime(CLOCK_MONOTONIC, &t_req_start);
                 CURLcode res = curl_easy_perform(c);
+                clock_gettime(CLOCK_MONOTONIC, &t_req_end);
+                double elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
+                                     (t_req_end.tv_nsec - t_req_start.tv_nsec) * 1e-9;
 
                 if (res != CURLE_OK || !chunk.data) {
                     fprintf(stderr, "Request failed: %s\n", curl_easy_strerror(res));
@@ -1054,6 +1132,7 @@ int main(int argc, char **argv) {
                 int finish_reason_tok = -1;
                 int message_tok = -1;
                 int tool_calls_tok = -1;
+                int usage_tok = -1;
 
                 int error_tok = -1;
                 for (int i = 1; i < r; i++) {
@@ -1067,7 +1146,28 @@ int main(int argc, char **argv) {
                             tool_calls_tok = i + 1;
                         } else if (len == 5 && strncmp(chunk.data + tok[i].start, "error", 5) == 0) {
                             error_tok = i + 1;
+                        } else if (len == 5 && strncmp(chunk.data + tok[i].start, "usage", 5) == 0) {
+                            usage_tok = i + 1;
                         }
+                    }
+                }
+
+                /* Parse token usage for display */
+                int prompt_tokens = 0, completion_tokens = 0, total_tokens = 0;
+                if (usage_tok != -1 && tok[usage_tok].type == JSMN_OBJECT) {
+                    int u_end = tok[usage_tok].end;
+                    int k = usage_tok + 1;
+                    while (k < r && tok[k].start < u_end) {
+                        if (tok[k].type == JSMN_STRING) {
+                            int ulen = tok[k].end - tok[k].start;
+                            if (ulen == 13 && strncmp(chunk.data + tok[k].start, "prompt_tokens", 13) == 0)
+                                prompt_tokens = atoi(chunk.data + tok[k+1].start);
+                            else if (ulen == 17 && strncmp(chunk.data + tok[k].start, "completion_tokens", 17) == 0)
+                                completion_tokens = atoi(chunk.data + tok[k+1].start);
+                            else if (ulen == 12 && strncmp(chunk.data + tok[k].start, "total_tokens", 12) == 0)
+                                total_tokens = atoi(chunk.data + tok[k+1].start);
+                        }
+                        k = json_skip_token(tok, r, k + 1);
                     }
                 }
 
@@ -1298,7 +1398,44 @@ int main(int argc, char **argv) {
                                       mcp_tool_name = unescaped_name;
                                   }
 
-                                  fprintf(stderr, "[ai] calling MCP tool '%s' on server '%s'\n", mcp_tool_name, server_name);
+                                  /* Show a human-readable line for what the model is doing */
+                                  if (strcmp(mcp_tool_name, "read_file") == 0 ||
+                                      strcmp(mcp_tool_name, "write_file") == 0 ||
+                                      strcmp(mcp_tool_name, "edit_file") == 0 ||
+                                      strcmp(mcp_tool_name, "list_directory") == 0) {
+                                      char *fpath = json_get_string(unescaped_args, "path");
+                                      fprintf(stderr, "\033[2m[ai] %s: %s\033[0m\n",
+                                              mcp_tool_name, fpath ? fpath : "?");
+                                      if (fpath) free(fpath);
+                                  } else if (strcmp(mcp_tool_name, "web_search") == 0) {
+                                      char *q = json_get_string(unescaped_args, "query");
+                                      fprintf(stderr, "\033[2m[ai] web_search: \"%s\"\033[0m\n",
+                                              q ? q : "?");
+                                      if (q) free(q);
+                                  } else if (strcmp(mcp_tool_name, "fetch_webpage") == 0) {
+                                      char *url = json_get_string(unescaped_args, "url");
+                                      fprintf(stderr, "\033[2m[ai] fetch_webpage: %s\033[0m\n",
+                                              url ? url : "?");
+                                      if (url) free(url);
+                                  } else if (strcmp(mcp_tool_name, "delegate_task") == 0) {
+                                      char *task = json_get_string(unescaped_args, "task");
+                                      if (task) {
+                                          task[strcspn(task, "\n")] = '\0';
+                                          if (strlen(task) > 72) task[72] = '\0';
+                                          fprintf(stderr, "\033[2m[ai] delegate_task: \"%s...\"\033[0m\n", task);
+                                          free(task);
+                                      } else {
+                                          fprintf(stderr, "\033[2m[ai] delegate_task\033[0m\n");
+                                      }
+                                  } else if (strcmp(mcp_tool_name, "save_memory") == 0) {
+                                      char *mem = json_get_string(unescaped_args, "content");
+                                      fprintf(stderr, "\033[2m[ai] save_memory (%zu chars)\033[0m\n",
+                                              mem ? strlen(mem) : 0UL);
+                                      if (mem) free(mem);
+                                  } else {
+                                      fprintf(stderr, "\033[2m[ai] %s::%s\033[0m\n",
+                                              server_name, mcp_tool_name);
+                                  }
                                   
                                   char *escaped_args_shell = shell_escape(unescaped_args);
                                   char call_cmd[4096 + strlen(escaped_args_shell)];
@@ -1311,6 +1448,21 @@ int main(int argc, char **argv) {
 
                               if (!tool_output) {
                                   tool_output = strdup("Error: failed to execute tool");
+                              }
+
+                              /* Prefix tool results with a structured header so small models
+                                 can track which tool produced which data */
+                              if (strcmp(unescaped_name, "think") != 0 &&
+                                  strcmp(unescaped_name, "task_complete") != 0) {
+                                  int is_err = (strncmp(tool_output, "Error:", 6) == 0 ||
+                                                strncmp(tool_output, "[Command Failed", 15) == 0 ||
+                                                strncmp(tool_output, "{\"error\"", 8) == 0);
+                                  size_t hlen = strlen(unescaped_name) + strlen(tool_output) + 48;
+                                  char *hout = malloc(hlen);
+                                  snprintf(hout, hlen, "[Tool: %s | Status: %s]\n%s",
+                                           unescaped_name, is_err ? "error" : "ok", tool_output);
+                                  free(tool_output);
+                                  tool_output = hout;
                               }
 
                               /* Cap individual tool output to prevent context blowup */
@@ -1403,6 +1555,33 @@ int main(int argc, char **argv) {
                           
                           free(unescaped_content);
                           free(escaped_content);
+                      }
+
+                      /* If the model stopped with no content and no tool calls, nudge it
+                         to call task_complete rather than silently stalling */
+                      if ((content_tok == -1 ||
+                           tok[content_tok].end - tok[content_tok].start == 0) &&
+                          loop_count < 28) {
+                          const char *nudge = "{\"role\":\"user\",\"content\":\"Please call task_complete with your final answer.\"}";
+                          messages_json = append_message(messages_json, nudge);
+                          has_more = 1;
+                      }
+                  }
+
+                  /* Usage / speed stats line */
+                  if (!quiet_mode && (prompt_tokens > 0 || completion_tokens > 0)) {
+                      double tps = (elapsed_sec > 0.05 && completion_tokens > 0)
+                                   ? completion_tokens / elapsed_sec : 0.0;
+                      if (context_window > 0) {
+                          int pct = (int)(100.0 * total_tokens / context_window);
+                          fprintf(stderr,
+                              "\033[2m[loop %d | ctx %d/%d (%d%%) | +%d tok | %.0f tok/s]\033[0m\n",
+                              loop_count, total_tokens, context_window, pct,
+                              completion_tokens, tps);
+                      } else {
+                          fprintf(stderr,
+                              "\033[2m[loop %d | %d ctx tok | +%d new | %.0f tok/s]\033[0m\n",
+                              loop_count, prompt_tokens, completion_tokens, tps);
                       }
                   }
 

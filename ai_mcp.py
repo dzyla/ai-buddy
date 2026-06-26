@@ -197,25 +197,25 @@ def fetch_webpage(url):
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
-        
+
         html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
         html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
         html = re.sub(r'<p[^>]*>', '\n\n', html, flags=re.IGNORECASE)
         html = re.sub(r'<br[^>]*>', '\n', html, flags=re.IGNORECASE)
         html = re.sub(r'<h[1-6][^>]*>', '\n\n# ', html, flags=re.IGNORECASE)
         html = re.sub(r'</h[1-6]>', '\n', html, flags=re.IGNORECASE)
-        
+
         text = re.sub(r'<[^>]+>', '', html)
         text = text.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
         text = text.replace('&#x27;', "'").replace('&#39;', "'").replace('&ndash;', '-').replace('&mdash;', '-')
-        
+
         lines = [line.strip() for line in text.splitlines()]
         text = "\n".join([line for line in lines if line])
-        
+
         if len(text) > 10000:
             text = text[:10000] + "\n... (truncated)"
-            
-        return text
+
+        return f"[Source: {url}]\n\n{text}"
     except Exception as e:
         return f"Error fetching webpage: {e}"
 
@@ -232,40 +232,89 @@ def save_memory(content):
     except Exception as e:
         return f"Error saving memory: {e}"
 
-def extract_text_from_pdf(path):
-    # Try pdftotext first (very common on Linux via poppler-utils)
-    try:
-        proc = subprocess.run(["pdftotext", path, "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode == 0:
-            return proc.stdout
-    except Exception:
-        pass
-    
-    # Try pypdf Python library
-    try:
-        import pypdf
-        reader = pypdf.PdfReader(path)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        if text:
-            return text
-    except Exception:
-        pass
+def _clean_pdf_text(raw):
+    # Repair soft-hyphenation at line breaks (word-\nrest -> wordrest)
+    raw = re.sub(r'-\n(?=[a-z])', '', raw)
+    # Remove control characters except newline/tab
+    raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw)
+    # Collapse runs of blank lines to at most two
+    raw = re.sub(r'\n{3,}', '\n\n', raw)
+    # Collapse runs of spaces/tabs on a single line
+    raw = re.sub(r'[ \t]{2,}', ' ', raw)
+    return raw.strip()
 
-    # Try pdfplumber Python library
+def extract_text_from_pdf(path):
+    source_header = f"[Source: {path}]\n\n"
+    pages_text = []
+
+    # 1. pdfplumber — best layout-awareness; also extracts tables
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
-            text = ""
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-            if text:
-                return text
+            meta = pdf.metadata or {}
+            meta_parts = []
+            if meta.get("Title"):
+                meta_parts.append(f"Title: {meta['Title']}")
+            if meta.get("Author"):
+                meta_parts.append(f"Author: {meta['Author']}")
+            if meta_parts:
+                pages_text.append("[PDF Metadata] " + " | ".join(meta_parts))
+
+            for i, page in enumerate(pdf.pages, 1):
+                parts = []
+                body = page.extract_text(x_tolerance=2, y_tolerance=3) or ""
+                if body.strip():
+                    parts.append(body)
+                # Append any tables found on the page as simple CSV-ish blocks
+                for table in page.extract_tables() or []:
+                    rows = []
+                    for row in table:
+                        rows.append(" | ".join(cell.strip() if cell else "" for cell in row))
+                    if rows:
+                        parts.append("[Table]\n" + "\n".join(rows))
+                if parts:
+                    pages_text.append(f"--- Page {i} ---\n" + "\n\n".join(parts))
+
+        if pages_text:
+            return source_header + _clean_pdf_text("\n\n".join(pages_text))
     except Exception:
         pass
 
-    return "Error: Could not parse PDF. Please ensure the 'pdftotext' command-line utility or 'pypdf' Python library is installed."
+    # 2. pypdf
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(path)
+        meta = reader.metadata or {}
+        meta_parts = []
+        if getattr(meta, "title", None):
+            meta_parts.append(f"Title: {meta.title}")
+        if getattr(meta, "author", None):
+            meta_parts.append(f"Author: {meta.author}")
+        if meta_parts:
+            pages_text.append("[PDF Metadata] " + " | ".join(meta_parts))
+
+        for i, page in enumerate(reader.pages, 1):
+            body = page.extract_text() or ""
+            if body.strip():
+                pages_text.append(f"--- Page {i} ---\n{body}")
+
+        if pages_text:
+            return source_header + _clean_pdf_text("\n\n".join(pages_text))
+    except Exception:
+        pass
+
+    # 3. pdftotext (poppler-utils) — reliable fallback for scanned/complex PDFs
+    try:
+        proc = subprocess.run(
+            ["pdftotext", "-layout", path, "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return source_header + _clean_pdf_text(proc.stdout)
+    except Exception:
+        pass
+
+    return "Error: Could not parse PDF. Install 'pdfplumber' (pip install pdfplumber), 'pypdf' (pip install pypdf), or 'pdftotext' (apt install poppler-utils)."
 
 def list_directory(path="."):
     try:
@@ -355,34 +404,119 @@ def is_binary_file(filepath):
     except:
         return False
 
-def read_file(path):
+def extract_code_outline(content):
+    """Return a list of top-level definitions with line numbers."""
+    outline = []
+    patterns = re.compile(
+        r'^(?:'
+        r'(?:async\s+)?def\s+\w+'          # Python functions
+        r'|class\s+\w+'                     # Python/JS/TS/Rust classes
+        r'|(?:pub\s+)?(?:fn|impl|struct|enum|trait)\s+\w+'  # Rust
+        r'|func\s+\w+'                      # Go
+        r'|(?:async\s+)?function\s+\w+'    # JS/TS
+        r'|(?:export\s+)?(?:const|let)\s+\w+\s*=\s*(?:async\s+)?\('  # arrow fns
+        r'|(?:interface|type)\s+\w+'        # TS
+        r')'
+    )
+    for i, line in enumerate(content.splitlines(), 1):
+        stripped = line.lstrip()
+        if patterns.match(stripped):
+            outline.append(f"  L{i:>5}: {stripped[:90]}")
+        if len(outline) >= 40:
+            outline.append("  ... (outline truncated at 40 entries)")
+            break
+    return "\n".join(outline)
+
+def read_file(path, start_line=None, end_line=None):
     try:
         abs_path = os.path.abspath(os.path.expanduser(path))
         if not os.path.exists(abs_path):
             return f"Error: file {path} does not exist."
-            
+
         ext = os.path.splitext(abs_path)[1].lower()
         if ext not in ['.png', '.jpg', '.jpeg', '.webp', '.pdf'] and is_binary_file(abs_path):
             return f"Error: Cannot read binary file '{path}'. This file appears to be a compiled binary or non-text file."
-        
-        # If it's an image, return a special tag that the C binary intercepts to load base64
+
         if ext in ['.png', '.jpg', '.jpeg', '.webp']:
             return f"[IMAGE_DATA_SUCCESS:{abs_path}]"
-            
-        # If PDF
+
         if ext == '.pdf':
             return extract_text_from_pdf(abs_path)
-            
-        # Otherwise, treat as text file
+
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            if len(content) > 12000:
-                content = content[:12000] + "\n... (truncated to 12KB)"
-            return content
         except Exception as e:
             return f"Error reading text file: {e}"
-            
+
+        lines = content.splitlines()
+        total_lines = len(lines)
+        total_chars = len(content)
+
+        # Line-range read (model requested a specific slice)
+        if start_line is not None or end_line is not None:
+            s = max(0, (start_line or 1) - 1)
+            e = min(total_lines, end_line or total_lines)
+            snippet = "\n".join(lines[s:e])
+            return (f"[{abs_path} | lines {s+1}-{e} of {total_lines}]\n"
+                    f"[Use read_file with start_line/end_line to read other sections]\n\n"
+                    f"{snippet}")
+
+        # Small file — return as-is
+        if total_chars <= 12000:
+            return content
+
+        # Large file (12 KB – 80 KB): return smart outline + head + tail
+        if total_chars <= 80000:
+            outline = extract_code_outline(content)
+            head = "\n".join(lines[:80])
+            tail = "\n".join(lines[-30:])
+            omitted = total_lines - 110
+            parts = [
+                f"[Large file: {total_lines} lines, {total_chars} chars | {abs_path}]",
+                f"[To read a specific section: read_file(path, start_line=N, end_line=M)]",
+            ]
+            if outline:
+                parts.append(f"\n### Code outline\n{outline}")
+            parts.append(f"\n### First 80 lines\n{head}")
+            if omitted > 0:
+                parts.append(f"\n... ({omitted} lines omitted) ...")
+            parts.append(f"\n### Last 30 lines\n{tail}")
+            return "\n".join(parts)
+
+        # Very large file (> 80 KB): delegate digest to a sub-agent
+        ai_bin = "/usr/local/bin/ai"
+        if not os.path.exists(ai_bin):
+            ai_bin = "./ai"
+        if not os.path.exists(ai_bin):
+            # Fall back to the outline + head approach
+            outline = extract_code_outline(content)
+            head = "\n".join(lines[:60])
+            return (f"[Very large file: {total_lines} lines | {abs_path}]\n"
+                    f"[Sub-agent digest unavailable; showing outline + first 60 lines]\n\n"
+                    f"### Code outline\n{outline}\n\n### First 60 lines\n{head}")
+
+        digest_prompt = (
+            f"Read and digest the file '{abs_path}'. "
+            f"Summarise its purpose, structure, key functions/classes/variables, "
+            f"and any important patterns or TODOs. "
+            f"Keep the summary under 800 words. Output in markdown."
+        )
+        try:
+            proc = subprocess.run(
+                [ai_bin, digest_prompt],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=90
+            )
+            summary = proc.stdout.strip()
+            if not summary:
+                summary = "(sub-agent returned no output)"
+        except Exception as ex:
+            summary = f"(sub-agent error: {ex})"
+
+        return (f"[Very large file: {total_lines} lines, {total_chars} chars | {abs_path}]\n"
+                f"[Digest produced by sub-agent]\n\n{summary}")
+
     except Exception as e:
         return f"Error opening file: {e}"
 
@@ -662,9 +796,33 @@ def render_markdown(text):
         
     return "\n".join(rendered)
 
+TOOL_REQUIRED_ARGS = {
+    "execute_command": ["command"],
+    "web_search":      ["query"],
+    "fetch_webpage":   ["url"],
+    "read_file":       ["path"],
+    "write_file":      ["path", "content"],
+    "edit_file":       ["path", "search_content", "replace_content"],
+    "save_memory":     ["content"],
+    "delegate_task":   ["task"],
+    "think":           ["reasoning"],
+    "task_complete":   ["summary"],
+}
+
+def repair_json(s):
+    """Best-effort repair of common small-model JSON mistakes."""
+    s = s.strip()
+    # Remove trailing commas before } or ]
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+    # Close unclosed braces (truncated output)
+    if s and s[0] == '{':
+        depth = sum(1 if c == '{' else -1 if c == '}' else 0 for c in s)
+        s += '}' * max(0, depth)
+    return s
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ai_mcp.py [list-tools | call-tool | render-markdown]", file=sys.stderr)
+        print("Usage: ai_mcp.py [list-tools | call-tool | render-markdown | trim-messages]", file=sys.stderr)
         sys.exit(1)
 
     action = sys.argv[1]
@@ -675,6 +833,20 @@ def main():
             sys.exit(0)
         text = sys.argv[2]
         print(render_markdown(text))
+        sys.exit(0)
+
+    if action == "trim-messages":
+        if len(sys.argv) < 3:
+            sys.exit(1)
+        try:
+            with open(sys.argv[2]) as f:
+                messages = json.load(f)
+            # Keep: system prompt (0), first user turn (1), last 20 messages
+            if len(messages) > 22:
+                messages = messages[:2] + messages[-20:]
+            print(json.dumps(messages))
+        except Exception:
+            print("[]")
         sys.exit(0)
 
     if action == "list-tools":
@@ -761,13 +933,26 @@ def main():
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file. Supports text files, PDFs (extracts text), and image files (PNG, JPG, JPEG, WEBP) which are shown directly in context.",
+                "description": (
+                    "Read the contents of a file. Supports text files, PDFs (extracts text), "
+                    "and image files (PNG, JPG, JPEG, WEBP) which are shown in context. "
+                    "For large text files an outline + head/tail is returned automatically. "
+                    "Use start_line and end_line to read a specific section of a large file."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "The path to the file to read."
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "First line to return (1-based, inclusive). Omit to start from the beginning."
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "Last line to return (1-based, inclusive). Omit to read to the end."
                         }
                     },
                     "required": ["path"]
@@ -928,9 +1113,19 @@ def main():
 
         try:
             arguments = json.loads(args_json)
-        except Exception as e:
-            print(json.dumps({"error": f"Failed to parse arguments JSON: {e}"}))
-            sys.exit(1)
+        except Exception:
+            try:
+                arguments = json.loads(repair_json(args_json))
+            except Exception as e:
+                print(json.dumps({"error": f"Failed to parse arguments JSON even after repair: {e}"}))
+                sys.exit(1)
+
+        # Validate required arguments before dispatch
+        required = TOOL_REQUIRED_ARGS.get(tool_name, [])
+        missing = [k for k in required if k not in arguments]
+        if missing:
+            print(json.dumps({"error": f"Missing required argument(s): {', '.join(missing)}"}))
+            sys.exit(0)
 
         # Route custom tools
         if tool_name == "think" or server_name == "think":
@@ -957,7 +1152,9 @@ def main():
             print(result)
         elif tool_name == "read_file" or server_name == "read_file":
             path = arguments.get("path", "")
-            result = read_file(path)
+            start_line = arguments.get("start_line", None)
+            end_line = arguments.get("end_line", None)
+            result = read_file(path, start_line=start_line, end_line=end_line)
             print(result)
         elif tool_name == "write_file" or server_name == "write_file":
             path = arguments.get("path", "")
