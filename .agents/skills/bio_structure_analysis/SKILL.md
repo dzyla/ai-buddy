@@ -5,8 +5,48 @@ description: Guides structural analysis tasks — parsing PDB/mmCIF/MRC files, r
 
 # Structural Biology Analysis
 
-## Core Rule
-When a structural question involves a file, **write a self-contained Python script, save it to `/tmp/bio_analysis.py`, execute it with `execute_command`, and report the actual output**. Never describe what the user could run — run it.
+## Core Rules
+
+**NEVER use `read_file` on PDB, mmCIF, MRC, MAP, XTC, DCD, or TRR files.** These are binary or multi-megabyte text formats — reading them as text is useless and will flood the context. Always parse them with the appropriate Python library instead.
+
+When any structural question involves a file path, **write a self-contained Python script, save it to `/tmp/bio_analysis.py`, execute it with `execute_command`, and report the actual output**. Never describe what the user could run — run it.
+
+## Structure Overview (use for "tell me about this file" / "what's in this structure")
+
+When asked to describe or summarize any PDB/mmCIF file, run this immediately:
+
+```python
+import gemmi, sys
+
+path = sys.argv[1] if len(sys.argv) > 1 else "input.cif"
+st = gemmi.read_structure(path)
+meta = st.info  # dict of _entry.id, _exptl.method, _refine.ls_d_res_high, etc.
+
+print(f"Entry: {st.name}")
+print(f"Method: {meta.get('_exptl.method', 'N/A')}")
+print(f"Resolution: {meta.get('_refine.ls_d_res_high', meta.get('_em_3d_reconstruction.resolution', 'N/A'))} Å")
+print(f"Space group: {st.spacegroup_hm}")
+print(f"Models: {len(st)}")
+
+model = st[0]
+print(f"\nChains ({len(list(model))}):")
+for chain in model:
+    residues = list(chain)
+    polymer = [r for r in residues if r.entity_type == gemmi.EntityType.Polymer]
+    hetero  = [r for r in residues if r.entity_type == gemmi.EntityType.NonPolymer]
+    water   = [r for r in residues if r.entity_type == gemmi.EntityType.Water]
+    seq = "".join(gemmi.find_tabulated_residue(r.name).one_letter_code
+                  for r in polymer if gemmi.find_tabulated_residue(r.name).one_letter_code != '?')
+    print(f"  Chain {chain.name}: {len(polymer)} residues, {len(hetero)} ligands, "
+          f"{len(water)} waters  seq: {seq[:60]}{'...' if len(seq)>60 else ''}")
+
+ligands = {r.name for c in model for r in c
+           if r.entity_type == gemmi.EntityType.NonPolymer and r.name != 'HOH'}
+if ligands:
+    print(f"\nLigands: {', '.join(sorted(ligands))}")
+```
+
+Run it as: `execute_command python3 /tmp/bio_analysis.py /path/to/file.cif`
 
 ## Parsing
 
