@@ -1825,6 +1825,12 @@ int main(int argc, char **argv) {
                 } else if (tool_calls_tok != -1) {
                     should_call_tools = 1;
                 }
+                /* Always honour tool_calls if present and non-empty, regardless of finish_reason */
+                if (!should_call_tools && tool_calls_tok != -1
+                        && tok[tool_calls_tok].type == JSMN_ARRAY
+                        && tok[tool_calls_tok].size > 0) {
+                    should_call_tools = 1;
+                }
 
                 if (should_call_tools && tool_calls_tok != -1 && tok[tool_calls_tok].type == JSMN_ARRAY) {
                     int num_calls = tok[tool_calls_tok].size;
