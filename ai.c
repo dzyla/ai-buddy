@@ -1748,6 +1748,7 @@ int main(int argc, char **argv) {
                 int message_tok = -1;
                 int tool_calls_tok = -1;
                 int usage_tok = -1;
+                int finish_reason_length = 0;
 
                 int error_tok = -1;
                 for (int i = 1; i < r; i++) {
@@ -1765,6 +1766,12 @@ int main(int argc, char **argv) {
                             usage_tok = i + 1;
                         }
                     }
+                }
+
+                if (finish_reason_tok != -1) {
+                    int flen = tok[finish_reason_tok].end - tok[finish_reason_tok].start;
+                    if (flen == 6 && strncmp(chunk.data + tok[finish_reason_tok].start, "length", 6) == 0)
+                        finish_reason_length = 1;
                 }
 
                 /* Parse token usage for display */
@@ -2163,6 +2170,15 @@ int main(int argc, char **argv) {
                           current_tok = json_skip_token(tok, r, current_tok);
                       }
                   } else {
+                      if (finish_reason_length) {
+                          fprintf(stderr, "\033[1;33m[ai] Warning: model hit token limit — "
+                                          "response truncated. Nudging to complete.\033[0m\n");
+                          messages_json = append_message(messages_json,
+                              "{\"role\":\"user\",\"content\":\"Your last response was cut off "
+                              "by the token limit. Call task_complete now with your current "
+                              "best answer.\"}");
+                          has_more = 1;
+                      } else {
                       has_more = 0;
 
                       int content_tok = -1;
@@ -2235,6 +2251,7 @@ int main(int argc, char **argv) {
                           messages_json = append_message(messages_json, nudge);
                           has_more = 1;
                       }
+                      } /* end !finish_reason_length else */
                   }
 
                   /* Usage / speed stats line */
