@@ -785,12 +785,29 @@ def edit_file(path, search_content, replace_content):
             return f"Error: file {path} does not exist."
         with open(abs_path, "r") as f:
             content = f.read()
-        if search_content not in content:
-            return f"Error: search content not found in {path}. Make sure the search block matches exactly including whitespace."
-        new_content = content.replace(search_content, replace_content)
-        with open(abs_path, "w") as f:
-            f.write(new_content)
-        return f"File successfully edited at {path}"
+        if search_content in content:
+            new_content = content.replace(search_content, replace_content)
+            with open(abs_path, "w") as f:
+                f.write(new_content)
+            return f"File successfully edited at {path}"
+        # Fuzzy retry: strip trailing whitespace per line and compare
+        search_lines = search_content.splitlines()
+        content_lines = content.splitlines()
+        n = len(search_lines)
+        matched_start = -1
+        for i in range(len(content_lines) - n + 1):
+            if all(content_lines[i + j].rstrip() == search_lines[j].rstrip()
+                   for j in range(n)):
+                matched_start = i
+                break
+        if matched_start >= 0:
+            original_span = "\n".join(content_lines[matched_start:matched_start + n])
+            new_content = content.replace(original_span, replace_content, 1)
+            with open(abs_path, "w") as f:
+                f.write(new_content)
+            return f"File successfully edited at {path} (fuzzy whitespace match used)"
+        return (f"Error: search content not found in {path}. "
+                f"Make sure the search block matches exactly including whitespace.")
     except Exception as e:
         return f"Error editing file: {e}"
 
