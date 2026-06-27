@@ -1237,21 +1237,14 @@ int main(int argc, char **argv) {
     if (!env_key || !*env_key) env_key = prof_key;
     if (!env_model || !*env_model) env_model = prof_model;
 
-    // If cmd_model is specified, or env_model is different from what is in env_url,
-    // let's try to auto-detect its URL to avoid port mismatches!
+    // Always try to detect the live URL for the current model.
+    // Snap-based models (gemma4, qwen3) use dynamic ports that change between runs,
+    // so INFER_BASE_URL in .bashrc can be stale. Detection succeeds quickly via
+    // `<model> status`; if it fails (unknown model, remote API), we fall back to env_url.
     static char detected_cmd_url[512] = "";
     if (env_model && *env_model) {
-        int should_detect = 0;
-        if (cmd_model) {
-            should_detect = 1;
-        } else if (!env_url || !*env_url) {
-            should_detect = 1;
-        }
-        
-        if (should_detect) {
-            if (detect_model_url(env_model, detected_cmd_url, sizeof(detected_cmd_url))) {
-                env_url = detected_cmd_url;
-            }
+        if (detect_model_url(env_model, detected_cmd_url, sizeof(detected_cmd_url))) {
+            env_url = detected_cmd_url;
         }
     }
 
