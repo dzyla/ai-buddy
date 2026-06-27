@@ -14,6 +14,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
+#include <sys/select.h>
+#include <errno.h>
 
 #define MAX_LINE 1024
 #define MAX_VAL  512
@@ -537,49 +540,143 @@ static char* shell_escape(const char *src) {
     return dest;
 }
 
+static struct termios orig_termios;
+static int raw_mode_active = 0;
+
+static void disable_raw_mode(void) {
+    if (raw_mode_active) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        raw_mode_active = 0;
+    }
+}
+
+static void enable_raw_mode(void) {
+    if (!isatty(STDIN_FILENO)) return;
+    if (tcgetattr(STDIN_FILENO, &orig_termios) < 0) return;
+    
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON); // Disable echo and canonical mode, keep signals (Ctrl+C works)
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) >= 0) {
+        raw_mode_active = 1;
+        atexit(disable_raw_mode);
+    }
+}
+
 static char* run_shell_command(const char *cmd, int *exit_status) {
+    int started_raw = 0;
+    if (!raw_mode_active && isatty(STDIN_FILENO)) {
+        enable_raw_mode();
+        started_raw = 1;
+    }
+
     FILE *fp = popen(cmd, "r");
     if (!fp) {
+        if (started_raw) disable_raw_mode();
         if (exit_status) *exit_status = -1;
         return strdup("Error: failed to run command");
     }
     
+    int pipe_fd = fileno(fp);
+    int fd_flags = fcntl(pipe_fd, F_GETFL, 0);
+    fcntl(pipe_fd, F_SETFL, fd_flags | O_NONBLOCK);
+
     size_t size = 4096;
     size_t len = 0;
     char *buf = malloc(size);
     if (!buf) {
         pclose(fp);
+        if (started_raw) disable_raw_mode();
         if (exit_status) *exit_status = -1;
         return NULL;
     }
     buf[0] = '\0';
-    
-    char tmp[1024];
-    while (fgets(tmp, sizeof(tmp), fp) != NULL) {
-        size_t tmp_len = strlen(tmp);
-        if (len + tmp_len >= size - 1) {
-            size *= 2;
-            char *new_buf = realloc(buf, size);
-            if (!new_buf) {
-                free(buf);
-                pclose(fp);
-                if (exit_status) *exit_status = -1;
-                return NULL;
-            }
-            buf = new_buf;
+
+    int interrupted = 0;
+    while (1) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(pipe_fd, &fds);
+        if (raw_mode_active) {
+            FD_SET(STDIN_FILENO, &fds);
         }
-        strcpy(buf + len, tmp);
-        len += tmp_len;
+
+        int max_fd = pipe_fd;
+        if (raw_mode_active && STDIN_FILENO > max_fd) {
+            max_fd = STDIN_FILENO;
+        }
+
+        struct timeval tv = {0, 100000}; // 100ms timeout
+        int r = select(max_fd + 1, &fds, NULL, NULL, &tv);
+
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        // Check ESC key on stdin
+        if (raw_mode_active && FD_ISSET(STDIN_FILENO, &fds)) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                if (c == 27) { // ESC key
+                    interrupted = 1;
+                    char kill_cmd[128];
+                    snprintf(kill_cmd, sizeof(kill_cmd), "pkill -P %d 2>/dev/null", getpid());
+                    system(kill_cmd);
+                    fprintf(stderr, "\n\033[1;31m[ai] Tool execution interrupted by ESC key.\033[0m\n");
+                    break;
+                }
+            }
+        }
+
+        // Read from pipe
+        if (FD_ISSET(pipe_fd, &fds)) {
+            char tmp[1024];
+            ssize_t n = read(pipe_fd, tmp, sizeof(tmp) - 1);
+            if (n > 0) {
+                tmp[n] = '\0';
+                if (len + n >= size - 1) {
+                    size *= 2;
+                    char *new_buf = realloc(buf, size);
+                    if (!new_buf) {
+                        free(buf);
+                        pclose(fp);
+                        if (started_raw) disable_raw_mode();
+                        if (exit_status) *exit_status = -1;
+                        return NULL;
+                    }
+                    buf = new_buf;
+                }
+                memcpy(buf + len, tmp, n);
+                len += n;
+                buf[len] = '\0';
+            } else if (n == 0) {
+                break; // EOF
+            } else {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
+                }
+            }
+        }
     }
-    
+
     int status = pclose(fp);
+    if (started_raw) {
+        disable_raw_mode();
+    }
+
     if (exit_status) {
-        if (status == -1) {
+        if (interrupted) {
+            *exit_status = 130; // SIGINT / interrupted status
+        } else if (status == -1) {
             *exit_status = -1;
         } else {
             *exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : status;
         }
     }
+
     return buf;
 }
 
@@ -2076,9 +2173,20 @@ int main(int argc, char **argv) {
 
                       /* If the model stopped with no content and no tool calls, nudge it
                          to call task_complete rather than silently stalling */
-                      if ((content_tok == -1 ||
-                           tok[content_tok].end - tok[content_tok].start == 0) &&
-                          loop_count < 28) {
+                      int is_content_empty = 1;
+                      if (content_tok != -1 && tok[content_tok].type == JSMN_STRING) {
+                          char *unescaped_content = unescape_json_string(chunk.data + tok[content_tok].start, tok[content_tok].end - tok[content_tok].start);
+                          if (unescaped_content) {
+                              for (size_t idx = 0; idx < strlen(unescaped_content); idx++) {
+                                  if (!isspace((unsigned char)unescaped_content[idx])) {
+                                      is_content_empty = 0;
+                                      break;
+                                  }
+                              }
+                              free(unescaped_content);
+                          }
+                      }
+                      if (is_content_empty && loop_count < 28) {
                           const char *nudge = "{\"role\":\"user\",\"content\":\"Please call task_complete with your final answer.\"}";
                           messages_json = append_message(messages_json, nudge);
                           has_more = 1;
