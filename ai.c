@@ -1878,7 +1878,17 @@ int main(int argc, char **argv) {
                           if (call_id_tok != -1 && name_tok != -1 && args_tok != -1) {
                               char *unescaped_id = unescape_json_string(chunk.data + tok[call_id_tok].start, tok[call_id_tok].end - tok[call_id_tok].start);
                               char *unescaped_name = unescape_json_string(chunk.data + tok[name_tok].start, tok[name_tok].end - tok[name_tok].start);
-                              char *unescaped_args = unescape_json_string(chunk.data + tok[args_tok].start, tok[args_tok].end - tok[args_tok].start);
+                              char *unescaped_args;
+                              if (tok[args_tok].type == JSMN_STRING) {
+                                  unescaped_args = unescape_json_string(
+                                      chunk.data + tok[args_tok].start,
+                                      tok[args_tok].end - tok[args_tok].start);
+                              } else {
+                                  int alen = tok[args_tok].end - tok[args_tok].start;
+                                  unescaped_args = malloc(alen + 1);
+                                  memcpy(unescaped_args, chunk.data + tok[args_tok].start, alen);
+                                  unescaped_args[alen] = '\0';
+                              }
 
                               char *tool_output = NULL;
 
