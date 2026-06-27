@@ -382,6 +382,165 @@ def extract_text_from_pdf(path):
 
     return "Error: Could not parse PDF. Install 'pdfplumber' (pip install pdfplumber), 'pypdf' (pip install pypdf), or 'pdftotext' (apt install poppler-utils)."
 
+def computer_control(arguments):
+    action = arguments.get("action")
+    x = arguments.get("x")
+    y = arguments.get("y")
+    text = arguments.get("text")
+    window_id = arguments.get("window_id")
+
+    # 1. screenshot
+    if action == "screenshot":
+        import tempfile
+        tmp_dir = tempfile.gettempdir()
+        scrot_path = os.path.join(tmp_dir, "ai_screenshot.png")
+        cmd = f"scrot -z '{scrot_path}' 2>/dev/null || scrot '{scrot_path}' 2>/dev/null || gnome-screenshot -f '{scrot_path}' 2>/dev/null"
+        ret = os.system(cmd)
+        if ret == 0 and os.path.exists(scrot_path):
+            return f"[IMAGE_DATA_SUCCESS:{scrot_path}] Screenshot captured successfully."
+        else:
+            return "Error: failed to take screenshot. Ensure 'scrot' or 'gnome-screenshot' is installed."
+
+    # 2. click
+    elif action == "click":
+        if x is not None and y is not None:
+            cmd = f"xdotool mousemove {x} {y} click 1"
+        else:
+            cmd = "xdotool click 1"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Clicked successfully at current mouse position or ({x}, {y})."
+        return "Error: failed to perform click action. Check if 'xdotool' is installed."
+
+    # 3. double_click
+    elif action == "double_click":
+        if x is not None and y is not None:
+            cmd = f"xdotool mousemove {x} {y} click --repeat 2 --delay 100 1"
+        else:
+            cmd = "xdotool click --repeat 2 --delay 100 1"
+        ret = os.system(cmd)
+        if ret == 0:
+            return "Double-clicked successfully."
+        return "Error: failed to double-click."
+
+    # 4. right_click
+    elif action == "right_click":
+        if x is not None and y is not None:
+            cmd = f"xdotool mousemove {x} {y} click 3"
+        else:
+            cmd = "xdotool click 3"
+        ret = os.system(cmd)
+        if ret == 0:
+            return "Right-clicked successfully."
+        return "Error: failed to right-click."
+
+    # 5. mouse_move
+    elif action == "mouse_move":
+        if x is None or y is None:
+            return "Error: coordinates x and y are required for mouse_move."
+        cmd = f"xdotool mousemove {x} {y}"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Moved mouse to ({x}, {y})."
+        return "Error: failed to move mouse."
+
+    # 6. mouse_drag
+    elif action == "mouse_drag":
+        if x is None or y is None:
+            return "Error: coordinates x and y are required for mouse_drag."
+        cmd = f"xdotool mousedown 1 mousemove {x} {y} mouseup 1"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Dragged mouse to ({x}, {y})."
+        return "Error: failed to drag mouse."
+
+    # 7. type_text
+    elif action == "type_text":
+        if not text:
+            return "Error: text argument is required for type_text."
+        escaped_text = text.replace("'", "'\\''")
+        cmd = f"xdotool type '{escaped_text}'"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Typed text: '{text}'"
+        return "Error: failed to type text."
+
+    # 8. key_combo
+    elif action == "key_combo":
+        if not text:
+            return "Error: text argument (e.g. 'ctrl+c', 'Escape', 'Alt+Tab') is required for key_combo."
+        cmd = f"xdotool key '{text}'"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Pressed key combination: {text}"
+        return "Error: failed to press key combo."
+
+    # 9. minimize_all
+    elif action == "minimize_all":
+        import subprocess
+        proc = subprocess.run(["wmctrl", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            os.system("xdotool key ctrl+super+d")
+            return "Attempted minimizing all windows via keyboard shortcut."
+        
+        lines = proc.stdout.strip().split("\n")
+        minimized_count = 0
+        for line in lines:
+            parts = line.split()
+            if not parts:
+                continue
+            win_id = parts[0]
+            ret = os.system(f"wmctrl -i -b add,hidden -r {win_id} 2>/dev/null")
+            if ret == 0:
+                minimized_count += 1
+        return f"Successfully minimized {minimized_count} windows."
+
+    # 10. minimize_window
+    elif action == "minimize_window":
+        if not window_id:
+            cmd = "xdotool getactivewindow windowminimize"
+        else:
+            cmd = f"wmctrl -i -b add,hidden -r {window_id} 2>/dev/null || wmctrl -b add,hidden -r {window_id}"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Minimized window '{window_id or 'active'}'."
+        return f"Error: failed to minimize window '{window_id}'."
+
+    # 11. maximize_window
+    elif action == "maximize_window":
+        if not window_id:
+            return "Error: window_id is required to maximize a window."
+        cmd = f"wmctrl -i -b add,maximized_vert,maximized_horz -r {window_id} 2>/dev/null || wmctrl -b add,maximized_vert,maximized_horz -r {window_id}"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Maximized window '{window_id}'."
+        return f"Error: failed to maximize window '{window_id}'."
+
+    # 12. close_window
+    elif action == "close_window":
+        if not window_id:
+            cmd = "xdotool getactivewindow windowkill"
+        else:
+            cmd = f"wmctrl -i -c {window_id} 2>/dev/null || wmctrl -c {window_id}"
+        ret = os.system(cmd)
+        if ret == 0:
+            return f"Closed window '{window_id or 'active'}'."
+        return f"Error: failed to close window '{window_id}'."
+
+    # 13. list_windows
+    elif action == "list_windows":
+        import subprocess
+        proc = subprocess.run(["wmctrl", "-lG"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode == 0:
+            return proc.stdout
+        proc = subprocess.run(["wmctrl", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode == 0:
+            return proc.stdout
+        return "Error: wmctrl is not installed or failed to execute."
+
+    else:
+        return f"Error: Unknown action '{action}'."
+
 def list_directory(path="."):
     try:
         abs_path = os.path.abspath(os.path.expanduser(path))
@@ -896,6 +1055,7 @@ TOOL_REQUIRED_ARGS = {
     "delegate_task":   ["task"],
     "think":           ["reasoning"],
     "task_complete":   ["summary"],
+    "computer_control": ["action"],
 }
 
 def repair_json(s):
@@ -1163,21 +1323,77 @@ def main():
             "type": "function",
             "function": {
                 "name": "delegate_task",
-                "description": "Run a self-contained sub-task in a parallel helper agent that has full tool access. Use for independent parallel work. Give complete, standalone instructions — the agent has no memory of this conversation.",
+                "description": "Run one or more self-contained sub-tasks in parallel helper agents that have full tool access. Use to distribute independent parallel work. Give complete, standalone instructions for each.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "A list of detailed, self-contained task instructions to run concurrently in parallel helper agents."
+                        },
                         "task": {
                             "type": "string",
-                            "description": "The detailed, self-contained instructions for the helper agent."
+                            "description": "A single detailed, self-contained task instruction to run (used as fallback)."
                         }
-                    },
-                    "required": ["task"]
+                    }
                 }
             }
         })
 
-        # 11. task_complete — last so model only sees it as exit
+        # 11. computer_control
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "computer_control",
+                "description": "Control the user's screen/windows, capture screenshots, move mouse, click, type, and manipulate windows.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "screenshot",
+                                "click",
+                                "double_click",
+                                "right_click",
+                                "mouse_move",
+                                "mouse_drag",
+                                "type_text",
+                                "key_combo",
+                                "minimize_all",
+                                "minimize_window",
+                                "maximize_window",
+                                "close_window",
+                                "list_windows"
+                            ],
+                            "description": "The specific control action to perform."
+                        },
+                        "x": {
+                            "type": "integer",
+                            "description": "X coordinate for mouse actions (optional)."
+                        },
+                        "y": {
+                            "type": "integer",
+                            "description": "Y coordinate for mouse actions (optional)."
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The text to type or the key combination to press (optional)."
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "The target window ID or name (optional)."
+                        }
+                    },
+                    "required": ["action"]
+                }
+            }
+        })
+
+        # 12. task_complete — last so model only sees it as exit
         openai_tools.append({
             "type": "function",
             "function": {
@@ -1233,6 +1449,9 @@ def main():
 
         # Validate required arguments before dispatch
         required = TOOL_REQUIRED_ARGS.get(tool_name, [])
+        if tool_name == "delegate_task":
+            if "task" in arguments or "tasks" in arguments:
+                required = []
         missing = [k for k in required if k not in arguments]
         if missing:
             print(json.dumps({"error": f"Missing required argument(s): {', '.join(missing)}"}))
@@ -1279,48 +1498,87 @@ def main():
             result = edit_file(path, search_content, replace_content)
             print(result)
         elif tool_name == "delegate_task" or server_name == "delegate_task":
-            task = arguments.get("task", "")
-            try:
-                ai_bin = os.environ.get("INFER_BIN_PATH")
-                if not ai_bin or not os.path.exists(ai_bin):
-                    ai_bin = "/usr/local/bin/ai"
-                if not os.path.exists(ai_bin):
-                    ai_bin = "./ai"
-                
-                task_timeout = 300
-                env_timeout = os.environ.get("INFER_TASK_TIMEOUT")
-                if env_timeout:
-                    try:
-                        task_timeout = int(env_timeout)
-                    except ValueError:
-                        pass
-                cmd_args = [ai_bin]
-                if os.environ.get("INFER_AUTO_APPROVE") == "1":
-                    cmd_args.append("-y")
-                if os.environ.get("INFER_QUIET") == "1":
-                    cmd_args.append("-q")
-                cmd_args.append(task)
+            tasks = arguments.get("tasks")
+            if not isinstance(tasks, list):
+                single_task = arguments.get("task", "")
+                tasks = [single_task] if single_task else []
+            
+            if not tasks:
+                print("Error: no task specified for delegate_task.")
+            else:
+                try:
+                    ai_bin = os.environ.get("INFER_BIN_PATH")
+                    if not ai_bin or not os.path.exists(ai_bin):
+                        ai_bin = "/usr/local/bin/ai"
+                    if not os.path.exists(ai_bin):
+                        ai_bin = "./ai"
+                    
+                    task_timeout = 300
+                    env_timeout = os.environ.get("INFER_TASK_TIMEOUT")
+                    if env_timeout:
+                        try:
+                            task_timeout = int(env_timeout)
+                        except ValueError:
+                            pass
 
-                proc = subprocess.run(
-                    cmd_args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=task_timeout
-                )
-                output = proc.stdout.strip()
-                err = proc.stderr.strip()
-                
-                result = ""
-                if output:
-                    result += output
-                if err:
-                    result += f"\n[Agent Stderr]: {err}"
-                if not result:
-                    result = "Agent completed the task but returned no output."
-                print(result)
-            except Exception as e:
-                print(f"Error delegating task: {e}")
+                    def run_single_agent(t_desc, idx):
+                        cmd_args = [ai_bin]
+                        if os.environ.get("INFER_AUTO_APPROVE") == "1":
+                            cmd_args.append("-y")
+                        if os.environ.get("INFER_QUIET") == "1":
+                            cmd_args.append("-q")
+                        cmd_args.append(t_desc)
+
+                        try:
+                            proc = subprocess.run(
+                                cmd_args,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                timeout=task_timeout
+                            )
+                            out = proc.stdout.strip()
+                            err = proc.stderr.strip()
+                            res = ""
+                            if out:
+                                res += out
+                            if err:
+                                res += f"\n[Agent Stderr]: {err}"
+                            if not res:
+                                res = "Agent completed the task but returned no output."
+                            return idx, res
+                        except subprocess.TimeoutExpired:
+                            return idx, f"Error: Agent execution timed out after {task_timeout} seconds."
+                        except Exception as ex:
+                            return idx, f"Error executing agent: {ex}"
+
+                    # Execute tasks in parallel using ThreadPoolExecutor
+                    results_map = {}
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                        futures = {executor.submit(run_single_agent, t, i): i for i, t in enumerate(tasks)}
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                idx, res = future.result()
+                                results_map[idx] = res
+                            except Exception as e:
+                                idx = futures[future]
+                                results_map[idx] = f"Error in thread execution: {e}"
+
+                    # Combine output in original order
+                    combined_result = ""
+                    for i in range(len(tasks)):
+                        if len(tasks) > 1:
+                            combined_result += f"=== Parallel Agent #{i+1} Output ===\n{results_map.get(i, '')}\n\n"
+                        else:
+                            combined_result += results_map.get(i, '')
+                    
+                    print(combined_result.strip())
+                except Exception as e:
+                    print(f"Error delegating task: {e}")
+        elif tool_name == "computer_control" or server_name == "computer_control":
+            result = computer_control(arguments)
+            print(result)
         else:
             # Route to MCP server
             cfg = mcp_servers.get(server_name)
