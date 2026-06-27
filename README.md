@@ -15,7 +15,7 @@ It reads from stdin, sends to an LLM, runs tools dynamically (shell commands, we
 ## Features
 
 - **Interactive Chat / REPL**: Run `ai` with no arguments, or with `-i` / `--interactive`, to start a multi-turn conversation shell. Chat history is preserved across turns.
-- **Agentic Tool Loop**: The agent loops up to 30 times per turn, calling tools, reading results, and calling more tools until it calls `task_complete`. `tool_choice: required` forces every response to use a tool.
+- **Agentic Tool Loop**: The agent loops up to 30 times per turn, calling tools, reading results, and calling more tools until it calls `task_complete`. Defaults to `tool_choice: required` to force a tool call every iteration. Set `INFER_TOOL_CHOICE=auto` for servers that do not support `required`.
 - **Transparent Reasoning**: The `think` tool lets the model write a step-by-step plan before acting. Reasoning is shown to you in real time (suppress with `-q` / `--quiet`).
 - **Shell Command Execution**: The model can run any shell command. You get a `[Y/n]` confirmation prompt before each one, with stderr and stdout both captured and fed back into context.
 - **Safety Confirmation / Auto-Approve**: Command execution prompts protect you by default. Use `-y` / `--yes` or `INFER_AUTO_APPROVE=1` to bypass for scripted or trusted sessions.
@@ -33,7 +33,7 @@ It reads from stdin, sends to an LLM, runs tools dynamically (shell commands, we
 - **Auto Skill Loading**: `SKILL.md` files are loaded from `./.agents/skills/*/` (project-level) and `~/.config/ai/skills/*/` (global) and injected into the system prompt.
 - **Job History Logging**: Every job (prompt, pipe writer, response) is appended to `~/.cache/ai/history.jsonl`.
 - **Rich Terminal Rendering**: Markdown is rendered with ANSI escape codes — colored headers, bullet/numbered lists, fenced code blocks with syntax highlighting (Python, C, Bash, Rust, JS, …), bordered tables with column alignment, inline bold/italic/code, and LaTeX → Unicode math symbols with super/subscript conversion.
-- **Context Size Guards**: Individual tool results are capped at 3 000 characters. Once the full conversation exceeds 40 KB, new tool results are stubbed to preserve model focus.
+- **Context Size Guards**: Individual tool results are capped at 64 KB (`INFER_MAX_TOOL_OUTPUT`). Once the conversation exceeds 250 KB, new tool results are stubbed to preserve model focus (`INFER_STUB_THRESHOLD`). Messages are trimmed when context exceeds 100 KB (`INFER_TRIM_THRESHOLD`).
 - **Debug Mode**: Set `INFER_DEBUG` to dump every raw request and response payload to stderr.
 
 ---
@@ -62,7 +62,7 @@ brew install curl python
 # Clone and build
 git clone https://github.com/dzyla/ai.git
 cd ai
-gcc -o ai ai.c -lcurl
+gcc -o ai ai.c cJSON.c -lcurl
 
 # Install system-wide
 sudo cp ai /usr/local/bin/
@@ -91,6 +91,25 @@ export INFER_MODEL="gemma4"
 ```
 
 Reload your shell or run `source ~/.bashrc` to apply.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `INFER_BASE_URL` | API endpoint (must end in `/v1/`; `chat/completions` appended) | — |
+| `INFER_API_KEY` | API key for authentication | — |
+| `INFER_MODEL` | Model name (e.g. `gemma-4-9b-it`) | — |
+| `INFER_AUTO_APPROVE=1` | Auto-approve all `execute_command` prompts | disabled |
+| `INFER_DEBUG` | Dump raw request/response payloads to stderr | disabled |
+| `INFER_QUIET=1` | Suppress `[thinking]` output from the `think` tool | disabled |
+| `INFER_TOOL_CHOICE` | Force tool call mode: `required` (default) or `auto` | `required` |
+| `INFER_TEMPERATURE` | Override temperature for API requests | (model default) |
+| `INFER_MAX_TOKENS` | Override max tokens for API requests | (model default) |
+| `INFER_CONTEXT_WINDOW` | Override auto-detected context window size | (auto-detected) |
+| `INFER_TASK_TIMEOUT` | Force `task_complete` after N seconds | 300 |
+| `INFER_MAX_TOOL_OUTPUT` | Cap individual tool output in bytes | 65536 |
+| `INFER_TRIM_THRESHOLD` | Trigger message trimming when context exceeds this (bytes) | 100000 |
+| `INFER_STUB_THRESHOLD` | Stub tool results once context exceeds this (bytes) | 250000 |
 
 ---
 
@@ -201,12 +220,13 @@ Tools from the server are namespaced as `my_server__tool_name` in the model's to
 | `execute_command` | Runs a shell command with confirmation prompt. Stdout+stderr captured and returned. |
 | `web_search` | DuckDuckGo Lite search. Returns up to 5 results with title, URL, snippet. |
 | `fetch_webpage` | Downloads URL and converts HTML to readable text (10 KB limit). |
-| `read_file` | Reads text (12 KB limit), PDF (pdftotext/pypdf/pdfplumber), or image (injected into vision context). |
+| `read_file` | Reads text, PDF (pdftotext/pypdf/pdfplumber), or image (injected into vision context). Optional `start_line`/`end_line` for large files. |
 | `write_file` | Writes content to a file, creating parent directories as needed. |
 | `edit_file` | Search-and-replace edit on an existing file. Match must be exact. |
 | `list_directory` | Lists directory contents with sizes and `[DIR]` markers. |
 | `save_memory` | Persists text to `~/.config/ai/memory.txt` (overwrites, 4 KB cap). |
 | `delegate_task` | Spawns a child `ai` process with full tool access (60 s timeout). |
+| `computer_control` | Take screenshots, move mouse, click, type, press keys, and manage windows via xdotool/scrot. |
 | `task_complete` | Signals completion. The `summary` argument is rendered as markdown and printed. |
 
 ---

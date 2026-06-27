@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build, install, run
 
 ```bash
-gcc -o ai ai.c -lcurl          # build (only dependency is libcurl + jsmn.h, vendored)
+gcc -o ai ai.c cJSON.c -lcurl  # build (only dependencies are libcurl + jsmn.h + cJSON.h/cJSON.c, vendored)
 ./setup.sh                     # full install: apt deps, build, copy to /usr/local/bin, set up gemma4 snap + env
 sudo cp ai ai_mcp.py /usr/local/bin/   # manual install of both halves
 ```
@@ -24,6 +24,7 @@ Optional environment variables:
 - `INFER_AUTO_APPROVE=1` — auto-approve all `execute_command` calls without prompting.
 - `INFER_DEBUG` — dump raw request/response payloads to stderr on every loop iteration.
 - `INFER_QUIET=1` — suppress `[thinking]` output from the `think` tool (same as `-q`).
+- `INFER_TOOL_CHOICE` — `required` (default) or `auto`; controls the `tool_choice` field sent in every request.
 - `INFER_MAX_TOOL_OUTPUT` — caps individual tool output (default: 65536).
 - `INFER_TRIM_THRESHOLD` — triggers message trimming if context exceeds this size (default: 100000).
 - `INFER_STUB_THRESHOLD` — stubs subsequent tool results once context size exceeds this (default: 250000).
@@ -35,7 +36,7 @@ The system is split across two files that talk to each other by **shell-invoking
 **`ai.c` — the agent loop (C).** Owns the conversation. Responsibilities:
 - Builds the `messages` JSON array by hand with `snprintf`/`json_escape` (no JSON library for *generating* requests).
 - Parses LLM responses with the vendored **jsmn** tokenizer (`jsmn.h`) — token-index walking, not a DOM. Most response-handling bugs live here.
-- Runs the agentic loop: POST via libcurl → parse `tool_calls` → execute each → append `tool` messages → repeat (capped at **30** iterations per turn). Sends `tool_choice: required` so small models always call a tool.
+- Runs the agentic loop: POST via libcurl → parse `tool_calls` → execute each → append `tool` messages → repeat (capped at **30** iterations per turn). Sends `tool_choice: required` by default (overridable via `INFER_TOOL_CHOICE=auto` for servers that do not support it).
 - Handles `think`, `task_complete`, and `execute_command` **natively in C**:
   - `think`: prints `[thinking] …` to stdout (suppressed by quiet mode); returns `{"ok":true}`.
   - `task_complete`: renders the `summary` argument via `render-markdown`, logs the job, and exits the loop.
@@ -48,10 +49,11 @@ The system is split across two files that talk to each other by **shell-invoking
 - Detects pipe-writer via `/proc` inspection and includes the originating command name in the user message.
 - Handles image file arguments: detects `.png`/`.jpg`/`.jpeg`/`.webp` paths, base64-encodes them, and injects a `image_url` content block into the first user message.
 - Intercepts `[IMAGE_DATA_SUCCESS:<path>]` returned by `read_file` and similarly injects the image into conversation context.
+- Detects `finish_reason: "length"` (model hit token limit) and injects a recovery nudge instead of rendering truncated output.
 
 **`ai_mcp.py` — the tool backend (Python).** Three subcommands matching how `ai.c` calls it: `list-tools`, `call-tool`, `render-markdown`. It:
-- Defines **11 native tools** as OpenAI function schemas in `list-tools` (in schema order): `think`, `execute_command`, `web_search`, `fetch_webpage`, `read_file`, `write_file`, `edit_file`, `list_directory`, `save_memory`, `delegate_task`, `task_complete`.
-- Implements the actual logic for each (DuckDuckGo Lite scraping, HTML→text, PDF extraction via pdftotext/pypdf/pdfplumber fallback chain, binary-file heuristic rejection, etc.).
+- Defines **12 native tools** as OpenAI function schemas in `list-tools` (in schema order): `think`, `execute_command`, `web_search`, `fetch_webpage`, `read_file`, `write_file`, `edit_file`, `list_directory`, `save_memory`, `delegate_task`, `computer_control`, `task_complete`.
+- Implements the actual logic for each (DuckDuckGo Lite scraping, HTML→text, PDF extraction via pdftotext/pypdf/pdfplumber fallback chain, binary-file heuristic rejection, etc.). `edit_file`: search-and-replace on an existing file. Falls back to a trailing-whitespace-tolerant fuzzy match if the exact string is not found.
 - Acts as a generic **MCP client**: any server in `mcp.json` is started over stdio JSON-RPC and its tools are namespaced `<server>__<tool>`. `ai.c` splits on `__` to route calls back.
 - `render-markdown` does all terminal ANSI rendering: headers, ordered/unordered lists, fenced code blocks with per-language syntax highlighting, bordered tables with column alignment, inline bold/italic/code, and LaTeX→Unicode math symbols with super/subscript conversion.
 
