@@ -1723,12 +1723,16 @@ int main(int argc, char **argv) {
                 }
 
                 jsmn_parser p;
-                jsmntok_t tok[2048];
+                jsmntok_t tok[4096];
                 jsmn_init(&p);
-                int r = jsmn_parse(&p, chunk.data, chunk.size, tok, 2048);
+                int r = jsmn_parse(&p, chunk.data, chunk.size, tok, 4096);
 
                 if (r < 0) {
-                    fprintf(stderr, "Failed to parse JSON response: %d\n", r);
+                    if (r == JSMN_ERROR_NOMEM)
+                        fprintf(stderr, "[ai] Error: response JSON exceeds token buffer "
+                                        "(>4096 tokens). Increase jsmntok_t array in ai.c.\n");
+                    else
+                        fprintf(stderr, "Failed to parse JSON response: %d\n", r);
                     free(payload);
                     free(chunk.data);
                     break;
