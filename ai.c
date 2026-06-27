@@ -25,17 +25,24 @@ static char  model[MAX_VAL];
 static float temperature_val  = -1.0f;
 static int   max_tokens_val   = -1;
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
+static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
+static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
+static int   trim_threshold   = 100000;/* set via INFER_TRIM_THRESHOLD; default 100000 */
+static int   stub_threshold   = 250000;/* set via INFER_STUB_THRESHOLD; default 250000 */
 
 static const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
-    "SPEED RULE (highest priority):\n"
-    "- Single-step tasks (list files, read a file, run one command, check disk/memory, look up a fact you know) must complete in ONE tool call followed immediately by task_complete. Do NOT use think first. Do NOT make extra tool calls.\n"
-    "- Only use think when the task genuinely requires planning across 3+ tool calls.\n\n"
+    "EFFICIENCY (highest priority — every extra tool call costs 15-30 seconds on local hardware):\n"
+    "- Single-step tasks (list files, read one file, run one command, factual question) = ONE tool call then task_complete. No think.\n"
+    "- Routine sequences (git operations, file edits, package installs, shell scripts): skip think. Start with the first command directly.\n"
+    "- Only use think for genuinely complex planning (3+ interdependent unknowns). If you use it, call it ONCE before your first action. After ANY non-think tool call, NEVER call think again.\n"
+    "- Once ALL requested operations succeed (exit 0, file saved, git pushed), call task_complete IMMEDIATELY. Do NOT verify, re-read, or run extra diagnostics.\n\n"
     "TOOL USE:\n"
     "- For facts you already know (e.g. definitions, formulas, capitals), call task_complete directly — no tools needed.\n"
-    "- Use web_search only when you need current data (prices, news, live stats) or genuinely don't know.\n"
-    "- After web_search, you MUST call fetch_webpage on at least one result URL before task_complete.\n"
-    "- If fetch_webpage returns noisy or incomplete data, try execute_command with a Python/curl script.\n"
+    "- For scientific databases, public APIs, or structured data (PDB, UniProt, NCBI, NASA, arXiv, etc.): use execute_command with curl to query the REST API directly. DO NOT rely on web_search snippets for structured data — the API will give exact answers.\n"
+    "  Examples: PDB → `curl 'https://search.rcsb.org/rcsbsearch/v2/query' -d '{...}'`; arXiv → `curl 'https://export.arxiv.org/api/query?search_query=...'`\n"
+    "- Use web_search for general questions or current news. web_search now auto-fetches the top result — check [Top result full content] first before calling fetch_webpage again.\n"
+    "- Do NOT repeat web_search with slightly different queries — if the first search returns no answer, fetch the top result URL or switch to an API.\n"
     "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n"
     "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
     "CITATIONS:\n"
@@ -45,6 +52,8 @@ static const char *SYSTEM_PROMPT =
     "FAILURE RECOVERY:\n"
     "- If execute_command fails, read the error, fix the root cause, and retry. At least 3 attempts before giving up.\n"
     "- If a library is missing, install it with pip/apt. If a web source is blocked or noisy, find an alternative.\n"
+    "- If fetch_webpage returns a WARNING about JavaScript or returns fewer than 80 words, the page is JS-only. Switch to execute_command with curl to a plain-text API instead.\n"
+    "- For current weather: execute_command `curl -s 'wttr.in/Miami?format=3'` (replace city name). Never rely on weather.com/weather.gov — they require JavaScript.\n"
     "- Never tell the user to 'visit a link' or 'run a command themselves' — do it yourself.\n\n"
     "DELEGATION:\n"
     "- For tasks with independent parallel sub-tasks, use delegate_task to run them concurrently.\n"
@@ -424,6 +433,24 @@ static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return realsize;
 }
 
+static void append_utf8(char *dest, int *d, uint32_t cp) {
+    if (cp <= 0x7F) {
+        dest[(*d)++] = (char)cp;
+    } else if (cp <= 0x7FF) {
+        dest[(*d)++] = (char)(0xC0 | ((cp >> 6) & 0x1F));
+        dest[(*d)++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        dest[(*d)++] = (char)(0xE0 | ((cp >> 12) & 0x0F));
+        dest[(*d)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        dest[(*d)++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0x10FFFF) {
+        dest[(*d)++] = (char)(0xF0 | ((cp >> 18) & 0x07));
+        dest[(*d)++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        dest[(*d)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        dest[(*d)++] = (char)(0x80 | (cp & 0x3F));
+    }
+}
+
 /* ---------------- MAIN ---------------- */
 static char* unescape_json_string(const char *s, int len) {
     char *dest = malloc(len + 1);
@@ -449,18 +476,32 @@ static char* unescape_json_string(const char *s, int len) {
             case 'u': {
                 if (i + 4 <= len) {
                     uint32_t cp = 0;
+                    int valid = 1;
                     for (int k = 0; k < 4; k++) {
                         int hv = hexval(s[i + k]);
-                        if (hv < 0) { cp = 0; break; }
+                        if (hv < 0) { valid = 0; break; }
                         cp = (cp << 4) | (uint32_t)hv;
                     }
-                    i += 4;
-                    if (cp > 0 && cp <= 0x7F) {
-                        dest[d++] = (char)cp;
+                    if (valid) {
+                        i += 4;
+                        // Check if it's a high surrogate (0xD800 to 0xDBFF)
+                        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= len && s[i] == '\\' && s[i+1] == 'u') {
+                            uint32_t cp2 = 0;
+                            int valid2 = 1;
+                            for (int k = 0; k < 4; k++) {
+                                int hv = hexval(s[i + 2 + k]);
+                                if (hv < 0) { valid2 = 0; break; }
+                                cp2 = (cp2 << 4) | (uint32_t)hv;
+                            }
+                            if (valid2 && cp2 >= 0xDC00 && cp2 <= 0xDFFF) {
+                                cp = 0x10000 + (((cp - 0xD800) << 10) | (cp2 - 0xDC00));
+                                i += 6;
+                            }
+                        }
+                        append_utf8(dest, &d, cp);
                     } else {
                         dest[d++] = '\\';
                         dest[d++] = 'u';
-                        for (int k = 0; k < 4; k++) dest[d++] = s[i - 4 + k];
                     }
                 } else {
                     dest[d++] = '\\';
@@ -713,7 +754,7 @@ static char* read_memory_file() {
 /* Write messages_json to a temp file, ask Python to trim it, return trimmed version.
    Keeps: messages[0] (system), messages[1] (first user), last 20 messages. */
 static char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
-    if (strlen(messages_json) <= 35000) return messages_json;
+    if ((int)strlen(messages_json) <= trim_threshold) return messages_json;
     char tmpfile[128];
     snprintf(tmpfile, sizeof(tmpfile), "/tmp/ai_msgs_%d.json", (int)getpid());
     FILE *fp = fopen(tmpfile, "w");
@@ -732,11 +773,304 @@ static char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
     return messages_json;
 }
 
+static int update_config_file(const char *file_path, const char *new_model, const char *new_url) {
+    FILE *fp = fopen(file_path, "r");
+    if (!fp) return 0; // File doesn't exist
+    
+    // Read the file content
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    char *content = malloc(size + 1024);
+    if (!content) {
+        fclose(fp);
+        return 0;
+    }
+    
+    long read_bytes = fread(content, 1, size, fp);
+    content[read_bytes] = '\0';
+    fclose(fp);
+    
+    // 1. Update INFER_MODEL
+    char *line = strstr(content, "export INFER_MODEL=");
+    char *temp_content = NULL;
+    if (line) {
+        char *next_line = strchr(line, '\n');
+        if (!next_line) next_line = line + strlen(line);
+        long prefix_len = line - content;
+        long suffix_len = strlen(next_line);
+        
+        temp_content = malloc(prefix_len + suffix_len + strlen(new_model) + 64);
+        if (temp_content) {
+            memcpy(temp_content, content, prefix_len);
+            int offset = prefix_len;
+            offset += sprintf(temp_content + offset, "export INFER_MODEL=\"%s\"", new_model);
+            strcpy(temp_content + offset, next_line);
+        }
+    } else {
+        temp_content = malloc(size + strlen(new_model) + 64);
+        if (temp_content) {
+            sprintf(temp_content, "%s\nexport INFER_MODEL=\"%s\"\n", content, new_model);
+        }
+    }
+    
+    if (!temp_content) {
+        free(content);
+        return 0;
+    }
+    
+    // 2. Update INFER_BASE_URL if new_url is provided
+    char *final_content = NULL;
+    if (new_url && strlen(new_url) > 0) {
+        char *url_line = strstr(temp_content, "export INFER_BASE_URL=");
+        if (url_line) {
+            char *next_line = strchr(url_line, '\n');
+            if (!next_line) next_line = url_line + strlen(url_line);
+            long prefix_len = url_line - temp_content;
+            long suffix_len = strlen(next_line);
+            
+            final_content = malloc(prefix_len + suffix_len + strlen(new_url) + 64);
+            if (final_content) {
+                memcpy(final_content, temp_content, prefix_len);
+                int offset = prefix_len;
+                offset += sprintf(final_content + offset, "export INFER_BASE_URL=\"%s\"", new_url);
+                strcpy(final_content + offset, next_line);
+            }
+        } else {
+            final_content = malloc(strlen(temp_content) + strlen(new_url) + 64);
+            if (final_content) {
+                sprintf(final_content, "%s\nexport INFER_BASE_URL=\"%s\"\n", temp_content, new_url);
+            }
+        }
+    } else {
+        final_content = strdup(temp_content);
+    }
+    
+    free(content);
+    free(temp_content);
+    
+    if (!final_content) return 0;
+    
+    // Write back
+    fp = fopen(file_path, "w");
+    if (!fp) {
+        free(final_content);
+        return 0;
+    }
+    fputs(final_content, fp);
+    fclose(fp);
+    free(final_content);
+    
+    printf("Successfully updated default settings in %s.\n", file_path);
+    return 1;
+}
+
+static int detect_model_url(const char *model_name, char *url_out, size_t max_len) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%s status 2>/dev/null", model_name);
+    FILE *status_fp = popen(cmd, "r");
+    if (!status_fp) return 0;
+    
+    char line[1024];
+    int found = 0;
+    while (fgets(line, sizeof(line), status_fp)) {
+        char *openai_ptr = strstr(line, "openai:");
+        if (openai_ptr) {
+            char *url_start = openai_ptr + 7;
+            while (*url_start == ' ' || *url_start == '\t') url_start++;
+            char *url_end = url_start;
+            while (*url_end && *url_end != '\n' && *url_end != '\r' && *url_end != ' ' && *url_end != '\t') {
+                url_end++;
+            }
+            int len = url_end - url_start;
+            if (len > 0 && (size_t)len < max_len - 2) {
+                memcpy(url_out, url_start, len);
+                url_out[len] = '\0';
+                
+                // Ensure trailing slash
+                if (len > 0 && url_out[len - 1] != '/') {
+                    url_out[len] = '/';
+                    url_out[len + 1] = '\0';
+                }
+                found = 1;
+                break;
+            }
+        }
+    }
+    pclose(status_fp);
+    return found;
+}
+
+static void load_from_profiles(char **url, char **key, char **model) {
+    char *home = getenv("HOME");
+    if (!home) return;
+
+    char paths[2][1024];
+    snprintf(paths[0], sizeof(paths[0]), "%s/.bashrc", home);
+    snprintf(paths[1], sizeof(paths[1]), "%s/.zshrc", home);
+
+    static char f_url[512] = "";
+    static char f_key[256] = "";
+    static char f_model[256] = "";
+
+    // Clear static strings
+    f_url[0] = '\0';
+    f_key[0] = '\0';
+    f_model[0] = '\0';
+
+    for (int p = 0; p < 2; p++) {
+        FILE *fp = fopen(paths[p], "r");
+        if (!fp) continue;
+
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            // Strip trailing spaces and newlines
+            char *end = line + strlen(line) - 1;
+            while (end >= line && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
+                *end = '\0';
+                end--;
+            }
+
+            char *url_ptr = strstr(line, "export INFER_BASE_URL=");
+            if (url_ptr) {
+                char *val = url_ptr + 22;
+                if (*val == '"' || *val == '\'') val++;
+                char *val_end = val + strlen(val) - 1;
+                while (val_end > val && (*val_end == '"' || *val_end == '\'')) {
+                    *val_end = '\0';
+                    val_end--;
+                }
+                strncpy(f_url, val, sizeof(f_url) - 1);
+            }
+
+            char *key_ptr = strstr(line, "export INFER_API_KEY=");
+            if (key_ptr) {
+                char *val = key_ptr + 21;
+                if (*val == '"' || *val == '\'') val++;
+                char *val_end = val + strlen(val) - 1;
+                while (val_end > val && (*val_end == '"' || *val_end == '\'')) {
+                    *val_end = '\0';
+                    val_end--;
+                }
+                strncpy(f_key, val, sizeof(f_key) - 1);
+            }
+
+            char *model_ptr = strstr(line, "export INFER_MODEL=");
+            if (model_ptr) {
+                char *val = model_ptr + 19;
+                if (*val == '"' || *val == '\'') val++;
+                char *val_end = val + strlen(val) - 1;
+                while (val_end > val && (*val_end == '"' || *val_end == '\'')) {
+                    *val_end = '\0';
+                    val_end--;
+                }
+                strncpy(f_model, val, sizeof(f_model) - 1);
+            }
+        }
+        fclose(fp);
+    }
+
+    if ((!*url || !**url) && strlen(f_url) > 0) *url = f_url;
+    if ((!*key || !**key) && strlen(f_key) > 0) *key = f_key;
+    if ((!*model || !**model) && strlen(f_model) > 0) *model = f_model;
+}
+
+static int detect_context_window(CURL *c, const char *cur_api_url) {
+    char models_url[1024];
+    const char *chat_ptr = strstr(cur_api_url, "chat/completions");
+    if (chat_ptr) {
+        size_t prefix_len = chat_ptr - cur_api_url;
+        snprintf(models_url, sizeof(models_url), "%.*smodels", (int)prefix_len, cur_api_url);
+    } else {
+        return 0;
+    }
+    
+    struct response m_chunk = {0};
+    curl_easy_setopt(c, CURLOPT_URL, models_url);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&m_chunk);
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+    
+    CURLcode m_res = curl_easy_perform(c);
+    int detected_win = 0;
+    if (m_res == CURLE_OK && m_chunk.data) {
+        char *n_ctx_ptr = strstr(m_chunk.data, "\"n_ctx\"");
+        if (n_ctx_ptr) {
+            char *ptr = n_ctx_ptr + 7;
+            while (*ptr && !isdigit((unsigned char)*ptr)) ptr++;
+            if (*ptr) {
+                detected_win = atoi(ptr);
+            }
+        }
+    }
+    
+    if (m_chunk.data) free(m_chunk.data);
+    
+    // Restore Curl state
+    curl_easy_setopt(c, CURLOPT_URL, cur_api_url);
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 0L);
+    curl_easy_setopt(c, CURLOPT_POST, 1L);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, NULL);
+    
+    return detected_win;
+}
+
+static int set_default_model(const char *new_model) {
+    char detected_url[512] = "";
+    if (detect_model_url(new_model, detected_url, sizeof(detected_url))) {
+        printf("Detected API endpoint for %s: %s\n", new_model, detected_url);
+    } else {
+        printf("Could not auto-detect API endpoint for %s (leaving existing INFER_BASE_URL).\n", new_model);
+    }
+    
+    char *home = getenv("HOME");
+    if (!home) {
+        fprintf(stderr, "Error: HOME environment variable not set.\n");
+        return 1;
+    }
+    
+    char bash_path[1024];
+    snprintf(bash_path, sizeof(bash_path), "%s/.bashrc", home);
+    int updated_any = update_config_file(bash_path, new_model, detected_url);
+    
+    char zsh_path[1024];
+    snprintf(zsh_path, sizeof(zsh_path), "%s/.zshrc", home);
+    updated_any |= update_config_file(zsh_path, new_model, detected_url);
+    
+    if (updated_any) {
+        printf("Successfully updated default model to '%s'.\n", new_model);
+        printf("Please run 'source ~/.bashrc' (or source ~/.zshrc) or restart your terminal to apply changes.\n");
+    } else {
+        fprintf(stderr, "Error: could not find or update .bashrc or .zshrc in %s.\n", home);
+    }
+    return 0;
+}
+
+
 int main(int argc, char **argv) {
+    char exe_path[512] = "";
+    ssize_t r_exe = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (r_exe > 0) {
+        exe_path[r_exe] = '\0';
+        setenv("INFER_BIN_PATH", exe_path, 1);
+    }
+
     int is_stdin_tty = isatty(STDIN_FILENO);
     int interactive_mode = 0;
     int auto_approve = 0;
     int quiet_mode = 0;
+
+    // Parse set-default option first
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--set-default") == 0 || strcmp(argv[i], "-s") == 0) {
+            if (i + 1 < argc) {
+                return set_default_model(argv[i+1]);
+            } else {
+                fprintf(stderr, "Error: --set-default requires a model name argument.\n");
+                return 1;
+            }
+        }
+    }
 
     // Parse help flags first
     for (int i = 1; i < argc; i++) {
@@ -747,6 +1081,8 @@ int main(int argc, char **argv) {
             printf("  -i, --interactive    Start an interactive multi-turn chat session.\n");
             printf("  -y, --yes            Auto-approve all command execution requests without prompting.\n");
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
+            printf("  -m, --model MODEL    Override the default model selection.\n");
+            printf("  -s, --set-default M  Set the global default model in shell configs.\n");
             printf("  -h, --help           Display this help screen.\n\n");
             printf("Examples:\n");
             printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
@@ -757,18 +1093,61 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Parse model flag first if present
+    char *cmd_model = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+            if (i + 1 < argc) {
+                cmd_model = argv[i+1];
+                i++;
+            }
+        }
+    }
+
     // Load from Environment Variables
     char *env_url = getenv("INFER_BASE_URL");
     char *env_key = getenv("INFER_API_KEY");
-    char *env_model = getenv("INFER_MODEL");
+    char *env_model = cmd_model ? cmd_model : getenv("INFER_MODEL");
+
+    char *prof_url = NULL;
+    char *prof_key = NULL;
+    char *prof_model = NULL;
+    load_from_profiles(&prof_url, &prof_key, &prof_model);
+
+    if (!env_url || !*env_url) env_url = prof_url;
+    if (!env_key || !*env_key) env_key = prof_key;
+    if (!env_model || !*env_model) env_model = prof_model;
+
+    // If cmd_model is specified, or env_model is different from what is in env_url,
+    // let's try to auto-detect its URL to avoid port mismatches!
+    static char detected_cmd_url[512] = "";
+    if (env_model && *env_model) {
+        int should_detect = 0;
+        if (cmd_model) {
+            should_detect = 1;
+        } else if (!env_url || !*env_url) {
+            should_detect = 1;
+        }
+        
+        if (should_detect) {
+            if (detect_model_url(env_model, detected_cmd_url, sizeof(detected_cmd_url))) {
+                env_url = detected_cmd_url;
+            }
+        }
+    }
 
     if (!env_url || !*env_url || !env_key || !*env_key || !env_model || !*env_model) {
         fprintf(stderr, "Error: missing required environment variables.\n");
         if (!env_url || !*env_url) fprintf(stderr, "Please set INFER_BASE_URL environment variable.\n");
         if (!env_key || !*env_key) fprintf(stderr, "Please set INFER_API_KEY environment variable.\n");
-        if (!env_model || !*env_model) fprintf(stderr, "Please set INFER_MODEL environment variable.\n");
+        if (!env_model || !*env_model) fprintf(stderr, "Please set INFER_MODEL environment variable or use -m/--model flag.\n");
         return 1;
     }
+
+    // Set updated environment variables for subagents/python script
+    setenv("INFER_BASE_URL", env_url, 1);
+    setenv("INFER_API_KEY", env_key, 1);
+    setenv("INFER_MODEL", env_model, 1);
 
     // Parse flags
     for (int i = 1; i < argc; i++) {
@@ -780,6 +1159,9 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet_mode = 1;
+        }
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+            if (i + 1 < argc) i++;
         }
     }
 
@@ -793,12 +1175,32 @@ int main(int argc, char **argv) {
         quiet_mode = 1;
     }
 
+    // Export resolved settings back to environment variables so subagents inherit them
+    if (auto_approve) {
+        setenv("INFER_AUTO_APPROVE", "1", 1);
+    } else {
+        unsetenv("INFER_AUTO_APPROVE");
+    }
+    if (quiet_mode) {
+        setenv("INFER_QUIET", "1", 1);
+    } else {
+        unsetenv("INFER_QUIET");
+    }
+
     char *env_temp = getenv("INFER_TEMPERATURE");
     if (env_temp && *env_temp) temperature_val = (float)atof(env_temp);
     char *env_maxtok = getenv("INFER_MAX_TOKENS");
     if (env_maxtok && *env_maxtok) max_tokens_val = atoi(env_maxtok);
     char *env_ctxwin = getenv("INFER_CONTEXT_WINDOW");
     if (env_ctxwin && *env_ctxwin) context_window = atoi(env_ctxwin);
+    char *env_timeout = getenv("INFER_TASK_TIMEOUT");
+    if (env_timeout && *env_timeout) task_timeout_sec = atoi(env_timeout);
+    char *env_max_tool = getenv("INFER_MAX_TOOL_OUTPUT");
+    if (env_max_tool && *env_max_tool) max_tool_output = atoi(env_max_tool);
+    char *env_trim = getenv("INFER_TRIM_THRESHOLD");
+    if (env_trim && *env_trim) trim_threshold = atoi(env_trim);
+    char *env_stub = getenv("INFER_STUB_THRESHOLD");
+    if (env_stub && *env_stub) stub_threshold = atoi(env_stub);
 
     if (argc < 2 && is_stdin_tty) {
         interactive_mode = 1;
@@ -837,6 +1239,10 @@ int main(int argc, char **argv) {
                 if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
                 if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
                 if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
+                if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+                    if (i + 1 < argc) i++;
+                    continue;
+                }
                 has_prompt_args = 1;
                 break;
             }
@@ -857,6 +1263,10 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+            if (i + 1 < argc) i++;
+            continue;
+        }
         if (is_image_file(argv[i])) {
             image_path = argv[i];
             break;
@@ -868,6 +1278,10 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+            if (i + 1 < argc) i++;
+            continue;
+        }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         prompt_len += strlen(argv[i]) + 1;
     }
@@ -879,6 +1293,10 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+            if (i + 1 < argc) i++;
+            continue;
+        }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         if (added) strcat(prompt, " ");
         strcat(prompt, argv[i]);
@@ -1010,13 +1428,17 @@ int main(int argc, char **argv) {
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
 
+    if (context_window == 0) {
+        context_window = detect_context_window(c, api_url);
+    }
+
     int debug_mode = getenv("INFER_DEBUG") != NULL;
     int keep_going = 1;
     int first_turn = 1;
     char *current_prompt = strdup(prompt ? prompt : "");
 
     if (interactive_mode && !run_query_this_turn) {
-        printf("\033[1;35m::: ai Agent (local gemma4) interactive mode :::\033[0m\n");
+        printf("\033[1;35m::: ai Agent (local %s) interactive mode :::\033[0m\n", model);
         printf("Type \033[33mexit\033[0m, \033[33mquit\033[0m, or press \033[33mCtrl+D\033[0m to leave.\n\n");
     }
 
@@ -1064,7 +1486,9 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
-            
+            struct timespec task_start;
+            clock_gettime(CLOCK_MONOTONIC, &task_start);
+
             while (has_more && loop_count < 30) {
                 loop_count++;
                 
@@ -1105,6 +1529,75 @@ int main(int argc, char **argv) {
                 clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                 double elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
                                      (t_req_end.tv_nsec - t_req_start.tv_nsec) * 1e-9;
+
+                if (res != CURLE_OK && (res == CURLE_COULDNT_CONNECT || res == CURLE_COULDNT_RESOLVE_HOST || res == CURLE_OPERATION_TIMEDOUT)) {
+                    char *prof_url = NULL;
+                    char *prof_key = NULL;
+                    char *prof_model = NULL;
+                    load_from_profiles(&prof_url, &prof_key, &prof_model);
+                    
+                    if (prof_url && strlen(prof_url) > 0) {
+                        char prof_api_url[1024];
+                        const char *comp_path = "chat/completions";
+                        size_t p_len = strlen(prof_url);
+                        int p_needs_slash = p_len > 0 && prof_url[p_len - 1] != '/';
+                        snprintf(prof_api_url, sizeof(prof_api_url), "%s%s%s", prof_url, p_needs_slash ? "/" : "", comp_path);
+                        
+                        if (strcmp(prof_api_url, api_url) != 0) {
+                            if (debug_mode) {
+                                fprintf(stderr, "Warning: Connection to environment endpoint %s failed.\n", api_url);
+                                fprintf(stderr, "Attempting connection to profile default endpoint %s (model: %s)...\n", prof_api_url, prof_model ? prof_model : "unknown");
+                            }
+                            
+                            strcpy(api_url, prof_api_url);
+                            if (prof_key) strcpy(api_key, prof_key);
+                            if (prof_model) strcpy(model, prof_model);
+                            
+                            setenv("INFER_BASE_URL", prof_url, 1);
+                            if (prof_key) setenv("INFER_API_KEY", prof_key, 1);
+                            if (prof_model) setenv("INFER_MODEL", prof_model, 1);
+                            
+                            curl_easy_setopt(c, CURLOPT_URL, api_url);
+                            
+                            char new_auth[1024];
+                            snprintf(new_auth, sizeof(new_auth), "Authorization: Bearer %s", api_key);
+                            curl_slist_free_all(h);
+                            h = NULL;
+                            h = curl_slist_append(h, "Content-Type: application/json");
+                            h = curl_slist_append(h, new_auth);
+                            curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+                            
+                            if (context_window == 0) {
+                                context_window = detect_context_window(c, api_url);
+                            }
+                            curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&chunk);
+                            
+                            free(payload);
+                            size_t new_plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
+                            payload = malloc(new_plen);
+                            if (tools_json && strlen(tools_json) > 10) {
+                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"auto\"}",
+                                         model, opt_fields, messages_json, tools_json);
+                            } else {
+                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
+                                         model, opt_fields, messages_json);
+                            }
+                            curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
+                            
+                            if (chunk.data) {
+                                free(chunk.data);
+                                chunk.data = NULL;
+                                chunk.size = 0;
+                            }
+                            
+                            clock_gettime(CLOCK_MONOTONIC, &t_req_start);
+                            res = curl_easy_perform(c);
+                            clock_gettime(CLOCK_MONOTONIC, &t_req_end);
+                            elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
+                                          (t_req_end.tv_nsec - t_req_start.tv_nsec) * 1e-9;
+                        }
+                    }
+                }
 
                 if (res != CURLE_OK || !chunk.data) {
                     fprintf(stderr, "Request failed: %s\n", curl_easy_strerror(res));
@@ -1267,74 +1760,76 @@ int main(int argc, char **argv) {
 
                               char *tool_output = NULL;
 
-                              if (strcmp(unescaped_name, "think") == 0) {
-                                  jsmn_parser arg_parser;
-                                  jsmntok_t arg_toks[32];
-                                  jsmn_init(&arg_parser);
-                                  int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 32);
-                                  char *reasoning = NULL;
-                                  for (int a = 1; a < arg_r; a++) {
-                                      if (arg_toks[a].type == JSMN_STRING &&
-                                          arg_toks[a].end - arg_toks[a].start == 9 &&
-                                          strncmp(unescaped_args + arg_toks[a].start, "reasoning", 9) == 0) {
-                                          reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
-                                                                           arg_toks[a+1].end - arg_toks[a+1].start);
-                                          break;
-                                      }
-                                  }
-                                  if (!quiet_mode && reasoning) {
-                                      fprintf(stdout, "\033[2m[thinking] %s\033[0m\n", reasoning);
-                                      fflush(stdout);
-                                  }
-                                  if (reasoning) free(reasoning);
-                                  tool_output = strdup("{\"ok\":true}");
-                              } else if (strcmp(unescaped_name, "task_complete") == 0) {
-                                  jsmn_parser arg_parser;
-                                  jsmntok_t arg_toks[32];
-                                  jsmn_init(&arg_parser);
-                                  int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 32);
-                                  char *summary = NULL;
-                                  for (int a = 1; a < arg_r; a++) {
-                                      if (arg_toks[a].type == JSMN_STRING &&
-                                          arg_toks[a].end - arg_toks[a].start == 7 &&
-                                          strncmp(unescaped_args + arg_toks[a].start, "summary", 7) == 0) {
-                                          summary = unescape_json_string(unescaped_args + arg_toks[a+1].start,
-                                                                         arg_toks[a+1].end - arg_toks[a+1].start);
-                                          break;
-                                      }
-                                  }
-                                  if (summary) {
-                                      log_job(current_prompt, pipe_writer, summary, interactive_mode);
-                                      char *escaped_summary = shell_escape(summary);
-                                      char render_cmd[4096 + strlen(escaped_summary)];
-                                      snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_summary);
-                                      char *rendered = run_shell_command(render_cmd, NULL);
-                                      if (rendered) {
-                                          printf("%s\n", rendered);
-                                          free(rendered);
-                                      } else {
-                                          printf("%s\n", summary);
-                                      }
-                                      free(escaped_summary);
-                                      free(summary);
-                                  }
-                                  tool_output = strdup("{\"ok\":true}");
-                                  has_more = 0;
-                                  task_done = 1;
-                              } else if (strcmp(unescaped_name, "execute_command") == 0) {
-                                  jsmn_parser arg_parser;
-                                  jsmntok_t arg_toks[64];
-                                  jsmn_init(&arg_parser);
-                                  int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 64);
-                                  char *cmd_val = NULL;
-                                  for (int a = 1; a < arg_r; a++) {
-                                      if (arg_toks[a].type == JSMN_STRING && 
-                                          arg_toks[a].end - arg_toks[a].start == 7 &&
-                                          strncmp(unescaped_args + arg_toks[a].start, "command", 7) == 0) {
-                                          cmd_val = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
-                                          break;
-                                      }
-                                  }
+                               if (strcmp(unescaped_name, "think") == 0) {
+                                   jsmn_parser arg_parser;
+                                   jsmntok_t arg_toks[256];
+                                   jsmn_init(&arg_parser);
+                                   int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 256);
+                                   char *reasoning = NULL;
+                                   for (int a = 1; a < arg_r; a++) {
+                                       if (arg_toks[a].type == JSMN_STRING &&
+                                           arg_toks[a].end - arg_toks[a].start == 9 &&
+                                           strncmp(unescaped_args + arg_toks[a].start, "reasoning", 9) == 0) {
+                                           reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                            arg_toks[a+1].end - arg_toks[a+1].start);
+                                           break;
+                                       }
+                                   }
+                                   if (!quiet_mode && reasoning) {
+                                       fprintf(stderr, "\033[2m[thinking] %s\033[0m\n", reasoning);
+                                       fflush(stderr);
+                                   }
+                                   if (reasoning) free(reasoning);
+                                   tool_output = strdup("{\"ok\":true}");
+                               } else if (strcmp(unescaped_name, "task_complete") == 0) {
+                                   jsmn_parser arg_parser;
+                                   jsmntok_t arg_toks[2048];
+                                   jsmn_init(&arg_parser);
+                                   int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 2048);
+                                   char *summary = NULL;
+                                   for (int a = 1; a < arg_r; a++) {
+                                       if (arg_toks[a].type == JSMN_STRING &&
+                                           arg_toks[a].end - arg_toks[a].start == 7 &&
+                                           strncmp(unescaped_args + arg_toks[a].start, "summary", 7) == 0) {
+                                           summary = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                          arg_toks[a+1].end - arg_toks[a+1].start);
+                                           break;
+                                       }
+                                   }
+                                   if (summary) {
+                                       log_job(current_prompt, pipe_writer, summary, interactive_mode);
+                                       char *escaped_summary = shell_escape(summary);
+                                       char render_cmd[4096 + strlen(escaped_summary)];
+                                       snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_summary);
+                                       char *rendered = run_shell_command(render_cmd, NULL);
+                                       fflush(stderr);
+                                       printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
+                                       if (rendered) {
+                                           printf("%s\n", rendered);
+                                           free(rendered);
+                                       } else {
+                                           printf("%s\n", summary);
+                                       }
+                                       free(escaped_summary);
+                                       free(summary);
+                                   }
+                                   tool_output = strdup("{\"ok\":true}");
+                                   has_more = 0;
+                                   task_done = 1;
+                               } else if (strcmp(unescaped_name, "execute_command") == 0) {
+                                   jsmn_parser arg_parser;
+                                   jsmntok_t arg_toks[512];
+                                   jsmn_init(&arg_parser);
+                                   int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 512);
+                                   char *cmd_val = NULL;
+                                   for (int a = 1; a < arg_r; a++) {
+                                       if (arg_toks[a].type == JSMN_STRING && 
+                                           arg_toks[a].end - arg_toks[a].start == 7 &&
+                                           strncmp(unescaped_args + arg_toks[a].start, "command", 7) == 0) {
+                                           cmd_val = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
+                                           break;
+                                       }
+                                   }
 
                                   if (cmd_val) {
                                       int approved = auto_approve;
@@ -1466,16 +1961,24 @@ int main(int argc, char **argv) {
                               }
 
                               /* Cap individual tool output to prevent context blowup */
-                              if (strlen(tool_output) > 3000) {
-                                  char *capped = malloc(3020);
-                                  memcpy(capped, tool_output, 3000);
-                                  strcpy(capped + 3000, "\n... [truncated]");
-                                  free(tool_output);
-                                  tool_output = capped;
+                              if ((int)strlen(tool_output) > max_tool_output) {
+                                  size_t orig_len = strlen(tool_output);
+                                  char suffix[350];
+                                  snprintf(suffix, sizeof(suffix), 
+                                           "\n\n... [TRUNCATED: Tool output was %zu bytes. Capped at %d bytes. The model should decide if it wants to use a different tool/command to narrow down the query (e.g. grep, find, head/tail, line-range read_file), or run the command with pagination, or proceed with the truncated context.]", 
+                                           orig_len, max_tool_output);
+                                  size_t suffix_len = strlen(suffix);
+                                  char *capped = malloc(max_tool_output + suffix_len + 1);
+                                  if (capped) {
+                                      memcpy(capped, tool_output, max_tool_output);
+                                      strcpy(capped + max_tool_output, suffix);
+                                      free(tool_output);
+                                      tool_output = capped;
+                                  }
                               }
 
                               /* If total context is already large, stub this result */
-                              if (strlen(messages_json) > 40000) {
+                              if ((int)strlen(messages_json) > stub_threshold) {
                                   free(tool_output);
                                   tool_output = strdup("[context limit reached \xe2\x80\x94 result omitted to preserve model focus]");
                               }
@@ -1523,29 +2026,43 @@ int main(int argc, char **argv) {
                       has_more = 0;
 
                       int content_tok = -1;
+                      int reasoning_content_tok = -1;
                       if (message_tok != -1) {
                           int msg_end = tok[message_tok].end;
                           int k = message_tok + 1;
                           while (k < r && tok[k].start < msg_end) {
-                              if (tok[k].type == JSMN_STRING && 
-                                  tok[k].end - tok[k].start == 7 &&
-                                  strncmp(chunk.data + tok[k].start, "content", 7) == 0) {
-                                  content_tok = k + 1;
-                                  break;
+                              if (tok[k].type == JSMN_STRING) {
+                                  int flen = tok[k].end - tok[k].start;
+                                  if (flen == 7 && strncmp(chunk.data + tok[k].start, "content", 7) == 0) {
+                                      content_tok = k + 1;
+                                  } else if (flen == 17 && strncmp(chunk.data + tok[k].start, "reasoning_content", 17) == 0) {
+                                      reasoning_content_tok = k + 1;
+                                  }
                               }
                               k = json_skip_token(tok, r, k + 1);
                           }
+                      }
+
+                      if (!quiet_mode && reasoning_content_tok != -1 && tok[reasoning_content_tok].type == JSMN_STRING) {
+                          char *unescaped_reasoning = unescape_json_string(chunk.data + tok[reasoning_content_tok].start, tok[reasoning_content_tok].end - tok[reasoning_content_tok].start);
+                          if (unescaped_reasoning && strlen(unescaped_reasoning) > 0) {
+                              fprintf(stderr, "\033[2m[thinking]\n%s\033[0m\n", unescaped_reasoning);
+                              fflush(stderr);
+                          }
+                          free(unescaped_reasoning);
                       }
 
                       if (content_tok != -1 && tok[content_tok].type == JSMN_STRING) {
                           char *unescaped_content = unescape_json_string(chunk.data + tok[content_tok].start, tok[content_tok].end - tok[content_tok].start);
                           log_job(current_prompt, pipe_writer, unescaped_content, interactive_mode);
                           char *escaped_content = shell_escape(unescaped_content);
-                          
+
                           char render_cmd[4096 + strlen(escaped_content)];
                           snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_content);
                           char *rendered_output = run_shell_command(render_cmd, NULL);
-                          
+
+                          fflush(stderr);
+                          printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
                           if (rendered_output) {
                               printf("%s", rendered_output);
                               free(rendered_output);
@@ -1575,13 +2092,29 @@ int main(int argc, char **argv) {
                       if (context_window > 0) {
                           int pct = (int)(100.0 * total_tokens / context_window);
                           fprintf(stderr,
-                              "\033[2m[loop %d | ctx %d/%d (%d%%) | +%d tok | %.0f tok/s]\033[0m\n",
+                              "\n\033[2m[loop %d | ctx %d/%d (%d%%) | +%d tok | %.0f tok/s]\033[0m\n",
                               loop_count, total_tokens, context_window, pct,
                               completion_tokens, tps);
                       } else {
                           fprintf(stderr,
-                              "\033[2m[loop %d | %d ctx tok | +%d new | %.0f tok/s]\033[0m\n",
+                              "\n\033[2m[loop %d | %d ctx tok | +%d new | %.0f tok/s]\033[0m\n",
                               loop_count, prompt_tokens, completion_tokens, tps);
+                      }
+                  }
+
+                  /* Task timeout check: if total elapsed > INFER_TASK_TIMEOUT, force one final iteration */
+                  if (task_timeout_sec > 0 && has_more) {
+                      struct timespec t_now;
+                      clock_gettime(CLOCK_MONOTONIC, &t_now);
+                      double task_elapsed = (t_now.tv_sec  - task_start.tv_sec) +
+                                            (t_now.tv_nsec - task_start.tv_nsec) * 1e-9;
+                      if (task_elapsed > (double)task_timeout_sec) {
+                          fprintf(stderr,
+                              "\033[1;33m[ai] task timeout (%.0fs / %ds limit). Forcing task_complete.\033[0m\n",
+                              task_elapsed, task_timeout_sec);
+                          messages_json = append_message(messages_json,
+                              "{\"role\":\"user\",\"content\":\"[TIMEOUT] Maximum task duration reached. You MUST call task_complete NOW with your current best answer. No more tool calls.\"}");
+                          loop_count = 28; /* allow exactly one more iteration */
                       }
                   }
 
@@ -1589,7 +2122,7 @@ int main(int argc, char **argv) {
                   free(chunk.data);
               }
           }
-          
+
           if (!interactive_mode) {
               keep_going = 0;
           }

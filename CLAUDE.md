@@ -24,6 +24,9 @@ Optional environment variables:
 - `INFER_AUTO_APPROVE=1` — auto-approve all `execute_command` calls without prompting.
 - `INFER_DEBUG` — dump raw request/response payloads to stderr on every loop iteration.
 - `INFER_QUIET=1` — suppress `[thinking]` output from the `think` tool (same as `-q`).
+- `INFER_MAX_TOOL_OUTPUT` — caps individual tool output (default: 65536).
+- `INFER_TRIM_THRESHOLD` — triggers message trimming if context exceeds this size (default: 100000).
+- `INFER_STUB_THRESHOLD` — stubs subsequent tool results once context size exceeds this (default: 250000).
 
 ## Architecture: two cooperating processes
 
@@ -41,7 +44,7 @@ The system is split across two files that talk to each other by **shell-invoking
 - Fetches the tool catalog at startup via `python3 ai_mcp.py list-tools`.
 - Renders final assistant text via `python3 ai_mcp.py render-markdown <text>`.
 - Assembles the system prompt from: hardcoded `SYSTEM_PROMPT`, live system context (`get_system_context`), persistent memory, and loaded skills.
-- Caps each tool result to **3 000 chars** and stubs any result once `messages_json` exceeds **40 KB** to prevent context blowup.
+- Caps each tool result to `INFER_MAX_TOOL_OUTPUT` (default: 64 KB) and stubs any result once `messages_json` exceeds `INFER_STUB_THRESHOLD` (default: 250 KB) to prevent context blowup. Trims messages when context exceeds `INFER_TRIM_THRESHOLD` (default: 100 KB).
 - Detects pipe-writer via `/proc` inspection and includes the originating command name in the user message.
 - Handles image file arguments: detects `.png`/`.jpg`/`.jpeg`/`.webp` paths, base64-encodes them, and injects a `image_url` content block into the first user message.
 - Intercepts `[IMAGE_DATA_SUCCESS:<path>]` returned by `read_file` and similarly injects the image into conversation context.
