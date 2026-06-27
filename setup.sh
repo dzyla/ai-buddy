@@ -6,7 +6,7 @@ sudo apt-get update
 sudo apt-get install -y gcc libcurl4-openssl-dev
 
 echo "2. Building and installing the 'ai' CLI..."
-gcc -o ai ai.c -lcurl
+gcc -o ai ai.c cJSON.c -lcurl
 sudo cp ai /usr/local/bin/
 sudo chmod +x /usr/local/bin/ai
 sudo cp ai_mcp.py /usr/local/bin/
