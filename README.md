@@ -22,7 +22,7 @@ It reads from stdin, sends to an LLM, runs tools dynamically (shell commands, we
 - **Web Search**: Searches DuckDuckGo Lite without any API key. Results include title, URL, and snippet.
 - **Webpage Fetching**: Downloads and cleans HTML to readable text (scripts/styles stripped, HTML entities decoded, truncated at 10 KB).
 - **File Reading**: Reads text files (truncated at 12 KB), PDFs (via `pdftotext` → `pypdf` → `pdfplumber` fallback chain), and image files (PNG, JPG, JPEG, WEBP — injected directly into vision context). Binary files are rejected with a clear error.
-- **File Writing & Editing**: Creates new files (with parent directories) via `write_file`. Makes precise search-and-replace edits to existing files via `edit_file` — the search block must match exactly.
+- **File Writing & Editing**: Creates new files (with parent directories) via `write_file`. Makes precise search-and-replace edits to existing files via `edit_file`. Falls back to trailing-whitespace-tolerant fuzzy matching when the exact string is not found.
 - **Directory Listing**: Safe directory exploration via `list_directory`, showing file sizes and `[DIR]` markers.
 - **Persistent Memory**: The model can call `save_memory` to store facts, preferences, or context to `~/.config/ai/memory.txt` (capped at 4 KB). Memory is injected into every system prompt automatically.
 - **Recursive Agent Delegation**: `delegate_task` spawns an independent child `ai` process with full tool access and a 60-second timeout. Use it for parallel, independent sub-tasks.
@@ -222,7 +222,7 @@ Tools from the server are namespaced as `my_server__tool_name` in the model's to
 | `fetch_webpage` | Downloads URL and converts HTML to readable text (10 KB limit). |
 | `read_file` | Reads text, PDF (pdftotext/pypdf/pdfplumber), or image (injected into vision context). Optional `start_line`/`end_line` for large files. |
 | `write_file` | Writes content to a file, creating parent directories as needed. |
-| `edit_file` | Search-and-replace edit on an existing file. Match must be exact. |
+| `edit_file` | Search-and-replace edit on an existing file. Falls back to trailing-whitespace fuzzy match if exact string not found. |
 | `list_directory` | Lists directory contents with sizes and `[DIR]` markers. |
 | `save_memory` | Persists text to `~/.config/ai/memory.txt` (overwrites, 4 KB cap). |
 | `delegate_task` | Spawns a child `ai` process with full tool access (60 s timeout). |
