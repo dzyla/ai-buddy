@@ -964,6 +964,11 @@ static int update_config_file(const char *file_path, const char *new_model, cons
 }
 
 static int detect_model_url(const char *model_name, char *url_out, size_t max_len) {
+    if (strcmp(model_name, "llama") == 0 || strcmp(model_name, "llama-server") == 0) {
+        strncpy(url_out, "http://localhost:8080/v1/", max_len - 1);
+        url_out[max_len - 1] = '\0';
+        return 1;
+    }
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "%s status 2>/dev/null", model_name);
     FILE *status_fp = popen(cmd, "r");
@@ -1157,8 +1162,22 @@ int main(int argc, char **argv) {
     int auto_approve = 0;
     int quiet_mode = 0;
 
-    // Parse set-default option first
+    // Parse set-default and install-llama options first (both exit early)
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--install-llama") == 0) {
+            char *home = getenv("HOME");
+            if (!home) { fprintf(stderr, "Error: HOME not set.\n"); return 1; }
+            char script[1024];
+            snprintf(script, sizeof(script), "%s/.local/bin/llama-install.sh", home);
+            char *repo = (i + 1 < argc && argv[i+1][0] != '-') ? argv[i+1] : NULL;
+            if (repo)
+                execl("/bin/bash", "bash", script, repo, (char *)NULL);
+            else
+                execl("/bin/bash", "bash", script, (char *)NULL);
+            perror("execl: could not run llama-install.sh");
+            fprintf(stderr, "Run ./setup_llama.sh first to install the script.\n");
+            return 1;
+        }
         if (strcmp(argv[i], "--set-default") == 0 || strcmp(argv[i], "-s") == 0) {
             if (i + 1 < argc) {
                 return set_default_model(argv[i+1]);
@@ -1180,6 +1199,9 @@ int main(int argc, char **argv) {
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
             printf("  -m, --model MODEL    Override the default model selection.\n");
             printf("  -s, --set-default M  Set the global default model in shell configs.\n");
+            printf("  --install-llama [R]  Download, build llama.cpp and start a local server.\n");
+            printf("                       R: optional HuggingFace repo (e.g. unsloth/gemma-4-12b-it-GGUF).\n");
+            printf("                       Omit R to show an interactive model selection menu.\n");
             printf("  -h, --help           Display this help screen.\n\n");
             printf("Examples:\n");
             printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
