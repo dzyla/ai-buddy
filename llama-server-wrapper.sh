@@ -28,7 +28,7 @@ LAST_SEEN=$(date +%s)
 
 while kill -0 "$LLAMA_PID" 2>/dev/null; do
     sleep "$CHECK_INTERVAL"
-    CONNS=$(ss -tn | grep ":${PORT}.*ESTAB" 2>/dev/null | wc -l)
+    CONNS=$(ss -tn | { grep ":${PORT}.*ESTAB" 2>/dev/null || true; } | wc -l)
     if [ "$CONNS" -gt 0 ]; then
         LAST_SEEN=$(date +%s)
     fi
