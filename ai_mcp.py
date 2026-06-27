@@ -7,6 +7,12 @@ import urllib.request
 import urllib.parse
 import re
 
+try:
+    import trafilatura
+    _HAS_TRAFILATURA = True
+except ImportError:
+    _HAS_TRAFILATURA = False
+
 CONFIG_PATHS = [
     os.path.join(os.getcwd(), "mcp.json"),
     os.path.join(os.getcwd(), "mcp_config.json"),
@@ -144,77 +150,137 @@ def ddg_lite_search(query):
         req = urllib.request.Request(
             url,
             data=data,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
-        
+
         trs = re.findall(r'<tr.*?>(.*?)</tr>', html, re.DOTALL)
         results = []
-        
+        top_url = None
+
         i = 0
         while i < len(trs):
             tr = trs[i]
-            link_match = re.search(r'(<a[^>]+class=\'result-link\'[^>]*>)(.*?)</a>', tr, re.DOTALL)
+            link_match = re.search(r"(<a[^>]+class='result-link'[^>]*>)(.*?)</a>", tr, re.DOTALL)
             if link_match:
                 tag = link_match.group(1)
-                text = link_match.group(2)
                 href_match = re.search(r'href="([^"]+)"', tag)
                 link = href_match.group(1) if href_match else ""
-                title = re.sub(r'<[^>]+>', '', text).strip()
-                
+                title = re.sub(r'<[^>]+>', '', link_match.group(2)).strip()
+
                 snippet = ""
                 if i + 1 < len(trs):
-                    next_tr = trs[i + 1]
-                    snippet_match = re.search(r'<td[^>]+class=\'result-snippet\'[^>]*>(.*?)</td>', next_tr, re.DOTALL)
-                    if snippet_match:
-                        snippet = re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()
-                        snippet = snippet.replace('&amp;', '&').replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').replace('&nbsp;', ' ')
-                
+                    sm = re.search(r"<td[^>]+class='result-snippet'[^>]*>(.*?)</td>",
+                                   trs[i + 1], re.DOTALL)
+                    if sm:
+                        snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip()
+                        snippet = (snippet.replace('&amp;', '&').replace('&quot;', '"')
+                                         .replace('&lt;', '<').replace('&gt;', '>')
+                                         .replace('&nbsp;', ' '))
+
+                if not top_url and link.startswith('http'):
+                    top_url = link
                 results.append(f"Title: {title}\nURL: {link}\nSnippet: {snippet}\n")
                 if len(results) >= 5:
                     break
                 i += 2
                 continue
             i += 1
-            
+
         if not results:
             return "No results found."
-            
-        return "\n".join(results)
+
+        output = "\n".join(results)
+
+        # Auto-fetch the top result to provide full content (snippets are always truncated)
+        if top_url:
+            try:
+                full = fetch_webpage(top_url)
+                # Keep first 4000 chars of article body to stay within context budget
+                body = full.split('\n\n', 1)[-1] if '\n\n' in full else full
+                if len(body.split()) > 40:
+                    body_trimmed = body[:4000] + ("\n... [more at URL]" if len(body) > 4000 else "")
+                    output += f"\n---\n[Top result full content — {top_url}]\n{body_trimmed}"
+            except Exception:
+                pass
+
+        return output
     except Exception as e:
         return f"Error during web search: {e}"
 
+def _html_to_text_fallback(html, url):
+    """Regex-based HTML→text extraction used when trafilatura is unavailable."""
+    orig_html = html
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<p[^>]*>', '\n\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'<br[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'<h[1-6][^>]*>', '\n\n## ', html, flags=re.IGNORECASE)
+    html = re.sub(r'</h[1-6]>', '\n', html, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', html)
+    text = (text.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&amp;', '&')
+                .replace('&lt;', '<').replace('&gt;', '>').replace('&#x27;', "'")
+                .replace('&#39;', "'").replace('&ndash;', '-').replace('&mdash;', '-'))
+    lines = [l.strip() for l in text.splitlines()]
+    text = "\n".join(l for l in lines if l)
+    word_count = len(text.split())
+    js_indicators = ['enable javascript', 'javascript is required', 'javascript is disabled',
+                     'you need to enable javascript', 'requires javascript']
+    is_js_only = (any(ind in text.lower() for ind in js_indicators)
+                  or (word_count < 40 and '<noscript>' in orig_html.lower()))
+    if is_js_only:
+        return (f"[WARNING: This page requires JavaScript and returned no useful content "
+                f"({word_count} words). Use execute_command with curl to a plain-text API. "
+                f"For weather: curl -s 'wttr.in/CITY?format=3']\n\n{text[:2000]}")
+    max_tool = 65536
+    max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
+    if max_tool_output_env:
+        try:
+            max_tool = int(max_tool_output_env)
+        except ValueError:
+            pass
+    web_limit = max(10000, int(max_tool * 0.8))
+    if len(text) > web_limit:
+        text = text[:web_limit] + f"\n... [truncated. Page content size was {len(text)} characters. Limit is {web_limit}.]"
+    return text
+
+
 def fetch_webpage(url):
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-        )
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+        if _HAS_TRAFILATURA:
+            # trafilatura fetches + extracts main article body, strips nav/ads/footers
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded:
+                text = trafilatura.extract(
+                    downloaded,
+                    include_comments=False,
+                    include_tables=True,
+                    deduplicate=True,
+                    no_fallback=False,
+                )
+                if text and len(text.split()) > 30:
+                    max_tool = 65536
+                    max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
+                    if max_tool_output_env:
+                        try:
+                            max_tool = int(max_tool_output_env)
+                        except ValueError:
+                            pass
+                    web_limit = max(12000, int(max_tool * 0.8))
+                    if len(text) > web_limit:
+                        text = text[:web_limit] + f"\n... [truncated. Page content size was {len(text)} characters. Limit is {web_limit}.]"
+                    return f"[Source: {url}]\n\n{text}"
+            # trafilatura returned nothing → fall through to regex
+
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
 
-        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<p[^>]*>', '\n\n', html, flags=re.IGNORECASE)
-        html = re.sub(r'<br[^>]*>', '\n', html, flags=re.IGNORECASE)
-        html = re.sub(r'<h[1-6][^>]*>', '\n\n# ', html, flags=re.IGNORECASE)
-        html = re.sub(r'</h[1-6]>', '\n', html, flags=re.IGNORECASE)
-
-        text = re.sub(r'<[^>]+>', '', html)
-        text = text.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-        text = text.replace('&#x27;', "'").replace('&#39;', "'").replace('&ndash;', '-').replace('&mdash;', '-')
-
-        lines = [line.strip() for line in text.splitlines()]
-        text = "\n".join([line for line in lines if line])
-
-        if len(text) > 10000:
-            text = text[:10000] + "\n... (truncated)"
-
+        text = _html_to_text_fallback(html, url)
         return f"[Source: {url}]\n\n{text}"
     except Exception as e:
         return f"Error fetching webpage: {e}"
@@ -366,24 +432,27 @@ def highlight_line(line, lang):
         return string_placeholder.format(len(strings) - 1)
         
     temp_line = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\'', repl_str, line)
-    
+
+    # Numbers must run FIRST — before keyword/constant substitutions inject digits
+    # inside ANSI escape codes (e.g. \033[1;33m), which would otherwise be
+    # re-matched by \b(\d+)\b and corrupt the sequence.
+    temp_line = re.sub(r'\b(\d+)\b', r'\033[35m\1\033[0m', temp_line)
+
     keywords = [
-        "def", "class", "return", "if", "elif", "else", "for", "while", "break", "continue", 
-        "import", "from", "as", "try", "except", "finally", "raise", "assert", "with", "in", 
+        "def", "class", "return", "if", "elif", "else", "for", "while", "break", "continue",
+        "import", "from", "as", "try", "except", "finally", "raise", "assert", "with", "in",
         "is", "not", "and", "or", "lambda", "global", "nonlocal", "pass", "yield", "del",
-        "int", "char", "float", "double", "void", "struct", "union", "enum", "typedef", 
-        "const", "static", "extern", "volatile", "inline", "switch", "case", "default", 
-        "do", "goto", "sizeof", "alignof", "then", "fi", "done", "esac", "local", "export", 
+        "int", "char", "float", "double", "void", "struct", "union", "enum", "typedef",
+        "const", "static", "extern", "volatile", "inline", "switch", "case", "default",
+        "do", "goto", "sizeof", "alignof", "then", "fi", "done", "esac", "local", "export",
         "function", "let", "var", "fn", "impl", "pub", "use", "mod"
     ]
     keyword_re = r'\b(' + '|'.join(keywords) + r')\b'
     temp_line = re.sub(keyword_re, r'\033[1;33m\1\033[0m', temp_line)
-    
+
     constants = ["True", "False", "None", "true", "false", "null", "NULL", "self"]
     const_re = r'\b(' + '|'.join(constants) + r')\b'
     temp_line = re.sub(const_re, r'\033[35m\1\033[0m', temp_line)
-    
-    temp_line = re.sub(r'\b(\d+)\b', r'\033[35m\1\033[0m', temp_line)
     
     for idx, s in enumerate(strings):
         temp_line = temp_line.replace(string_placeholder.format(idx), f"\033[32m{s}\033[0m")
@@ -463,11 +532,22 @@ def read_file(path, start_line=None, end_line=None):
                     f"{snippet}")
 
         # Small file — return as-is
-        if total_chars <= 12000:
+        max_tool = 65536
+        max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
+        if max_tool_output_env:
+            try:
+                max_tool = int(max_tool_output_env)
+            except ValueError:
+                pass
+
+        small_file_limit = max(12000, int(max_tool * 0.8))
+        large_file_limit = max(80000, int(max_tool * 5.0))
+
+        if total_chars <= small_file_limit:
             return content
 
-        # Large file (12 KB – 80 KB): return smart outline + head + tail
-        if total_chars <= 80000:
+        # Large file (small_file_limit – large_file_limit): return smart outline + head + tail
+        if total_chars <= large_file_limit:
             outline = extract_code_outline(content)
             head = "\n".join(lines[:80])
             tail = "\n".join(lines[-30:])
@@ -484,8 +564,10 @@ def read_file(path, start_line=None, end_line=None):
             parts.append(f"\n### Last 30 lines\n{tail}")
             return "\n".join(parts)
 
-        # Very large file (> 80 KB): delegate digest to a sub-agent
-        ai_bin = "/usr/local/bin/ai"
+        # Very large file (> large_file_limit): delegate digest to a sub-agent
+        ai_bin = os.environ.get("INFER_BIN_PATH")
+        if not ai_bin or not os.path.exists(ai_bin):
+            ai_bin = "/usr/local/bin/ai"
         if not os.path.exists(ai_bin):
             ai_bin = "./ai"
         if not os.path.exists(ai_bin):
@@ -503,10 +585,17 @@ def read_file(path, start_line=None, end_line=None):
             f"Keep the summary under 800 words. Output in markdown."
         )
         try:
+            task_timeout = 180
+            env_timeout = os.environ.get("INFER_TASK_TIMEOUT")
+            if env_timeout:
+                try:
+                    task_timeout = max(90, int(env_timeout) // 2)
+                except ValueError:
+                    pass
             proc = subprocess.run(
                 [ai_bin, digest_prompt],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=90
+                text=True, timeout=task_timeout
             )
             summary = proc.stdout.strip()
             if not summary:
@@ -841,10 +930,32 @@ def main():
         try:
             with open(sys.argv[2]) as f:
                 messages = json.load(f)
+            # Compress think reasoning in assistant messages to reclaim context tokens
+            MAX_THINK = 120
+            compressed = []
+            for msg in messages:
+                if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                    new_calls = []
+                    for call in msg['tool_calls']:
+                        if call.get('function', {}).get('name') == 'think':
+                            try:
+                                args = json.loads(call['function']['arguments'])
+                                r = args.get('reasoning', '')
+                                if len(r) > MAX_THINK:
+                                    args['reasoning'] = r[:MAX_THINK] + '…'
+                                    call = dict(call)
+                                    call['function'] = dict(call['function'])
+                                    call['function']['arguments'] = json.dumps(args)
+                            except Exception:
+                                pass
+                        new_calls.append(call)
+                    msg = dict(msg)
+                    msg['tool_calls'] = new_calls
+                compressed.append(msg)
             # Keep: system prompt (0), first user turn (1), last 20 messages
-            if len(messages) > 22:
-                messages = messages[:2] + messages[-20:]
-            print(json.dumps(messages))
+            if len(compressed) > 22:
+                compressed = compressed[:2] + compressed[-20:]
+            print(json.dumps(compressed))
         except Exception:
             print("[]")
         sys.exit(0)
@@ -857,13 +968,13 @@ def main():
             "type": "function",
             "function": {
                 "name": "think",
-                "description": "Use before any task requiring more than one tool call. Write your plan: what you know, what you need to find, and which tools you will call in order. This reasoning is shown to the user.",
+                "description": "Plan before a multi-step task. Call ONCE before your first action — never again after any non-think tool has been called. Keep reasoning under 50 words.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "reasoning": {
                             "type": "string",
-                            "description": "Your step-by-step plan for completing the task."
+                            "description": "Brief plan (≤50 words): what steps you will take and in what order."
                         }
                     },
                     "required": ["reasoning"]
@@ -1170,16 +1281,32 @@ def main():
         elif tool_name == "delegate_task" or server_name == "delegate_task":
             task = arguments.get("task", "")
             try:
-                ai_bin = "/usr/local/bin/ai"
+                ai_bin = os.environ.get("INFER_BIN_PATH")
+                if not ai_bin or not os.path.exists(ai_bin):
+                    ai_bin = "/usr/local/bin/ai"
                 if not os.path.exists(ai_bin):
                     ai_bin = "./ai"
                 
+                task_timeout = 300
+                env_timeout = os.environ.get("INFER_TASK_TIMEOUT")
+                if env_timeout:
+                    try:
+                        task_timeout = int(env_timeout)
+                    except ValueError:
+                        pass
+                cmd_args = [ai_bin]
+                if os.environ.get("INFER_AUTO_APPROVE") == "1":
+                    cmd_args.append("-y")
+                if os.environ.get("INFER_QUIET") == "1":
+                    cmd_args.append("-q")
+                cmd_args.append(task)
+
                 proc = subprocess.run(
-                    [ai_bin, task],
+                    cmd_args,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=60
+                    timeout=task_timeout
                 )
                 output = proc.stdout.strip()
                 err = proc.stderr.strip()
