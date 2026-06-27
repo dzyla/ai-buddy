@@ -1915,9 +1915,11 @@ int main(int argc, char **argv) {
                                    if (summary) {
                                        log_job(current_prompt, pipe_writer, summary, interactive_mode);
                                        char *escaped_summary = shell_escape(summary);
-                                       char render_cmd[4096 + strlen(escaped_summary)];
-                                       snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_summary);
+                                       size_t rcmd1_len = strlen(mcp_script) + strlen(escaped_summary) + 32;
+                                       char *render_cmd = malloc(rcmd1_len);
+                                       snprintf(render_cmd, rcmd1_len, "python3 %s render-markdown %s", mcp_script, escaped_summary);
                                        char *rendered = run_shell_command(render_cmd, NULL);
+                                       free(render_cmd);
                                        fflush(stderr);
                                        printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
                                        if (rendered) {
@@ -2172,10 +2174,11 @@ int main(int argc, char **argv) {
                           char *unescaped_content = unescape_json_string(chunk.data + tok[content_tok].start, tok[content_tok].end - tok[content_tok].start);
                           log_job(current_prompt, pipe_writer, unescaped_content, interactive_mode);
                           char *escaped_content = shell_escape(unescaped_content);
-
-                          char render_cmd[4096 + strlen(escaped_content)];
-                          snprintf(render_cmd, sizeof(render_cmd), "python3 %s render-markdown %s", mcp_script, escaped_content);
-                          char *rendered_output = run_shell_command(render_cmd, NULL);
+                          size_t rcmd2_len = strlen(mcp_script) + strlen(escaped_content) + 32;
+                          char *render_cmd2 = malloc(rcmd2_len);
+                          snprintf(render_cmd2, rcmd2_len, "python3 %s render-markdown %s", mcp_script, escaped_content);
+                          char *rendered_output = run_shell_command(render_cmd2, NULL);
+                          free(render_cmd2);
 
                           fflush(stderr);
                           printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
