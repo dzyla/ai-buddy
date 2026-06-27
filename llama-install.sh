@@ -186,7 +186,13 @@ export INFER_MODEL=\"llama\"
 "
 
 for PROFILE in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
-    if [ -f "$PROFILE" ] && ! grep -q "INFER_BASE_URL.*localhost:${PORT}" "$PROFILE"; then
+    if [ ! -f "$PROFILE" ]; then continue; fi
+    if grep -q "INFER_BASE_URL" "$PROFILE"; then
+        echo "==> WARNING: $PROFILE already has INFER_BASE_URL set."
+        echo "    Existing config will remain; llama block NOT appended."
+        echo "    To switch to llama, run:  ai --set-default llama"
+        echo "    Or manually update INFER_BASE_URL/INFER_MODEL in $PROFILE"
+    else
         printf '%s\n' "$INFER_BLOCK" >> "$PROFILE"
         echo "==> Updated $PROFILE"
     fi
