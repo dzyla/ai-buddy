@@ -1313,6 +1313,12 @@ int main(int argc, char **argv) {
     if (env_trim && *env_trim) trim_threshold = atoi(env_trim);
     char *env_stub = getenv("INFER_STUB_THRESHOLD");
     if (env_stub && *env_stub) stub_threshold = atoi(env_stub);
+    const char *tool_choice_val = "required";
+    char *env_tool_choice = getenv("INFER_TOOL_CHOICE");
+    if (env_tool_choice && (strcmp(env_tool_choice, "auto") == 0
+                         || strcmp(env_tool_choice, "required") == 0)) {
+        tool_choice_val = env_tool_choice;
+    }
 
     if (argc < 2 && is_stdin_tty) {
         interactive_mode = 1;
@@ -1620,8 +1626,8 @@ int main(int argc, char **argv) {
                 size_t plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
                 payload = malloc(plen);
                 if (tools_json && strlen(tools_json) > 10) {
-                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"auto\"}",
-                             model, opt_fields, messages_json, tools_json);
+                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
+                             model, opt_fields, messages_json, tools_json, tool_choice_val);
                 } else {
                     snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
                              model, opt_fields, messages_json);
@@ -1688,8 +1694,8 @@ int main(int argc, char **argv) {
                             size_t new_plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
                             payload = malloc(new_plen);
                             if (tools_json && strlen(tools_json) > 10) {
-                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"auto\"}",
-                                         model, opt_fields, messages_json, tools_json);
+                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
+                                         model, opt_fields, messages_json, tools_json, tool_choice_val);
                             } else {
                                 snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
                                          model, opt_fields, messages_json);
