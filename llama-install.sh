@@ -110,12 +110,12 @@ echo "$GGUF_FILES"
 TOTAL=$(echo "$GGUF_FILES" | wc -l)
 read -rp "Pick a file [1-${TOTAL}]: " FILE_CHOICE
 
-CHOSEN_FILE=$(echo "$GGUF_FILES" | python3 -c "
-import sys
+CHOSEN_FILE=$(echo "$GGUF_FILES" | FILE_CHOICE="${FILE_CHOICE}" python3 -c "
+import sys, os
 lines = sys.stdin.read().strip().split('\n')
-idx = int('${FILE_CHOICE}') - 1
+idx = int(os.environ['FILE_CHOICE']) - 1
 if idx < 0 or idx >= len(lines):
-    raise SystemExit('Invalid selection')
+    raise SystemExit('Invalid selection: ' + os.environ['FILE_CHOICE'])
 print(lines[idx].split(') ', 1)[1])
 ")
 
@@ -127,6 +127,7 @@ if [ -f "$MODEL_PATH" ]; then
     echo "==> Model already exists at ${MODEL_PATH}, skipping download."
 else
     echo "==> Downloading ${CHOSEN_FILE}..."
+    mkdir -p "$(dirname "$MODEL_PATH")"
     curl -L --progress-bar \
         ${HF_TOKEN_HEADER:+-H "$HF_TOKEN_HEADER"} \
         "https://huggingface.co/${CHOSEN_REPO}/resolve/main/${CHOSEN_FILE}" \
@@ -145,7 +146,7 @@ cat > "${SYSTEMD_DIR}/llama-server.socket" <<SOCKET_EOF
 Description=llama-server on-demand socket
 
 [Socket]
-ListenStream=${PORT}
+ListenStream=127.0.0.1:${PORT}
 Accept=no
 
 [Install]
@@ -157,12 +158,15 @@ cat > "${SYSTEMD_DIR}/llama-server.service" <<SERVICE_EOF
 [Unit]
 Description=llama-server (on-demand, idle-unload)
 Requires=llama-server.socket
+After=llama-server.socket
 
 [Service]
 Type=simple
 Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
+ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
 ExecStart=${BIN_DIR}/llama-server-wrapper.sh
+ExecStopPost=/bin/bash -c 'systemctl --user start llama-server.socket || true'
 Restart=no
 StandardOutput=journal
 StandardError=journal
