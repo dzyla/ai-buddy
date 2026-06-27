@@ -542,12 +542,26 @@ static char* shell_escape(const char *src) {
 
 static struct termios orig_termios;
 static int raw_mode_active = 0;
+static volatile int g_esc_requested = 0;
+static char *g_system_message_json = NULL;
 
 static void disable_raw_mode(void) {
     if (raw_mode_active) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_mode_active = 0;
     }
+}
+
+/* Called by libcurl periodically during transfers; returning non-zero aborts. */
+static int curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                             curl_off_t ultotal, curl_off_t ulnow) {
+    (void)clientp; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    if (raw_mode_active && !g_esc_requested) {
+        char ch;
+        if (read(STDIN_FILENO, &ch, 1) == 1 && ch == 27)
+            g_esc_requested = 1;
+    }
+    return g_esc_requested ? 1 : 0;
 }
 
 static void enable_raw_mode(void) {
@@ -1148,6 +1162,111 @@ static int set_default_model(const char *new_model) {
     return 0;
 }
 
+/* compact_session: ask the LLM to summarise the conversation, then rebuild
+   messages_json as [system, compacted-user, compacted-assistant].
+   Returns a new messages_json (caller must use the returned pointer). */
+static char* compact_session(char *messages_json, const char *mcp_script,
+                              CURL *curl_handle, const char *model_name) {
+    (void)mcp_script;
+    fprintf(stderr, "\033[1;35m[ai] Compacting session — requesting summary...\033[0m\n");
+    fflush(stderr);
+
+    size_t orig_size = strlen(messages_json);
+
+    const char *summary_req =
+        "{\"role\":\"user\",\"content\":\"Provide a comprehensive summary of this entire "
+        "conversation so far. Include: all topics discussed, decisions made, code written "
+        "or modified, commands run and their results, key findings, and any pending tasks. "
+        "Be thorough — this summary will replace the full conversation history.\"}";
+
+    char *temp_msgs = strdup(messages_json);
+    temp_msgs = append_message(temp_msgs, summary_req);
+
+    size_t plen = strlen(model_name) + strlen(temp_msgs) + 128;
+    char *payload = malloc(plen);
+    snprintf(payload, plen,
+             "{\"model\":\"%s\",\"stream\":false,\"messages\":%s}",
+             model_name, temp_msgs);
+    free(temp_msgs);
+
+    struct response chunk = {0};
+    int saved_esc = g_esc_requested;
+    g_esc_requested = 0;
+    if (raw_mode_active) disable_raw_mode();
+    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payload);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+    curl_easy_perform(curl_handle);
+    g_esc_requested = saved_esc;
+    free(payload);
+
+    char *summary = NULL;
+    if (chunk.data && chunk.size > 5) {
+        jsmn_parser cp;
+        jsmntok_t ctok[1024];
+        jsmn_init(&cp);
+        int cr = jsmn_parse(&cp, chunk.data, chunk.size, ctok, 1024);
+        int msg_tok = -1;
+        for (int i = 1; i < cr; i++) {
+            if (ctok[i].type == JSMN_STRING) {
+                int clen = ctok[i].end - ctok[i].start;
+                if (clen == 7 && strncmp(chunk.data + ctok[i].start, "message", 7) == 0) {
+                    msg_tok = i + 1;
+                }
+            }
+        }
+        if (msg_tok != -1 && ctok[msg_tok].type == JSMN_OBJECT) {
+            int msg_end = ctok[msg_tok].end;
+            int k = msg_tok + 1;
+            while (k < cr && ctok[k].start < msg_end) {
+                if (ctok[k].type == JSMN_STRING) {
+                    int flen = ctok[k].end - ctok[k].start;
+                    if (flen == 7 && strncmp(chunk.data + ctok[k].start, "content", 7) == 0
+                        && k + 1 < cr && ctok[k+1].type == JSMN_STRING) {
+                        summary = unescape_json_string(chunk.data + ctok[k+1].start,
+                                                       ctok[k+1].end - ctok[k+1].start);
+                        break;
+                    }
+                }
+                k = json_skip_token(ctok, cr, k + 1);
+            }
+        }
+    }
+    if (chunk.data) free(chunk.data);
+
+    if (!summary || strlen(summary) < 20) {
+        fprintf(stderr, "[ai] Compact failed: could not extract summary from model.\n");
+        if (summary) free(summary);
+        return messages_json;
+    }
+
+    char *new_msgs = malloc(4096);
+    strcpy(new_msgs, "[]");
+
+    if (g_system_message_json)
+        new_msgs = append_message(new_msgs, g_system_message_json);
+
+    char *safe_sum = json_escape(summary);
+    size_t cu_len = strlen(safe_sum) + 128;
+    char *compact_user = malloc(cu_len);
+    snprintf(compact_user, cu_len,
+             "{\"role\":\"user\",\"content\":\"[Session compacted. Summary:\\n%s]\"}",
+             safe_sum);
+    new_msgs = append_message(new_msgs, compact_user);
+    free(compact_user);
+    free(safe_sum);
+    free(summary);
+
+    new_msgs = append_message(new_msgs,
+        "{\"role\":\"assistant\",\"content\":\"Understood. I have the context from our "
+        "previous conversation. Ready to continue.\"}");
+
+    free(messages_json);
+
+    fprintf(stderr, "\033[1;35m[ai] Session compacted (%.1f KB → %.1f KB).\033[0m\n",
+            orig_size / 1024.0, strlen(new_msgs) / 1024.0);
+    return new_msgs;
+}
+
 
 int main(int argc, char **argv) {
     char exe_path[512] = "";
@@ -1470,6 +1589,7 @@ int main(int argc, char **argv) {
     }
 
     messages_json = append_message(messages_json, sys_msg);
+    g_system_message_json = strdup(sys_msg); /* saved for compact_session */
 
     if (safe_mem) free(safe_mem);
     if (memory) free(memory);
@@ -1545,6 +1665,8 @@ int main(int argc, char **argv) {
     curl_easy_setopt(c, CURLOPT_URL, api_url);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
 
     if (context_window == 0) {
         context_window = detect_context_window(c, api_url);
@@ -1557,34 +1679,102 @@ int main(int argc, char **argv) {
 
     if (interactive_mode && !run_query_this_turn) {
         printf("\033[1;35m::: ai Agent (local %s) interactive mode :::\033[0m\n", model);
-        printf("Type \033[33mexit\033[0m, \033[33mquit\033[0m, or press \033[33mCtrl+D\033[0m to leave.\n\n");
+        printf("Type \033[33mexit\033[0m or \033[33mquit\033[0m to leave. "
+               "\033[33m:help\033[0m for commands. "
+               "\033[33mESC\033[0m during execution to interrupt.\n\n");
     }
 
     while (keep_going) {
         if (interactive_mode && (!run_query_this_turn || !first_turn)) {
+            /* Auto-compact when context grows very large */
+            if (strlen(messages_json) > (size_t)(trim_threshold * 3)) {
+                fprintf(stderr,
+                    "\n\033[1;33m[ai] Context is large (%zu KB). Auto-compacting...\033[0m\n",
+                    strlen(messages_json) / 1024);
+                messages_json = compact_session(messages_json, mcp_script, c, model);
+            }
+
             printf("\n\033[1;32mai>\033[0m ");
             fflush(stdout);
-            
+
             char user_input[4096];
             if (!fgets(user_input, sizeof(user_input), stdin)) {
                 printf("\n");
                 break;
             }
-            
+
             // Trim newline
             size_t len = strlen(user_input);
             while (len > 0 && (user_input[len - 1] == '\n' || user_input[len - 1] == '\r')) {
                 user_input[len - 1] = '\0';
                 len--;
             }
-            
+
             if (strcmp(user_input, "exit") == 0 || strcmp(user_input, "quit") == 0) {
                 break;
             }
-            
+
             if (len == 0) {
                 continue;
             }
+
+            /* ── Interactive slash/colon commands ── */
+            if (user_input[0] == ':') {
+                if (strcmp(user_input, ":compact") == 0) {
+                    messages_json = compact_session(messages_json, mcp_script, c, model);
+                    printf("\033[2m[context compacted — continue the conversation]\033[0m\n");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":clear") == 0) {
+                    char *fresh = malloc(4096);
+                    strcpy(fresh, "[]");
+                    if (g_system_message_json)
+                        fresh = append_message(fresh, g_system_message_json);
+                    free(messages_json);
+                    messages_json = fresh;
+                    printf("\033[2m[conversation cleared — starting fresh]\033[0m\n");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":help") == 0) {
+                    printf("\n\033[1;36mInteractive commands:\033[0m\n");
+                    printf("  :compact   Summarise + reset context (keeps semantic history)\n");
+                    printf("  :clear     Wipe conversation history entirely\n");
+                    printf("  :status    Show context size and model info\n");
+                    printf("  :memory    Show persistent memory\n");
+                    printf("  :help      Show this message\n");
+                    printf("  exit/quit  Leave interactive mode\n");
+                    printf("\n\033[2mPress ESC at any time during agent execution to interrupt.\033[0m\n\n");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":status") == 0) {
+                    size_t ctx_bytes = strlen(messages_json);
+                    printf("\n\033[1;36mSession status:\033[0m\n");
+                    printf("  Model          : %s\n", model);
+                    printf("  Context size   : %zu KB\n", ctx_bytes / 1024);
+                    if (context_window > 0)
+                        printf("  Context window : %d tokens\n", context_window);
+                    printf("  Trim threshold : %d bytes\n", trim_threshold);
+                    printf("  Auto-compact at: %d bytes (~%.0f KB)\n",
+                           trim_threshold * 3, trim_threshold * 3.0 / 1024);
+                    printf("  :compact needed: %s\n\n",
+                           ctx_bytes > (size_t)(trim_threshold * 2) ? "YES (recommended)" : "no");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":memory") == 0) {
+                    char *mem = read_memory_file();
+                    if (mem && strlen(mem) > 0)
+                        printf("\n\033[1;36mPersistent memory:\033[0m\n%s\n\n", mem);
+                    else
+                        printf("\033[2m[no persistent memory saved yet]\033[0m\n");
+                    if (mem) free(mem);
+                    run_query_this_turn = 0;
+                    continue;
+                }
+            } /* end colon commands */
             
             char *safe_input = json_escape(user_input);
             char *user_msg_str = malloc(strlen(safe_input) + 128);
@@ -1604,10 +1794,13 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
+            int step_limit = 30;
+            g_esc_requested = 0;
             struct timespec task_start;
             clock_gettime(CLOCK_MONOTONIC, &task_start);
 
-            while (has_more && loop_count < 30) {
+step_limit_check:
+            while (has_more && loop_count < step_limit) {
                 loop_count++;
                 
                 messages_json = maybe_trim_messages(messages_json, mcp_script);
@@ -1641,10 +1834,13 @@ int main(int argc, char **argv) {
                 curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
                 curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&chunk);
 
+                g_esc_requested = 0;
+                if (interactive_mode) enable_raw_mode();
                 struct timespec t_req_start, t_req_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_req_start);
                 CURLcode res = curl_easy_perform(c);
                 clock_gettime(CLOCK_MONOTONIC, &t_req_end);
+                if (interactive_mode) disable_raw_mode();
                 double elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
                                      (t_req_end.tv_nsec - t_req_start.tv_nsec) * 1e-9;
 
@@ -1708,13 +1904,25 @@ int main(int argc, char **argv) {
                                 chunk.size = 0;
                             }
                             
+                            g_esc_requested = 0;
+                            if (interactive_mode) enable_raw_mode();
                             clock_gettime(CLOCK_MONOTONIC, &t_req_start);
                             res = curl_easy_perform(c);
                             clock_gettime(CLOCK_MONOTONIC, &t_req_end);
+                            if (interactive_mode) disable_raw_mode();
                             elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
                                           (t_req_end.tv_nsec - t_req_start.tv_nsec) * 1e-9;
                         }
                     }
+                }
+
+                /* ESC pressed during LLM request */
+                if (g_esc_requested) {
+                    fprintf(stderr, "\n\033[1;31m[ai] Interrupted by user (ESC).\033[0m\n");
+                    free(payload);
+                    if (chunk.data) free(chunk.data);
+                    has_more = 0;
+                    break;
                 }
 
                 if (res != CURLE_OK || !chunk.data) {
@@ -2009,7 +2217,10 @@ int main(int argc, char **argv) {
                                           int exit_code = 0;
                                           char *raw_output = run_shell_command(cmd_with_stderr, &exit_code);
                                           free(cmd_with_stderr);
-                                          
+
+                                          if (exit_code == 130) /* ESC / SIGINT during command */
+                                              g_esc_requested = 1;
+
                                           if (raw_output) {
                                               size_t out_len = strlen(raw_output);
                                               tool_output = malloc(out_len + 128);
@@ -2169,6 +2380,12 @@ int main(int argc, char **argv) {
 
                           current_tok = json_skip_token(tok, r, current_tok);
                       }
+
+                      /* ESC pressed during command execution — stop agent loop */
+                      if (g_esc_requested) {
+                          fprintf(stderr, "\n\033[1;31m[ai] Task interrupted (ESC). Returning to prompt.\033[0m\n");
+                          has_more = 0;
+                      }
                   } else {
                       if (finish_reason_length) {
                           fprintf(stderr, "\033[1;33m[ai] Warning: model hit token limit — "
@@ -2289,7 +2506,36 @@ int main(int argc, char **argv) {
 
                   free(payload);
                   free(chunk.data);
-              }
+              } /* end inner while */
+
+            /* Step-limit: ask user whether to continue */
+            if (has_more && loop_count >= step_limit) {
+                FILE *tty_f = fopen("/dev/tty", "r+");
+                if (tty_f) {
+                    fprintf(tty_f,
+                        "\n\033[1;33m[ai] Agent has taken %d steps. Continue for 30 more? [Y/n]: \033[0m",
+                        loop_count);
+                    fflush(tty_f);
+                    char cont_resp[64] = {0};
+                    int user_continue = 0;
+                    if (fgets(cont_resp, sizeof(cont_resp), tty_f)) {
+                        char *cr = cont_resp;
+                        while (*cr && isspace((unsigned char)*cr)) cr++;
+                        if (*cr == '\0' || *cr == 'y' || *cr == 'Y'
+                            || strncasecmp(cr, "yes", 3) == 0)
+                            user_continue = 1;
+                    }
+                    fclose(tty_f);
+                    if (user_continue) {
+                        step_limit += 30;
+                        goto step_limit_check;
+                    }
+                }
+                fprintf(stderr,
+                    "\033[1;33m[ai] Task stopped by user after %d steps.\033[0m\n",
+                    loop_count);
+                has_more = 0;
+            }
           }
 
           if (!interactive_mode) {
@@ -2303,6 +2549,7 @@ int main(int argc, char **argv) {
     free(messages_json);
     if (tools_json) free(tools_json);
     if (current_prompt) free(current_prompt);
+    if (g_system_message_json) free(g_system_message_json);
     curl_slist_free_all(h);
     curl_easy_cleanup(c);
     return 0;
