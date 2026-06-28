@@ -7,7 +7,8 @@ PORT=8080
 CHECK_INTERVAL=10
 
 echo "[llama-wrapper] Starting llama-server — model: $MODEL_PATH"
-llama-server --model "$MODEL_PATH" --host 127.0.0.1 --port "$PORT" --ctx-size 4096 &
+llama-server --model "$MODEL_PATH" --host 127.0.0.1 --port "$PORT" \
+    --ctx-size 131072 --n-gpu-layers 99 --flash-attn on &
 LLAMA_PID=$!
 
 cleanup() {

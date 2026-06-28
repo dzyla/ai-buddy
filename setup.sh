@@ -44,6 +44,7 @@ CONFIG_SNIPPET="
 export INFER_BASE_URL=\"$ENDPOINT\"
 export INFER_API_KEY=\"not-needed\"
 export INFER_MODEL=\"gemma4\"
+export PUBMED_API_KEY=\"myapp_kZnDpemyN9z43CqNrOYEE-LhAH9_UsxhWTavLkWv22Y\"
 "
 
 # Append configuration to the user's bash profile
