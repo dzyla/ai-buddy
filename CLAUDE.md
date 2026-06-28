@@ -10,8 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 gcc -o ai ai.c cJSON.c -lcurl  # build (only dependencies are libcurl + jsmn.h + cJSON.h/cJSON.c, vendored)
-./setup.sh                     # full install: apt deps, build, copy to /usr/local/bin, set up gemma4 snap + env
-sudo cp ai ai_mcp.py /usr/local/bin/   # manual install of both halves
+./compile_and_install.sh       # build, copy to /usr/bin, and sync .agents/skills/ → ~/.config/ai/skills/
+./setup.sh                     # full install: apt deps, build, copy to /usr/local/bin, set up llama.cpp + env
+sudo cp ai ai_mcp.py /usr/local/bin/   # manual install of both halves (skills not synced)
 ```
 
 There is no test suite, linter, or package manifest. Verify changes by running the binary directly (e.g. `INFER_* env vars set; echo "hi" | ./ai "say hello"`).
@@ -40,7 +41,7 @@ The system is split across two files that talk to each other by **shell-invoking
 - Handles `think`, `task_complete`, and `execute_command` **natively in C**:
   - `think`: prints `[thinking] …` to stdout (suppressed by quiet mode); returns `{"ok":true}`.
   - `task_complete`: renders the `summary` argument via `render-markdown`, logs the job, and exits the loop.
-  - `execute_command`: opens `/dev/tty` for a `[Y/n]` confirmation prompt (bypassed by auto-approve), runs the command with `2>&1` capture, and wraps the result in `[Command Success]` / `[Command Failed with exit status N]`.
+  - `execute_command`: opens `/dev/tty` for a `[Y/n]` confirmation prompt (bypassed when `g_auto_approve` is set), runs the command with `2>&1` capture, and wraps the result in `[Command Success]` / `[Command Failed with exit status N]`.
 - Delegates every **other** tool call to `ai_mcp.py` by shelling out: `python3 ai_mcp.py call-tool <server> <tool> <json-args>`.
 - Fetches the tool catalog at startup via `python3 ai_mcp.py list-tools`.
 - Renders final assistant text via `python3 ai_mcp.py render-markdown <text>`.
@@ -50,6 +51,8 @@ The system is split across two files that talk to each other by **shell-invoking
 - Handles image file arguments: detects `.png`/`.jpg`/`.jpeg`/`.webp` paths, base64-encodes them, and injects a `image_url` content block into the first user message.
 - Intercepts `[IMAGE_DATA_SUCCESS:<path>]` returned by `read_file` and similarly injects the image into conversation context.
 - Detects `finish_reason: "length"` (model hit token limit) and injects a recovery nudge instead of rendering truncated output.
+- In interactive mode handles `:compact`, `:clear`, `:status`, `:memory`, `:auto`, and `:help` colon-commands, and Shift-Tab (`ESC [ Z`) to toggle `g_auto_approve` both at the prompt (cooked mode) and during agent execution (raw mode via the libcurl progress callback). The `ai>` prompt changes to `ai(auto)>` while auto-approve is active.
+- `compact_session`: sends the full conversation to the LLM for summarisation, prints progress dots via the libcurl progress callback while waiting, and only replaces the conversation history if the LLM returns a usable summary (≥20 chars).
 
 **`ai_mcp.py` — the tool backend (Python).** Three subcommands matching how `ai.c` calls it: `list-tools`, `call-tool`, `render-markdown`. It:
 - Defines **12 native tools** as OpenAI function schemas in `list-tools` (in schema order): `think`, `execute_command`, `web_search`, `fetch_webpage`, `read_file`, `write_file`, `edit_file`, `list_directory`, `save_memory`, `delegate_task`, `computer_control`, `task_complete`.
@@ -76,6 +79,8 @@ A native tool requires edits in **both** files, kept in sync:
 ## Skills
 
 `ai.c` auto-loads `SKILL.md` files into the system prompt from `./.agents/skills/*/` (per-project) and `~/.config/ai/skills/*/` (global). These are plain markdown guidance for the model, not executable. The `.agents/skills/` dir in this repo is the project's own skill set (e.g. `karpathy_guidelines`, `autonomous_troubleshooting`).
+
+`compile_and_install.sh` copies the entire `.agents/skills/` tree to `~/.config/ai/skills/` on every install, so skills are always found regardless of the working directory when `ai` is invoked. Re-run the script (or manually `cp -r .agents/skills/. ~/.config/ai/skills/`) after adding or editing a skill.
 
 ## Runtime state locations
 
