@@ -62,9 +62,8 @@ static const char *SYSTEM_PROMPT =
     "- For tasks with independent parallel sub-tasks, use delegate_task to run them concurrently.\n"
     "- delegate_task agents have full tool access. Give them specific, self-contained instructions.\n\n"
     "SKILLS:\n"
-    "- Domain skills exist for specialized tasks (bioinformatics, structure analysis, MD simulation, drug design, etc.).\n"
-    "- Call load_skill() with no argument to see what is available. Call load_skill(name) to read a skill before working in that domain.\n"
-    "- Always load a relevant skill before starting domain-specific work you are less certain about.";
+    "- Domain skills exist. Call load_skill() to list them, load_skill(name) to read one.\n"
+    "- Additional CRITICAL triggers may follow in the system context — obey them exactly.";
 
 static char* get_system_context() {
     char cwd[1024] = "Unknown";
@@ -195,29 +194,81 @@ static char* load_skills_from_dir(const char *base_dir) {
     return buf;
 }
 
-static char* load_all_skills() {
-    char *global_skills = NULL;
+/* Scan one skill directory and append CRITICAL trigger lines to buf.
+   Format: "- CRITICAL — <condition> → load_skill('<name>') before any other tool.\n"
+   Only skills whose description starts with "CRITICAL" are included. */
+static char* collect_triggers_from_dir(const char *base_dir, char *buf,
+                                        size_t *len, size_t *cap,
+                                        int *found_any) {
+    DIR *dir = opendir(base_dir);
+    if (!dir) return buf;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char skill_path[1024];
+        snprintf(skill_path, sizeof(skill_path), "%s/%s/SKILL.md", base_dir, entry->d_name);
+
+        FILE *fp = fopen(skill_path, "r");
+        if (!fp) continue;
+        char header[512];
+        size_t n = fread(header, 1, sizeof(header) - 1, fp);
+        header[n] = '\0';
+        fclose(fp);
+
+        char *desc = parse_skill_description(header);
+        if (strncmp(desc, "CRITICAL", 8) != 0) { free(desc); continue; }
+
+        /* Extract condition: everything up to the first ": " separator. */
+        const char *sep = strstr(desc, ": ");
+        size_t cond_len = sep ? (size_t)(sep - desc) : strlen(desc);
+        char *cond = malloc(cond_len + 1);
+        memcpy(cond, desc, cond_len);
+        cond[cond_len] = '\0';
+        free(desc);
+
+        /* Skip if this skill name was already added (exists in both dirs). */
+        char check[256];
+        snprintf(check, sizeof(check), "load_skill('%s')", entry->d_name);
+        if (strstr(buf, check)) { free(cond); continue; }
+
+        char line[1024];
+        int llen = snprintf(line, sizeof(line),
+            "- %s → call load_skill('%s') before any other tool.\n",
+            cond, entry->d_name);
+        free(cond);
+
+        if (*len + (size_t)llen + 4 >= *cap) {
+            *cap = *cap * 2 + (size_t)llen + 256;
+            buf = realloc(buf, *cap);
+        }
+        memcpy(buf + *len, line, llen);
+        *len += llen;
+        buf[*len] = '\0';
+        (*found_any)++;
+    }
+    closedir(dir);
+    return buf;
+}
+
+/* Return a string of CRITICAL trigger rules, or NULL if none exist. */
+static char* load_critical_triggers() {
+    size_t cap = 4096, len = 0;
+    int found = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+
     char *home = getenv("HOME");
     if (home) {
         char global_path[1024];
         snprintf(global_path, sizeof(global_path), "%s/.config/ai/skills", home);
-        global_skills = load_skills_from_dir(global_path);
+        buf = collect_triggers_from_dir(global_path, buf, &len, &cap, &found);
     }
+    buf = collect_triggers_from_dir("./.agents/skills", buf, &len, &cap, &found);
 
-    char *local_skills = load_skills_from_dir("./.agents/skills");
-
-    if (!global_skills && !local_skills) return strdup("");
-
-    const char *header = "Skills (call load_skill(name) to read full guidance before using):\n";
-    size_t total_len = strlen(header)
-                       + (global_skills ? strlen(global_skills) : 0)
-                       + (local_skills  ? strlen(local_skills)  : 0) + 1;
-    char *res = malloc(total_len);
-    strcpy(res, header);
-
-    if (global_skills) { strcat(res, global_skills); free(global_skills); }
-    if (local_skills)  { strcat(res, local_skills);  free(local_skills);  }
-    return res;
+    if (!found) { free(buf); return NULL; }
+    return buf;
 }
 
 /* ---------------- HELPERS ---------------- */
@@ -1611,27 +1662,42 @@ int main(int argc, char **argv) {
     // Add System Prompt, Context, Memory & Skills
     char *memory = read_memory_file();
     char *sys_ctx = get_system_context();
+    char *triggers = load_critical_triggers();
 
     char *safe_system = json_escape(SYSTEM_PROMPT);
     char *safe_ctx = json_escape(sys_ctx);
     char *safe_mem = memory ? json_escape(memory) : NULL;
+    char *safe_triggers = triggers ? json_escape(triggers) : NULL;
     char *sys_msg = NULL;
 
-    size_t mlen = strlen(safe_system) + strlen(safe_ctx) + (safe_mem ? strlen(safe_mem) * 2 : 0) + 256;
+    /* Build the content string: SYSTEM_PROMPT + ctx + optional triggers + optional memory */
+    size_t mlen = strlen(safe_system) + strlen(safe_ctx)
+                  + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
+                  + (safe_mem ? strlen(safe_mem) + 64 : 0) + 256;
     sys_msg = malloc(mlen);
 
-    if (safe_mem && strlen(safe_mem) > 0) {
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}",
-                safe_system, safe_ctx, safe_mem);
-    } else {
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\"}",
-                safe_system, safe_ctx);
-    }
+    /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
+    char *content = malloc(mlen);
+    int clen = snprintf(content, mlen, "%s\n\n%s", SYSTEM_PROMPT, sys_ctx);
+    if (triggers && strlen(triggers) > 0)
+        clen += snprintf(content + clen, mlen - clen,
+                         "\n\nCRITICAL SKILL TRIGGERS (obey BEFORE any other tool):\n%s", triggers);
+    if (memory && strlen(memory) > 0)
+        clen += snprintf(content + clen, mlen - clen,
+                         "\n\nPersistent Memory/Preferences:\n%s", memory);
+
+    char *safe_content = json_escape(content);
+    snprintf(sys_msg, mlen + strlen(safe_content) + 32,
+             "{\"role\":\"system\",\"content\":\"%s\"}", safe_content);
+    free(content);
+    free(safe_content);
 
     messages_json = append_message(messages_json, sys_msg);
     g_system_message_json = strdup(sys_msg); /* saved for compact_session */
 
+    if (safe_triggers) free(safe_triggers);
     if (safe_mem) free(safe_mem);
+    if (triggers) free(triggers);
     if (memory) free(memory);
     free(sys_ctx);
     free(safe_system);
