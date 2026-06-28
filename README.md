@@ -18,7 +18,7 @@ It reads from stdin, sends to an LLM, runs tools dynamically (shell commands, we
 - **Agentic Tool Loop**: The agent loops up to 30 times per turn, calling tools, reading results, and calling more tools until it calls `task_complete`. Defaults to `tool_choice: required` to force a tool call every iteration. Set `INFER_TOOL_CHOICE=auto` for servers that do not support `required`.
 - **Transparent Reasoning**: The `think` tool lets the model write a step-by-step plan before acting. Reasoning is shown to you in real time (suppress with `-q` / `--quiet`).
 - **Shell Command Execution**: The model can run any shell command. You get a `[Y/n]` confirmation prompt before each one, with stderr and stdout both captured and fed back into context.
-- **Safety Confirmation / Auto-Approve**: Command execution prompts protect you by default. Use `-y` / `--yes` or `INFER_AUTO_APPROVE=1` to bypass for scripted or trusted sessions.
+- **Safety Confirmation / Auto-Approve**: Command execution prompts protect you by default. Use `-y` / `--yes` or `INFER_AUTO_APPROVE=1` to bypass for scripted or trusted sessions. In interactive mode, press **Shift-Tab** at any time (at the prompt or mid-execution) to toggle auto-approve on/off — the prompt changes to `ai(auto)>` while it is active. The `:auto` command does the same.
 - **Web Search**: Searches DuckDuckGo Lite without any API key. Results include title, URL, and snippet.
 - **Webpage Fetching**: Downloads and cleans HTML to readable text (scripts/styles stripped, HTML entities decoded, truncated at 10 KB).
 - **File Reading**: Reads text files (truncated at 12 KB), PDFs (via `pdftotext` → `pypdf` → `pdfplumber` fallback chain), and image files (PNG, JPG, JPEG, WEBP — injected directly into vision context). Binary files are rejected with a clear error.
@@ -62,18 +62,23 @@ brew install curl python
 # Clone and build
 git clone https://github.com/dzyla/ai.git
 cd ai
-gcc -o ai ai.c cJSON.c -lcurl
 
-# Install system-wide
-sudo cp ai /usr/local/bin/
-sudo cp ai_mcp.py /usr/local/bin/
-sudo chmod +x /usr/local/bin/ai
-sudo chmod +x /usr/local/bin/ai_mcp.py
+# Recommended: build, install, and sync skills in one step
+./compile_and_install.sh
 ```
 
-### Quick Install with gemma4 (Linux)
+This compiles the binary, copies `ai` and `ai_mcp.py` to `/usr/bin/`, and syncs all skills from `.agents/skills/` to `~/.config/ai/skills/` so they are available from any working directory. Re-run after editing skills.
 
-`setup.sh` automates everything: apt dependencies, build, system install, and local [gemma4](https://snapcraft.io/gemma4) inference snap setup:
+Manual install (skills not synced automatically):
+```bash
+gcc -o ai ai.c cJSON.c -lcurl
+sudo cp ai ai_mcp.py /usr/local/bin/
+sudo chmod +x /usr/local/bin/ai /usr/local/bin/ai_mcp.py
+```
+
+### Quick Install with llama.cpp (Linux)
+
+`setup.sh` automates everything: build dependencies, llama.cpp build with GPU auto-detection (CUDA/ROCm/Vulkan/CPU), model download, `ai` binary install, and systemd user service setup:
 
 ```bash
 ./setup.sh
@@ -129,6 +134,25 @@ ai
 # Start with an initial query and stay interactive
 ai -i "let's look at this project"
 ```
+
+#### Interactive commands
+
+| Command | Effect |
+|---------|--------|
+| `:compact` | Summarise conversation and reset context (keeps semantic history) |
+| `:clear` | Wipe conversation history entirely |
+| `:status` | Show context size, model, and auto-approve state |
+| `:memory` | Show persistent memory contents |
+| `:auto` | Toggle auto-approve for `execute_command` on/off |
+| `:help` | Show command list |
+| `exit` / `quit` | Leave interactive mode |
+
+#### Keyboard shortcuts (interactive mode)
+
+| Key | Effect |
+|-----|--------|
+| **ESC** | Interrupt the running agent turn |
+| **Shift-Tab** | Toggle auto-approve on/off (works at prompt and mid-execution) |
 
 ### Flags Reference
 
