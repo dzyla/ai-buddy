@@ -51,7 +51,8 @@ The system is split across two files that talk to each other by **shell-invoking
 - Handles image file arguments: detects `.png`/`.jpg`/`.jpeg`/`.webp` paths, base64-encodes them, and injects a `image_url` content block into the first user message.
 - Intercepts `[IMAGE_DATA_SUCCESS:<path>]` returned by `read_file` and similarly injects the image into conversation context.
 - Detects `finish_reason: "length"` (model hit token limit) and injects a recovery nudge instead of rendering truncated output.
-- In interactive mode handles `:compact`, `:clear`, `:status`, `:memory`, `:auto`, and `:help` colon-commands, and Shift-Tab (`ESC [ Z`) to toggle `g_auto_approve` both at the prompt (cooked mode) and during agent execution (raw mode via the libcurl progress callback). The `ai>` prompt changes to `ai(auto)>` while auto-approve is active.
+- In interactive mode handles `:compact`, `:clear`, `:status`, `:memory`, `:auto`, and `:help` colon-commands, and Shift-Tab (`ESC [ Z`) to toggle `g_auto_approve` both at the prompt and during agent execution (raw mode via the libcurl progress callback). The `ai>` prompt changes to `ai(auto)>` while auto-approve is active.
+- The interactive prompt uses a self-contained line editor (`read_line_interactive` / `lineed_*` in `ai.c`): arrow keys navigate history (up/down) and move the cursor (left/right), with Ctrl+A/E (line start/end), Ctrl+K/U (kill to end/start), Ctrl+W (kill word), Ctrl+L (clear screen), Home/End, Delete. History is persisted to `~/.cache/ai/input_history` across sessions.
 - `compact_session`: sends the full conversation to the LLM for summarisation, prints progress dots via the libcurl progress callback while waiting, and only replaces the conversation history if the LLM returns a usable summary (≥20 chars).
 
 **`ai_mcp.py` — the tool backend (Python).** Three subcommands matching how `ai.c` calls it: `list-tools`, `call-tool`, `render-markdown`. It:
