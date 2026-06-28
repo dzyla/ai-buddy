@@ -136,44 +136,58 @@ static void log_job(const char *prompt, const char *pipe_writer, const char *res
     fclose(fp);
 }
 
+/* Extract the "description:" value from SKILL.md frontmatter (reads first 512 bytes). */
+static char *parse_skill_description(const char *content) {
+    const char *key = "description:";
+    const char *found = strstr(content, key);
+    if (!found) return strdup("(no description)");
+    found += strlen(key);
+    while (*found == ' ') found++;
+    const char *end = found;
+    while (*end && *end != '\n' && *end != '\r') end++;
+    size_t len = (size_t)(end - found);
+    char *desc = malloc(len + 1);
+    memcpy(desc, found, len);
+    desc[len] = '\0';
+    return desc;
+}
+
+/* Build a compact one-line-per-skill index from a directory (name: description). */
 static char* load_skills_from_dir(const char *base_dir) {
     DIR *dir = opendir(base_dir);
     if (!dir) return NULL;
-    
+
     struct dirent *entry;
     size_t cap = 4096;
     size_t len = 0;
     char *buf = malloc(cap);
     buf[0] = '\0';
-    
+
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
-        
+
         char skill_path[1024];
         snprintf(skill_path, sizeof(skill_path), "%s/%s/SKILL.md", base_dir, entry->d_name);
-        
+
         FILE *fp = fopen(skill_path, "r");
         if (fp) {
-            fseek(fp, 0, SEEK_END);
-            long size = ftell(fp);
-            fseek(fp, 0, SEEK_SET);
-            if (size > 0) {
-                char *file_buf = malloc(size + 1);
-                size_t read_bytes = fread(file_buf, 1, size, fp);
-                file_buf[read_bytes] = '\0';
-                
-                if (len + read_bytes + 256 >= cap) {
-                    cap = cap * 2 + read_bytes + 256;
-                    buf = realloc(buf, cap);
-                }
-                
-                len += sprintf(buf + len, "\n\nSkill [%s]:\n%s", entry->d_name, file_buf);
-                free(file_buf);
-            }
+            char header[512];
+            size_t n = fread(header, 1, sizeof(header) - 1, fp);
+            header[n] = '\0';
             fclose(fp);
+
+            char *desc = parse_skill_description(header);
+            size_t entry_len = strlen(entry->d_name) + strlen(desc) + 16;
+            if (len + entry_len + 4 >= cap) {
+                cap = cap * 2 + entry_len;
+                buf = realloc(buf, cap);
+            }
+            len += sprintf(buf + len, "- %s: %s\n", entry->d_name, desc);
+            free(desc);
         }
     }
     closedir(dir);
+    if (len == 0) { free(buf); return NULL; }
     return buf;
 }
 
@@ -185,21 +199,20 @@ static char* load_all_skills() {
         snprintf(global_path, sizeof(global_path), "%s/.config/ai/skills", home);
         global_skills = load_skills_from_dir(global_path);
     }
-    
+
     char *local_skills = load_skills_from_dir("./.agents/skills");
-    
-    size_t total_len = (global_skills ? strlen(global_skills) : 0) + (local_skills ? strlen(local_skills) : 0) + 1;
+
+    if (!global_skills && !local_skills) return strdup("");
+
+    const char *header = "Skills (call load_skill(name) to read full guidance before using):\n";
+    size_t total_len = strlen(header)
+                       + (global_skills ? strlen(global_skills) : 0)
+                       + (local_skills  ? strlen(local_skills)  : 0) + 1;
     char *res = malloc(total_len);
-    res[0] = '\0';
-    
-    if (global_skills) {
-        strcat(res, global_skills);
-        free(global_skills);
-    }
-    if (local_skills) {
-        strcat(res, local_skills);
-        free(local_skills);
-    }
+    strcpy(res, header);
+
+    if (global_skills) { strcat(res, global_skills); free(global_skills); }
+    if (local_skills)  { strcat(res, local_skills);  free(local_skills);  }
     return res;
 }
 
