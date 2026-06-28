@@ -544,6 +544,9 @@ static struct termios orig_termios;
 static int raw_mode_active = 0;
 static volatile int g_esc_requested = 0;
 static char *g_system_message_json = NULL;
+static volatile int g_compact_in_progress = 0;
+static int g_compact_dot_timer = 0;
+static int g_auto_approve = 0;
 
 static void disable_raw_mode(void) {
     if (raw_mode_active) {
@@ -556,10 +559,34 @@ static void disable_raw_mode(void) {
 static int curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                              curl_off_t ultotal, curl_off_t ulnow) {
     (void)clientp; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    if (g_compact_in_progress) {
+        if (++g_compact_dot_timer % 3 == 0) {
+            fprintf(stderr, ".");
+            fflush(stderr);
+        }
+        return 0;
+    }
     if (raw_mode_active && !g_esc_requested) {
         char ch;
-        if (read(STDIN_FILENO, &ch, 1) == 1 && ch == 27)
-            g_esc_requested = 1;
+        if (read(STDIN_FILENO, &ch, 1) == 1) {
+            if (ch == 27) {
+                /* peek for Shift-Tab sequence: ESC [ Z */
+                char seq[2] = {0, 0};
+                int n = read(STDIN_FILENO, seq, 2);
+                if (n == 2 && seq[0] == '[' && seq[1] == 'Z') {
+                    g_auto_approve ^= 1;
+                    if (g_auto_approve)
+                        setenv("INFER_AUTO_APPROVE", "1", 1);
+                    else
+                        unsetenv("INFER_AUTO_APPROVE");
+                    fprintf(stderr, "\n\033[1;33m[ai] Auto-approve %s (Shift-Tab to toggle)\033[0m\n",
+                            g_auto_approve ? "ON" : "OFF");
+                    fflush(stderr);
+                } else {
+                    g_esc_requested = 1;
+                }
+            }
+        }
     }
     return g_esc_requested ? 1 : 0;
 }
@@ -1166,8 +1193,9 @@ static int set_default_model(const char *new_model) {
    messages_json as [system, compacted-user, compacted-assistant].
    Returns a new messages_json (caller must use the returned pointer). */
 static char* compact_session(char *messages_json, const char *mcp_script,
-                              CURL *curl_handle, const char *model_name) {
+                              CURL *curl_handle, const char *model_name, int *out_success) {
     (void)mcp_script;
+    if (out_success) *out_success = 0;
     fprintf(stderr, "\033[1;35m[ai] Compacting session — requesting summary...\033[0m\n");
     fflush(stderr);
 
@@ -1193,9 +1221,13 @@ static char* compact_session(char *messages_json, const char *mcp_script,
     int saved_esc = g_esc_requested;
     g_esc_requested = 0;
     if (raw_mode_active) disable_raw_mode();
+    g_compact_in_progress = 1;
+    g_compact_dot_timer = 0;
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payload);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
     curl_easy_perform(curl_handle);
+    g_compact_in_progress = 0;
+    fprintf(stderr, "\n");
     g_esc_requested = saved_esc;
     free(payload);
 
@@ -1264,6 +1296,7 @@ static char* compact_session(char *messages_json, const char *mcp_script,
 
     fprintf(stderr, "\033[1;35m[ai] Session compacted (%.1f KB → %.1f KB).\033[0m\n",
             orig_size / 1024.0, strlen(new_msgs) / 1024.0);
+    if (out_success) *out_success = 1;
     return new_msgs;
 }
 
@@ -1278,7 +1311,6 @@ int main(int argc, char **argv) {
 
     int is_stdin_tty = isatty(STDIN_FILENO);
     int interactive_mode = 0;
-    int auto_approve = 0;
     int quiet_mode = 0;
 
     // Parse set-default and install-llama options first (both exit early)
@@ -1386,7 +1418,7 @@ int main(int argc, char **argv) {
             interactive_mode = 1;
         }
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
-            auto_approve = 1;
+            g_auto_approve = 1;
         }
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet_mode = 1;
@@ -1398,7 +1430,7 @@ int main(int argc, char **argv) {
 
     char *env_approve = getenv("INFER_AUTO_APPROVE");
     if (env_approve && (strcmp(env_approve, "1") == 0 || strcasecmp(env_approve, "true") == 0)) {
-        auto_approve = 1;
+        g_auto_approve = 1;
     }
 
     char *env_quiet = getenv("INFER_QUIET");
@@ -1407,7 +1439,7 @@ int main(int argc, char **argv) {
     }
 
     // Export resolved settings back to environment variables so subagents inherit them
-    if (auto_approve) {
+    if (g_auto_approve) {
         setenv("INFER_AUTO_APPROVE", "1", 1);
     } else {
         unsetenv("INFER_AUTO_APPROVE");
@@ -1691,16 +1723,32 @@ int main(int argc, char **argv) {
                 fprintf(stderr,
                     "\n\033[1;33m[ai] Context is large (%zu KB). Auto-compacting...\033[0m\n",
                     strlen(messages_json) / 1024);
-                messages_json = compact_session(messages_json, mcp_script, c, model);
+                messages_json = compact_session(messages_json, mcp_script, c, model, NULL);
             }
 
-            printf("\n\033[1;32mai>\033[0m ");
+            if (g_auto_approve)
+                printf("\n\033[1;32mai\033[0m\033[1;33m(auto)\033[0m\033[1;32m>\033[0m ");
+            else
+                printf("\n\033[1;32mai>\033[0m ");
             fflush(stdout);
 
             char user_input[4096];
             if (!fgets(user_input, sizeof(user_input), stdin)) {
                 printf("\n");
                 break;
+            }
+
+            /* Shift-Tab at prompt (cooked mode delivers ESC [ Z then newline) */
+            if (user_input[0] == '\033' && user_input[1] == '[' && user_input[2] == 'Z') {
+                g_auto_approve ^= 1;
+                if (g_auto_approve)
+                    setenv("INFER_AUTO_APPROVE", "1", 1);
+                else
+                    unsetenv("INFER_AUTO_APPROVE");
+                printf("\033[1;33m[ai] Auto-approve %s (Shift-Tab to toggle)\033[0m\n",
+                       g_auto_approve ? "ON" : "OFF");
+                run_query_this_turn = 0;
+                continue;
             }
 
             // Trim newline
@@ -1721,8 +1769,10 @@ int main(int argc, char **argv) {
             /* ── Interactive slash/colon commands ── */
             if (user_input[0] == ':') {
                 if (strcmp(user_input, ":compact") == 0) {
-                    messages_json = compact_session(messages_json, mcp_script, c, model);
-                    printf("\033[2m[context compacted — continue the conversation]\033[0m\n");
+                    int compact_ok = 0;
+                    messages_json = compact_session(messages_json, mcp_script, c, model, &compact_ok);
+                    if (compact_ok)
+                        printf("\033[2m[context compacted — continue the conversation]\033[0m\n");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -1743,9 +1793,10 @@ int main(int argc, char **argv) {
                     printf("  :clear     Wipe conversation history entirely\n");
                     printf("  :status    Show context size and model info\n");
                     printf("  :memory    Show persistent memory\n");
+                    printf("  :auto      Toggle auto-approve for execute_command\n");
                     printf("  :help      Show this message\n");
                     printf("  exit/quit  Leave interactive mode\n");
-                    printf("\n\033[2mPress ESC at any time during agent execution to interrupt.\033[0m\n\n");
+                    printf("\n\033[2mPress ESC to interrupt. Shift-Tab to toggle auto-approve.\033[0m\n\n");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -1759,8 +1810,21 @@ int main(int argc, char **argv) {
                     printf("  Trim threshold : %d bytes\n", trim_threshold);
                     printf("  Auto-compact at: %d bytes (~%.0f KB)\n",
                            trim_threshold * 3, trim_threshold * 3.0 / 1024);
-                    printf("  :compact needed: %s\n\n",
+                    printf("  :compact needed: %s\n",
                            ctx_bytes > (size_t)(trim_threshold * 2) ? "YES (recommended)" : "no");
+                    printf("  Auto-approve   : %s\n\n",
+                           g_auto_approve ? "\033[1;33mON\033[0m (Shift-Tab to disable)" : "off");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":auto") == 0) {
+                    g_auto_approve ^= 1;
+                    if (g_auto_approve)
+                        setenv("INFER_AUTO_APPROVE", "1", 1);
+                    else
+                        unsetenv("INFER_AUTO_APPROVE");
+                    printf("\033[1;33m[ai] Auto-approve %s\033[0m\n",
+                           g_auto_approve ? "ON — commands run without confirmation" : "OFF — manual confirmation required");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -2187,7 +2251,7 @@ step_limit_check:
                                    }
 
                                   if (cmd_val) {
-                                      int approved = auto_approve;
+                                      int approved = g_auto_approve;
                                       if (!approved) {
                                           FILE *tty = fopen("/dev/tty", "r+");
                                           if (tty) {
