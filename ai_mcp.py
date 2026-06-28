@@ -1365,16 +1365,15 @@ def main():
             "type": "function",
             "function": {
                 "name": "load_skill",
-                "description": "Read the full guidance content of a named skill. Skills are listed in the system prompt with one-line descriptions. Call this before working in a domain where a relevant skill exists (e.g. call load_skill('bio_structure_analysis') before handling PDB/CIF files).",
+                "description": "Explore and load domain skills. Call with no argument (empty name) to list all available skills with descriptions. Call with a skill name to read its full guidance. Always call with no argument first if you are unsure what skills exist, then load the relevant one before starting domain work.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "The skill directory name as listed in the system prompt (e.g. 'bio_structure_analysis', 'karpathy_guidelines')."
+                            "description": "Skill directory name to load (e.g. 'bio_structure_analysis'). Omit or leave empty to list all available skills."
                         }
-                    },
-                    "required": ["name"]
+                    }
                 }
             }
         })
@@ -1613,14 +1612,36 @@ def main():
                 except Exception as e:
                     print(f"Error delegating task: {e}")
         elif tool_name == "load_skill" or server_name == "load_skill":
+            import re as _re
             skill_name = arguments.get("name", "").strip()
+            skill_dirs = [
+                os.path.join(os.getcwd(), ".agents", "skills"),
+                os.path.join(os.path.expanduser("~"), ".config", "ai", "skills"),
+            ]
             if not skill_name:
-                print("Error: 'name' argument required.")
+                # List mode: return index of name + description for every available skill
+                index = "Available skills (call load_skill(name) to read full guidance):\n"
+                seen = set()
+                for base in skill_dirs:
+                    if not os.path.isdir(base):
+                        continue
+                    for entry in sorted(os.listdir(base)):
+                        if entry in seen:
+                            continue
+                        skill_path = os.path.join(base, entry, "SKILL.md")
+                        if os.path.isfile(skill_path):
+                            try:
+                                with open(skill_path, "r", encoding="utf-8", errors="replace") as f:
+                                    header = f.read(512)
+                                m = _re.search(r'^description:\s*(.+)', header, _re.MULTILINE)
+                                desc = m.group(1).strip() if m else "(no description)"
+                            except Exception:
+                                desc = "(unreadable)"
+                            index += f"- {entry}: {desc}\n"
+                            seen.add(entry)
+                print(index if seen else "No skills found.")
             else:
-                skill_dirs = [
-                    os.path.join(os.getcwd(), ".agents", "skills"),
-                    os.path.join(os.path.expanduser("~"), ".config", "ai", "skills"),
-                ]
+                # Load mode: return full content of named skill
                 found = False
                 for base in skill_dirs:
                     skill_path = os.path.join(base, skill_name, "SKILL.md")
@@ -1629,18 +1650,16 @@ def main():
                             with open(skill_path, "r", encoding="utf-8", errors="replace") as f:
                                 content = f.read()
                             print(f"[Skill: {skill_name}]\n{content}")
-                            found = True
-                            break
                         except Exception as e:
                             print(f"Error reading skill '{skill_name}': {e}")
-                            found = True
-                            break
+                        found = True
+                        break
                 if not found:
                     available = []
                     for base in skill_dirs:
                         if os.path.isdir(base):
                             available.extend(os.listdir(base))
-                    print(f"Skill '{skill_name}' not found. Available: {', '.join(sorted(set(available))) or 'none'}")
+                    print(f"Skill '{skill_name}' not found. Call load_skill() with no argument to list available skills.")
         elif tool_name == "computer_control" or server_name == "computer_control":
             result = computer_control(arguments)
             print(result)

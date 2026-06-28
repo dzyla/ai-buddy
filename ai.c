@@ -60,7 +60,11 @@ static const char *SYSTEM_PROMPT =
     "- Never tell the user to 'visit a link' or 'run a command themselves' — do it yourself.\n\n"
     "DELEGATION:\n"
     "- For tasks with independent parallel sub-tasks, use delegate_task to run them concurrently.\n"
-    "- delegate_task agents have full tool access. Give them specific, self-contained instructions.";
+    "- delegate_task agents have full tool access. Give them specific, self-contained instructions.\n\n"
+    "SKILLS:\n"
+    "- Domain skills exist for specialized tasks (bioinformatics, structure analysis, MD simulation, drug design, etc.).\n"
+    "- Call load_skill() with no argument to see what is available. Call load_skill(name) to read a skill before working in that domain.\n"
+    "- Always load a relevant skill before starting domain-specific work you are less certain about.";
 
 static char* get_system_context() {
     char cwd[1024] = "Unknown";
@@ -1607,29 +1611,20 @@ int main(int argc, char **argv) {
     // Add System Prompt, Context, Memory & Skills
     char *memory = read_memory_file();
     char *sys_ctx = get_system_context();
-    char *skills = load_all_skills();
 
     char *safe_system = json_escape(SYSTEM_PROMPT);
     char *safe_ctx = json_escape(sys_ctx);
-    char *safe_skills = skills ? json_escape(skills) : strdup("");
+    char *safe_mem = memory ? json_escape(memory) : NULL;
     char *sys_msg = NULL;
 
-    size_t mlen = strlen(safe_system) + strlen(safe_ctx) + strlen(safe_skills) + (memory ? strlen(memory) * 6 : 0) + 512;
+    size_t mlen = strlen(safe_system) + strlen(safe_ctx) + (safe_mem ? strlen(safe_mem) * 2 : 0) + 256;
     sys_msg = malloc(mlen);
 
-    char *safe_mem = memory ? json_escape(memory) : NULL;
-
-    if (safe_mem && strlen(safe_mem) > 0 && strlen(safe_skills) > 0) {
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nSkills/Guidelines:\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}", 
-                safe_system, safe_ctx, safe_skills, safe_mem);
-    } else if (safe_mem && strlen(safe_mem) > 0) {
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}", 
+    if (safe_mem && strlen(safe_mem) > 0) {
+        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nPersistent Memory/Preferences:\\n%s\"}",
                 safe_system, safe_ctx, safe_mem);
-    } else if (strlen(safe_skills) > 0) {
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\\n\\nSkills/Guidelines:\\n%s\"}", 
-                safe_system, safe_ctx, safe_skills);
     } else {
-        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\"}", 
+        sprintf(sys_msg, "{\"role\":\"system\",\"content\":\"%s\\n\\n%s\"}",
                 safe_system, safe_ctx);
     }
 
@@ -1638,11 +1633,9 @@ int main(int argc, char **argv) {
 
     if (safe_mem) free(safe_mem);
     if (memory) free(memory);
-    free(skills);
     free(sys_ctx);
     free(safe_system);
     free(safe_ctx);
-    free(safe_skills);
     free(sys_msg);
 
     // Add User Prompt
