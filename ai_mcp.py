@@ -1360,7 +1360,26 @@ def main():
             }
         })
 
-        # 11. computer_control
+        # 11. load_skill
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "load_skill",
+                "description": "Read the full guidance content of a named skill. Skills are listed in the system prompt with one-line descriptions. Call this before working in a domain where a relevant skill exists (e.g. call load_skill('bio_structure_analysis') before handling PDB/CIF files).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The skill directory name as listed in the system prompt (e.g. 'bio_structure_analysis', 'karpathy_guidelines')."
+                        }
+                    },
+                    "required": ["name"]
+                }
+            }
+        })
+
+        # 12. computer_control
         openai_tools.append({
             "type": "function",
             "function": {
@@ -1593,6 +1612,35 @@ def main():
                     print(combined_result.strip())
                 except Exception as e:
                     print(f"Error delegating task: {e}")
+        elif tool_name == "load_skill" or server_name == "load_skill":
+            skill_name = arguments.get("name", "").strip()
+            if not skill_name:
+                print("Error: 'name' argument required.")
+            else:
+                skill_dirs = [
+                    os.path.join(os.getcwd(), ".agents", "skills"),
+                    os.path.join(os.path.expanduser("~"), ".config", "ai", "skills"),
+                ]
+                found = False
+                for base in skill_dirs:
+                    skill_path = os.path.join(base, skill_name, "SKILL.md")
+                    if os.path.isfile(skill_path):
+                        try:
+                            with open(skill_path, "r", encoding="utf-8", errors="replace") as f:
+                                content = f.read()
+                            print(f"[Skill: {skill_name}]\n{content}")
+                            found = True
+                            break
+                        except Exception as e:
+                            print(f"Error reading skill '{skill_name}': {e}")
+                            found = True
+                            break
+                if not found:
+                    available = []
+                    for base in skill_dirs:
+                        if os.path.isdir(base):
+                            available.extend(os.listdir(base))
+                    print(f"Skill '{skill_name}' not found. Available: {', '.join(sorted(set(available))) or 'none'}")
         elif tool_name == "computer_control" or server_name == "computer_control":
             result = computer_control(arguments)
             print(result)
