@@ -15,4 +15,11 @@ dist/
 *.tmp
 
 # Local machine specific temporary files
-~lock.CLAUDE.md#
+~lock.CLAUDE.md#1a2c.pdb
+test_rcsb_api.py
+test_rcsb_api_v2.py
+test.mmcif
+valid_test.mmcif
+reverse_string.py
+fasta_parser.py
+create_valid_mmcif.py
