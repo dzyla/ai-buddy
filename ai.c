@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <sys/select.h>
 #include <errno.h>
@@ -647,8 +648,8 @@ static int curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                         setenv("INFER_AUTO_APPROVE", "1", 1);
                     else
                         unsetenv("INFER_AUTO_APPROVE");
-                    fprintf(stderr, "\n\033[1;33m[ai] Auto-approve %s (Shift-Tab to toggle)\033[0m\n",
-                            g_auto_approve ? "ON" : "OFF");
+                    fprintf(stderr, "\n\033[2mauto-approve %s\033[0m\n",
+                            g_auto_approve ? "on" : "off");
                     fflush(stderr);
                 } else {
                     g_esc_requested = 1;
@@ -682,6 +683,7 @@ static void enable_raw_mode(void) {
 static char *lineed_history[LINEED_MAX_HISTORY];
 static int   lineed_history_len  = 0;
 static char  lineed_history_path[1024] = "";
+static int   lineed_prev_rows    = 0;   /* rows occupied by last redraw */
 
 static void lineed_add_history(const char *line) {
     if (!line || !*line) return;
@@ -726,15 +728,72 @@ static void lineed_init(void) {
     atexit(lineed_save_history);
 }
 
+/* Count visible (non-ANSI-escape) display columns in a string. */
+static int lineed_visible_len(const char *s) {
+    int n = 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '\033' && *(s + 1) == '[') {
+            /* Skip CSI sequence: ESC [ ... <letter> */
+            s += 2;
+            while (*s && ((*s < 'A' || *s > 'Z') && (*s < 'a' || *s > 'z'))) s++;
+            if (*s) s++;
+        } else if (c >= 0xF0) { n++; s += 4; }  /* 4-byte UTF-8 → 1 col */
+        else if (c >= 0xE0)   { n++; s += 3; }  /* 3-byte UTF-8 → 1 col */
+        else if (c >= 0xC0)   { n++; s += 2; }  /* 2-byte UTF-8 → 1 col */
+        else if (c >= 0x80)   {      s++;    }  /* continuation byte    */
+        else                  { n++; s++;    }  /* plain ASCII          */
+    }
+    return n;
+}
+
+static int lineed_term_cols(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (int)ws.ws_col;
+    const char *e = getenv("COLUMNS");
+    return (e && *e) ? atoi(e) : 80;
+}
+
+/*
+ * Redraw the prompt+buffer, handling lines that wrap past the terminal width.
+ * Tracks lineed_prev_rows so we can erase the old content before rewriting.
+ */
 static void lineed_redraw(const char *prompt, const char *buf, int len, int cursor) {
+    int cols  = lineed_term_cols();
+    int plen  = lineed_visible_len(prompt);
     char tmp[32];
-    write(STDOUT_FILENO, "\r", 1);
+
+    /* Move to the first row of the previous draw, then erase to end of screen */
+    if (lineed_prev_rows > 0) {
+        snprintf(tmp, sizeof(tmp), "\033[%dA", lineed_prev_rows);
+        write(STDOUT_FILENO, tmp, strlen(tmp));
+    }
+    write(STDOUT_FILENO, "\r\033[J", 4);
+
+    /* Write prompt and buffer */
     write(STDOUT_FILENO, prompt, strlen(prompt));
     if (len > 0)
         write(STDOUT_FILENO, buf, (size_t)len);
-    write(STDOUT_FILENO, "\033[K", 3);
-    if (cursor < len) {
-        snprintf(tmp, sizeof(tmp), "\033[%dD", len - cursor);
+
+    /* Record how many extra rows this draw occupies */
+    int total = plen + len;
+    lineed_prev_rows = (total > 0) ? (total - 1) / cols : 0;
+
+    /* Place the cursor at (plen + cursor) in the virtual unwrapped line */
+    int cursor_abs = plen + cursor;
+    int cursor_row = cursor_abs / cols;
+    int cursor_col = cursor_abs % cols;
+    int end_row    = (total > 0) ? (total - 1) / cols : 0;
+
+    int rows_up = end_row - cursor_row;
+    if (rows_up > 0) {
+        snprintf(tmp, sizeof(tmp), "\033[%dA", rows_up);
+        write(STDOUT_FILENO, tmp, strlen(tmp));
+    }
+    write(STDOUT_FILENO, "\r", 1);
+    if (cursor_col > 0) {
+        snprintf(tmp, sizeof(tmp), "\033[%dC", cursor_col);
         write(STDOUT_FILENO, tmp, strlen(tmp));
     }
 }
@@ -772,7 +831,23 @@ static char *read_line_interactive(const char *prompt) {
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 
+    lineed_prev_rows = 0;
+    write(STDOUT_FILENO, "\033[?2004h", 8); /* enable bracketed paste */
     write(STDOUT_FILENO, prompt, strlen(prompt));
+
+/* Disable bracketed paste and restore terminal at any exit point. */
+#define LINEED_RESTORE() do { \
+    write(STDOUT_FILENO, "\033[?2004l", 8); \
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); \
+} while (0)
+
+/* Insert one char into buf at cursor (no redraw). */
+#define LINEED_INS(ch) do { \
+    if (len < LINEED_MAX_LINE - 1) { \
+        memmove(buf + cursor + 1, buf + cursor, (size_t)(len - cursor + 1)); \
+        buf[cursor] = (char)(ch); cursor++; len++; \
+    } \
+} while (0)
 
     char buf[LINEED_MAX_LINE];
     int  len    = 0;
@@ -785,7 +860,7 @@ static char *read_line_interactive(const char *prompt) {
         unsigned char c;
         if (read(STDIN_FILENO, &c, 1) <= 0) {
             write(STDOUT_FILENO, "\r\n", 2);
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+            LINEED_RESTORE();
             return len > 0 ? strdup(buf) : NULL;
         }
 
@@ -797,7 +872,7 @@ static char *read_line_interactive(const char *prompt) {
         if (c == 4) { /* Ctrl+D */
             if (len == 0) {
                 write(STDOUT_FILENO, "\r\n", 2);
-                tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+                LINEED_RESTORE();
                 return NULL;
             }
             if (cursor < len) {
@@ -809,10 +884,10 @@ static char *read_line_interactive(const char *prompt) {
             continue;
         }
 
-        if (c == 3) { /* Ctrl+C — cancel line */
+        if (c == 3) { /* Ctrl+C — quit interactive mode */
             write(STDOUT_FILENO, "^C\r\n", 4);
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
-            return strdup("");
+            LINEED_RESTORE();
+            return NULL;
         }
 
         if (c == 127 || c == 8) { /* Backspace */
@@ -872,34 +947,64 @@ static char *read_line_interactive(const char *prompt) {
         }
 
         if (c == 27) { /* ESC — escape sequence */
-            unsigned char seq[2];
-            if (read(STDIN_FILENO, &seq[0], 1) != 1) continue;
+            unsigned char lead;
+            if (read(STDIN_FILENO, &lead, 1) != 1) continue;
 
-            if (seq[0] == '[') {
-                if (read(STDIN_FILENO, &seq[1], 1) != 1) continue;
+            if (lead == '[') {
+                /* CSI sequence: read numeric parameter(s) + terminator */
+                char   param[16]; int plen2 = 0;
+                unsigned char term = 0;
+                while (plen2 < 15) {
+                    unsigned char ch2;
+                    if (read(STDIN_FILENO, &ch2, 1) != 1) break;
+                    if ((ch2 >= 'A' && ch2 <= 'Z') || (ch2 >= 'a' && ch2 <= 'z') || ch2 == '~') {
+                        term = ch2; break;
+                    }
+                    param[plen2++] = (char)ch2;
+                }
+                param[plen2] = '\0';
+                int csi_num = plen2 > 0 ? atoi(param) : 0;
 
-                if (seq[1] >= '0' && seq[1] <= '9') {
-                    unsigned char tilde;
-                    if (read(STDIN_FILENO, &tilde, 1) != 1) continue;
-                    if (tilde == '~') {
-                        if (seq[1] == '3') { /* Delete */
-                            if (cursor < len) {
-                                memmove(buf + cursor, buf + cursor + 1,
-                                        (size_t)(len - cursor));
-                                len--;
-                                buf[len] = '\0';
-                                lineed_redraw(prompt, buf, len, cursor);
+                if (term == '~') {
+                    if (csi_num == 200) {
+                        /* ── Bracketed paste: collect until \033[201~ ── */
+                        for (;;) {
+                            unsigned char pc;
+                            if (read(STDIN_FILENO, &pc, 1) != 1) break;
+                            if (pc == '\033') {
+                                unsigned char pa;
+                                if (read(STDIN_FILENO, &pa, 1) != 1) break;
+                                if (pa == '[') {
+                                    char pn[16]; int pnl = 0; unsigned char pt = 0;
+                                    while (pnl < 15) {
+                                        if (read(STDIN_FILENO, &pt, 1) != 1) break;
+                                        if ((pt>='A'&&pt<='Z')||(pt>='a'&&pt<='z')||pt=='~') break;
+                                        pn[pnl++] = (char)pt;
+                                    }
+                                    pn[pnl] = '\0';
+                                    if (pt == '~' && atoi(pn) == 201) break; /* end paste */
+                                }
+                                /* Ignore other ESC sequences inside paste */
+                                continue;
                             }
-                        } else if (seq[1] == '1' || seq[1] == '7') { /* Home */
-                            cursor = 0;
-                            lineed_redraw(prompt, buf, len, cursor);
-                        } else if (seq[1] == '4' || seq[1] == '8') { /* End */
-                            cursor = len;
+                            /* Newlines become spaces — keeps single-line editor clean */
+                            if (pc == '\r' || pc == '\n') { LINEED_INS(' '); continue; }
+                            if (pc >= 32 || pc == '\t')   { LINEED_INS(pc);  continue; }
+                        }
+                        lineed_redraw(prompt, buf, len, cursor);
+                    } else if (csi_num == 3) { /* Delete */
+                        if (cursor < len) {
+                            memmove(buf + cursor, buf + cursor + 1, (size_t)(len - cursor));
+                            len--; buf[len] = '\0';
                             lineed_redraw(prompt, buf, len, cursor);
                         }
+                    } else if (csi_num == 1 || csi_num == 7) { /* Home */
+                        cursor = 0; lineed_redraw(prompt, buf, len, cursor);
+                    } else if (csi_num == 4 || csi_num == 8) { /* End */
+                        cursor = len; lineed_redraw(prompt, buf, len, cursor);
                     }
                 } else {
-                    switch (seq[1]) {
+                    switch (term) {
                         case 'A': /* Up — history back */
                             if (hidx > 0) {
                                 if (hidx == lineed_history_len)
@@ -921,35 +1026,24 @@ static char *read_line_interactive(const char *prompt) {
                             }
                             break;
                         case 'C': /* Right */
-                            if (cursor < len) {
-                                cursor++;
-                                lineed_redraw(prompt, buf, len, cursor);
-                            }
+                            if (cursor < len) { cursor++; lineed_redraw(prompt, buf, len, cursor); }
                             break;
                         case 'D': /* Left */
-                            if (cursor > 0) {
-                                cursor--;
-                                lineed_redraw(prompt, buf, len, cursor);
-                            }
+                            if (cursor > 0) { cursor--; lineed_redraw(prompt, buf, len, cursor); }
                             break;
-                        case 'H': /* Home */
-                            cursor = 0;
-                            lineed_redraw(prompt, buf, len, cursor);
-                            break;
-                        case 'F': /* End */
-                            cursor = len;
-                            lineed_redraw(prompt, buf, len, cursor);
-                            break;
+                        case 'H': cursor = 0;   lineed_redraw(prompt, buf, len, cursor); break;
+                        case 'F': cursor = len; lineed_redraw(prompt, buf, len, cursor); break;
                         case 'Z': /* Shift-Tab */
                             write(STDOUT_FILENO, "\r\n", 2);
-                            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+                            LINEED_RESTORE();
                             return strdup("\033[Z");
                     }
                 }
-            } else if (seq[0] == 'O') {
+            } else if (lead == 'O') {
                 /* SS3 arrow key encoding (some terminals) */
-                if (read(STDIN_FILENO, &seq[1], 1) != 1) continue;
-                switch (seq[1]) {
+                unsigned char ss3;
+                if (read(STDIN_FILENO, &ss3, 1) != 1) continue;
+                switch (ss3) {
                     case 'A':
                         if (hidx > 0) {
                             if (hidx == lineed_history_len)
@@ -970,13 +1064,9 @@ static char *read_line_interactive(const char *prompt) {
                             lineed_redraw(prompt, buf, len, cursor);
                         }
                         break;
-                    case 'C':
-                        if (cursor < len) { cursor++; lineed_redraw(prompt, buf, len, cursor); }
-                        break;
-                    case 'D':
-                        if (cursor > 0) { cursor--; lineed_redraw(prompt, buf, len, cursor); }
-                        break;
-                    case 'H': cursor = 0; lineed_redraw(prompt, buf, len, cursor); break;
+                    case 'C': if (cursor < len) { cursor++; lineed_redraw(prompt, buf, len, cursor); } break;
+                    case 'D': if (cursor > 0)   { cursor--; lineed_redraw(prompt, buf, len, cursor); } break;
+                    case 'H': cursor = 0;   lineed_redraw(prompt, buf, len, cursor); break;
                     case 'F': cursor = len; lineed_redraw(prompt, buf, len, cursor); break;
                 }
             }
@@ -993,7 +1083,9 @@ static char *read_line_interactive(const char *prompt) {
         }
     }
 
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+    LINEED_RESTORE();
+#undef LINEED_RESTORE
+#undef LINEED_INS
     buf[len] = '\0';
     return strdup(buf);
 }
@@ -2040,7 +2132,6 @@ int main(int argc, char **argv) {
     size_t mlen = strlen(safe_system) + strlen(safe_ctx)
                   + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
                   + (safe_mem ? strlen(safe_mem) + 64 : 0) + 256;
-    sys_msg = malloc(mlen);
 
     /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
     char *content = malloc(mlen);
@@ -2052,8 +2143,11 @@ int main(int argc, char **argv) {
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nPersistent Memory/Preferences:\n%s", memory);
 
+    /* json_escape can expand content significantly; allocate sys_msg after escaping */
     char *safe_content = json_escape(content);
-    snprintf(sys_msg, mlen + strlen(safe_content) + 32,
+    size_t sys_msg_len = strlen(safe_content) + 64;
+    sys_msg = malloc(sys_msg_len);
+    snprintf(sys_msg, sys_msg_len,
              "{\"role\":\"system\",\"content\":\"%s\"}", safe_content);
     free(content);
     free(safe_content);
@@ -2148,10 +2242,8 @@ int main(int argc, char **argv) {
     char *current_prompt = strdup(prompt ? prompt : "");
 
     if (interactive_mode && !run_query_this_turn) {
-        printf("\033[1;35m::: ai Agent (local %s) interactive mode :::\033[0m\n", model);
-        printf("Type \033[33mexit\033[0m or \033[33mquit\033[0m to leave. "
-               "\033[33m:help\033[0m for commands. "
-               "\033[33mESC\033[0m during execution to interrupt.\n\n");
+        printf("\033[1;36mai\033[0m  \033[2m%s\033[0m\n", model);
+        printf("\033[2m:help · ESC to interrupt · Shift-Tab to toggle auto-approve\033[0m\n\n");
         lineed_init();
     }
 
@@ -2168,8 +2260,8 @@ int main(int argc, char **argv) {
             printf("\n");
             fflush(stdout);
             const char *prompt_str = g_auto_approve
-                ? "\033[1;32mai\033[0m\033[1;33m(auto)\033[0m\033[1;32m>\033[0m "
-                : "\033[1;32mai>\033[0m ";
+                ? "\033[1;33mai\033[0m\033[2m>\033[0m "
+                : "\033[1;36mai\033[0m\033[2m>\033[0m ";
             char *line = read_line_interactive(prompt_str);
             if (!line) {
                 printf("\n");
@@ -2188,8 +2280,8 @@ int main(int argc, char **argv) {
                     setenv("INFER_AUTO_APPROVE", "1", 1);
                 else
                     unsetenv("INFER_AUTO_APPROVE");
-                printf("\033[1;33m[ai] Auto-approve %s (Shift-Tab to toggle)\033[0m\n",
-                       g_auto_approve ? "ON" : "OFF");
+                printf("\033[2mauto-approve %s\033[0m\n",
+                       g_auto_approve ? "on" : "off");
                 run_query_this_turn = 0;
                 continue;
             }
@@ -2206,6 +2298,9 @@ int main(int argc, char **argv) {
 
             /* ── Interactive slash/colon commands ── */
             if (user_input[0] == ':') {
+                if (strcmp(user_input, ":quit") == 0 || strcmp(user_input, ":exit") == 0) {
+                    break;
+                }
                 if (strcmp(user_input, ":compact") == 0) {
                     int compact_ok = 0;
                     messages_json = compact_session(messages_json, mcp_script, c, model, &compact_ok);
@@ -2233,8 +2328,9 @@ int main(int argc, char **argv) {
                     printf("  :memory    Show persistent memory\n");
                     printf("  :auto      Toggle auto-approve for execute_command\n");
                     printf("  :help      Show this message\n");
+                    printf("  :quit/:exit  Leave interactive mode\n");
                     printf("  exit/quit  Leave interactive mode\n");
-                    printf("\n\033[2mPress ESC to interrupt. Shift-Tab to toggle auto-approve.\033[0m\n\n");
+                    printf("\n\033[2mPress Ctrl+C or ESC to interrupt. Shift-Tab to toggle auto-approve.\033[0m\n\n");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -2261,8 +2357,8 @@ int main(int argc, char **argv) {
                         setenv("INFER_AUTO_APPROVE", "1", 1);
                     else
                         unsetenv("INFER_AUTO_APPROVE");
-                    printf("\033[1;33m[ai] Auto-approve %s\033[0m\n",
-                           g_auto_approve ? "ON — commands run without confirmation" : "OFF — manual confirmation required");
+                    printf("\033[2mauto-approve %s\033[0m\n",
+                           g_auto_approve ? "on" : "off");
                     run_query_this_turn = 0;
                     continue;
                 }
