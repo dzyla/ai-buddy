@@ -285,6 +285,81 @@ def fetch_webpage(url):
     except Exception as e:
         return f"Error fetching webpage: {e}"
 
+def fetch_webpage_js(url, wait_for="networkidle", timeout_ms=30000):
+    """Fetch a JS-rendered page via Playwright and return its content as markdown."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "[Error: playwright not installed. Run: pip install playwright && playwright install chromium]"
+
+    try:
+        from markdownify import markdownify as md
+        _HAS_MARKDOWNIFY = True
+    except ImportError:
+        _HAS_MARKDOWNIFY = False
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"})
+                page.goto(url, timeout=timeout_ms)
+                try:
+                    page.wait_for_load_state(wait_for, timeout=timeout_ms)
+                except Exception:
+                    pass  # timeout on networkidle is fine — grab what we have
+                html = page.content()
+            finally:
+                browser.close()
+
+        # Strip script/style/noscript blocks before conversion
+        clean_html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        clean_html = re.sub(r'<style[^>]*>.*?</style>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
+        clean_html = re.sub(r'<noscript[^>]*>.*?</noscript>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
+
+        # Try trafilatura first — best main-content extraction from raw HTML
+        if _HAS_TRAFILATURA:
+            text = trafilatura.extract(
+                clean_html,
+                include_comments=False,
+                include_tables=True,
+                deduplicate=True,
+                no_fallback=False,
+            )
+            if text and len(text.split()) > 30:
+                text = text.strip()
+            else:
+                text = None
+        else:
+            text = None
+
+        if not text:
+            if _HAS_MARKDOWNIFY:
+                text = md(clean_html, heading_style="ATX",
+                          strip=["head", "nav", "footer", "aside"])
+            else:
+                text = _html_to_text_fallback(clean_html, url)
+
+        # Collapse excessive blank lines
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
+        max_tool = 65536
+        max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
+        if max_tool_output_env:
+            try:
+                max_tool = int(max_tool_output_env)
+            except ValueError:
+                pass
+        web_limit = max(12000, int(max_tool * 0.8))
+        if len(text) > web_limit:
+            text = text[:web_limit] + f"\n... [truncated. Content was {len(text)} chars, limit {web_limit}.]"
+
+        return f"[Source (JS-rendered): {url}]\n\n{text}"
+    except Exception as e:
+        return f"Error fetching JS page: {e}"
+
+
 MEMORY_PATH = os.path.expanduser("~/.config/ai/memory.txt")
 
 def save_memory(content):
@@ -1073,7 +1148,145 @@ TOOL_REQUIRED_ARGS = {
     "think":           ["reasoning"],
     "task_complete":   ["summary"],
     "computer_control": ["action"],
+    "pubmed_search":          ["query"],
+    "pubmed_research_round":  ["query"],
 }
+
+def _pubmed_fetch_raw(query, top_k=10, start_date=None, end_date=None, high_quality_only=True):
+    """Return parsed JSON results list from the search API, or a string error."""
+    import urllib.request as _req
+    import json as _json
+
+    base_url = os.environ.get("PUBMED_SEARCH_URL", "http://152.53.80.217:8080").rstrip("/")
+    api_key  = os.environ.get("PUBMED_API_KEY") or os.environ.get("MSS_API_KEY", "")
+    if not api_key:
+        return "Error: no API key found. Set PUBMED_API_KEY (or MSS_API_KEY) environment variable."
+
+    top_k = max(5, min(10, int(top_k)))
+    payload = {"query": query, "top_k": top_k, "high_quality_only": bool(high_quality_only)}
+    if start_date:
+        payload["start_date"] = start_date
+    if end_date:
+        payload["end_date"] = end_date
+
+    data = _json.dumps(payload).encode("utf-8")
+    req = _req.Request(
+        f"{base_url}/search",
+        data=data,
+        headers={"Content-Type": "application/json", "X-API-Key": api_key},
+        method="POST",
+    )
+    try:
+        with _req.urlopen(req, timeout=60) as resp:
+            body = _json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return f"Error calling PubMed search API: {e}"
+
+    return body
+
+
+def pubmed_search(query, top_k=10, start_date=None, end_date=None, high_quality_only=True):
+    body = _pubmed_fetch_raw(query, top_k, start_date, end_date, high_quality_only)
+    if isinstance(body, str):
+        return body  # error string
+
+    results = body.get("results", [])
+    if not results:
+        return f"No results found for query: {query}"
+
+    lines = [
+        f"Search: \"{body.get('query', query)}\"  |  "
+        f"{body.get('total_results', len(results))} result(s)  |  "
+        f"{body.get('search_time_seconds', '?')}s\n"
+    ]
+    for i, p in enumerate(results, 1):
+        doi = p.get("doi", "N/A")
+        doi_url = f"https://doi.org/{doi}" if doi and doi != "N/A" else "N/A"
+        lines.append(
+            f"[{i}] {p.get('title', 'N/A')}\n"
+            f"    Authors : {p.get('authors', 'N/A')}\n"
+            f"    Journal : {p.get('journal', 'N/A')}  ({p.get('year', '?')})  [{p.get('source', '')}]\n"
+            f"    DOI     : {doi}  →  {doi_url}\n"
+            f"    Score   : {p.get('score', '?')}\n"
+            f"    Abstract: {p.get('abstract', 'N/A')}\n"
+        )
+    return "\n".join(lines)
+
+def pubmed_research_round(query, known_dois=None, start_date=None, end_date=None):
+    """
+    Fetch full abstracts from the search API, read them in Python, and return a
+    compact structured digest to the main agent. No LLM sub-process — fast (~1.5s).
+
+    The full abstract text is read here; only extracted key sentences go back to
+    the main agent, keeping its context clean across multiple rounds.
+    """
+    body = _pubmed_fetch_raw(query, top_k=10, start_date=start_date, end_date=end_date)
+    if isinstance(body, str):
+        return body  # error
+
+    results = body.get("results", [])
+    elapsed = body.get("search_time_seconds", "?")
+    if not results:
+        return f"No results for: {query}"
+
+    known = set(known_dois or [])
+    new_papers = []
+    repeat_dois = []
+
+    for p in results:
+        doi = p.get("doi", "N/A") or "N/A"
+        abstract = (p.get("abstract", "") or "").strip()
+
+        # Extract leading sentences (usually background + main finding) and trailing
+        # sentence (usually conclusion). Full abstract is read; we surface key parts.
+        sentences = re.split(r'(?<=[.!?])\s+', abstract)
+        if len(sentences) >= 3:
+            excerpt = " ".join(sentences[:2]) + " … " + sentences[-1]
+        elif sentences:
+            excerpt = " ".join(sentences[:3])
+        else:
+            excerpt = abstract[:300]
+
+        entry = dict(
+            doi=doi,
+            title=p.get("title", "N/A"),
+            authors=p.get("authors", "N/A"),
+            journal=p.get("journal", "N/A"),
+            year=p.get("year", "?"),
+            source=p.get("source", ""),
+            score=round(float(p.get("score", 0)), 4),
+            excerpt=excerpt,
+        )
+
+        if doi != "N/A" and doi in known:
+            repeat_dois.append(doi)
+        else:
+            new_papers.append(entry)
+
+    # Sort new papers chronologically so temporal narrative is immediately readable
+    new_papers.sort(key=lambda x: (x["year"] if isinstance(x["year"], int) else 0))
+
+    lines = [
+        f'ROUND: "{query}"',
+        f'API: {len(results)} results in {elapsed}s | {len(new_papers)} new, {len(repeat_dois)} already seen\n',
+    ]
+
+    if new_papers:
+        lines.append("PAPERS (new, oldest → newest):")
+        for p in new_papers:
+            doi_url = f"https://doi.org/{p['doi']}" if p['doi'] != "N/A" else "N/A"
+            lines.append(
+                f"  {p['year']} [{p['score']}] {p['title']}\n"
+                f"    {p['authors']}\n"
+                f"    {p['journal']} [{p['source']}]\n"
+                f"    DOI: {p['doi']}  →  {doi_url}\n"
+                f"    Abstract: {p['excerpt']}\n"
+            )
+
+    if repeat_dois:
+        lines.append(f"ALREADY SEEN DOIs: {', '.join(repeat_dois)}")
+
+    return "\n".join(lines)
 
 def repair_json(s):
     """Best-effort repair of common small-model JSON mistakes."""
@@ -1428,6 +1641,121 @@ def main():
             }
         })
 
+        # 13. fetch_webpage_js — Playwright-based for JS-protected sites
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "fetch_webpage_js",
+                "description": (
+                    "Fetch a webpage that requires JavaScript to render (e.g. UniProt, React/Vue SPAs, "
+                    "Cloudflare-protected sites) using a headless Chromium browser. Returns content as markdown. "
+                    "Use this when fetch_webpage returns empty content, a JS-required warning, or a login page. "
+                    "Slower than fetch_webpage (~5-15s) — prefer fetch_webpage for static pages."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch with a headless browser."
+                        },
+                        "wait_for": {
+                            "type": "string",
+                            "enum": ["networkidle", "load", "domcontentloaded"],
+                            "description": "When to consider the page ready. 'networkidle' (default) waits for no network activity — best for SPAs. 'load' waits for the load event. 'domcontentloaded' is fastest but may miss late-rendered content."
+                        }
+                    },
+                    "required": ["url"]
+                }
+            }
+        })
+
+        # pubmed_research_round — delegates to a sub-agent; main agent never sees raw abstracts
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "pubmed_research_round",
+                "description": (
+                    "Search biomedical literature and return a compact digest. "
+                    "Fetches full abstracts from the API, reads them in Python, and surfaces the key opening and closing sentences per paper. "
+                    "Use this for ALL literature research — prefer it over pubmed_search. "
+                    "Call with different descriptive-sentence queries across multiple rounds: "
+                    "read digest → note new DOIs and gaps → call again with refined query → repeat until saturation → synthesise. "
+                    "Pass known_dois from previous rounds to track overlap."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Full descriptive sentence (60–300 chars) describing what the ideal abstract would say. "
+                                "Semantic search — longer sentences outperform short keywords. "
+                                "Example: 'Uromodulin protects the kidney against ascending urinary tract infections by forming a gel barrier that traps uropathogenic bacteria in the tubular lumen'"
+                            )
+                        },
+                        "known_dois": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "DOIs already collected in previous rounds — sub-agent will flag overlaps."
+                        },
+                        "start_date": {
+                            "type": "string",
+                            "description": "Restrict to papers published on or after YYYY-MM-DD. Optional."
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "description": "Restrict to papers published on or before YYYY-MM-DD. Optional."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+
+        # pubmed_search
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "pubmed_search",
+                "description": (
+                    "Semantic search across 50M+ biomedical abstracts (PubMed, BioRxiv, MedRxiv, arXiv). "
+                    "Returns titles, authors, journals, DOIs, abstracts, and relevance scores. "
+                    "Use iteratively: search → digest abstracts → refine query → search again → synthesise. "
+                    "Always report DOIs so manuscripts can be retrieved. "
+                    "Requires PUBMED_API_KEY (or MSS_API_KEY) environment variable."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural-language search query (3–500 chars), e.g. 'CRISPR base editing off-target effects'."
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Number of results to return (5–10, default 10).",
+                            "default": 10
+                        },
+                        "start_date": {
+                            "type": "string",
+                            "description": "Restrict to papers published on or after this date (YYYY-MM-DD). Optional."
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "description": "Restrict to papers published on or before this date (YYYY-MM-DD). Optional."
+                        },
+                        "high_quality_only": {
+                            "type": "boolean",
+                            "description": "Exclude papers with missing or very short abstracts (default true).",
+                            "default": True
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+
         # 12. task_complete — last so model only sees it as exit
         openai_tools.append({
             "type": "function",
@@ -1510,6 +1838,11 @@ def main():
         elif tool_name == "fetch_webpage" or server_name == "fetch_webpage":
             url = arguments.get("url", "")
             result = fetch_webpage(url)
+            print(result)
+        elif tool_name == "fetch_webpage_js" or server_name == "fetch_webpage_js":
+            url = arguments.get("url", "")
+            wait_for = arguments.get("wait_for", "networkidle")
+            result = fetch_webpage_js(url, wait_for=wait_for)
             print(result)
         elif tool_name == "save_memory" or server_name == "save_memory":
             content = arguments.get("content", "")
@@ -1662,6 +1995,23 @@ def main():
                     print(f"Skill '{skill_name}' not found. Call load_skill() with no argument to list available skills.")
         elif tool_name == "computer_control" or server_name == "computer_control":
             result = computer_control(arguments)
+            print(result)
+        elif tool_name == "pubmed_research_round" or server_name == "pubmed_research_round":
+            result = pubmed_research_round(
+                query=arguments.get("query", ""),
+                known_dois=arguments.get("known_dois"),
+                start_date=arguments.get("start_date"),
+                end_date=arguments.get("end_date"),
+            )
+            print(result)
+        elif tool_name == "pubmed_search" or server_name == "pubmed_search":
+            result = pubmed_search(
+                query=arguments.get("query", ""),
+                top_k=arguments.get("top_k", 10),
+                start_date=arguments.get("start_date"),
+                end_date=arguments.get("end_date"),
+                high_quality_only=arguments.get("high_quality_only", True),
+            )
             print(result)
         else:
             # Route to MCP server
