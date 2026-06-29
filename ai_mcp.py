@@ -5,13 +5,28 @@ import json
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
 import re
+import time
 
 try:
     import trafilatura
     _HAS_TRAFILATURA = True
 except ImportError:
     _HAS_TRAFILATURA = False
+
+SEARXNG_INSTANCES = [
+    "https://searx.be",
+    "https://search.inetol.net",
+    "https://searxng.online",
+    "https://priv.au",
+    "https://searx.tiekoetter.com",
+    "https://search.sapti.me",
+    "https://paulgo.io",
+    "https://searx.lunar.icu",
+    "https://search.rhscz.eu",
+    "https://etsi.me",
+]
 
 CONFIG_PATHS = [
     os.path.join(os.getcwd(), "mcp.json"),
@@ -209,6 +224,108 @@ def ddg_lite_search(query):
         return output
     except Exception as e:
         return f"Error during web search: {e}"
+
+_SEARCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def brave_search(query, num_results=8):
+    """Scrape Brave Search HTML; return (list_of_result_strs, top_url) or (None, None)."""
+    q = urllib.parse.quote(query)
+    url = f"https://search.brave.com/search?q={q}&source=web"
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers=_SEARCH_HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                html = r.read().decode('utf-8', errors='ignore')
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                time.sleep(2)
+                continue
+            return None, None
+        except Exception:
+            return None, None
+
+    blocks = re.findall(r'data-type="web".*?(?=data-type="web"|</main>)', html, re.DOTALL)
+    lines = []
+    top_url = None
+    for block in blocks[:num_results]:
+        url_m = re.search(
+            r'<a href="(https?://(?!imgs\.search\.brave\.com|cdn\.search\.brave\.com)[^"]+)"',
+            block,
+        )
+        url = url_m.group(1) if url_m else ''
+        title_m = re.search(r'class="[^"]*search-snippet-title[^"]*" title="([^"]+)"', block)
+        title = title_m.group(1) if title_m else 'No title'
+        snip_m = re.search(
+            r'class="[^"]*desktop-default-regular[^"]*t-primary[^"]*"[^>]*>(.*?)</div>',
+            block, re.DOTALL,
+        )
+        snippet = re.sub(r'<!--.*?-->|<[^>]+>', '', snip_m.group(1) if snip_m else '').strip()
+        if url and not top_url:
+            top_url = url
+        lines.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}\n")
+    if not lines:
+        return None, None
+    return lines, top_url
+
+def searxng_search(query, num_results=8):
+    """Try public SearXNG instances; return (list_of_result_strs, top_url) or (None, None)."""
+    params = urllib.parse.urlencode({
+        'q': query, 'format': 'json',
+        'engines': 'google,bing,duckduckgo', 'pageno': 1,
+    })
+    for base_url in SEARXNG_INSTANCES:
+        try:
+            req = urllib.request.Request(f"{base_url}/search?{params}", headers=_SEARCH_HEADERS)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            results = data.get('results', [])[:num_results]
+            if not results:
+                continue
+            lines = []
+            top_url = None
+            for r in results:
+                url = r.get('url', '')
+                title = r.get('title', 'No title')
+                snippet = r.get('content', '')
+                if not top_url and url.startswith('http'):
+                    top_url = url
+                lines.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}\n")
+            return lines, top_url
+        except Exception:
+            continue
+    return None, None
+
+def _finalize_search(lines, top_url):
+    """Join result lines and auto-fetch the top result for full content."""
+    output = "\n".join(lines)
+    if top_url:
+        try:
+            full = fetch_webpage(top_url)
+            body = full.split('\n\n', 1)[-1] if '\n\n' in full else full
+            if len(body.split()) > 40:
+                body_trimmed = body[:4000] + ("\n... [more at URL]" if len(body) > 4000 else "")
+                output += f"\n---\n[Top result full content — {top_url}]\n{body_trimmed}"
+        except Exception:
+            pass
+    return output
+
+def web_search(query):
+    """Search: Brave Search → SearXNG instances → DuckDuckGo Lite."""
+    lines, top_url = brave_search(query)
+    if lines:
+        return _finalize_search(lines, top_url)
+
+    lines, top_url = searxng_search(query)
+    if lines:
+        return _finalize_search(lines, top_url)
+
+    return ddg_lite_search(query)
 
 def _html_to_text_fallback(html, url):
     """Regex-based HTML→text extraction used when trafilatura is unavailable."""
@@ -1831,57 +1948,7 @@ def main():
             }
         })
 
-        # 13. computer_control
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": "computer_control",
-                "description": "Control the user's screen/windows, capture screenshots, move mouse, click, type, and manipulate windows.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": [
-                                "screenshot",
-                                "click",
-                                "double_click",
-                                "right_click",
-                                "mouse_move",
-                                "mouse_drag",
-                                "type_text",
-                                "key_combo",
-                                "minimize_all",
-                                "minimize_window",
-                                "maximize_window",
-                                "close_window",
-                                "list_windows"
-                            ],
-                            "description": "The specific control action to perform."
-                        },
-                        "x": {
-                            "type": "integer",
-                            "description": "X coordinate for mouse actions (optional)."
-                        },
-                        "y": {
-                            "type": "integer",
-                            "description": "Y coordinate for mouse actions (optional)."
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "The text to type or the key combination to press (optional)."
-                        },
-                        "window_id": {
-                            "type": "string",
-                            "description": "The target window ID or name (optional)."
-                        }
-                    },
-                    "required": ["action"]
-                }
-            }
-        })
-
-        # 14. fetch_webpage_js — Playwright-based for JS-protected sites
+        # 13. fetch_webpage_js — Playwright-based for JS-protected sites
         openai_tools.append({
             "type": "function",
             "function": {
@@ -1906,49 +1973,6 @@ def main():
                         }
                     },
                     "required": ["url"]
-                }
-            }
-        })
-
-        # pubmed_research_round — delegates to a sub-agent; main agent never sees raw abstracts
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": "pubmed_research_round",
-                "description": (
-                    "Search biomedical literature and return a compact digest. "
-                    "Fetches full abstracts from the API, reads them in Python, and surfaces the key opening and closing sentences per paper. "
-                    "Use this for ALL literature research — prefer it over pubmed_search. "
-                    "Call with different descriptive-sentence queries across multiple rounds: "
-                    "read digest → note new DOIs and gaps → call again with refined query → repeat until saturation → synthesise. "
-                    "Pass known_dois from previous rounds to track overlap."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": (
-                                "Full descriptive sentence (60–300 chars) describing what the ideal abstract would say. "
-                                "Semantic search — longer sentences outperform short keywords. "
-                                "Example: 'Uromodulin protects the kidney against ascending urinary tract infections by forming a gel barrier that traps uropathogenic bacteria in the tubular lumen'"
-                            )
-                        },
-                        "known_dois": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "DOIs already collected in previous rounds — sub-agent will flag overlaps."
-                        },
-                        "start_date": {
-                            "type": "string",
-                            "description": "Restrict to papers published on or after YYYY-MM-DD. Optional."
-                        },
-                        "end_date": {
-                            "type": "string",
-                            "description": "Restrict to papers published on or before YYYY-MM-DD. Optional."
-                        }
-                    },
-                    "required": ["query"]
                 }
             }
         })
@@ -2073,7 +2097,7 @@ def main():
             print(result)
         elif tool_name == "web_search" or server_name == "web_search":
             query = arguments.get("query", "")
-            result = ddg_lite_search(query)
+            result = web_search(query)
             print(result)
         elif tool_name == "fetch_webpage" or server_name == "fetch_webpage":
             url = arguments.get("url", "")
