@@ -1308,6 +1308,7 @@ TOOL_REQUIRED_ARGS = {
     "execute_command": ["command"],
     "web_search":      ["query"],
     "fetch_webpage":   ["url"],
+    "fetch_smart":     ["url"],
     "read_file":       ["path"],
     "write_file":      ["path", "content"],
     "edit_file":       ["path", "search_content", "replace_content"],
@@ -1601,13 +1602,38 @@ def main():
             "type": "function",
             "function": {
                 "name": "fetch_webpage",
-                "description": "Download and read the text content of a URL. Use after web_search to read actual page content. Required before task_complete if search returned URLs — never present links without reading them.",
+                "description": "Download and read a static, unprotected URL quickly. For any URL that might be JS-rendered or bot-protected, use fetch_smart instead. Required before task_complete if search returned URLs — never present links without reading them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
                             "description": "The URL of the webpage to fetch."
+                        }
+                    },
+                    "required": ["url"]
+                }
+            }
+        })
+
+        # 4b. fetch_smart
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "fetch_smart",
+                "description": (
+                    "Preferred fetch tool. Downloads a URL using browser TLS fingerprint impersonation "
+                    "(curl_cffi) to bypass Cloudflare and similar bot protections. Automatically escalates "
+                    "to Playwright+stealth for JS-rendered pages if the fast path is blocked. "
+                    "Use this for any URL that might be protected, JS-heavy, or from a news/media site. "
+                    "Falls back to fetch_webpage if curl_cffi is not installed."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch."
                         }
                     },
                     "required": ["url"]
@@ -1861,10 +1887,10 @@ def main():
             "function": {
                 "name": "fetch_webpage_js",
                 "description": (
-                    "Fetch a webpage that requires JavaScript to render (e.g. UniProt, React/Vue SPAs, "
-                    "Cloudflare-protected sites) using a headless Chromium browser. Returns content as markdown. "
-                    "Use this when fetch_webpage returns empty content, a JS-required warning, or a login page. "
-                    "Slower than fetch_webpage (~5-15s) — prefer fetch_webpage for static pages."
+                    "Explicit Playwright override: renders the page with a real headless browser + stealth patches "
+                    "(playwright-stealth, realistic 1920×1080 viewport, lazy-load scroll). "
+                    "Use only when you need direct control over JS rendering or wait_for behaviour. "
+                    "For most cases, prefer fetch_smart which cascades automatically."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2052,6 +2078,10 @@ def main():
         elif tool_name == "fetch_webpage" or server_name == "fetch_webpage":
             url = arguments.get("url", "")
             result = fetch_webpage(url)
+            print(result)
+        elif tool_name == "fetch_smart" or server_name == "fetch_smart":
+            url = arguments.get("url", "")
+            result = fetch_smart(url)
             print(result)
         elif tool_name == "fetch_webpage_js" or server_name == "fetch_webpage_js":
             url = arguments.get("url", "")
