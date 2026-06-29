@@ -2000,6 +2000,30 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* deep-research sub-command: bypass LLM loop, delegate to Python orchestrator */
+    if (argc >= 2 && strcmp(argv[1], "deep-research") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: ai deep-research \"topic\"\n");
+            return 1;
+        }
+        char topic[4096] = {0};
+        for (int i = 2; i < argc; i++) {
+            if (i > 2) strncat(topic, " ", sizeof(topic) - strlen(topic) - 1);
+            strncat(topic, argv[i], sizeof(topic) - strlen(topic) - 1);
+        }
+        char script[1024];
+        if (access("./deep_research.py", R_OK) == 0) {
+            snprintf(script, sizeof(script), "./deep_research.py");
+        } else {
+            const char *home = getenv("HOME");
+            snprintf(script, sizeof(script), "%s/.local/bin/deep_research.py",
+                     home ? home : "~");
+        }
+        char cmd[8192];
+        snprintf(cmd, sizeof(cmd), "python3 %s \"%s\"", script, topic);
+        return system(cmd);
+    }
+
     // Parse help flags first
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -2026,6 +2050,7 @@ int main(int argc, char **argv) {
             printf("  ps aux | head -n 20 | ai \"what's eating memory?\"\n");
             printf("  ai -i \"let's look at this project\"\n");
             printf("  ai -y \"backup ~/.bashrc\"\n");
+            printf("  ai deep-research \"quantum computing\"  # deep multi-source research report\n");
             return 0;
         }
     }
