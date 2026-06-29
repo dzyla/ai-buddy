@@ -360,6 +360,71 @@ def fetch_webpage_js(url, wait_for="networkidle", timeout_ms=30000):
         return f"Error fetching JS page: {e}"
 
 
+def _is_blocked(text, status_code=200):
+    """Return True if a fetched response looks like a bot-block or empty page."""
+    if status_code in (403, 429, 503):
+        return True
+    if not text or len(text.split()) < 10:
+        return True
+    lower = text.lower()
+    cf_markers = [
+        'cf-browser-verification', 'cf_chl_opt', 'checking your browser',
+        'please wait while we verify', 'ddos-guard', 'enable javascript',
+        'javascript is required',
+    ]
+    return any(m in lower for m in cf_markers)
+
+
+def fetch_smart(url):
+    """Speed-first cascade: curl_cffi TLS impersonation → Playwright+stealth → urllib."""
+    # ── Step 1: curl_cffi (browser TLS fingerprint) ──────────────────────────
+    try:
+        from curl_cffi import requests as cffi_req
+        resp = cffi_req.get(url, impersonate="chrome124", timeout=15,
+                            allow_redirects=True)
+        html = resp.text
+        if _HAS_TRAFILATURA:
+            text = trafilatura.extract(
+                html,
+                include_comments=False,
+                include_tables=True,
+                deduplicate=True,
+                no_fallback=False,
+            )
+        else:
+            text = None
+        if not text:
+            text = _html_to_text_fallback(html, url)
+        if not _is_blocked(text, resp.status_code):
+            max_tool = int(os.environ.get("INFER_MAX_TOOL_OUTPUT", 65536))
+            web_limit = max(12000, int(max_tool * 0.8))
+            if len(text) > web_limit:
+                text = text[:web_limit] + f"\n... [truncated at {web_limit} chars]"
+            return f"[Source (smart/curl): {url}]\n\n{text}"
+        # blocked — fall through to Playwright
+    except ImportError:
+        # curl_cffi not installed — fall back to urllib path
+        return fetch_webpage(url)
+    except Exception:
+        pass  # network error or parse failure — try Playwright
+
+    # ── Step 2: Playwright + stealth ─────────────────────────────────────────
+    try:
+        js_result = fetch_webpage_js(url)
+        body_part = js_result.split('\n\n', 1)[-1] if '\n\n' in js_result else js_result
+        if not _is_blocked(body_part):
+            return js_result.replace('[Source (JS-rendered):', '[Source (smart/stealth):', 1)
+    except Exception:
+        pass
+
+    # ── Step 3: Final urllib fallback ────────────────────────────────────────
+    result = fetch_webpage(url)
+    body_part = result.split('\n\n', 1)[-1] if '\n\n' in result else result
+    if _is_blocked(body_part):
+        result = f"[FETCH_WARN: site resisted all fetch methods — content may be incomplete]\n\n{result}"
+    return result
+
+
 MEMORY_PATH = os.path.expanduser("~/.config/ai/memory.txt")
 
 def save_memory(content):
