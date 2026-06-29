@@ -1,3 +1,6 @@
+# Compiled binary (build with: ./install.sh)
+ai
+
 # Ignore Python cache and compiled files
 __pycache__/
 *.pyc

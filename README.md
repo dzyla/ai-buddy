@@ -1,278 +1,253 @@
-# ai 🤖
+# ai
 
-A minimal, agentic CLI tool for piping anything into an LLM and executing terminal work, written in pure C and Python with zero external library dependencies.
+A minimal, agentic CLI that pipes anything into an LLM and executes work in the terminal — written in C and Python with no external library dependencies beyond `libcurl`.
 
 ```bash
 ps aux | ai "what's eating memory"
-ai "tell me what is taking most space"
-ai "what are the coldest and hottest places in US right now?"
+git diff | ai "summarize my changes"
+ai "what's the current Bitcoin price?"
+ai -i   # interactive REPL
 ```
-
-It reads from stdin, sends to an LLM, runs tools dynamically (shell commands, web searches, webpage crawling, file reads/writes, delegated sub-agents), maintains persistent memory, and outputs beautifully formatted markdown directly in your terminal.
 
 ---
 
-## Features
+## Quick Start
 
-- **Interactive Chat / REPL**: Run `ai` with no arguments, or with `-i` / `--interactive`, to start a multi-turn conversation shell. Chat history is preserved across turns.
-- **Agentic Tool Loop**: The agent loops up to 30 times per turn, calling tools, reading results, and calling more tools until it calls `task_complete`. Defaults to `tool_choice: required` to force a tool call every iteration. Set `INFER_TOOL_CHOICE=auto` for servers that do not support `required`.
-- **Transparent Reasoning**: The `think` tool lets the model write a step-by-step plan before acting. Reasoning is shown to you in real time (suppress with `-q` / `--quiet`).
-- **Shell Command Execution**: The model can run any shell command. You get a `[Y/n]` confirmation prompt before each one, with stderr and stdout both captured and fed back into context.
-- **Safety Confirmation / Auto-Approve**: Command execution prompts protect you by default. Use `-y` / `--yes` or `INFER_AUTO_APPROVE=1` to bypass for scripted or trusted sessions. In interactive mode, press **Shift-Tab** at any time (at the prompt or mid-execution) to toggle auto-approve on/off — the prompt changes to `ai(auto)>` while it is active. The `:auto` command does the same.
-- **Web Search**: Searches DuckDuckGo Lite without any API key. Results include title, URL, and snippet.
-- **Webpage Fetching**: Downloads and cleans HTML to readable text (scripts/styles stripped, HTML entities decoded, truncated at 10 KB).
-- **File Reading**: Reads text files (truncated at 12 KB), PDFs (via `pdftotext` → `pypdf` → `pdfplumber` fallback chain), and image files (PNG, JPG, JPEG, WEBP — injected directly into vision context). Binary files are rejected with a clear error.
-- **File Writing & Editing**: Creates new files (with parent directories) via `write_file`. Makes precise search-and-replace edits to existing files via `edit_file`. Falls back to trailing-whitespace-tolerant fuzzy matching when the exact string is not found.
-- **Directory Listing**: Safe directory exploration via `list_directory`, showing file sizes and `[DIR]` markers.
-- **Persistent Memory**: The model can call `save_memory` to store facts, preferences, or context to `~/.config/ai/memory.txt` (capped at 4 KB). Memory is injected into every system prompt automatically.
-- **Recursive Agent Delegation**: `delegate_task` spawns an independent child `ai` process with full tool access and a 60-second timeout. Use it for parallel, independent sub-tasks.
-- **Multimodal Image Input**: Pass an image path (`.png`, `.jpg`, `.jpeg`, `.webp`) as an argument — it is base64-encoded and sent as a vision `image_url` alongside your text prompt.
-- **MCP Server Integration**: Any server listed in `mcp.json` is started as a subprocess over stdio JSON-RPC. Its tools are namespaced as `<server>__<tool>` and automatically added to the model's tool catalog.
-- **System Context Injection**: OS, current working directory, user, shell, and local time are injected into every system prompt for accurate local context.
-- **Pipe-Writer Detection**: When you pipe a command's output into `ai`, the originating command is identified via `/proc` and included in the user message for extra context.
-- **Auto Skill Loading**: `SKILL.md` files are loaded from `./.agents/skills/*/` (project-level) and `~/.config/ai/skills/*/` (global) and injected into the system prompt.
-- **Job History Logging**: Every job (prompt, pipe writer, response) is appended to `~/.cache/ai/history.jsonl`.
-- **Rich Terminal Rendering**: Markdown is rendered with ANSI escape codes — colored headers, bullet/numbered lists, fenced code blocks with syntax highlighting (Python, C, Bash, Rust, JS, …), bordered tables with column alignment, inline bold/italic/code, and LaTeX → Unicode math symbols with super/subscript conversion.
-- **Context Size Guards**: Individual tool results are capped at 64 KB (`INFER_MAX_TOOL_OUTPUT`). Once the conversation exceeds 250 KB, new tool results are stubbed to preserve model focus (`INFER_STUB_THRESHOLD`). Messages are trimmed when context exceeds 100 KB (`INFER_TRIM_THRESHOLD`).
-- **Debug Mode**: Set `INFER_DEBUG` to dump every raw request and response payload to stderr.
+### 1. Install dependencies
 
----
-
-## Installation
-
-### Prerequisites
-
-- `libcurl`
-- A C compiler (`gcc` / `clang`)
-- Python 3
-
-On Ubuntu/Debian:
 ```bash
-sudo apt install libcurl4-openssl-dev python3
+sudo apt install gcc libcurl4-openssl-dev python3   # Debian/Ubuntu
+brew install curl python                             # macOS
 ```
 
-On macOS:
-```bash
-brew install curl python
-```
-
-### Build & Install
+### 2. Build and install
 
 ```bash
-# Clone and build
 git clone https://github.com/dzyla/ai.git
 cd ai
-
-# Recommended: build, install, and sync skills in one step
-./compile_and_install.sh
+./install.sh
 ```
 
-This compiles the binary, copies `ai` and `ai_mcp.py` to `/usr/bin/`, and syncs all skills from `.agents/skills/` to `~/.config/ai/skills/` so they are available from any working directory. Re-run after editing skills.
-
-Manual install (skills not synced automatically):
-```bash
-gcc -o ai ai.c cJSON.c -lcurl
-sudo cp ai ai_mcp.py /usr/local/bin/
-sudo chmod +x /usr/local/bin/ai /usr/local/bin/ai_mcp.py
-```
-
-### Quick Install with llama.cpp (Linux)
-
-`setup.sh` automates everything: build dependencies, llama.cpp build with GPU auto-detection (CUDA/ROCm/Vulkan/CPU), model download, `ai` binary install, and systemd user service setup:
+Everything goes to `~/.local/bin` — no sudo required. To uninstall:
 
 ```bash
-./setup.sh
-source ~/.bashrc
+rm ~/.local/bin/{ai,ai_mcp.py,ai-backend,llama-server-wrapper.sh,pubmed_mcp_server.py}
 ```
 
-### Configuration
-
-Set environment variables in your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
+### 3. Point it at a model
 
 ```bash
-export INFER_BASE_URL="http://localhost:8080/v1/"   # must end in /v1/
-export INFER_API_KEY="not-needed"
-export INFER_MODEL="gemma4"
+# If you have a Canonical AI snap (qwen3-6, gemma4) installed:
+ai-backend snap
+
+# Or set env vars manually for any OpenAI-compatible endpoint:
+cat > ~/.config/ai/env <<'EOF'
+export INFER_BASE_URL="http://localhost:8080/v1/"
+export INFER_API_KEY="your-key"
+export INFER_MODEL="your-model-name"
+EOF
+
+source ~/.config/ai/env
+ai "hello"
 ```
 
-Reload your shell or run `source ~/.bashrc` to apply.
+---
 
-### Environment Variables
+## Backends
+
+`ai-backend` manages which LLM server `ai` talks to. Config lives in `~/.config/ai/env` and is sourced by your shell on startup.
+
+```bash
+ai-backend status          # show active backend and what's available
+ai-backend auto            # switch to whatever is currently running
+ai-backend qwen3-6         # switch to qwen3-6 snap (reads its live port)
+ai-backend gemma4          # switch to gemma4 snap
+ai-backend llama           # switch to local llama-server
+ai-backend llama /path/to/model.gguf   # switch + set model file
+ai-backend llama --list    # list downloaded models
+```
+
+### Local llama.cpp server
+
+To set up a local inference server with GPU acceleration and on-demand auto-start:
+
+```bash
+./install.sh llama
+```
+
+This builds llama.cpp (auto-detects CUDA/ROCm/Vulkan), downloads a model from HuggingFace (interactive), and creates a systemd user service that starts on the first `ai` call and shuts down after 120 s of idle.
+
+```bash
+# Logs
+journalctl --user -u llama-server -f
+
+# Force restart with a different model
+ai-backend llama ~/.local/share/ai/models/my-model.gguf
+systemctl --user restart llama-server
+```
+
+---
+
+## Configuration
+
+All config lives in `~/.config/ai/env` (managed by `ai-backend`) and is sourced from `~/.bashrc`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `INFER_BASE_URL` | API endpoint (must end in `/v1/`; `chat/completions` appended) | — |
-| `INFER_API_KEY` | API key for authentication | — |
-| `INFER_MODEL` | Model name (e.g. `gemma-4-9b-it`) | — |
-| `INFER_AUTO_APPROVE=1` | Auto-approve all `execute_command` prompts | disabled |
-| `INFER_DEBUG` | Dump raw request/response payloads to stderr | disabled |
-| `INFER_QUIET=1` | Suppress `[thinking]` output from the `think` tool | disabled |
-| `INFER_TOOL_CHOICE` | Force tool call mode: `required` (default) or `auto` | `required` |
-| `INFER_TEMPERATURE` | Override temperature for API requests | (model default) |
-| `INFER_MAX_TOKENS` | Override max tokens for API requests | (model default) |
-| `INFER_CONTEXT_WINDOW` | Override auto-detected context window size | (auto-detected) |
+| `INFER_BASE_URL` | API endpoint — must end in `/v1/` | required |
+| `INFER_API_KEY` | API key | required |
+| `INFER_MODEL` | Model name sent in each request | required |
+| `INFER_AUTO_APPROVE=1` | Skip `[Y/n]` prompts for shell commands | off |
+| `INFER_QUIET=1` | Suppress `[thinking]` output | off |
+| `INFER_TOOL_CHOICE` | `required` (force tool call) or `auto` | `required` |
+| `INFER_DEBUG` | Dump raw JSON payloads to stderr | off |
+| `INFER_MAX_TOOL_OUTPUT` | Cap individual tool output (bytes) | 65536 |
+| `INFER_TRIM_THRESHOLD` | Trim conversation when context exceeds this | 100000 |
+| `INFER_STUB_THRESHOLD` | Stub tool results once context exceeds this | 250000 |
 | `INFER_TASK_TIMEOUT` | Force `task_complete` after N seconds | 300 |
-| `INFER_MAX_TOOL_OUTPUT` | Cap individual tool output in bytes | 65536 |
-| `INFER_TRIM_THRESHOLD` | Trigger message trimming when context exceeds this (bytes) | 100000 |
-| `INFER_STUB_THRESHOLD` | Stub tool results once context exceeds this (bytes) | 250000 |
+
+### MCP servers
+
+Register additional tool servers in `mcp.json` (project-local) or `~/.config/ai/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "node",
+      "args": ["~/.local/bin/my-mcp-server.js"],
+      "env": { "API_KEY": "..." }
+    }
+  }
+}
+```
+
+Paths in `args` support `~` and `$HOME`. Tools appear as `my_server__tool_name` in the model's catalog.
+
+Config search order: `./mcp.json` → `./mcp_config.json` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`
 
 ---
 
 ## Usage
 
-### Basic Queries
+### One-shot queries
+
 ```bash
 ai "what's the tar command to extract .tar.gz?"
 ai how do I exit vim
 ```
 
 ### Interactive REPL
+
 ```bash
-# Start an interactive conversation shell
-ai
-
-# Start with an initial query and stay interactive
-ai -i "let's look at this project"
+ai          # start conversation shell
+ai -i "let's look at this project"   # start with an initial prompt
 ```
-
-#### Interactive commands
 
 | Command | Effect |
 |---------|--------|
-| `:compact` | Summarise conversation and reset context (keeps semantic history) |
+| `:compact` | Summarise conversation and reset context |
 | `:clear` | Wipe conversation history entirely |
-| `:status` | Show context size, model, and auto-approve state |
-| `:memory` | Show persistent memory contents |
-| `:auto` | Toggle auto-approve for `execute_command` on/off |
+| `:status` | Show context size, model, auto-approve state |
+| `:memory` | Show persistent memory |
+| `:auto` | Toggle auto-approve for shell commands |
 | `:help` | Show command list |
-| `exit` / `quit` | Leave interactive mode |
-
-#### Keyboard shortcuts (interactive mode)
 
 | Key | Effect |
 |-----|--------|
-| **ESC** | Interrupt the running agent turn |
-| **Shift-Tab** | Toggle auto-approve on/off (works at prompt and mid-execution) |
+| `Shift-Tab` | Toggle auto-approve (at prompt or mid-execution) |
+| `ESC` | Interrupt the running agent turn |
+| `↑ / ↓` | Navigate input history |
 
-### Flags Reference
+### Pipe anything in
 
-| Flag | Long form | Env var | Effect |
-|------|-----------|---------|--------|
-| `-i` | `--interactive` | — | Start multi-turn REPL |
-| `-y` | `--yes` | `INFER_AUTO_APPROVE=1` | Auto-approve all shell commands |
-| `-q` | `--quiet` | `INFER_QUIET=1` | Suppress `[thinking]` reasoning output |
-| `-h` | `--help` | — | Print help and exit |
-| — | — | `INFER_DEBUG` | Dump raw JSON payloads to stderr |
-
-### Piping Command Output
 ```bash
-# Analyze memory hogs
-ps aux | head -n 20 | ai "what's using the most memory?"
-
-# Analyze disk space
+ps aux | head -20 | ai "what's using the most memory?"
 df -h | ai "am I running out of space anywhere?"
-
-# Code review
 git diff | ai "summarize my changes"
-
-# Empty pipe — agent re-runs the command itself to inspect stderr
-some-failing-command | ai "why is this failing?"
+dmesg | tail -20 | ai "any hardware warnings?"
 ```
 
-### Real-Time Web Queries
-```bash
-ai "who won the latest Formula 1 race?"
-ai "what's the current Bitcoin price?"
-```
+### Flags
 
-### Multimodal Queries (Images)
+| Flag | Long | Env var | Effect |
+|------|------|---------|--------|
+| `-i` | `--interactive` | | Start REPL |
+| `-y` | `--yes` | `INFER_AUTO_APPROVE=1` | Auto-approve shell commands |
+| `-q` | `--quiet` | `INFER_QUIET=1` | Suppress thinking output |
+| `-h` | `--help` | | Print help |
+
+### Images
+
 ```bash
-ai "what is in this picture?" path/to/image.png
+ai "what's in this picture?" path/to/image.png
 ai "describe the chart" screenshot.webp
 ```
 
-### Persistent Memory
-```bash
-# Store a preference
-ai "remember my name is Bob and I prefer Python. Save to memory."
+### Persistent memory
 
-# Recall it later
-ai "what is my name?"
-```
-
-### Auto-Approved Scripted Usage
 ```bash
-ai -y "create a backup of ~/.bashrc to ~/bashrc.bak"
-INFER_AUTO_APPROVE=1 ai "install ripgrep via apt"
+ai "remember my name is Alice and I prefer TypeScript. Save to memory."
+ai "what's my name?"   # recalled in a fresh session
 ```
 
 ---
 
-## MCP Server Integration
+## Tools
 
-Register MCP servers in any of these locations (checked in order):
-
-1. `./mcp.json`
-2. `./mcp_config.json`
-3. `~/.config/ai/mcp.json`
-4. `~/.config/ai/mcp_config.json`
-5. `~/.gemini/config/mcp_config.json`
-6. `~/.lmstudio/mcp.json`
-
-Example `mcp.json`:
-```json
-{
-  "mcpServers": {
-    "my-server": {
-      "command": "node",
-      "args": ["/path/to/mcp-server/index.js"],
-      "env": { "API_KEY": "…" }
-    }
-  }
-}
-```
-
-Tools from the server are namespaced as `my_server__tool_name` in the model's tool catalog.
-
----
-
-## Native Tool Reference
-
-| Tool | Description |
+| Tool | What it does |
 |------|-------------|
-| `think` | Model writes a step-by-step plan before acting. Output shown in dim text (suppressed by `-q`). |
-| `execute_command` | Runs a shell command with confirmation prompt. Stdout+stderr captured and returned. |
-| `web_search` | DuckDuckGo Lite search. Returns up to 5 results with title, URL, snippet. |
-| `fetch_webpage` | Downloads URL and converts HTML to readable text (10 KB limit). |
-| `read_file` | Reads text, PDF (pdftotext/pypdf/pdfplumber), or image (injected into vision context). Optional `start_line`/`end_line` for large files. |
-| `write_file` | Writes content to a file, creating parent directories as needed. |
-| `edit_file` | Search-and-replace edit on an existing file. Falls back to trailing-whitespace fuzzy match if exact string not found. |
-| `list_directory` | Lists directory contents with sizes and `[DIR]` markers. |
-| `save_memory` | Persists text to `~/.config/ai/memory.txt` (overwrites, 4 KB cap). |
-| `delegate_task` | Spawns a child `ai` process with full tool access (60 s timeout). |
-| `computer_control` | Take screenshots, move mouse, click, type, press keys, and manage windows via xdotool/scrot. |
-| `task_complete` | Signals completion. The `summary` argument is rendered as markdown and printed. |
+| `think` | Model writes a step-by-step plan before acting |
+| `execute_command` | Runs a shell command with `[Y/n]` confirmation |
+| `web_search` | DuckDuckGo Lite — no API key needed |
+| `fetch_webpage` | Downloads and cleans a URL to readable text |
+| `read_file` | Text, PDF (pdftotext/pypdf/pdfplumber), images (vision) |
+| `write_file` | Write a file, creating parent dirs as needed |
+| `edit_file` | Search-and-replace edit; fuzzy-matches trailing whitespace |
+| `list_directory` | Directory listing with sizes |
+| `save_memory` | Persist text to `~/.config/ai/memory.txt` (4 KB cap) |
+| `delegate_task` | Spawn a child `ai` process for independent sub-tasks |
+| `computer_control` | Screenshot, mouse, keyboard via xdotool/scrot |
+| `task_complete` | Signal completion; `summary` rendered as markdown |
 
 ---
 
-## Runtime State
+## Skills
+
+Drop a `SKILL.md` into `.agents/skills/<name>/` (project-local) or `~/.config/ai/skills/<name>/` (global) and `ai` will load it into every system prompt automatically.
+
+Re-run `./install.sh` after adding skills to sync project skills to the global location.
+
+---
+
+## Runtime state
 
 | Path | Purpose |
 |------|---------|
-| `~/.cache/ai/history.jsonl` | Append-only job log (timestamp, prompt, pipe writer, interactive flag, response) |
-| `~/.config/ai/memory.txt` | Persistent memory, injected into every system prompt (4 KB cap) |
+| `~/.config/ai/env` | Active backend config (INFER_* vars) |
+| `~/.config/ai/memory.txt` | Persistent memory, injected into every prompt |
 | `~/.config/ai/mcp.json` | Global MCP server registry |
-| `~/.config/ai/skills/*/SKILL.md` | Global skill files, loaded into system prompt |
-| `./.agents/skills/*/SKILL.md` | Project-local skill files, loaded into system prompt |
+| `~/.config/ai/skills/` | Global skills directory |
+| `~/.cache/ai/history.jsonl` | Append-only job log |
+| `~/.cache/ai/input_history` | Interactive REPL input history |
+| `~/.local/share/ai/models/` | Downloaded GGUF model files |
+| `~/.local/share/ai/llama.cpp/` | llama.cpp source and build |
+
+---
+
+## Architecture
+
+Two cooperating processes talk via subprocess calls — no shared library or IPC:
+
+- **`ai.c`** — the agent loop. Owns the conversation, calls the LLM, handles `think` / `task_complete` / `execute_command` natively, delegates all other tool calls to `ai_mcp.py`.
+- **`ai_mcp.py`** — the tool backend. Implements 12 native tools and acts as a generic MCP client for any server in `mcp.json`.
+
+For details on the architecture, adding tools, and cross-process contracts, see [`CLAUDE.md`](CLAUDE.md).
 
 ---
 
 ## Acknowledgements
 
-This project is a fork of the original [infer](https://github.com/chethanreddy1/infer) repository by [chethanreddy1](https://github.com/chethanreddy1). The original was a minimal C-based CLI for piping content to LLMs. This fork adds: agentic tool-calling loop, shell command execution with confirmation, web search and webpage fetching, file read/write/edit tools, persistent memory, recursive sub-agent delegation, multimodal image input, MCP server integration, skill loading, rich terminal markdown rendering (syntax highlighting, tables, LaTeX math), context size guards, and interactive REPL mode.
+Fork of [infer](https://github.com/chethanreddy1/infer) by chethanreddy1. Extended with: agentic tool loop, shell execution, web search, file ops, persistent memory, sub-agent delegation, multimodal images, MCP integration, skill loading, rich terminal markdown rendering, context guards, and interactive REPL.
 
----
-
-## License
-
-MIT
+**License:** MIT

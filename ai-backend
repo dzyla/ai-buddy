@@ -1,0 +1,198 @@
+#!/bin/bash
+# ai-backend — show or switch the active LLM backend for the 'ai' CLI
+#
+# Backends are written to ~/.config/ai/env and sourced from ~/.bashrc.
+# Each snap's port is detected live so it stays correct after snap updates.
+
+ENV_FILE="${HOME}/.config/ai/env"
+mkdir -p "$(dirname "$ENV_FILE")"
+
+SYSTEMD_SERVICE="${HOME}/.config/systemd/user/llama-server.service"
+MODEL_DIR="${HOME}/.local/share/ai/models"
+
+usage() {
+    cat <<'EOF'
+Usage: ai-backend [COMMAND] [OPTIONS]
+
+Commands:
+  status              Show current backend and all available backends
+  auto                Switch to the best available backend automatically
+  qwen3-6             Switch to qwen3-6 snap (reads its live port)
+  gemma4              Switch to gemma4 snap (reads its live port)
+  llama [PATH]        Switch to local llama-server (port 8080)
+                        PATH  path to a .gguf model file; if omitted, uses
+                              the current model or lists available models
+  llama --list        List downloaded models in ~/.local/share/ai/models/
+
+If no command is given, 'status' is shown.
+EOF
+}
+
+# Return the OpenAI endpoint for a snap, or fail if snap not installed
+get_snap_endpoint() {
+    local snap="$1"
+    command -v "$snap" &>/dev/null || return 1
+    local ep
+    ep=$("$snap" status 2>/dev/null | grep -i 'openai:' | awk '{print $2}')
+    [ -n "$ep" ] || return 1
+    # Ensure trailing slash
+    [[ "$ep" == */ ]] && echo "$ep" || echo "${ep}/"
+}
+
+is_snap_active() {
+    local snap="$1"
+    command -v "$snap" &>/dev/null || return 1
+    "$snap" status 2>/dev/null | grep -q "server: active"
+}
+
+write_env() {
+    local url="$1" model="$2"
+    # Ensure trailing slash
+    [[ "$url" == */ ]] || url="${url}/"
+    # Preserve any non-INFER exports already in the file (e.g. PUBMED_API_KEY)
+    local extras=""
+    if [ -f "$ENV_FILE" ]; then
+        extras=$(grep "^export" "$ENV_FILE" | grep -v "^export INFER_" || true)
+    fi
+    cat > "$ENV_FILE" <<EOF
+# ai backend — managed by ai-backend (do not edit manually)
+# Switch with: ai-backend [qwen3-6|gemma4|llama|auto]
+export INFER_BASE_URL="${url}"
+export INFER_API_KEY="not-needed"
+export INFER_MODEL="${model}"
+export INFER_TOOL_CHOICE=auto
+EOF
+    [ -n "$extras" ] && printf '%s\n' "$extras" >> "$ENV_FILE"
+}
+
+cmd="${1:-status}"
+
+case "$cmd" in
+    status)
+        echo "=== Active backend ==="
+        if [ -f "$ENV_FILE" ]; then
+            grep "^export INFER" "$ENV_FILE"
+        else
+            echo "(none — run: ai-backend auto)"
+        fi
+        echo ""
+        echo "=== Available backends ==="
+        for snap in qwen3-6 gemma4; do
+            if command -v "$snap" &>/dev/null; then
+                ep=$(get_snap_endpoint "$snap" 2>/dev/null || echo "?")
+                if is_snap_active "$snap"; then
+                    printf "  %-10s [RUNNING]  %s\n" "$snap" "$ep"
+                else
+                    printf "  %-10s [stopped]  %s\n" "$snap" "$ep"
+                fi
+            fi
+        done
+        if curl -sf http://localhost:8080/health &>/dev/null; then
+            printf "  %-10s [RUNNING]  %s\n" "llama" "http://localhost:8080/v1/"
+        elif [ -f "${HOME}/.local/bin/llama-server" ]; then
+            printf "  %-10s [stopped]  %s\n" "llama" "http://localhost:8080/v1/"
+        fi
+        ;;
+
+    auto)
+        # Priority: qwen3-6 > gemma4 > llama
+        if is_snap_active qwen3-6; then
+            ep=$(get_snap_endpoint qwen3-6)
+            write_env "$ep" "qwen3-6"
+            echo "Switched to qwen3-6 (${ep})"
+        elif is_snap_active gemma4; then
+            ep=$(get_snap_endpoint gemma4)
+            write_env "$ep" "gemma4"
+            echo "Switched to gemma4 (${ep})"
+        elif curl -sf http://localhost:8080/health &>/dev/null; then
+            write_env "http://localhost:8080/v1/" "llama"
+            echo "Switched to llama-server (http://localhost:8080/v1/)"
+        else
+            echo "No backend is currently running."
+            echo "Start one:  qwen3-6 status | systemctl --user start llama-server"
+            exit 1
+        fi
+        echo "Apply now:  source ~/.config/ai/env"
+        ;;
+
+    qwen3-6)
+        ep=$(get_snap_endpoint qwen3-6) || { echo "qwen3-6 snap not installed"; exit 1; }
+        write_env "$ep" "qwen3-6"
+        echo "Switched to qwen3-6 (${ep})"
+        echo "Apply now:  source ~/.config/ai/env"
+        ;;
+
+    gemma4)
+        ep=$(get_snap_endpoint gemma4) || { echo "gemma4 snap not installed"; exit 1; }
+        write_env "$ep" "gemma4"
+        echo "Switched to gemma4 (${ep})"
+        echo "Apply now:  source ~/.config/ai/env"
+        ;;
+
+    llama)
+        model_arg="${2:-}"
+
+        if [ "$model_arg" = "--list" ]; then
+            echo "=== Downloaded models in ${MODEL_DIR} ==="
+            find "$MODEL_DIR" -name "*.gguf" ! -name "mmproj-*.gguf" ! -path "*/MTP/*" \
+                2>/dev/null | sort | while read -r f; do
+                size=$(du -h "$f" 2>/dev/null | cut -f1)
+                printf "  %-8s  %s\n" "$size" "$f"
+            done
+            exit 0
+        fi
+
+        if [ -n "$model_arg" ]; then
+            # Resolve to absolute path
+            model_path="$(realpath "$model_arg" 2>/dev/null || echo "$model_arg")"
+            [ -f "$model_path" ] || { echo "Model file not found: $model_path"; exit 1; }
+        else
+            # Use model from existing service file, or auto-find first available
+            model_path=$(grep -oP '(?<=LLAMA_MODEL_PATH=)\S+' "$SYSTEMD_SERVICE" 2>/dev/null | head -1)
+            if [ -z "$model_path" ]; then
+                model_path=$(find "$MODEL_DIR" -name "*.gguf" ! -name "mmproj-*.gguf" \
+                    ! -path "*/MTP/*" 2>/dev/null | sort | head -1)
+            fi
+            if [ -z "$model_path" ]; then
+                echo "No model found. Specify one:"
+                echo "  ai-backend llama /path/to/model.gguf"
+                echo "  ai-backend llama --list"
+                exit 1
+            fi
+            echo "Using model: $model_path"
+        fi
+
+        # Update systemd service with new model path (if service file exists)
+        if [ -f "$SYSTEMD_SERVICE" ]; then
+            sed -i "s|^Environment=LLAMA_MODEL_PATH=.*|Environment=LLAMA_MODEL_PATH=${model_path}|" \
+                "$SYSTEMD_SERVICE"
+            systemctl --user daemon-reload 2>/dev/null || true
+            echo "Updated systemd service: LLAMA_MODEL_PATH=${model_path}"
+        fi
+
+        # Also update the on-demand launcher in ~/.local/bin/ai if present
+        LAUNCHER="${HOME}/.local/bin/ai"
+        if [ -f "$LAUNCHER" ] && grep -q 'MODEL_PATH=' "$LAUNCHER"; then
+            sed -i "s|^MODEL_PATH=.*|MODEL_PATH=\"${model_path}\"|" "$LAUNCHER"
+            echo "Updated on-demand launcher: ${LAUNCHER}"
+        fi
+
+        write_env "http://localhost:8080/v1/" "llama"
+        echo "Switched to llama-server (http://localhost:8080/v1/)"
+        echo "Model:     $model_path"
+        echo ""
+        echo "Apply now:  source ~/.config/ai/env"
+        echo "Start srv:  systemctl --user restart llama-server"
+        echo "       or:  LLAMA_MODEL_PATH=\"$model_path\" ~/.local/bin/llama-server-wrapper.sh"
+        ;;
+
+    -h|--help|help)
+        usage
+        ;;
+
+    *)
+        echo "Unknown backend: $1"
+        usage
+        exit 1
+        ;;
+esac

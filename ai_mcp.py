@@ -73,7 +73,7 @@ def start_server(cfg):
     if "command" in cfg:
         cmd.append(cfg["command"])
     if "args" in cfg:
-        cmd.extend(cfg["args"])
+        cmd.extend(os.path.expandvars(os.path.expanduser(a)) for a in cfg["args"])
     
     if not cmd:
         return None
