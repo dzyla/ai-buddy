@@ -20,7 +20,11 @@
 #include <errno.h>
 
 #define MAX_LINE 1024
-#define MAX_VAL  512
+#define MAX_VAL  2048
+
+#ifndef AI_VERSION
+#define AI_VERSION "dev"
+#endif
 
 // Config globals
 static char  api_url[MAX_VAL];
@@ -28,6 +32,7 @@ static char  api_key[MAX_VAL];
 static char  model[MAX_VAL];
 static float temperature_val  = -1.0f;
 static int   max_tokens_val   = -1;
+static int   no_tools_mode    = 0;
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
 static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
@@ -59,9 +64,13 @@ static const char *SYSTEM_PROMPT =
     "- If fetch_webpage returns a WARNING about JavaScript or returns fewer than 80 words, the page is JS-only. Switch to execute_command with curl to a plain-text API instead.\n"
     "- For current weather: execute_command `curl -s 'wttr.in/Miami?format=3'` (replace city name). Never rely on weather.com/weather.gov — they require JavaScript.\n"
     "- Never tell the user to 'visit a link' or 'run a command themselves' — do it yourself.\n\n"
-    "DELEGATION:\n"
-    "- For tasks with independent parallel sub-tasks, use delegate_task to run them concurrently.\n"
-    "- delegate_task agents have full tool access. Give them specific, self-contained instructions.\n\n"
+    "PARALLEL EXECUTION (use these tools whenever work can be split):\n"
+    "- parallel_fetch({\"urls\":[\"url1\",\"url2\",...]}) — fetch N pages at once. Use instead of N sequential fetch_webpage calls. Ideal for reading multiple search results, papers, or docs.\n"
+    "- delegate_task({\"tasks\":[\"task1\",\"task2\",...]}) — spawn N agents concurrently. Use for independent sub-tasks that need their own tool loops (summarise a paper, write a script, run a benchmark). Always pass tasks as an ARRAY, never as a single string.\n"
+    "- Example — publication digest: parallel_fetch({\"urls\":[paper1,paper2,paper3]}) then synthesise.\n"
+    "- Example — multi-site comparison: parallel_fetch({\"urls\":[site1,site2,site3]}).\n"
+    "- Example — parallel research: delegate_task({\"tasks\":[\"Search for X and summarise findings\",\"Search for Y and summarise findings\"]}).\n"
+    "- Rule: if you would call fetch_webpage or web_search more than once for independent URLs/queries, use parallel_fetch or delegate_task instead.\n\n"
     "SKILLS:\n"
     "- Domain skills exist. Call load_skill() to list them, load_skill(name) to read one.\n"
     "- Additional CRITICAL triggers may follow in the system context — obey them exactly.";
@@ -230,7 +239,7 @@ static char* collect_triggers_from_dir(const char *base_dir, char *buf,
         free(desc);
 
         /* Skip if this skill name was already added (exists in both dirs). */
-        char check[256];
+        char check[512];
         snprintf(check, sizeof(check), "load_skill('%s')", entry->d_name);
         if (strstr(buf, check)) { free(cond); continue; }
 
@@ -682,7 +691,7 @@ static void enable_raw_mode(void) {
 
 static char *lineed_history[LINEED_MAX_HISTORY];
 static int   lineed_history_len  = 0;
-static char  lineed_history_path[1024] = "";
+static char  lineed_history_path[2048] = "";
 static int   lineed_prev_rows    = 0;   /* rows occupied by last redraw */
 
 static void lineed_add_history(const char *line) {
@@ -1490,6 +1499,19 @@ static int update_config_file(const char *file_path, const char *new_model, cons
 
 static int detect_model_url(const char *model_name, char *url_out, size_t max_len) {
     if (strcmp(model_name, "llama") == 0 || strcmp(model_name, "llama-server") == 0) {
+        char *env_base = getenv("INFER_BASE_URL");
+        if (env_base && *env_base) {
+            strncpy(url_out, env_base, max_len - 1);
+            url_out[max_len - 1] = '\0';
+            size_t len = strlen(url_out);
+            if (len > 0 && url_out[len - 1] != '/') {
+                if (len < max_len - 1) {
+                    url_out[len] = '/';
+                    url_out[len + 1] = '\0';
+                }
+            }
+            return 1;
+        }
         strncpy(url_out, "http://localhost:8080/v1/", max_len - 1);
         url_out[max_len - 1] = '\0';
         return 1;
@@ -1694,11 +1716,13 @@ static char* compact_session(char *messages_json, const char *mcp_script,
     char *temp_msgs = strdup(messages_json);
     temp_msgs = append_message(temp_msgs, summary_req);
 
-    size_t plen = strlen(model_name) + strlen(temp_msgs) + 128;
+    char *esc_model = json_escape(model_name);
+    size_t plen = strlen(esc_model) + strlen(temp_msgs) + 128;
     char *payload = malloc(plen);
     snprintf(payload, plen,
              "{\"model\":\"%s\",\"stream\":false,\"messages\":%s}",
-             model_name, temp_msgs);
+             esc_model, temp_msgs);
+    free(esc_model);
     free(temp_msgs);
 
     struct response chunk = {0};
@@ -1839,8 +1863,12 @@ int main(int argc, char **argv) {
     int interactive_mode = 0;
     int quiet_mode = 0;
 
-    // Parse set-default and install-llama options first (both exit early)
+    // Parse set-default, install-llama, and version options first (all exit early)
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("ai %s\n", AI_VERSION);
+            return 0;
+        }
         if (strcmp(argv[i], "--install-llama") == 0) {
             char *home = getenv("HOME");
             if (!home) { fprintf(stderr, "Error: HOME not set.\n"); return 1; }
@@ -1874,14 +1902,20 @@ int main(int argc, char **argv) {
             printf("  -i, --interactive    Start an interactive multi-turn chat session.\n");
             printf("  -y, --yes            Auto-approve all command execution requests without prompting.\n");
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
-            printf("  -m, --model MODEL    Override the default model selection.\n");
+            printf("  -n, --no-tools       Skip the agent loop — get a direct text response (fast).\n");
+            printf("  -t, --temperature N  Set sampling temperature (e.g. 0.0 for deterministic, 1.0 for creative).\n");
+            printf("  -f, --file PATH      Attach a file as context (text or image).\n");
+            printf("  -m, --model MODEL    Override the default model for this call.\n");
             printf("  -s, --set-default M  Set the global default model in shell configs.\n");
+            printf("  -v, --version        Print the build commit and exit.\n");
             printf("  --install-llama [R]  Download, build llama.cpp and start a local server.\n");
             printf("                       R: optional HuggingFace repo (e.g. unsloth/gemma-4-12b-it-GGUF).\n");
-            printf("                       Omit R to show an interactive model selection menu.\n");
             printf("  -h, --help           Display this help screen.\n\n");
             printf("Examples:\n");
             printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
+            printf("  ai -n \"what is RNA?\"                 # direct answer, no tool loop\n");
+            printf("  ai -t 0.2 \"write a haiku about Rust\"  # low temperature\n");
+            printf("  ai -f error.log \"why is it crashing?\"\n");
             printf("  ps aux | head -n 20 | ai \"what's eating memory?\"\n");
             printf("  ai -i \"let's look at this project\"\n");
             printf("  ai -y \"backup ~/.bashrc\"\n");
@@ -1889,14 +1923,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Parse model flag first if present
+    // Parse model, file, and no-tools flags first
     char *cmd_model = NULL;
+    char *cmd_file  = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-            if (i + 1 < argc) {
-                cmd_model = argv[i+1];
-                i++;
-            }
+            if (i + 1 < argc) { cmd_model = argv[i+1]; i++; }
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
+            if (i + 1 < argc) { cmd_file = argv[i+1]; i++; }
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) {
+            no_tools_mode = 1;
         }
     }
 
@@ -1942,15 +1978,18 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
             interactive_mode = 1;
-        }
-        if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
+        } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
             g_auto_approve = 1;
-        }
-        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
+        } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet_mode = 1;
-        }
-        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-            if (i + 1 < argc) i++;
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) {
+            no_tools_mode = 1;
+        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
+            temperature_val = (float)atof(argv[i+1]);
+            i++;
+        } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
+                    strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            i++;
         }
     }
 
@@ -2009,22 +2048,71 @@ int main(int argc, char **argv) {
     snprintf(model, sizeof(model), "%s", env_model);
 
     // Get tools JSON from python script
+    static char user_mcp_path[1024];
     const char *mcp_script = "./ai_mcp.py";
     if (access(mcp_script, F_OK) != 0) {
-        mcp_script = "/usr/local/bin/ai_mcp.py";
+        char *home = getenv("HOME");
+        if (home) {
+            snprintf(user_mcp_path, sizeof(user_mcp_path), "%s/.local/bin/ai_mcp.py", home);
+            if (access(user_mcp_path, F_OK) == 0) {
+                mcp_script = user_mcp_path;
+            } else {
+                mcp_script = "/usr/local/bin/ai_mcp.py";
+            }
+        } else {
+            mcp_script = "/usr/local/bin/ai_mcp.py";
+        }
     }
     
-    char tools_cmd[1024];
-    snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
-    char *tools_json = run_shell_command(tools_cmd, NULL);
-    if (tools_json && (strncmp(tools_json, "Error", 5) == 0 || strlen(tools_json) < 5)) {
-        free(tools_json);
-        tools_json = NULL;
+    char *tools_json = NULL;
+    if (!no_tools_mode) {
+        char tools_cmd[2048];
+        snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
+        tools_json = run_shell_command(tools_cmd, NULL);
+        if (tools_json && (strncmp(tools_json, "Error", 5) == 0 || strlen(tools_json) < 5)) {
+            free(tools_json);
+            tools_json = NULL;
+        }
     }
 
     // 1. Prepare Inputs
     char *pipe_writer = find_pipe_writer();
     char *pipe_in = read_stdin();
+
+    // Load file context (-f / --file)
+    if (cmd_file) {
+        if (is_image_file(cmd_file)) {
+            // Will be picked up below as image_path
+        } else {
+            FILE *fp = fopen(cmd_file, "r");
+            if (!fp) {
+                fprintf(stderr, "Error: cannot open '%s': %s\n", cmd_file, strerror(errno));
+                return 1;
+            }
+            fseek(fp, 0, SEEK_END);
+            long fsz = ftell(fp);
+            rewind(fp);
+            char *fbuf = malloc(fsz + 1);
+            fread(fbuf, 1, fsz, fp);
+            fbuf[fsz] = '\0';
+            fclose(fp);
+            if (pipe_in && strlen(pipe_in) > 0) {
+                size_t clen = (size_t)fsz + strlen(pipe_in) + 32;
+                char *combined = malloc(clen);
+                snprintf(combined, clen, "%s\n\n%s", fbuf, pipe_in);
+                free(pipe_in);
+                free(fbuf);
+                pipe_in = combined;
+            } else {
+                if (pipe_in) free(pipe_in);
+                pipe_in = fbuf;
+            }
+            if (!pipe_writer) {
+                const char *base = strrchr(cmd_file, '/');
+                pipe_writer = strdup(base ? base + 1 : cmd_file);
+            }
+        }
+    }
 
     if (interactive_mode && !is_stdin_tty) {
         if (!freopen("/dev/tty", "r", stdin)) {
@@ -2034,9 +2122,12 @@ int main(int argc, char **argv) {
                 if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
                 if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
                 if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
-                if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-                    if (i + 1 < argc) i++;
-                    continue;
+                if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+                if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+                if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
+                     strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+                     strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+                    i++; continue;
                 }
                 has_prompt_args = 1;
                 break;
@@ -2053,16 +2144,19 @@ int main(int argc, char **argv) {
     }
 
     // Check if any argument is an image file
-    char *image_path = NULL;
+    char *image_path = cmd_file && is_image_file(cmd_file) ? cmd_file : NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
-        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-            if (i + 1 < argc) i++;
-            continue;
+        if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
+             strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            i++; continue;
         }
-        if (is_image_file(argv[i])) {
+        if (!image_path && is_image_file(argv[i])) {
             image_path = argv[i];
             break;
         }
@@ -2073,9 +2167,12 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
-        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-            if (i + 1 < argc) i++;
-            continue;
+        if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
+             strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            i++; continue;
         }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         prompt_len += strlen(argv[i]) + 1;
@@ -2088,9 +2185,12 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
-        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-            if (i + 1 < argc) i++;
-            continue;
+        if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
+             strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            i++; continue;
         }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         if (added) strcat(prompt, " ");
@@ -2222,7 +2322,7 @@ int main(int argc, char **argv) {
     // 2. Setup Curl
     CURL *c = curl_easy_init();
     struct curl_slist *h = NULL;
-    char auth[1024]; snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+    char auth[MAX_VAL + 64]; snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
     h = curl_slist_append(h, "Content-Type: application/json");
     h = curl_slist_append(h, auth);
 
@@ -2415,16 +2515,18 @@ step_limit_check:
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"max_tokens\":%d", max_tokens_val);
 
+                char *esc_model = json_escape(model);
                 char *payload = NULL;
-                size_t plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
+                size_t plen = strlen(esc_model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
                 payload = malloc(plen);
                 if (tools_json && strlen(tools_json) > 10) {
                     snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
-                             model, opt_fields, messages_json, tools_json, tool_choice_val);
+                             esc_model, opt_fields, messages_json, tools_json, tool_choice_val);
                 } else {
                     snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
-                             model, opt_fields, messages_json);
+                             esc_model, opt_fields, messages_json);
                 }
+                free(esc_model);
 
                 if (debug_mode) {
                     fprintf(stderr, "[debug] Loop %d payload: %s\n", loop_count, payload);
@@ -2473,7 +2575,7 @@ step_limit_check:
                             
                             curl_easy_setopt(c, CURLOPT_URL, api_url);
                             
-                            char new_auth[1024];
+                            char new_auth[MAX_VAL + 64];
                             snprintf(new_auth, sizeof(new_auth), "Authorization: Bearer %s", api_key);
                             curl_slist_free_all(h);
                             h = NULL;
@@ -2871,15 +2973,35 @@ step_limit_check:
                                               url ? url : "?");
                                       if (url) free(url);
                                   } else if (strcmp(mcp_tool_name, "delegate_task") == 0) {
-                                      char *task = json_get_string(unescaped_args, "task");
-                                      if (task) {
-                                          task[strcspn(task, "\n")] = '\0';
-                                          if (strlen(task) > 72) task[72] = '\0';
-                                          fprintf(stderr, "\033[2m[ai] delegate_task: \"%s...\"\033[0m\n", task);
-                                          free(task);
-                                      } else {
-                                          fprintf(stderr, "\033[2m[ai] delegate_task\033[0m\n");
+                                      /* Count tasks array entries for a useful log line */
+                                      int ntasks = 0;
+                                      const char *tp = strstr(unescaped_args, "\"tasks\"");
+                                      if (tp) {
+                                          const char *arr = strchr(tp, '[');
+                                          if (arr) {
+                                              arr++;
+                                              while (*arr) {
+                                                  while (*arr && isspace((unsigned char)*arr)) arr++;
+                                                  if (*arr == '"') { ntasks++; /* skip to close */ arr++; while (*arr && !(*arr == '"' && *(arr-1) != '\\')) arr++; if (*arr) arr++; }
+                                                  else if (*arr == ']') break;
+                                                  else if (*arr == ',') arr++;
+                                                  else arr++;
+                                              }
+                                          }
                                       }
+                                      if (ntasks > 0)
+                                          fprintf(stderr, "\033[2m[ai] delegate_task: %d parallel agent(s)\033[0m\n", ntasks);
+                                      else
+                                          fprintf(stderr, "\033[2m[ai] delegate_task\033[0m\n");
+                                  } else if (strcmp(mcp_tool_name, "parallel_fetch") == 0) {
+                                      /* Count urls array entries */
+                                      int nurls = 0;
+                                      const char *up = strstr(unescaped_args, "\"urls\"");
+                                      if (up) {
+                                          const char *arr = strchr(up, '[');
+                                          if (arr) { arr++; while (*arr) { while (*arr && isspace((unsigned char)*arr)) arr++; if (*arr == '"') { nurls++; arr++; while (*arr && !(*arr == '"' && *(arr-1) != '\\')) arr++; if (*arr) arr++; } else if (*arr == ']') break; else if (*arr == ',') arr++; else arr++; } }
+                                      }
+                                      fprintf(stderr, "\033[2m[ai] parallel_fetch: %d URL(s)\033[0m\n", nurls);
                                   } else if (strcmp(mcp_tool_name, "save_memory") == 0) {
                                       char *mem = json_get_string(unescaped_args, "content");
                                       fprintf(stderr, "\033[2m[ai] save_memory (%zu chars)\033[0m\n",
