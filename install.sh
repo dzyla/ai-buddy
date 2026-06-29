@@ -55,8 +55,9 @@ cp "${SCRIPT_DIR}/ai"             "${BIN_DIR}/ai"
 cp "${SCRIPT_DIR}/ai_mcp.py"      "${BIN_DIR}/ai_mcp.py"
 cp "${SCRIPT_DIR}/ai-backend"     "${BIN_DIR}/ai-backend"
 cp "${SCRIPT_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/pubmed_mcp_server.py"
-chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py"
-echo "==> Installed: ai  ai_mcp.py  ai-backend  pubmed_mcp_server.py"
+cp "${SCRIPT_DIR}/deep_research.py"   "${BIN_DIR}/deep_research.py"
+chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
+echo "==> Installed: ai  ai_mcp.py  ai-backend  pubmed_mcp_server.py  deep_research.py"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
