@@ -625,6 +625,13 @@ static char *g_system_message_json = NULL;
 static volatile int g_compact_in_progress = 0;
 static int g_compact_dot_timer = 0;
 static int g_auto_approve = 0;
+static volatile int g_agent_loop_active = 0; /* 1 while the has_more agent loop runs */
+
+/* Shared stdin accumulation buffer for :btw detection (used by progress_cb + poll) */
+static char g_agent_stdin_buf[4096] = "";
+static int  g_agent_stdin_len = 0;
+static char g_btw_message[4096] = "";
+static volatile int g_btw_available = 0;
 
 static void disable_raw_mode(void) {
     if (raw_mode_active) {
@@ -652,16 +659,52 @@ static int curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                 char seq[2] = {0, 0};
                 int n = read(STDIN_FILENO, seq, 2);
                 if (n == 2 && seq[0] == '[' && seq[1] == 'Z') {
-                    g_auto_approve ^= 1;
-                    if (g_auto_approve)
-                        setenv("INFER_AUTO_APPROVE", "1", 1);
-                    else
-                        unsetenv("INFER_AUTO_APPROVE");
-                    fprintf(stderr, "\n\033[2mauto-approve %s\033[0m\n",
-                            g_auto_approve ? "on" : "off");
-                    fflush(stderr);
+                    if (g_agent_loop_active && !g_auto_approve) {
+                        /* Safety: can't enable auto-approve during an active task */
+                        fprintf(stderr,
+                            "\n\033[2m[Shift-Tab: auto-approve can only be enabled "
+                            "before a task starts]\033[0m\n");
+                        fflush(stderr);
+                    } else {
+                        g_auto_approve ^= 1;
+                        if (g_auto_approve)
+                            setenv("INFER_AUTO_APPROVE", "1", 1);
+                        else
+                            unsetenv("INFER_AUTO_APPROVE");
+                        fprintf(stderr, "\n\033[2mauto-approve %s\033[0m\n",
+                                g_auto_approve ? "on" : "off");
+                        fflush(stderr);
+                    }
+                    g_agent_stdin_len = 0;
                 } else {
                     g_esc_requested = 1;
+                }
+            } else if (ch == '\r' || ch == '\n') {
+                /* Complete line — check for :btw command */
+                g_agent_stdin_buf[g_agent_stdin_len] = '\0';
+                const char *line = g_agent_stdin_buf;
+                while (*line == ' ') line++;
+                if (strncmp(line, ":btw", 4) == 0) {
+                    const char *msg = line + 4;
+                    while (*msg == ' ') msg++;
+                    if (*msg) {
+                        strncpy(g_btw_message, msg, sizeof(g_btw_message) - 1);
+                        g_btw_message[sizeof(g_btw_message) - 1] = '\0';
+                        g_btw_available = 1;
+                        fprintf(stderr, "\n\033[2m[btw] queued\033[0m\n");
+                        fflush(stderr);
+                    } else {
+                        fprintf(stderr, "\n\033[2m[btw] usage: :btw <message>\033[0m\n");
+                        fflush(stderr);
+                    }
+                }
+                g_agent_stdin_len = 0;
+            } else if (ch >= 32 && ch <= 126) {
+                /* Echo printable char so user can see what they're typing */
+                if (g_agent_stdin_len < (int)sizeof(g_agent_stdin_buf) - 1) {
+                    g_agent_stdin_buf[g_agent_stdin_len++] = ch;
+                    fputc(ch, stderr);
+                    fflush(stderr);
                 }
             }
         }
@@ -682,6 +725,70 @@ static void enable_raw_mode(void) {
         raw_mode_active = 1;
         atexit(disable_raw_mode);
     }
+}
+
+/* Poll stdin non-blocking between tool calls for Shift-Tab / ESC / :btw.
+   Temporarily enters raw mode so that chars buffered during tool execution
+   (typed in canonical mode) are read without blocking. */
+static void poll_agent_stdin(void) {
+    if (!isatty(STDIN_FILENO) || raw_mode_active) return;
+
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) return;
+
+    char ch;
+    while (!g_esc_requested && read(STDIN_FILENO, &ch, 1) == 1) {
+        if (ch == 27) {
+            char seq[2] = {0, 0};
+            int n = read(STDIN_FILENO, seq, 2);
+            if (n == 2 && seq[0] == '[' && seq[1] == 'Z') {
+                /* Shift-Tab */
+                if (g_agent_loop_active && !g_auto_approve) {
+                    fprintf(stderr,
+                        "\n\033[2m[Shift-Tab: auto-approve can only be enabled "
+                        "before a task starts]\033[0m\n");
+                    fflush(stderr);
+                } else {
+                    g_auto_approve ^= 1;
+                    if (g_auto_approve) setenv("INFER_AUTO_APPROVE", "1", 1);
+                    else               unsetenv("INFER_AUTO_APPROVE");
+                    fprintf(stderr, "\n\033[2mauto-approve %s\033[0m\n",
+                            g_auto_approve ? "on" : "off");
+                    fflush(stderr);
+                }
+                g_agent_stdin_len = 0;
+            } else {
+                g_esc_requested = 1;
+            }
+        } else if (ch == '\r' || ch == '\n') {
+            g_agent_stdin_buf[g_agent_stdin_len] = '\0';
+            const char *line = g_agent_stdin_buf;
+            while (*line == ' ') line++;
+            if (strncmp(line, ":btw", 4) == 0) {
+                const char *msg = line + 4;
+                while (*msg == ' ') msg++;
+                if (*msg) {
+                    strncpy(g_btw_message, msg, sizeof(g_btw_message) - 1);
+                    g_btw_message[sizeof(g_btw_message) - 1] = '\0';
+                    g_btw_available = 1;
+                    fprintf(stderr, "\033[2m[btw] queued\033[0m\n");
+                    fflush(stderr);
+                } else {
+                    fprintf(stderr, "\033[2m[btw] usage: :btw <message>\033[0m\n");
+                    fflush(stderr);
+                }
+            }
+            g_agent_stdin_len = 0;
+        } else if (ch >= 32 && ch <= 126) {
+            if (g_agent_stdin_len < (int)sizeof(g_agent_stdin_buf) - 1)
+                g_agent_stdin_buf[g_agent_stdin_len++] = ch;
+        }
+    }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
 }
 
 /* ── Minimal interactive line editor with history ─────────────────────────── */
@@ -2343,7 +2450,7 @@ int main(int argc, char **argv) {
 
     if (interactive_mode && !run_query_this_turn) {
         printf("\033[1;36mai\033[0m  \033[2m%s\033[0m\n", model);
-        printf("\033[2m:help · ESC to interrupt · Shift-Tab to toggle auto-approve\033[0m\n\n");
+        printf("\033[2m:help · ESC to interrupt · Shift-Tab to disable auto-approve · :btw <msg> to inject a note mid-task\033[0m\n\n");
         lineed_init();
     }
 
@@ -2422,15 +2529,17 @@ int main(int argc, char **argv) {
                 }
                 if (strcmp(user_input, ":help") == 0) {
                     printf("\n\033[1;36mInteractive commands:\033[0m\n");
-                    printf("  :compact   Summarise + reset context (keeps semantic history)\n");
-                    printf("  :clear     Wipe conversation history entirely\n");
-                    printf("  :status    Show context size and model info\n");
-                    printf("  :memory    Show persistent memory\n");
-                    printf("  :auto      Toggle auto-approve for execute_command\n");
-                    printf("  :help      Show this message\n");
-                    printf("  :quit/:exit  Leave interactive mode\n");
-                    printf("  exit/quit  Leave interactive mode\n");
-                    printf("\n\033[2mPress Ctrl+C or ESC to interrupt. Shift-Tab to toggle auto-approve.\033[0m\n\n");
+                    printf("  :compact       Summarise + reset context (keeps semantic history)\n");
+                    printf("  :clear         Wipe conversation history entirely\n");
+                    printf("  :status        Show context size and model info\n");
+                    printf("  :memory        Show persistent memory\n");
+                    printf("  :auto          Toggle auto-approve for execute_command\n");
+                    printf("  :btw <msg>     Inject a note into the agent context mid-task\n");
+                    printf("  :help          Show this message\n");
+                    printf("  :quit/:exit    Leave interactive mode\n");
+                    printf("  exit/quit      Leave interactive mode\n");
+                    printf("\n\033[2mPress Ctrl+C or ESC to interrupt. "
+                           "Shift-Tab to disable auto-approve (enable only at prompt).\033[0m\n\n");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -2496,14 +2605,31 @@ int main(int argc, char **argv) {
             int has_more = 1;
             int step_limit = 30;
             g_esc_requested = 0;
+            g_agent_loop_active = 1;
             struct timespec task_start;
             clock_gettime(CLOCK_MONOTONIC, &task_start);
 
 step_limit_check:
             while (has_more && loop_count < step_limit) {
                 loop_count++;
-                
+
                 messages_json = maybe_trim_messages(messages_json, mcp_script);
+
+                /* Inject any :btw note typed by the user during the previous iteration */
+                if (g_btw_available && !g_esc_requested) {
+                    g_btw_available = 0;
+                    char *safe_btw = json_escape(g_btw_message);
+                    size_t btw_len = strlen(safe_btw) + 80;
+                    char *btw_msg = malloc(btw_len);
+                    snprintf(btw_msg, btw_len,
+                             "{\"role\":\"user\",\"content\":\"[User note mid-task: %s]\"}",
+                             safe_btw);
+                    messages_json = append_message(messages_json, btw_msg);
+                    fprintf(stderr, "\033[2m[btw] injected: %s\033[0m\n", g_btw_message);
+                    fflush(stderr);
+                    free(safe_btw);
+                    free(btw_msg);
+                }
 
                 /* Build optional parameter fields */
                 char opt_fields[128] = "";
@@ -3103,6 +3229,9 @@ step_limit_check:
                           current_tok = json_skip_token(tok, r, current_tok);
                       }
 
+                      /* Poll stdin for Shift-Tab / :btw typed while tools were executing */
+                      if (interactive_mode) poll_agent_stdin();
+
                       /* ESC pressed during command execution — stop agent loop */
                       if (g_esc_requested) {
                           fprintf(stderr, "\n\033[1;31m[ai] Task interrupted (ESC). Returning to prompt.\033[0m\n");
@@ -3281,6 +3410,7 @@ step_limit_check:
                     loop_count);
                 has_more = 0;
             }
+            g_agent_loop_active = 0;
           }
 
           if (!interactive_mode) {
