@@ -9,10 +9,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build, install, run
 
 ```bash
-gcc -o ai ai.c cJSON.c -lcurl  # build (only dependencies are libcurl + jsmn.h + cJSON.h/cJSON.c, vendored)
-./compile_and_install.sh       # build, copy to /usr/bin, and sync .agents/skills/ → ~/.config/ai/skills/
-./setup.sh                     # full install: apt deps, build, copy to /usr/local/bin, set up llama.cpp + env
-sudo cp ai ai_mcp.py /usr/local/bin/   # manual install of both halves (skills not synced)
+gcc -o ai ai.c cJSON.c -lcurl  # build only (dependencies: libcurl + jsmn.h + cJSON.h/cJSON.c, vendored)
+./install.sh                   # build + install to ~/.local/bin + sync skills (no sudo)
+./install.sh llama             # also set up local llama.cpp server + model download
+./install.sh snap              # also detect and configure a running AI snap (qwen3-6/gemma4)
+```
+
+Backend is managed by `ai-backend` (installed to `~/.local/bin/`). Active config lives in `~/.config/ai/env`.
+```bash
+ai-backend status              # show active backend and available options
+ai-backend auto                # switch to whatever is currently running
+ai-backend qwen3-6             # switch to qwen3-6 snap
+ai-backend llama /path/to.gguf # switch to llama-server with specific model
 ```
 
 There is no test suite, linter, or package manifest. Verify changes by running the binary directly (e.g. `INFER_* env vars set; echo "hi" | ./ai "say hello"`).

@@ -2,7 +2,7 @@
   "mcpServers": {
     "pubmed": {
       "command": "python3",
-      "args": ["/home/dzyla/ai-buddy/pubmed_mcp_server.py"],
+      "args": ["~/.local/bin/pubmed_mcp_server.py"],
       "env": {
         "PUBMED_API_KEY": "myapp_kZnDpemyN9z43CqNrOYEE-LhAH9_UsxhWTavLkWv22Y",
         "PUBMED_SEARCH_URL": "http://152.53.80.217:8080"
