@@ -799,6 +799,24 @@ def read_file(path, start_line=None, end_line=None):
             return "\n".join(parts)
 
         # Very large file (> large_file_limit): delegate digest to a sub-agent
+        if os.environ.get("AI_DIGESTING") == "1":
+            # Fall back to the outline + head/tail approach to avoid infinite recursion
+            outline = extract_code_outline(content)
+            head = "\n".join(lines[:80])
+            tail = "\n".join(lines[-30:])
+            omitted = total_lines - 110
+            parts = [
+                f"[Large file: {total_lines} lines, {total_chars} chars | {abs_path}]",
+                f"[To read a specific section: read_file(path, start_line=N, end_line=M)]",
+            ]
+            if outline:
+                parts.append(f"\n### Code outline\n{outline}")
+            parts.append(f"\n### First 80 lines\n{head}")
+            if omitted > 0:
+                parts.append(f"\n... ({omitted} lines omitted) ...")
+            parts.append(f"\n### Last 30 lines\n{tail}")
+            return "\n".join(parts)
+
         ai_bin = os.environ.get("INFER_BIN_PATH")
         if not ai_bin or not os.path.exists(ai_bin):
             ai_bin = "/usr/local/bin/ai"
@@ -826,10 +844,13 @@ def read_file(path, start_line=None, end_line=None):
                     task_timeout = max(90, int(env_timeout) // 2)
                 except ValueError:
                     pass
+            env = os.environ.copy()
+            env["AI_DIGESTING"] = "1"
             proc = subprocess.run(
                 [ai_bin, digest_prompt],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=task_timeout
+                text=True, timeout=task_timeout,
+                env=env
             )
             summary = proc.stdout.strip()
             if not summary:
@@ -876,7 +897,8 @@ def edit_file(path, search_content, replace_content):
                 matched_start = i
                 break
         if matched_start >= 0:
-            original_span = "\n".join(content_lines[matched_start:matched_start + n])
+            content_lines_with_ends = content.splitlines(keepends=True)
+            original_span = "".join(content_lines_with_ends[matched_start:matched_start + n])
             new_content = content.replace(original_span, replace_content, 1)
             with open(abs_path, "w") as f:
                 f.write(new_content)
@@ -921,13 +943,13 @@ def render_math(text):
         val = match.group(1) or match.group(2)
         return "".join(superscripts.get(c, c) for c in val)
         
-    text = re.sub(r'\^\{([^}]+)\}|\^([0-9+\-nix])', repl_super, text)
+    text = re.sub(r'\^\{([^}]+)\}|\^([0-9+\-nix]+)', repl_super, text)
     
     def repl_sub(match):
         val = match.group(1) or match.group(2)
         return "".join(subscripts.get(c, c) for c in val)
         
-    text = re.sub(r'\_\{([^}]+)\}|\_([0-9+\-ijkx])', repl_sub, text)
+    text = re.sub(r'\_\{([^}]+)\}|\_([0-9+\-ijkx]+)', repl_sub, text)
     text = re.sub(r'√\{([^}]+)\}', r'√\1', text)
     return text
 
@@ -939,8 +961,32 @@ def render_math_safely(line):
         codes.append(match.group(0))
         return code_placeholder.format(len(codes) - 1)
         
+    # Protect backtick inline code
     temp_line = re.sub(r'`[^`\n]+`', repl_code, line)
-    temp_line = render_math(temp_line)
+    
+    # Render block math $$ ... $$
+    def repl_block_math(match):
+        math_content = match.group(1)
+        return render_math(math_content)
+        
+    temp_line = re.sub(r'\$\$(.*?)\$\$', repl_block_math, temp_line)
+    
+    # Render inline math $ ... $
+    def repl_inline_math(match):
+        math_content = match.group(1)
+        return render_math(math_content)
+        
+    temp_line = re.sub(r'\$([^$]+)\$', repl_inline_math, temp_line)
+    
+    # Render scientific notation outside math blocks (e.g. 10^-3 or 2^10)
+    superscripts = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ'}
+    def repl_super(match):
+        val = match.group(1) or match.group(2)
+        return "".join(superscripts.get(c, c) for c in val)
+    
+    temp_line = re.sub(r'(?<=\d)\^\{([^}]+)\}|(?<=\d)\^([0-9+\-nix]+)', repl_super, temp_line)
+    
+    # Restore code blocks
     for idx, c in enumerate(codes):
         temp_line = temp_line.replace(code_placeholder.format(idx), c)
     return temp_line
@@ -964,115 +1010,150 @@ def render_markdown(text):
     # Helper to parse a markdown table row into cells
     def parse_row(row):
         parts = row.split('|')
-        if parts[0].strip() == '':
-            parts = parts[1:]
-        if len(parts) > 0 and parts[-1].strip() == '':
-            parts = parts[:-1]
+        if parts[0].strip() == '': parts = parts[1:]
+        if len(parts) > 0 and parts[-1].strip() == '': parts = parts[:-1]
         return [cell.strip() for cell in parts]
-
-    # Helper to strip ANSI codes to get visible length
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     def visible_len(t):
         return len(ansi_escape.sub('', t))
-
-    # Helper to format inline markdown inside a cell
     def format_cell(cell, is_header=False):
-        cell = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', r'\033[1m\1\2\033[22m', cell)
-        cell = re.sub(r'\*(.*?)\*|_(.*?)_', r'\033[3m\1\2\033[23m', cell)
+        cell = re.sub(r'\*\*(.*?)\*\*', r'\033[1m\1\033[22m', cell)
+        cell = re.sub(r'(?<!\w)__(.*?)__(?!\w)', r'\033[1m\1\033[22m', cell)
+        cell = re.sub(r'\*(.*?)\*', r'\033[3m\1\033[23m', cell)
+        cell = re.sub(r'(?<!\w)_(.*?)_(?!\w)', r'\033[3m\1\033[23m', cell)
         cell = re.sub(r'`(.*?)`', r'\033[33m\1\033[39m', cell)
+        cell = render_math_safely(cell)
         if is_header:
             return f"\033[1;36m{cell}\033[0m"
         return cell
-
-    # Helper to pad a cell based on alignment and visible width
     def pad_cell(cell, width, align):
         vis_len = visible_len(cell)
         padding = width - vis_len
-        if padding <= 0:
-            return cell
+        if padding <= 0: return cell
         if align == 'center':
             left = padding // 2
             right = padding - left
             return ' ' * left + cell + ' ' * right
         elif align == 'right':
             return ' ' * padding + cell
-        else:
-            return cell + ' ' * padding
-
-    # Helper to render a table block
+        else: return cell + ' ' * padding
     def render_table(table_rows):
-        if len(table_rows) < 2:
-            return table_rows
-            
+        if len(table_rows) < 2: return table_rows
         header_cells = parse_row(table_rows[0])
-        # Parse alignment from separator row
         alignments = []
         sep_cells = parse_row(table_rows[1])
         for cell in sep_cells:
-            if cell.startswith(':') and cell.endswith(':'):
-                alignments.append('center')
-            elif cell.endswith(':'):
-                alignments.append('right')
-            else:
-                alignments.append('left')
-                
+            if cell.startswith(':') and cell.endswith(':'): alignments.append('center')
+            elif cell.endswith(':'): alignments.append('right')
+            else: alignments.append('left')
         body_rows = [parse_row(r) for r in table_rows[2:]]
         num_cols = len(header_cells)
-        
-        # Align column counts for body rows
         aligned_body = []
         for r in body_rows:
-            if len(r) < num_cols:
-                r = r + [''] * (num_cols - len(r))
-            elif len(r) > num_cols:
-                r = r[:num_cols]
+            if len(r) < num_cols: r = r + [''] * (num_cols - len(r))
+            elif len(r) > num_cols: r = r[:num_cols]
             aligned_body.append(r)
-            
-        if len(alignments) < num_cols:
-            alignments = alignments + ['left'] * (num_cols - len(alignments))
+        if len(alignments) < num_cols: alignments = alignments + ['left'] * (num_cols - len(alignments))
         alignments = alignments[:num_cols]
-        
-        # Format the header and body cells
-        f_header = [format_cell(c, is_header=True) for c in header_cells]
-        f_body = [[format_cell(c) for c in r] for r in aligned_body]
-        
-        # Calculate max column widths
-        col_widths = [0] * num_cols
+
+        raw_widths = [0] * num_cols
         for col_idx in range(num_cols):
-            w = visible_len(f_header[col_idx])
-            for row in f_body:
-                w = max(w, visible_len(row[col_idx]))
-            col_widths[col_idx] = w
-            
-        # Draw top line
+            w = len(header_cells[col_idx])
+            for r in aligned_body:
+                w = max(w, len(r[col_idx]))
+            raw_widths[col_idx] = w
+
+        import shutil
+        term_width = shutil.get_terminal_size((80, 24)).columns
+        border_overhead = 3 * num_cols + 1
+        available_width = term_width - border_overhead
+
+        col_widths = list(raw_widths)
+        total_raw = sum(raw_widths)
+        if total_raw > available_width and available_width > 0:
+            allocated = [min(w, 8) for w in raw_widths]
+            remaining = available_width - sum(allocated)
+            if remaining > 0:
+                needs_more = [i for i, w in enumerate(raw_widths) if w > allocated[i]]
+                if needs_more:
+                    total_needed = sum(raw_widths[i] - allocated[i] for i in needs_more)
+                    for i in needs_more:
+                        extra = int(remaining * (raw_widths[i] - allocated[i]) / total_needed)
+                        allocated[i] += extra
+                    diff = available_width - sum(allocated)
+                    idx = 0
+                    while diff > 0 and needs_more:
+                        allocated[needs_more[idx % len(needs_more)]] += 1
+                        diff -= 1
+                        idx += 1
+            col_widths = [max(1, w) for w in allocated]
+
+        def wrap_text(text, width):
+            if not text:
+                return [""]
+            segments = text.split('\n')
+            all_lines = []
+            for segment in segments:
+                words = segment.split(' ')
+                current_line = []
+                current_len = 0
+                for word in words:
+                    word_len = len(word)
+                    if current_len + word_len + (1 if current_line else 0) <= width:
+                        current_line.append(word)
+                        current_len += word_len + (1 if len(current_line) > 1 else 0)
+                    else:
+                        if word_len > width:
+                            if current_line:
+                                all_lines.append(" ".join(current_line))
+                            for j in range(0, len(word), width):
+                                all_lines.append(word[j:j+width])
+                            current_line = []
+                            current_len = 0
+                        else:
+                            if current_line:
+                                all_lines.append(" ".join(current_line))
+                            current_line = [word]
+                            current_len = word_len
+                if current_line:
+                    all_lines.append(" ".join(current_line))
+            return all_lines
+
+        def render_wrapped_row(row_cells, is_header=False):
+            wrapped_cells = []
+            for col_idx in range(num_cols):
+                wrapped_cells.append(wrap_text(row_cells[col_idx], col_widths[col_idx]))
+            max_lines = max(len(c) for c in wrapped_cells)
+            for col_idx in range(num_cols):
+                while len(wrapped_cells[col_idx]) < max_lines:
+                    wrapped_cells[col_idx].append("")
+            row_lines = []
+            for line_idx in range(max_lines):
+                line_parts = []
+                for col_idx in range(num_cols):
+                    cell_line = wrapped_cells[col_idx][line_idx]
+                    formatted = format_cell(cell_line, is_header)
+                    padded = pad_cell(formatted, col_widths[col_idx], alignments[col_idx])
+                    line_parts.append(f" {padded} ")
+                row_lines.append('\033[90m│\033[0m' + '\033[90m│\033[0m'.join(line_parts) + '\033[90m│\033[0m')
+            return row_lines
+
         top_parts = ['─' * (w + 2) for w in col_widths]
         top_line = '\033[90m┌' + '┬'.join(top_parts) + '┐\033[0m'
         
-        # Draw header row
-        header_parts = []
-        for idx, cell in enumerate(f_header):
-            padded = pad_cell(cell, col_widths[idx], alignments[idx])
-            header_parts.append(f" {padded} ")
-        header_line = '\033[90m│\033[0m' + '\033[90m│\033[0m'.join(header_parts) + '\033[90m│\033[0m'
+        header_lines = render_wrapped_row(header_cells, is_header=True)
         
-        # Draw separator line
         sep_parts = ['─' * (w + 2) for w in col_widths]
         sep_line = '\033[90m├' + '┼'.join(sep_parts) + '┤\033[0m'
         
-        # Draw body lines
         body_lines = []
-        for row in f_body:
-            row_parts = []
-            for idx, cell in enumerate(row):
-                padded = pad_cell(cell, col_widths[idx], alignments[idx])
-                row_parts.append(f" {padded} ")
-            body_lines.append('\033[90m│\033[0m' + '\033[90m│\033[0m'.join(row_parts) + '\033[90m│\033[0m')
+        for row in aligned_body:
+            body_lines.extend(render_wrapped_row(row, is_header=False))
             
-        # Draw bottom line
         bottom_parts = ['─' * (w + 2) for w in col_widths]
         bottom_line = '\033[90m└' + '┴'.join(bottom_parts) + '┘\033[0m'
         
-        return [top_line, header_line, sep_line] + body_lines + [bottom_line]
+        return [top_line] + header_lines + [sep_line] + body_lines + [bottom_line]
 
     i = 0
     in_code_block = False
@@ -1125,8 +1206,10 @@ def render_markdown(text):
             content = num_match.group(2)
             line = f"{prefix} {content}"
 
-        line = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', r'\033[1m\1\2\033[22m', line)
-        line = re.sub(r'\*(.*?)\*|_(.*?)_', r'\033[3m\1\2\033[23m', line)
+        line = re.sub(r'\*\*(.*?)\*\*', r'\033[1m\1\033[22m', line)
+        line = re.sub(r'(?<!\w)__(.*?)__(?!\w)', r'\033[1m\1\033[22m', line)
+        line = re.sub(r'\*(.*?)\*', r'\033[3m\1\033[23m', line)
+        line = re.sub(r'(?<!\w)_(.*?)_(?!\w)', r'\033[3m\1\033[23m', line)
         line = re.sub(r'`(.*?)`', r'\033[33m\1\033[39m', line)
         
         line = render_math_safely(line)
@@ -1144,13 +1227,31 @@ TOOL_REQUIRED_ARGS = {
     "write_file":      ["path", "content"],
     "edit_file":       ["path", "search_content", "replace_content"],
     "save_memory":     ["content"],
-    "delegate_task":   ["task"],
+    "delegate_task":   ["tasks"],
+    "parallel_fetch":  ["urls"],
     "think":           ["reasoning"],
     "task_complete":   ["summary"],
     "computer_control": ["action"],
     "pubmed_search":          ["query"],
     "pubmed_research_round":  ["query"],
 }
+
+# Per-agent and per-URL output caps for parallel tools
+_AGENT_OUTPUT_CAP = 10 * 1024       # 10 KB per sub-agent result
+_PARALLEL_FETCH_CAP = 10 * 1024     # 10 KB per fetched URL
+
+def _resolve_ai_bin():
+    """Return path to the ai binary, checking local install first."""
+    candidates = [
+        os.path.expanduser("~/.local/bin/ai"),
+        os.environ.get("INFER_BIN_PATH", ""),
+        "/usr/local/bin/ai",
+        "./ai",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return candidates[-1]  # fall back to ./ai even if missing
 
 def _pubmed_fetch_raw(query, top_k=10, start_date=None, end_date=None, high_quality_only=True):
     """Return parsed JSON results list from the search API, or a string error."""
@@ -1553,27 +1654,55 @@ def main():
             "type": "function",
             "function": {
                 "name": "delegate_task",
-                "description": "Run one or more self-contained sub-tasks in parallel helper agents that have full tool access. Use to distribute independent parallel work. Give complete, standalone instructions for each.",
+                "description": (
+                    "Spawn N helper agents that run IN PARALLEL and return their combined results. "
+                    "Use ONLY for independent sub-tasks (each agent must not depend on another's output). "
+                    "Always pass 'tasks' as an array — even for a single task. "
+                    "Example: fetch and summarise 3 papers → tasks:[\"Fetch https://... and summarise\", \"Fetch https://... and summarise\", ...]. "
+                    "Each task string must be fully self-contained with all context (URLs, file paths, goals). "
+                    "For fetching multiple URLs, prefer parallel_fetch instead — it is faster and needs no per-URL instructions."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "tasks": {
                             "type": "array",
-                            "items": {
-                                "type": "string"
-                            },
-                            "description": "A list of detailed, self-contained task instructions to run concurrently in parallel helper agents."
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "A single detailed, self-contained task instruction to run (used as fallback)."
+                            "items": {"type": "string"},
+                            "description": "Array of self-contained task instructions. Each runs in its own agent concurrently."
                         }
-                    }
+                    },
+                    "required": ["tasks"]
                 }
             }
         })
 
-        # 11. load_skill
+        # 11. parallel_fetch
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "parallel_fetch",
+                "description": (
+                    "Fetch multiple URLs concurrently and return all page contents in one call. "
+                    "Use instead of multiple sequential fetch_webpage calls whenever you need 2+ pages. "
+                    "Example use cases: reading several search results, fetching multiple papers/docs, "
+                    "multi-site comparison, publication digest. "
+                    "Each result is capped at 10 KB and labelled with its URL."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "urls": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of URLs to fetch concurrently."
+                        }
+                    },
+                    "required": ["urls"]
+                }
+            }
+        })
+
+        # 12. load_skill
         openai_tools.append({
             "type": "function",
             "function": {
@@ -1591,7 +1720,7 @@ def main():
             }
         })
 
-        # 12. computer_control
+        # 13. computer_control
         openai_tools.append({
             "type": "function",
             "function": {
@@ -1641,7 +1770,7 @@ def main():
             }
         })
 
-        # 13. fetch_webpage_js — Playwright-based for JS-protected sites
+        # 14. fetch_webpage_js — Playwright-based for JS-protected sites
         openai_tools.append({
             "type": "function",
             "function": {
@@ -1868,19 +1997,17 @@ def main():
         elif tool_name == "delegate_task" or server_name == "delegate_task":
             tasks = arguments.get("tasks")
             if not isinstance(tasks, list):
+                # Accept legacy single-task call gracefully
                 single_task = arguments.get("task", "")
                 tasks = [single_task] if single_task else []
-            
+
             if not tasks:
-                print("Error: no task specified for delegate_task.")
+                print("Error: delegate_task requires 'tasks' array with at least one item.")
             else:
                 try:
-                    ai_bin = os.environ.get("INFER_BIN_PATH")
-                    if not ai_bin or not os.path.exists(ai_bin):
-                        ai_bin = "/usr/local/bin/ai"
-                    if not os.path.exists(ai_bin):
-                        ai_bin = "./ai"
-                    
+                    import concurrent.futures
+                    ai_bin = _resolve_ai_bin()
+
                     task_timeout = 300
                     env_timeout = os.environ.get("INFER_TASK_TIMEOUT")
                     if env_timeout:
@@ -1889,14 +2016,11 @@ def main():
                         except ValueError:
                             pass
 
-                    def run_single_agent(t_desc, idx):
-                        cmd_args = [ai_bin]
-                        if os.environ.get("INFER_AUTO_APPROVE") == "1":
-                            cmd_args.append("-y")
-                        if os.environ.get("INFER_QUIET") == "1":
-                            cmd_args.append("-q")
-                        cmd_args.append(t_desc)
+                    n = len(tasks)
+                    print(f"[delegate_task] Starting {n} parallel agent(s)...", file=sys.stderr, flush=True)
 
+                    def run_single_agent(t_desc, idx):
+                        cmd_args = [ai_bin, "-y", "-q", t_desc]
                         try:
                             proc = subprocess.run(
                                 cmd_args,
@@ -1905,45 +2029,73 @@ def main():
                                 text=True,
                                 timeout=task_timeout
                             )
-                            out = proc.stdout.strip()
-                            err = proc.stderr.strip()
-                            res = ""
-                            if out:
-                                res += out
-                            if err:
-                                res += f"\n[Agent Stderr]: {err}"
-                            if not res:
-                                res = "Agent completed the task but returned no output."
-                            return idx, res
+                            out = (proc.stdout or "").strip()
+                            # Only surface stderr when the agent failed
+                            if proc.returncode != 0:
+                                err = (proc.stderr or "").strip()
+                                if err:
+                                    out = f"[exit {proc.returncode}] {out}\n[stderr]: {err[:500]}"
+                            if not out:
+                                out = f"Agent #{idx+1} completed with no output (exit {proc.returncode})."
+                            # Cap per-agent output
+                            if len(out) > _AGENT_OUTPUT_CAP:
+                                out = out[:_AGENT_OUTPUT_CAP] + f"\n... [truncated at {_AGENT_OUTPUT_CAP//1024} KB]"
+                            return idx, out
                         except subprocess.TimeoutExpired:
-                            return idx, f"Error: Agent execution timed out after {task_timeout} seconds."
+                            return idx, f"Error: agent #{idx+1} timed out after {task_timeout}s."
                         except Exception as ex:
-                            return idx, f"Error executing agent: {ex}"
+                            return idx, f"Error in agent #{idx+1}: {ex}"
 
-                    # Execute tasks in parallel using ThreadPoolExecutor
                     results_map = {}
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
                         futures = {executor.submit(run_single_agent, t, i): i for i, t in enumerate(tasks)}
                         for future in concurrent.futures.as_completed(futures):
                             try:
                                 idx, res = future.result()
                                 results_map[idx] = res
+                                print(f"[delegate_task] Agent #{idx+1}/{n} done.", file=sys.stderr, flush=True)
                             except Exception as e:
                                 idx = futures[future]
-                                results_map[idx] = f"Error in thread execution: {e}"
+                                results_map[idx] = f"Error in thread for agent #{idx+1}: {e}"
 
-                    # Combine output in original order
-                    combined_result = ""
-                    for i in range(len(tasks)):
-                        if len(tasks) > 1:
-                            combined_result += f"=== Parallel Agent #{i+1} Output ===\n{results_map.get(i, '')}\n\n"
-                        else:
-                            combined_result += results_map.get(i, '')
-                    
-                    print(combined_result.strip())
+                    combined = ""
+                    for i in range(n):
+                        label = f"--- Agent {i+1}/{n} ---\n" if n > 1 else ""
+                        combined += label + results_map.get(i, "") + "\n\n"
+                    print(combined.strip())
                 except Exception as e:
-                    print(f"Error delegating task: {e}")
+                    print(f"Error in delegate_task: {e}")
+
+        elif tool_name == "parallel_fetch" or server_name == "parallel_fetch":
+            import concurrent.futures
+            urls = arguments.get("urls", [])
+            if not urls:
+                print("Error: parallel_fetch requires 'urls' array with at least one URL.")
+            else:
+                n = len(urls)
+                print(f"[parallel_fetch] Fetching {n} URL(s) concurrently...", file=sys.stderr, flush=True)
+
+                def _fetch_one(url, idx):
+                    try:
+                        text = fetch_webpage(url)
+                        if len(text) > _PARALLEL_FETCH_CAP:
+                            text = text[:_PARALLEL_FETCH_CAP] + f"\n... [truncated at {_PARALLEL_FETCH_CAP//1024} KB]"
+                        print(f"[parallel_fetch] {idx+1}/{n} done: {url[:60]}", file=sys.stderr, flush=True)
+                        return idx, text
+                    except Exception as ex:
+                        return idx, f"Error fetching {url}: {ex}"
+
+                results_map = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+                    futures = {executor.submit(_fetch_one, u, i): i for i, u in enumerate(urls)}
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, res = future.result()
+                        results_map[idx] = res
+
+                combined = ""
+                for i in range(n):
+                    combined += f"=== URL {i+1}: {urls[i]} ===\n{results_map.get(i, '')}\n\n"
+                print(combined.strip())
         elif tool_name == "load_skill" or server_name == "load_skill":
             import re as _re
             skill_name = arguments.get("name", "").strip()
