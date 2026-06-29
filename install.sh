@@ -58,7 +58,11 @@ cp "${SCRIPT_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/pubmed_mcp_server.py"
 chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py"
 echo "==> Installed: ai  ai_mcp.py  ai-backend  pubmed_mcp_server.py"
 
-# ── 3. Sync skills ────────────────────────────────────────────────────────────
+# ── 3. Python optional deps ───────────────────────────────────────────────────
+echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
+pip install --quiet "curl-cffi>=0.7" playwright-stealth 2>/dev/null || true
+
+# ── 4. Sync skills ────────────────────────────────────────────────────────────
 if [ -d "$SKILLS_SRC" ]; then
     cp -r "${SKILLS_SRC}/." "${SKILLS_DST}/"
     count=$(ls "$SKILLS_SRC" | wc -l)
