@@ -318,16 +318,16 @@ def main():
             fetch_tasks.append((f"Q{q_id}.{j+1}", prompt))
 
         print(f"  Q{q_id}: spawning {len(fetch_tasks)} fetch agents...", end="", flush=True)
-        agent_results = run_agents_parallel(fetch_tasks, timeout=300)
-        ok = sum(1 for _, r in agent_results
-                 if "AGENT_ERROR" not in r and "AGENT_TIMEOUT" not in r)
-        print(f" {ok}/{len(fetch_tasks)} ok", flush=True)
+        run_agents_parallel(fetch_tasks, timeout=300)
 
+        written = 0
         for j in range(len(queries)):
             f = q_dir / f"source_{j+1}.md"
             if f.exists() and f.stat().st_size > 50:
                 all_source_files.append(str(f))
                 index_entries.append(f"- Q{q_id} / source {j+1}: `{f}`")
+                written += 1
+        print(f" {written}/{len(fetch_tasks)} files written", flush=True)
 
     index_path = session_dir / "index.md"
     index_path.write_text(
