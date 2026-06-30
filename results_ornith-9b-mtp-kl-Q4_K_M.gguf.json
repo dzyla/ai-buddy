@@ -1,0 +1,103 @@
+[
+  {
+    "id": "1_tool_calling_basic",
+    "name": "Basic Tool Calling (list_directory)",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 2.3928511142730713,
+    "turns": 2,
+    "tokens": 148,
+    "tps": 77.5,
+    "final_ctx": 4437,
+    "tools": [
+      "list_directory(?)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nListed the contents of /home/dzyla/ai-buddy. Contains 20 items: source files (ai.c, ai_mcp.py, cJSON, etc.), docs (LLM wrapper scripts, mcp config, benchmark results), and subdirectories (.agents, .claude, .git, docs).\n\n",
+    "stderr": "\u001b[2m[ai] list_directory: ?\u001b[0m\n\n\u001b[2m[loop 1 | ctx 3971/8192 (48%) | +45 tok | 35 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 4437/8192 (54%) | +103 tok | 120 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "2_file_reading",
+    "name": "File Reading & Context Integration",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 2.439504861831665,
+    "turns": 2,
+    "tokens": 285,
+    "tps": 122.0,
+    "final_ctx": 4272,
+    "tools": [
+      "read_file(bench_temp_cred.json)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nRead bench_temp_cred.json and extracted the API key value.\n\n\u2022 \u001b[1mFile:\u001b[22m \u001b[33mbench_temp_cred.json\u001b[39m\n\u2022 \u001b[1mContents:\u001b[22m \u001b[33m{\"api_key\": \"SECURE_KEY_12345\", \"user\": \"benchmark_tester\"}\u001b[39m\n\u2022 \u001b[1mAPI Key:\u001b[22m \u001b[33mSECURE_KEY_12345\u001b[39m\n\u2022 \u001b[1mUser:\u001b[22m \u001b[33mbenchmark_tester\u001b[39m\n\n",
+    "stderr": "\u001b[2m[ai] read_file: bench_temp_cred.json\u001b[0m\n\n\u001b[2m[loop 1 | ctx 4002/8192 (48%) | +64 tok | 107 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 4272/8192 (52%) | +221 tok | 137 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "3_shell_execution",
+    "name": "Computer Use (Shell Execution)",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 1.6597387790679932,
+    "turns": 2,
+    "tokens": 187,
+    "tps": 122.5,
+    "final_ctx": 4155,
+    "tools": [
+      "execute_command(uname -m)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nCPU architecture: x86_64 (64-bit AMD64/Intel 64)\n\n",
+    "stderr": "[ai] executing command: uname -m\n\n\u001b[2m[loop 1 | ctx 3990/8192 (48%) | +59 tok | 107 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 4155/8192 (50%) | +128 tok | 138 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "4_coding_execution",
+    "name": "Coding and Execution",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 3.311960220336914,
+    "turns": 3,
+    "tokens": 446,
+    "tps": 141.33333333333334,
+    "final_ctx": 4469,
+    "tools": [
+      "write_file(/home/dzyla/ai-buddy/bench_prime.py)",
+      "execute_command(python3 /home/dzyla/ai-buddy/bench_prime.py)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nThe script \u001b[33mbench_prime.py\u001b[39m calculates the sum of the first 50 prime numbers. It uses a trial-division \u001b[33mis_prime\u001b[39m helper and iterates upward counting primes until 50 are found. The final sum is \u001b[1m5117\u001b[22m.\n\n",
+    "stderr": "\u001b[2m[ai] write_file: /home/dzyla/ai-buddy/bench_prime.py\u001b[0m\n\n\u001b[2m[loop 1 | ctx 4222/8192 (51%) | +277 tok | 157 tok/s]\u001b[0m\n[ai] executing command: python3 /home/dzyla/ai-buddy/bench_prime.py\n\n\u001b[2m[loop 2 | ctx 4321/8192 (52%) | +56 tok | 136 tok/s]\u001b[0m\n\n\u001b[2m[loop 3 | ctx 4469/8192 (54%) | +113 tok | 131 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "5_error_recovery",
+    "name": "Error Recovery & Troubleshooting",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 5.540502548217773,
+    "turns": 6,
+    "tokens": 715,
+    "tps": 141.0,
+    "final_ctx": 4911,
+    "tools": [
+      "write_file(/home/dzyla/ai-buddy/bench_trouble.py)",
+      "execute_command(python /home/dzyla/ai-buddy/bench_trouble.py)",
+      "edit_file(/home/dzyla/ai-buddy/bench_trouble.py)",
+      "execute_command(python /home/dzyla/ai-buddy/bench_trouble.py)",
+      "read_file(/home/dzyla/ai-buddy/bench_trouble.py)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nSuccessfully demonstrated exception handling in Python:\n1. Wrote \u001b[33mbench_trouble.py\u001b[39m with \u001b[33mimport not_a_real_package_123\u001b[39m and \u001b[33mprint(\"Imported\")\u001b[39m\n2. Ran it \u2014 failed with \u001b[33mModuleNotFoundError: No module named 'not_a_real_package_123'\u001b[39m\n3. Edited the file to wrap the import in \u001b[33mtry/except ImportError\u001b[39m printing \"Recovered\" instead\n4. Ran it again \u2014 output: \u001b[33mRecovered\u001b[39m\n\n",
+    "stderr": "\u001b[2m[ai] write_file: /home/dzyla/ai-buddy/bench_trouble.py\u001b[0m\n\n\u001b[2m[loop 1 | ctx 4177/8192 (50%) | +204 tok | 139 tok/s]\u001b[0m\n[ai] executing command: python /home/dzyla/ai-buddy/bench_trouble.py\n\n\u001b[2m[loop 2 | ctx 4284/8192 (52%) | +63 tok | 128 tok/s]\u001b[0m\n\u001b[2m[ai] edit_file: /home/dzyla/ai-buddy/bench_trouble.py\u001b[0m\n\n\u001b[2m[loop 3 | ctx 4510/8192 (55%) | +128 tok | 167 tok/s]\u001b[0m\n[ai] executing command: python /home/dzyla/ai-buddy/bench_trouble.py\n\n\u001b[2m[loop 4 | ctx 4600/8192 (56%) | +63 tok | 148 tok/s]\u001b[0m\n\u001b[2m[ai] read_file: /home/dzyla/ai-buddy/bench_trouble.py\u001b[0m\n\n\u001b[2m[loop 5 | ctx 4693/8192 (57%) | +66 tok | 122 tok/s]\u001b[0m\n\n\u001b[2m[loop 6 | ctx 4911/8192 (59%) | +191 tok | 142 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "6_web_search",
+    "name": "Web Search & Fetch",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 20.956252574920654,
+    "turns": 2,
+    "tokens": 648,
+    "tps": 137.0,
+    "final_ctx": 5023,
+    "tools": [
+      "web_search(\"Google Antigravity AI coding assistant\")"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nSearched for 'Google Antigravity AI coding assistant'. Google Antigravity is a real product by Google \u2014 an AI-powered developer platform with an IDE, CLI, SDK, and agent orchestration capabilities. It supports natural language code commands, autocompletion, and context-aware AI agents. Version 2.0 expanded it into an \"agent-first development platform.\" Official getting-started codelab available.\n\n",
+    "stderr": "\u001b[2m[ai] web_search: \"Google Antigravity AI coding assistant\"\u001b[0m\n\n\u001b[2m[loop 1 | ctx 3987/8192 (48%) | +61 tok | 117 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 5023/8192 (61%) | +587 tok | 157 tok/s]\u001b[0m\n"
+  }
+]

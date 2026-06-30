@@ -1,0 +1,103 @@
+[
+  {
+    "id": "1_tool_calling_basic",
+    "name": "Basic Tool Calling (list_directory)",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 5.2442381381988525,
+    "turns": 2,
+    "tokens": 550,
+    "tps": 89.5,
+    "final_ctx": 4786,
+    "tools": [
+      "list_directory(/home/dzyla/ai-buddy)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nListed the contents of /home/dzyla/ai-buddy directory:\n\n\u001b[1mDirectories:\u001b[22m\n\u2022 \u001b[33m.agents\u001b[39m - Agent configuration\n\u2022 \u001b[33m.claude\u001b[39m - Claude configuration\n\u2022 \u001b[33m.git\u001b[39m - Version control\n\u2022 \u001b[33mdocs\u001b[39m - Documentation files\n\n\u001b[1mSource Files:\u001b[22m\n\u2022 \u001b[33mai.c\u001b[39m (151.6 KB) - Main C source file\n\u2022 \u001b[33mai_mcp.py\u001b[39m (95.3 KB) - MCP Python implementation\n\u2022 \u001b[33mcJSON.c\u001b[39m (78.8 KB) - JSON library implementation\n\u2022 \u001b[33mcJSON.h\u001b[39m (16.0 KB) - JSON library header\n\u2022 \u001b[33mjsmn.h\u001b[39m (11.9 KB) - JSON parser header\n\u2022 \u001b[33mbenchmark.py\u001b[39m (24.5 KB) - Benchmarking script\n\u2022 \u001b[33mdeep_research.py\u001b[39m (16.1 KB) - Deep research module\n\n\u001b[1mScripts:\u001b[22m\n\u2022 \u001b[33minstall.sh\u001b[39m (13.6 KB) - Installation script\n\u2022 \u001b[33mai-use.sh\u001b[39m (13.2 KB) - AI usage script\n\u2022 \u001b[33mllama-server-wrapper.sh\u001b[39m (6.1 KB) - Llama server wrapper\n\n\u001b[1mDocumentation:\u001b[22m\n\u2022 \u001b[33mREADME.md\u001b[39m (7.9 KB)\n\u2022 \u001b[33mCLAUDE.md\u001b[39m (9.3 KB)\n\u2022 \u001b[33mLICENSE\u001b[39m (34.3 KB)\n\u2022 \u001b[33mbenchmark_report.md\u001b[39m (7.7 KB)\n\n\u001b[1mConfiguration:\u001b[22m\n\u2022 \u001b[33mmcp.json\u001b[39m (288 B) - MCP configuration\n\u2022 \u001b[33m.gitignore\u001b[39m (423 B)\n\n\u001b[1mData Files:\u001b[22m\n\u2022 \u001b[33mai\u001b[39m (114.6 KB) - Binary/compiled file\n\u2022 \u001b[33mai-backend\u001b[39m (7.1 KB) - Backend binary\n\u2022 \u001b[33mresults_gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf.json\u001b[39m (9.8 KB) - Model results JSON\n\u2022 \u001b[33mtest_deep_research.py\u001b[39m (1.8 KB) - Test file\n\n",
+    "stderr": "\u001b[2m[ai] list_directory: /home/dzyla/ai-buddy\u001b[0m\n\n\u001b[2m[loop 1 | ctx 3986/8192 (48%) | +60 tok | 53 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 4786/8192 (58%) | +490 tok | 126 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "2_file_reading",
+    "name": "File Reading & Context Integration",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 3.059998035430908,
+    "turns": 2,
+    "tokens": 324,
+    "tps": 113.5,
+    "final_ctx": 4311,
+    "tools": [
+      "read_file(bench_temp_cred.json)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nThe API key from bench_temp_cred.json is: \u001b[1mSECURE_KEY_12345\u001b[22m (user: benchmark_tester).\n\n",
+    "stderr": "\u001b[2m[ai] read_file: bench_temp_cred.json\u001b[0m\n\n\u001b[2m[loop 1 | ctx 4072/8192 (49%) | +134 tok | 113 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 4311/8192 (52%) | +190 tok | 114 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "3_shell_execution",
+    "name": "Computer Use (Shell Execution)",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 1.5032029151916504,
+    "turns": 2,
+    "tokens": 139,
+    "tps": 104.5,
+    "final_ctx": 4107,
+    "tools": [
+      "execute_command(uname -m)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nThe CPU architecture of this machine is \u001b[1mx86_64\u001b[22m (64-bit AMD64/Intel 64).\n\n",
+    "stderr": "[ai] executing command: uname -m\n\n\u001b[2m[loop 1 | ctx 3987/8192 (48%) | +56 tok | 92 tok/s]\u001b[0m\n\n\u001b[2m[loop 2 | ctx 4107/8192 (50%) | +83 tok | 117 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "4_coding_execution",
+    "name": "Coding and Execution",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 5.772721767425537,
+    "turns": 3,
+    "tokens": 677,
+    "tps": 119.66666666666667,
+    "final_ctx": 4942,
+    "tools": [
+      "write_file(/home/dzyla/ai-buddy/bench_prime.py)",
+      "execute_command(python3 bench_prime.py)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nThe script \u001b[33mbench_prime.py\u001b[39m was written and executed. It finds the first 50 prime numbers and calculates their sum.\n\n\u001b[1mSum of the first 50 prime numbers: 5117\u001b[22m\n\nThe first 50 primes are: 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229.\n\n",
+    "stderr": "\u001b[2m[ai] write_file: /home/dzyla/ai-buddy/bench_prime.py\u001b[0m\n\n\u001b[2m[loop 1 | ctx 4241/8192 (51%) | +296 tok | 123 tok/s]\u001b[0m\n[ai] executing command: python3 bench_prime.py\n\n\u001b[2m[loop 2 | ctx 4334/8192 (52%) | +50 tok | 111 tok/s]\u001b[0m\n\n\u001b[2m[loop 3 | ctx 4942/8192 (60%) | +331 tok | 125 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "5_error_recovery",
+    "name": "Error Recovery & Troubleshooting",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 5.645084381103516,
+    "turns": 5,
+    "tokens": 582,
+    "tps": 109.6,
+    "final_ctx": 4751,
+    "tools": [
+      "write_file(/home/dzyla/ai-buddy/bench_trouble.py)",
+      "execute_command(python bench_trouble.py)",
+      "edit_file(/home/dzyla/ai-buddy/bench_trouble.py)",
+      "execute_command(python bench_trouble.py)"
+    ],
+    "stdout": "\n\u001b[2m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\n\nSuccessfully demonstrated exception handling in Python:\n1. Wrote bench_trouble.py to import non-existent package 'not_a_real_package_123' and print 'Imported'\n2. Ran it \u2014 it failed with \u001b[33mModuleNotFoundError: No module named 'not_a_real_package_123'\u001b[39m\n3. Edited the file to wrap the import in a try/except ImportError block that prints 'Recovered' instead\n4. Ran it again \u2014 it now successfully prints 'Recovered'\n\n",
+    "stderr": "\u001b[2m[ai] write_file: /home/dzyla/ai-buddy/bench_trouble.py\u001b[0m\n\n\u001b[2m[loop 1 | ctx 4180/8192 (51%) | +207 tok | 114 tok/s]\u001b[0m\n[ai] executing command: python bench_trouble.py\n\n\u001b[2m[loop 2 | ctx 4270/8192 (52%) | +46 tok | 108 tok/s]\u001b[0m\n\u001b[2m[ai] edit_file: /home/dzyla/ai-buddy/bench_trouble.py\u001b[0m\n\n\u001b[2m[loop 3 | ctx 4499/8192 (54%) | +131 tok | 111 tok/s]\u001b[0m\n[ai] executing command: python bench_trouble.py\n\n\u001b[2m[loop 4 | ctx 4577/8192 (55%) | +51 tok | 101 tok/s]\u001b[0m\n\n\u001b[2m[loop 5 | ctx 4751/8192 (57%) | +147 tok | 114 tok/s]\u001b[0m\n"
+  },
+  {
+    "id": "6_web_search",
+    "name": "Web Search & Fetch",
+    "status": "SUCCESS",
+    "success": true,
+    "time": 21.902994871139526,
+    "turns": 2,
+    "tokens": 2612,
+    "tps": 111.0,
+    "final_ctx": 8192,
+    "tools": [
+      "web_search(\"Google Antigravity AI coding assistant\")",
+      "Warning(model hit token limit \u2014 response truncated. Nudging to complete.)"
+    ],
+    "stdout": "",
+    "stderr": "\u001b[2m[ai] web_search: \"Google Antigravity AI coding assistant\"\u001b[0m\n\n\u001b[2m[loop 1 | ctx 3984/8192 (48%) | +58 tok | 97 tok/s]\u001b[0m\n\u001b[1;33m[ai] Warning: model hit token limit \u2014 response truncated. Nudging to complete.\u001b[0m\n\n\u001b[2m[loop 2 | ctx 8192/8192 (100%) | +2554 tok | 125 tok/s]\u001b[0m\n\n\u001b[1;31m[ai Error]\u001b[0m request (8224 tokens) exceeds the available context size (8192 tokens), try increasing it\n"
+  }
+]

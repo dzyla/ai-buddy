@@ -28,10 +28,10 @@ cd ai
 ./install.sh
 ```
 
-Everything goes to `~/.local/bin` — no sudo required. To uninstall:
+Everything goes to `~/.local/bin` — no sudo required. To uninstall (this will also cleanly stop and remove systemd service and socket files if you installed llama):
 
 ```bash
-rm ~/.local/bin/{ai,ai_mcp.py,ai-backend,llama-server-wrapper.sh,pubmed_mcp_server.py}
+./install.sh uninstall
 ```
 
 ### 3. Point it at a model

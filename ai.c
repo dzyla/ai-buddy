@@ -1732,6 +1732,65 @@ static void load_from_profiles(char **url, char **key, char **model) {
     if ((!*model || !**model) && strlen(f_model) > 0) *model = f_model;
 }
 
+static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk) {
+    char *url = NULL;
+    curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &url);
+    
+    int is_local = 0;
+    if (url && (strstr(url, "localhost") || strstr(url, "127.0.0.1"))) {
+        is_local = 1;
+    }
+    
+    CURLcode res;
+    int retries = 0;
+    int max_retries = 60; // 60 retries * 500ms = 30 seconds
+    
+    while (1) {
+        res = curl_easy_perform(c);
+        if (res == CURLE_OK) {
+            if (is_local && chunk && chunk->data && strstr(chunk->data, "Loading model")) {
+                retries++;
+                if (retries < max_retries) {
+                    if (retries == 1) {
+                        fprintf(stderr, "\033[2m[ai] Local server model is loading, waiting...\033[0m\n");
+                        fflush(stderr);
+                    }
+                    free(chunk->data);
+                    chunk->data = NULL;
+                    chunk->size = 0;
+                    usleep(500000); // 500ms
+                    continue;
+                }
+            }
+            break;
+        }
+        
+        if (is_local && 
+            (res == CURLE_COULDNT_CONNECT || 
+             res == CURLE_GOT_NOTHING || 
+             res == CURLE_RECV_ERROR || 
+             res == CURLE_SEND_ERROR || 
+             res == CURLE_OPERATION_TIMEDOUT) && 
+            retries < max_retries) {
+            retries++;
+            if (retries == 1) {
+                fprintf(stderr, "\033[2m[ai] Local server is starting up, waiting...\033[0m\n");
+                fflush(stderr);
+            }
+            if (chunk) {
+                if (chunk->data) free(chunk->data);
+                chunk->data = NULL;
+                chunk->size = 0;
+            }
+            usleep(500000); // 500ms
+            continue;
+        }
+        
+        break;
+    }
+    return res;
+}
+
 static int detect_context_window(CURL *c, const char *cur_api_url) {
     char models_url[1024];
     const char *chat_ptr = strstr(cur_api_url, "chat/completions");
@@ -1747,7 +1806,7 @@ static int detect_context_window(CURL *c, const char *cur_api_url) {
     curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&m_chunk);
     curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
     
-    CURLcode m_res = curl_easy_perform(c);
+    CURLcode m_res = perform_curl_with_retry(c, &m_chunk);
     int detected_win = 0;
     if (m_res == CURLE_OK && m_chunk.data) {
         char *n_ctx_ptr = strstr(m_chunk.data, "\"n_ctx\"");
@@ -1840,7 +1899,7 @@ static char* compact_session(char *messages_json, const char *mcp_script,
     g_compact_dot_timer = 0;
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payload);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_perform(curl_handle);
+    perform_curl_with_retry(curl_handle, &chunk);
     g_compact_in_progress = 0;
     fprintf(stderr, "\n");
     g_esc_requested = saved_esc;
@@ -2691,7 +2750,7 @@ step_limit_check:
                 if (interactive_mode) enable_raw_mode();
                 struct timespec t_req_start, t_req_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_req_start);
-                CURLcode res = curl_easy_perform(c);
+                CURLcode res = perform_curl_with_retry(c, &chunk);
                 clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                 if (interactive_mode) disable_raw_mode();
                 double elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
@@ -2760,7 +2819,7 @@ step_limit_check:
                             g_esc_requested = 0;
                             if (interactive_mode) enable_raw_mode();
                             clock_gettime(CLOCK_MONOTONIC, &t_req_start);
-                            res = curl_easy_perform(c);
+                            res = perform_curl_with_retry(c, &chunk);
                             clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                             if (interactive_mode) disable_raw_mode();
                             elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
