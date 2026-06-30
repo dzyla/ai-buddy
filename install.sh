@@ -5,9 +5,10 @@
 #   ./install.sh          Build and install ai CLI to ~/.local/bin
 #   ./install.sh llama    Also set up a local llama.cpp inference server
 #   ./install.sh snap     Also detect and configure an installed AI snap
+#   ./install.sh uninstall Uninstall the CLI, systemd services, and wrapper scripts
 #
 # Everything installs to ~/.local/bin — no sudo required.
-# To uninstall: rm ~/.local/bin/{ai,ai_mcp.py,ai-backend,llama-server,llama-server-wrapper.sh,pubmed_mcp_server.py}
+# To uninstall: ./install.sh uninstall
 
 set -euo pipefail
 
@@ -20,6 +21,48 @@ SKILLS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.agents/skills"
 SKILLS_DST="${HOME}/.config/ai/skills"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=8080
+
+# ── Subcommand: uninstall ─────────────────────────────────────────────────────
+if [ "${1:-}" = "uninstall" ]; then
+    echo "==> Uninstalling ai CLI and llama-server..."
+
+    # 1. Stop and disable systemd service and socket
+    if systemctl --user is-active llama-server.socket &>/dev/null || systemctl --user is-failed llama-server.socket &>/dev/null; then
+        echo "--> Stopping and disabling llama-server.socket..."
+        systemctl --user disable --now llama-server.socket || true
+    fi
+    if systemctl --user is-active llama-server.service &>/dev/null || systemctl --user is-failed llama-server.service &>/dev/null; then
+        echo "--> Stopping llama-server.service..."
+        systemctl --user stop llama-server.service || true
+    fi
+
+    # 2. Remove systemd unit files
+    if [ -f "${SYSTEMD_DIR}/llama-server.service" ] || [ -f "${SYSTEMD_DIR}/llama-server.socket" ]; then
+        echo "--> Removing systemd unit files..."
+        rm -f "${SYSTEMD_DIR}/llama-server.service" "${SYSTEMD_DIR}/llama-server.socket"
+        systemctl --user daemon-reload
+    fi
+
+    # 3. Remove binaries and scripts
+    echo "--> Removing binaries and wrapper scripts from ${BIN_DIR}..."
+    for f in ai ai_mcp.py ai-backend pubmed_mcp_server.py deep_research.py llama-server-wrapper.sh llama-server; do
+        rm -f "${BIN_DIR}/$f"
+    done
+
+    # 4. Remove custom skills
+    if [ -d "${SKILLS_DST}" ]; then
+        echo "--> Removing custom skills from ${SKILLS_DST}..."
+        rm -rf "${SKILLS_DST}"
+    fi
+
+    echo ""
+    echo "Uninstallation complete!"
+    echo "Note: Downloaded models at ${MODEL_DIR} and configuration in ~/.config/ai/ were preserved."
+    echo "To remove them manually, run:"
+    echo "  rm -rf ${DATA_DIR} ~/.config/ai"
+    echo "Also, remember to remove any 'config/ai/env' sourcing lines from your ~/.bashrc or ~/.zshrc."
+    exit 0
+fi
 
 mkdir -p "$BIN_DIR" "$DATA_DIR" "$MODEL_DIR" "$SYSTEMD_DIR" "$SKILLS_DST"
 
@@ -90,6 +133,7 @@ if [ "${1:-}" = "snap" ]; then
     echo "Apply: source ~/.config/ai/env"
     exit 0
 fi
+
 
 # ── Subcommand: llama ─────────────────────────────────────────────────────────
 if [ "${1:-}" = "llama" ]; then
@@ -215,6 +259,9 @@ print(lines[idx].split(') ', 1)[1])
         echo "==> Model ready: $MODEL_PATH"
     fi
 
+    # Stop existing socket/service before writing new configs to avoid "Socket unit configuration has changed" issues
+    systemctl --user stop llama-server.service llama-server.socket 2>/dev/null || true
+
     # Write systemd units
     cat > "${SYSTEMD_DIR}/llama-server.socket" <<SOCKET_EOF
 [Unit]
@@ -231,16 +278,16 @@ SOCKET_EOF
     cat > "${SYSTEMD_DIR}/llama-server.service" <<SERVICE_EOF
 [Unit]
 Description=llama-server (on-demand, idle-unload)
-Requires=llama-server.socket
 After=llama-server.socket
 
 [Service]
 Type=simple
+Environment=PATH=${BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
 ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
 ExecStart=${BIN_DIR}/llama-server-wrapper.sh
-ExecStopPost=/bin/bash -c 'systemctl --user start llama-server.socket || true'
+ExecStopPost=/bin/bash -c 'systemctl --user start --no-block llama-server.socket || true'
 Restart=no
 StandardOutput=journal
 StandardError=journal

@@ -1,5 +1,12 @@
 #!/bin/bash
-set -euo pipefail
+set -eo pipefail
+
+if [ -f "${HOME}/.config/ai/env" ]; then
+    set +u
+    source "${HOME}/.config/ai/env"
+    set -u
+fi
+set -u
 
 MODEL_PATH="${LLAMA_MODEL_PATH:?LLAMA_MODEL_PATH must be set}"
 IDLE_TIMEOUT="${LLAMA_IDLE_TIMEOUT:-120}"
@@ -68,6 +75,11 @@ PYEOF
     echo "[llama-wrapper] Auto ctx: ${CTX_SIZE} [${CTX_SOURCE}] (GPU free: ${VRAM_FREE_MB} MiB, RAM free: ${RAM_FREE_MB} MiB, factor: ${FACTOR})"
 fi
 # ──────────────────────────────────────────────────────────────────────────────
+
+if [[ "$(basename "$MODEL_PATH")" =~ [Mm][Tt][Pp] ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --spec-type draft-mtp"
+    echo "[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding."
+fi
 
 echo "[llama-wrapper] Starting llama-server — model: $(basename "$MODEL_PATH") ctx: ${CTX_SIZE}"
 # shellcheck disable=SC2086
