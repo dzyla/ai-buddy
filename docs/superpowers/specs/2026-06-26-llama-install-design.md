@@ -77,13 +77,16 @@ WantedBy=sockets.target
 ```ini
 [Unit]
 Description=llama-server (on-demand, idle-unload)
-Requires=llama-server.socket
+After=llama-server.socket
 
 [Service]
 Type=simple
+Environment=PATH=/home/<user>/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=LLAMA_MODEL_PATH=/home/<user>/.local/share/ai/models/<chosen-file>.gguf
 Environment=LLAMA_IDLE_TIMEOUT=120
+ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
 ExecStart=%h/.local/bin/llama-server-wrapper.sh
+ExecStopPost=/bin/bash -c 'systemctl --user start --no-block llama-server.socket || true'
 Restart=no
 StandardOutput=journal
 StandardError=journal
