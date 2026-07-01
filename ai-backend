@@ -4,7 +4,7 @@
 # Backends are written to ~/.config/ai/env and sourced from ~/.bashrc.
 # Each snap's port is detected live so it stays correct after snap updates.
 
-ENV_FILE="${HOME}/.config/ai/env"
+ENV_FILE="${HOME}/.local/share/ai/env"
 mkdir -p "$(dirname "$ENV_FILE")"
 
 SYSTEMD_SERVICE="${HOME}/.config/systemd/user/llama-server.service"
@@ -112,21 +112,18 @@ case "$cmd" in
             echo "Start one:  qwen3-6 status | systemctl --user start llama-server"
             exit 1
         fi
-        echo "Apply now:  source ~/.config/ai/env"
         ;;
 
     qwen3-6)
         ep=$(get_snap_endpoint qwen3-6) || { echo "qwen3-6 snap not installed"; exit 1; }
         write_env "$ep" "qwen3-6"
         echo "Switched to qwen3-6 (${ep})"
-        echo "Apply now:  source ~/.config/ai/env"
         ;;
 
     gemma4)
         ep=$(get_snap_endpoint gemma4) || { echo "gemma4 snap not installed"; exit 1; }
         write_env "$ep" "gemma4"
         echo "Switched to gemma4 (${ep})"
-        echo "Apply now:  source ~/.config/ai/env"
         ;;
 
     llama)
@@ -181,7 +178,6 @@ case "$cmd" in
         echo "Switched to llama-server (http://localhost:8080/v1/)"
         echo "Model:     $model_path"
         echo ""
-        echo "Apply now:  source ~/.config/ai/env"
         echo "Start srv:  systemctl --user restart llama-server"
         echo "       or:  LLAMA_MODEL_PATH=\"$model_path\" ~/.local/bin/llama-server-wrapper.sh"
         ;;

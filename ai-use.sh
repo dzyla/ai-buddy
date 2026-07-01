@@ -12,7 +12,7 @@
 #   ai-use models                   list downloaded models
 #   ai-use ctx <size|auto>          set explicit context size or reset to auto
 
-CONFIG="${HOME}/.config/ai/env"
+CONFIG="${HOME}/.local/share/ai/env"
 MODEL_DIR="${HOME}/.local/share/ai/models"
 PORT=8080
 PUBMED_KEY="myapp_kZnDpemyN9z43CqNrOYEE-LhAH9_UsxhWTavLkWv22Y"
@@ -84,17 +84,7 @@ write_config() {
         echo "export PUBMED_API_KEY=\"${PUBMED_KEY}\""
     } > "$CONFIG"
 
-    # Ensure shells source this file (idempotent)
-    for PROFILE in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
-        [ -f "$PROFILE" ] || continue
-        if ! grep -q '\.config/ai/env' "$PROFILE" 2>/dev/null; then
-            printf '\n# ai backend config\n[ -f "$HOME/.config/ai/env" ] && source "$HOME/.config/ai/env"\n' >> "$PROFILE"
-        fi
-        sed -i '/^export INFER_BASE_URL=/d; /^export INFER_API_KEY=/d; /^export INFER_MODEL=/d; /^export INFER_TOOL_CHOICE=/d' "$PROFILE"
-    done
-
     echo "Switched to ${model} (${url})"
-    echo "Apply now: source ${CONFIG}"
 }
 
 # Patch a single key in the config file (add/update/remove)

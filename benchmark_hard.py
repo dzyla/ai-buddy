@@ -66,7 +66,7 @@ TEST_CASES = [
 
 def load_ai_env() -> Dict[str, str]:
     env = os.environ.copy()
-    env_path = os.path.expanduser("~/.config/ai/env")
+    env_path = os.path.expanduser("~/.local/share/ai/env")
     if os.path.exists(env_path):
         with open(env_path, "r") as f:
             for line in f:
