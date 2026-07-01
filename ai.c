@@ -2017,7 +2017,55 @@ static char *extract_leaked_task_complete(const char *content) {
     return summary;
 }
 
+static void load_env_file() {
+    char *home = getenv("HOME");
+    if (!home) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.local/share/ai/env", home);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *ptr = line;
+        while (isspace((unsigned char)*ptr)) ptr++;
+        if (*ptr == '#' || *ptr == '\0') continue;
+        if (strncmp(ptr, "export ", 7) == 0) {
+            ptr += 7;
+        }
+        while (isspace((unsigned char)*ptr)) ptr++;
+        char *eq = strchr(ptr, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = ptr;
+        char *val = eq + 1;
+        char *key_end = key + strlen(key) - 1;
+        while (key_end > key && isspace((unsigned char)*key_end)) {
+            *key_end = '\0';
+            key_end--;
+        }
+        while (isspace((unsigned char)*val)) val++;
+        if (*val == '"') {
+            val++;
+            char *quote = strchr(val, '"');
+            if (quote) *quote = '\0';
+        } else if (*val == '\'') {
+            val++;
+            char *quote = strchr(val, '\'');
+            if (quote) *quote = '\0';
+        } else {
+            char *val_end = val + strlen(val) - 1;
+            while (val_end >= val && (isspace((unsigned char)*val_end) || *val_end == '\r' || *val_end == '\n')) {
+                *val_end = '\0';
+                val_end--;
+            }
+        }
+        setenv(key, val, 1);
+    }
+    fclose(fp);
+}
+
 int main(int argc, char **argv) {
+    load_env_file();
     char exe_path[512] = "";
     ssize_t r_exe = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (r_exe > 0) {
