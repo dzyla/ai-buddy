@@ -793,7 +793,7 @@ static void poll_agent_stdin(void) {
 
 /* ── Minimal interactive line editor with history ─────────────────────────── */
 
-#define LINEED_MAX_LINE    4096
+#define LINEED_MAX_LINE    1048576
 #define LINEED_MAX_HISTORY 500
 
 static char *lineed_history[LINEED_MAX_HISTORY];
@@ -834,7 +834,7 @@ static void lineed_init(void) {
              "%s/input_history", dir);
     FILE *f = fopen(lineed_history_path, "r");
     if (!f) return;
-    char buf[LINEED_MAX_LINE];
+    static char buf[LINEED_MAX_LINE];
     while (fgets(buf, sizeof(buf), f)) {
         size_t l = strlen(buf);
         while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
@@ -921,7 +921,7 @@ static void lineed_redraw(const char *prompt, const char *buf, int len, int curs
  */
 static char *read_line_interactive(const char *prompt) {
     if (!isatty(STDIN_FILENO)) {
-        char buf[LINEED_MAX_LINE];
+        static char buf[LINEED_MAX_LINE];
         write(STDOUT_FILENO, prompt, strlen(prompt));
         if (!fgets(buf, sizeof(buf), stdin)) return NULL;
         size_t l = strlen(buf);
@@ -931,7 +931,7 @@ static char *read_line_interactive(const char *prompt) {
 
     struct termios saved, raw;
     if (tcgetattr(STDIN_FILENO, &saved) < 0) {
-        char buf[LINEED_MAX_LINE];
+        static char buf[LINEED_MAX_LINE];
         write(STDOUT_FILENO, prompt, strlen(prompt));
         if (!fgets(buf, sizeof(buf), stdin)) return NULL;
         size_t l = strlen(buf);
@@ -965,12 +965,13 @@ static char *read_line_interactive(const char *prompt) {
     } \
 } while (0)
 
-    char buf[LINEED_MAX_LINE];
+    static char buf[LINEED_MAX_LINE];
     int  len    = 0;
     int  cursor = 0;
     int  hidx   = lineed_history_len;
-    char saved_buf[LINEED_MAX_LINE] = "";
+    static char saved_buf[LINEED_MAX_LINE];
     buf[0] = '\0';
+    saved_buf[0] = '\0';
 
     for (;;) {
         unsigned char c;

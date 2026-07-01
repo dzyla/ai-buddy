@@ -1101,6 +1101,13 @@ def edit_file(path, search_content, replace_content):
         if matched_start >= 0:
             content_lines_with_ends = content.splitlines(keepends=True)
             original_span = "".join(content_lines_with_ends[matched_start:matched_start + n])
+            # If search_content doesn't end with a newline, strip the trailing newline from original_span
+            # so we don't eat it during replacement.
+            if not search_content.endswith(('\n', '\r')):
+                if original_span.endswith('\r\n'):
+                    original_span = original_span[:-2]
+                elif original_span.endswith('\n'):
+                    original_span = original_span[:-1]
             new_content = content.replace(original_span, replace_content, 1)
             with open(abs_path, "w") as f:
                 f.write(new_content)
@@ -2020,6 +2027,99 @@ def main():
             }
         })
 
+        # Google Calendar tools
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "gcal_list_events",
+                "description": "List events from Google Calendar in a specified time range.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "time_min": {
+                            "type": "string",
+                            "description": "Start time in ISO 8601 format (e.g. '2026-07-01T00:00:00-06:00' or '2026-07-01T00:00:00Z'). Defaults to current time."
+                        },
+                        "time_max": {
+                            "type": "string",
+                            "description": "End time in ISO 8601 format. Defaults to 7 days from start time."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of events to return. Defaults to 20.",
+                            "default": 20
+                        }
+                    }
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "gcal_create_event",
+                "description": "Create a new event in Google Calendar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Title/summary of the calendar event."
+                        },
+                        "start_time": {
+                            "type": "string",
+                            "description": "Start time in ISO 8601 format (must include timezone offset, e.g. '2026-07-01T14:00:00-06:00')."
+                        },
+                        "end_time": {
+                            "type": "string",
+                            "description": "End time in ISO 8601 format (must include timezone offset, e.g. '2026-07-01T15:00:00-06:00')."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional detailed description of the event."
+                        },
+                        "location": {
+                            "type": "string",
+                            "description": "Optional location of the event."
+                        },
+                        "attendees": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of attendee emails."
+                        }
+                    },
+                    "required": ["summary", "start_time", "end_time"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "gcal_check_availability",
+                "description": "Check free/busy time slots for Google Calendar to query availability.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "time_min": {
+                            "type": "string",
+                            "description": "Start time in ISO 8601 format (e.g. '2026-07-01T08:00:00-06:00')."
+                        },
+                        "time_max": {
+                            "type": "string",
+                            "description": "End time in ISO 8601 format (e.g. '2026-07-01T17:00:00-06:00')."
+                        },
+                        "calendar_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of calendar IDs to check. Defaults to ['primary']."
+                        }
+                    },
+                    "required": ["time_min", "time_max"]
+                }
+            }
+        })
+
         # 12. task_complete — last so model only sees it as exit
         openai_tools.append({
             "type": "function",
@@ -2304,6 +2404,42 @@ def main():
                 high_quality_only=arguments.get("high_quality_only", True),
             )
             print(result)
+        elif tool_name == "gcal_list_events" or server_name == "gcal_list_events":
+            try:
+                import gcal
+                result = gcal.list_events(
+                    time_min=arguments.get("time_min"),
+                    time_max=arguments.get("time_max"),
+                    max_results=arguments.get("max_results", 20)
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in gcal_list_events: {e}")
+        elif tool_name == "gcal_create_event" or server_name == "gcal_create_event":
+            try:
+                import gcal
+                result = gcal.create_event(
+                    summary=arguments.get("summary"),
+                    start_time=arguments.get("start_time"),
+                    end_time=arguments.get("end_time"),
+                    description=arguments.get("description"),
+                    location=arguments.get("location"),
+                    attendees=arguments.get("attendees")
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in gcal_create_event: {e}")
+        elif tool_name == "gcal_check_availability" or server_name == "gcal_check_availability":
+            try:
+                import gcal
+                result = gcal.check_availability(
+                    time_min=arguments.get("time_min"),
+                    time_max=arguments.get("time_max"),
+                    calendar_ids=arguments.get("calendar_ids")
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in gcal_check_availability: {e}")
         else:
             # Route to MCP server
             cfg = mcp_servers.get(server_name)
