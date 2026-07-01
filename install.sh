@@ -45,7 +45,7 @@ if [ "${1:-}" = "uninstall" ]; then
 
     # 3. Remove binaries and scripts
     echo "--> Removing binaries and wrapper scripts from ${BIN_DIR}..."
-    for f in ai ai_mcp.py ai-backend pubmed_mcp_server.py deep_research.py llama-server-wrapper.sh llama-server; do
+    for f in ai ai_mcp.py gcal.py ai-backend pubmed_mcp_server.py deep_research.py llama-server-wrapper.sh llama-server; do
         rm -f "${BIN_DIR}/$f"
     done
 
@@ -94,13 +94,15 @@ echo "==> Built: ${SCRIPT_DIR}/ai"
 
 # ── 2. Install to ~/.local/bin ────────────────────────────────────────────────
 echo "==> Installing to ${BIN_DIR}..."
+rm -f "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
 cp "${SCRIPT_DIR}/ai"             "${BIN_DIR}/ai"
 cp "${SCRIPT_DIR}/ai_mcp.py"      "${BIN_DIR}/ai_mcp.py"
+cp "${SCRIPT_DIR}/gcal.py"        "${BIN_DIR}/gcal.py"
 cp "${SCRIPT_DIR}/ai-backend"     "${BIN_DIR}/ai-backend"
 cp "${SCRIPT_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/pubmed_mcp_server.py"
 cp "${SCRIPT_DIR}/deep_research.py"   "${BIN_DIR}/deep_research.py"
-chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
-echo "==> Installed: ai  ai_mcp.py  ai-backend  pubmed_mcp_server.py  deep_research.py"
+chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
+echo "==> Installed: ai  ai_mcp.py  gcal.py  ai-backend  pubmed_mcp_server.py  deep_research.py"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
@@ -165,7 +167,7 @@ if [ "${1:-}" = "llama" ]; then
         fi
         echo "==> Building llama-server (this takes a few minutes)..."
         cmake -B "${LLAMA_SRC}/build" -S "$LLAMA_SRC" \
-            -DCMAKE_BUILD_TYPE=Release $GPU_FLAGS
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $GPU_FLAGS
         cmake --build "${LLAMA_SRC}/build" --config Release \
             --target llama-server -j"$(nproc)"
         cp "${LLAMA_SRC}/build/bin/llama-server" "${BIN_DIR}/"

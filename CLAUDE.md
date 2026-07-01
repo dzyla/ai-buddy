@@ -15,7 +15,7 @@ gcc -o ai ai.c cJSON.c -lcurl  # build only (dependencies: libcurl + jsmn.h + cJ
 ./install.sh snap              # also detect and configure a running AI snap (qwen3-6/gemma4)
 ```
 
-Backend is managed by `ai-backend` (installed to `~/.local/bin/`). Active config lives in `~/.config/ai/env`.
+Backend is managed by `ai-backend` (installed to `~/.local/bin/`). Active config lives in `~/.local/share/ai/env`.
 ```bash
 ai-backend status              # show active backend and available options
 ai-backend auto                # switch to whatever is currently running

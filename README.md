@@ -41,13 +41,12 @@ Everything goes to `~/.local/bin` — no sudo required. To uninstall (this will 
 ai-backend snap
 
 # Or set env vars manually for any OpenAI-compatible endpoint:
-cat > ~/.config/ai/env <<'EOF'
+cat > ~/.local/share/ai/env <<'EOF'
 export INFER_BASE_URL="http://localhost:8080/v1/"
 export INFER_API_KEY="your-key"
 export INFER_MODEL="your-model-name"
 EOF
 
-source ~/.config/ai/env
 ai "hello"
 ```
 
@@ -55,7 +54,7 @@ ai "hello"
 
 ## Backends
 
-`ai-backend` manages which LLM server `ai` talks to. Config lives in `~/.config/ai/env` and is sourced by your shell on startup.
+`ai-backend` manages which LLM server `ai` talks to. Config lives in `~/.local/share/ai/env` and is loaded directly by the `ai` binary.
 
 ```bash
 ai-backend status          # show active backend and what's available
@@ -90,7 +89,7 @@ systemctl --user restart llama-server
 
 ## Configuration
 
-All config lives in `~/.config/ai/env` (managed by `ai-backend`) and is sourced from `~/.bashrc`.
+All config lives in `~/.local/share/ai/env` (managed by `ai-backend`) and is loaded directly by the `ai` binary.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -224,7 +223,7 @@ Re-run `./install.sh` after adding skills to sync project skills to the global l
 
 | Path | Purpose |
 |------|---------|
-| `~/.config/ai/env` | Active backend config (INFER_* vars) |
+| `~/.local/share/ai/env` | Active backend config (INFER_* vars) |
 | `~/.config/ai/memory.txt` | Persistent memory, injected into every prompt |
 | `~/.config/ai/mcp.json` | Global MCP server registry |
 | `~/.config/ai/skills/` | Global skills directory |

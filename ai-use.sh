@@ -99,6 +99,10 @@ patch_config_key() {
 }
 
 kill_llama_server() {
+    if systemctl --user is-active -q llama-server.service 2>/dev/null || systemctl --user is-failed -q llama-server.service 2>/dev/null; then
+        echo "Stopping llama-server.service..."
+        systemctl --user stop llama-server.service || true
+    fi
     local pid
     pid=$(pgrep -f "llama-server.*--model" 2>/dev/null | head -1)
     if [ -n "$pid" ]; then
