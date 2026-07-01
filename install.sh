@@ -153,8 +153,22 @@ if [ "${1:-}" = "llama" ]; then
     # Build with best available GPU backend
     if [ ! -f "${BIN_DIR}/llama-server" ]; then
         GPU_FLAGS="-DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_VULKAN=OFF"
+        # Robust CUDA detection
+        NVCC_BIN=""
         if command -v nvcc &>/dev/null; then
-            echo "==> CUDA detected — building with CUDA support."
+            NVCC_BIN=$(command -v nvcc)
+        else
+            for path in /usr/local/cuda/bin/nvcc /usr/local/cuda-13.3/bin/nvcc /usr/local/cuda-12.8/bin/nvcc /usr/local/cuda-12.5/bin/nvcc /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12.2/bin/nvcc /usr/local/cuda-12.1/bin/nvcc /usr/local/cuda-12.0/bin/nvcc /usr/local/cuda-11.*/bin/nvcc; do
+                if [ -x "$path" ]; then
+                    NVCC_BIN="$path"
+                    break
+                fi
+            done
+        fi
+        
+        if [ -n "$NVCC_BIN" ]; then
+            echo "==> CUDA detected at ${NVCC_BIN} — building with CUDA support."
+            export PATH="$(dirname "$NVCC_BIN"):$PATH"
             GPU_FLAGS="-DGGML_CUDA=ON"
         elif command -v hipcc &>/dev/null; then
             echo "==> ROCm detected — building with HIP support."
