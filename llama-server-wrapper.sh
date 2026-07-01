@@ -1,9 +1,9 @@
 #!/bin/bash
 set -eo pipefail
 
-if [ -f "${HOME}/.config/ai/env" ]; then
+if [ -f "${HOME}/.local/share/ai/env" ]; then
     set +u
-    source "${HOME}/.config/ai/env"
+    source "${HOME}/.local/share/ai/env"
     set -u
 fi
 set -u

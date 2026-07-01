@@ -113,16 +113,7 @@ if [ -d "$SKILLS_SRC" ]; then
     echo "==> Synced ${count} skill(s) to ${SKILLS_DST}"
 fi
 
-# ── 4. Ensure ~/.bashrc / ~/.zshrc sources ~/.config/ai/env ──────────────────
-for profile in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
-    [ -f "$profile" ] || continue
-    if grep -q 'config/ai/env' "$profile"; then
-        echo "==> ${profile}: already sources ~/.config/ai/env"
-    else
-        printf '\n# ai backend — switch with: ai-backend [qwen3-6|gemma4|llama|auto]\n[ -f "${HOME}/.config/ai/env" ] && source "${HOME}/.config/ai/env"\n' >> "$profile"
-        echo "==> Patched ${profile}"
-    fi
-done
+# Configuration is loaded directly by the ai binary from ~/.local/share/ai/env
 
 # ── Subcommand: snap ──────────────────────────────────────────────────────────
 if [ "${1:-}" = "snap" ]; then
@@ -130,7 +121,6 @@ if [ "${1:-}" = "snap" ]; then
     echo "==> Detecting active AI snap..."
     "${BIN_DIR}/ai-backend" auto
     echo ""
-    echo "Apply: source ~/.config/ai/env"
     exit 0
 fi
 
@@ -307,7 +297,6 @@ SERVICE_EOF
     echo "  Server:  http://localhost:${PORT}/v1/ (auto-starts on first 'ai' call)"
     echo "  Logs:    journalctl --user -u llama-server -f"
     echo ""
-    echo "Apply:  source ~/.bashrc"
     echo "Test:   ai \"hello\""
     echo "========================================"
     exit 0
@@ -324,7 +313,5 @@ echo "  ai-backend auto     # same, picks whatever is running"
 echo "  ai-backend status   # show what's available"
 echo ""
 echo "Or run './install.sh llama' to set up a local llama.cpp server."
-echo ""
-echo "Apply:  source ~/.bashrc && source ~/.config/ai/env"
 echo "Test:   ai \"hello\""
 echo "========================================"
