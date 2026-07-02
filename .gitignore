@@ -16,6 +16,7 @@ build/
 dist/
 *.log
 *.tmp
+*.deb
 
 # Local machine specific temporary files
 ~lock.CLAUDE.md#1a2c.pdb
