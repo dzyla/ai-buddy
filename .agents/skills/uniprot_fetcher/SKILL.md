@@ -1,6 +1,6 @@
 ---
 name: uniprot_fetcher
-description: Fetching protein data from UniProt — covers REST API, search queries, entry pages, FASTA, and JS-protected pages
+description: CRITICAL — when fetching protein data, UniProt details, or amino acid sequences: Guidelines for UniProt REST API, format selection, and JS bypass.
 triggers:
   - uniprot
   - protein entry

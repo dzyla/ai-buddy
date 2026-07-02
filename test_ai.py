@@ -67,6 +67,17 @@ def test_help_flag():
     assert "Usage: ai" in res.stdout
     assert "--interactive" in res.stdout
     assert "--yes" in res.stdout
+    assert "--continue" in res.stdout
+
+def test_continue_flag():
+    res = run_ai(["-c", "-n", "Respond with exactly SUCCESS."])
+    assert res.returncode == 0
+    assert "SUCCESS" in res.stdout
+
+def test_continue_env_var():
+    res = run_ai(["-n", "Respond with exactly SUCCESS."], env={"INFER_CONTINUE": "1"})
+    assert res.returncode == 0
+    assert "SUCCESS" in res.stdout
 
 def test_missing_env_vars():
     # Clear INFER env vars and HOME so it cannot load from profiles
@@ -160,3 +171,50 @@ def test_ai_mcp_edit_file_fuzzy(tmp_path):
     # The file should have replaced the first "foo" with "baz" and left the second "foo " intact
     new_content = test_file.read_text()
     assert new_content == "baz\n\nbar\n\nfoo \n"
+
+def test_scheduler_tools_listed():
+    res = subprocess.run(["python3", "ai_mcp.py", "list-tools"], capture_output=True, text=True)
+    assert res.returncode == 0
+    tools = json.loads(res.stdout)
+    tool_names = [t["function"]["name"] for t in tools]
+    assert "schedule_task" in tool_names
+    assert "unschedule_task" in tool_names
+    assert "list_scheduled_tasks" in tool_names
+
+def test_scheduler_tool_calls():
+    # First, list to ensure empty or normal state
+    res = subprocess.run([
+        "python3", "ai_mcp.py", "call-tool", "list_scheduled_tasks", "list_scheduled_tasks", "{}"
+    ], capture_output=True, text=True)
+    assert res.returncode == 0
+    
+    # Now, schedule a dummy task
+    res = subprocess.run([
+        "python3", "ai_mcp.py", "call-tool", "schedule_task", "schedule_task",
+        '{"task_id": "test_dummy_task", "prompt": "Respond with SUCCESS", "interval_seconds": 60}'
+    ], capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "Successfully scheduled task" in res.stdout
+    
+    # List tasks again and verify it is there
+    res = subprocess.run([
+        "python3", "ai_mcp.py", "call-tool", "list_scheduled_tasks", "list_scheduled_tasks", "{}"
+    ], capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "test_dummy_task" in res.stdout
+    assert "Respond with SUCCESS" in res.stdout
+    
+    # Now, unschedule it
+    res = subprocess.run([
+        "python3", "ai_mcp.py", "call-tool", "unschedule_task", "unschedule_task",
+        '{"task_id": "test_dummy_task"}'
+    ], capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "Successfully unscheduled/cancelled task" in res.stdout
+    
+    # Verify it is no longer listed
+    res = subprocess.run([
+        "python3", "ai_mcp.py", "call-tool", "list_scheduled_tasks", "list_scheduled_tasks", "{}"
+    ], capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "test_dummy_task" not in res.stdout

@@ -1,6 +1,6 @@
 ---
 name: cli-shell-diagnostics
-description: Behavioral guidelines for diagnosing terminal command failures, interpreting shell exit codes, and reading system logs.
+description: CRITICAL — when a shell command fails or you encounter execution errors: Behavioral guidelines for diagnosing terminal failures, exit codes, and reading system logs.
 ---
 
 # Shell Diagnostics Guidelines

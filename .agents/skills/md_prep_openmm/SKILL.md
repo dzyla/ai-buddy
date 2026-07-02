@@ -1,6 +1,6 @@
 ---
 name: md-prep-openmm
-description: Guides MD simulation preparation using the OpenMM Python ecosystem — PDBFixer cleaning, force field selection, solvation, minimization, and short production runs. Always execute Python directly.
+description: CRITICAL — when preparing PDB structures for molecular dynamics (MD) or running OpenMM simulations: Guidelines for PDBFixer cleaning, force fields, solvation, and minimization.
 ---
 
 # MD Simulation Preparation (OpenMM)

@@ -219,6 +219,14 @@ Re-run `./install.sh` after adding skills to sync project skills to the global l
 
 ---
 
+## Zulip Integration
+
+You can integrate `ai` with Zulip to chat with the local agent directly from your mobile device or desktop.
+
+For complete configuration instructions, bot creation, and setting up the systemd user service background daemon, see [docs/zulip-setup.md](docs/zulip-setup.md).
+
+---
+
 ## Runtime state
 
 | Path | Purpose |

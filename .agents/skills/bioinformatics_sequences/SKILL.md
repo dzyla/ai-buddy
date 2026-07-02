@@ -1,6 +1,6 @@
 ---
 name: bioinformatics-sequences
-description: Guides sequence search (PyHMMER/BLAST), MSA (muscle5/mafft), phylogenetics (IQ-TREE2/ete3), structure-sequence mapping, and HPC/SLURM patterns. Execute Python and CLI tools directly.
+description: CRITICAL — when analyzing FASTA sequences, multiple sequence alignments (MSA), or phylogenetics: Guidelines for PyHMMER/BLAST searches, muscle5/mafft alignment, and IQ-TREE2 trees.
 ---
 
 # Bioinformatics — Sequences & Pipelines

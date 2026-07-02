@@ -1444,6 +1444,9 @@ TOOL_REQUIRED_ARGS = {
     "computer_control": ["action"],
     "pubmed_search":          ["query"],
     "pubmed_research_round":  ["query"],
+    "schedule_task":   ["task_id", "prompt", "interval_seconds"],
+    "unschedule_task": ["task_id"],
+    "list_scheduled_tasks": [],
 }
 
 # Per-agent and per-URL output caps for parallel tools
@@ -1610,6 +1613,223 @@ def repair_json(s):
         s += '}' * max(0, depth)
     return s
 
+def schedule_task(task_id, prompt, interval_seconds, run_once=False):
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    
+    safe_task_id = "".join(c for c in task_id if c.isalnum() or c in ("_", "-"))
+    if not safe_task_id:
+        return "Error: task_id must contain alphanumeric characters, hyphens, or underscores."
+        
+    task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
+    os.makedirs(task_dir, exist_ok=True)
+    
+    task_file = os.path.join(task_dir, f"{safe_task_id}.json")
+    
+    saved_env = {}
+    for k, v in os.environ.items():
+        if k.startswith("INFER_") or k.startswith("ZULIP_") or k == "PATH":
+            saved_env[k] = v
+            
+    task_data = {
+        "task_id": safe_task_id,
+        "prompt": prompt,
+        "interval_seconds": max(10, int(interval_seconds)),
+        "run_once": bool(run_once),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_run": "never",
+        "env": saved_env
+    }
+    
+    existed = os.path.exists(task_file)
+    
+    try:
+        with open(task_file, "w") as f:
+            json.dump(task_data, f, indent=2)
+    except Exception as e:
+        return f"Error writing task file: {e}"
+        
+    if not existed:
+        try:
+            cmd = [sys.executable, __file__, "run-scheduler", safe_task_id]
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True
+            )
+            return f"Successfully scheduled task '{safe_task_id}' (running every {interval_seconds}s in the background)."
+        except Exception as e:
+            try:
+                os.remove(task_file)
+            except:
+                pass
+            return f"Error spawning scheduler process: {e}"
+    else:
+        return f"Updated scheduled task '{safe_task_id}' (running every {interval_seconds}s in the background)."
+
+def unschedule_task(task_id):
+    import os
+    safe_task_id = "".join(c for c in task_id if c.isalnum() or c in ("_", "-"))
+    task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
+    task_file = os.path.join(task_dir, f"{safe_task_id}.json")
+    
+    if os.path.exists(task_file):
+        try:
+            os.remove(task_file)
+            return f"Successfully unscheduled/cancelled task '{safe_task_id}'."
+        except Exception as e:
+            return f"Error removing task file: {e}"
+    else:
+        return f"Task '{safe_task_id}' not found or already unscheduled."
+
+def list_scheduled_tasks():
+    import os
+    import json
+    task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
+    if not os.path.exists(task_dir) or not os.path.isdir(task_dir):
+        return "No scheduled tasks found."
+        
+    files = [f for f in os.listdir(task_dir) if f.endswith(".json")]
+    if not files:
+        return "No scheduled tasks found."
+        
+    lines = []
+    for f in sorted(files):
+        path = os.path.join(task_dir, f)
+        try:
+            with open(path, "r") as tf:
+                data = json.load(tf)
+            tid = data.get("task_id")
+            interval = data.get("interval_seconds")
+            created = data.get("created_at")
+            last_run = data.get("last_run")
+            prompt = data.get("prompt")
+            lines.append(f"Task ID: {tid}")
+            lines.append(f"  Interval: {interval} seconds")
+            lines.append(f"  Created:  {created}")
+            lines.append(f"  Last Run: {last_run}")
+            lines.append(f"  Prompt:   {prompt}")
+            lines.append("-" * 40)
+        except Exception:
+            pass
+            
+    if not lines:
+        return "No scheduled tasks found."
+    return "\n".join(lines)
+
+def run_scheduler_loop(task_id):
+    import time
+    import json
+    import os
+    import subprocess
+    import threading
+
+    safe_task_id = "".join(c for c in task_id if c.isalnum() or c in ("_", "-"))
+    if not safe_task_id:
+        return
+
+    task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
+    task_file = os.path.join(task_dir, f"{safe_task_id}.json")
+
+    cache_dir = os.path.expanduser("~/.cache/ai")
+    os.makedirs(cache_dir, exist_ok=True)
+    log_file = os.path.join(cache_dir, "scheduler.log")
+
+    def log_message(msg):
+        try:
+            t = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_file, "a") as lf:
+                lf.write(f"[{t}] [Task: {safe_task_id}] {msg}\n")
+        except:
+            pass
+
+    def interruptible_sleep(seconds):
+        """Sleep for `seconds`, but wake up every 5s to check if the task file is gone.
+        Returns True if we should continue, False if cancelled (task file deleted)."""
+        deadline = time.monotonic() + seconds
+        check_interval = 5.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True  # normal timeout, continue
+            wait = min(remaining, check_interval)
+            time.sleep(wait)
+            if not os.path.exists(task_file):
+                return False  # cancelled
+
+    log_message("Scheduler loop started.")
+
+    while True:
+        if not os.path.exists(task_file):
+            log_message("Task file deleted. Exiting scheduler loop.")
+            break
+
+        try:
+            with open(task_file, "r") as f:
+                task_data = json.load(f)
+        except Exception as e:
+            log_message(f"Error reading task file: {e}")
+            time.sleep(1)
+            continue
+
+        interval = int(task_data.get("interval_seconds", 300))
+        prompt = task_data.get("prompt")
+        saved_env = task_data.get("env", {})
+        run_once = task_data.get("run_once", False)
+
+        # Interruptible sleep — wakes within 5s if task file is deleted
+        if not interruptible_sleep(interval):
+            log_message("Task file deleted during sleep. Exiting.")
+            break
+
+        # For run_once tasks: atomically delete the task file BEFORE spawning
+        # so that even if the agent crashes, the task doesn't repeat.
+        if run_once:
+            try:
+                os.remove(task_file)
+                log_message("run_once task: task file removed before agent spawn.")
+            except Exception as e:
+                log_message(f"run_once: could not remove task file: {e}")
+
+        ai_bin = _resolve_ai_bin()
+        cmd = [ai_bin, "-y", "-q", prompt]
+
+        run_env = os.environ.copy()
+        run_env.update(saved_env)
+
+        # Update last_run timestamp (only for recurring tasks — file may be gone for run_once)
+        if not run_once and os.path.exists(task_file):
+            try:
+                task_data["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                with open(task_file, "w") as f:
+                    json.dump(task_data, f, indent=2)
+            except Exception as e:
+                log_message(f"Error updating task file metadata: {e}")
+
+        try:
+            log_message(f"Spawning: {cmd}")
+            proc = subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=600)
+            if proc.returncode != 0:
+                log_message(f"Agent failed with exit status {proc.returncode}. Stderr: {proc.stderr.strip()[:200]}")
+            else:
+                log_message(f"Agent finished successfully. Output: {proc.stdout.strip()[:200]}")
+        except subprocess.TimeoutExpired:
+            log_message("Agent timed out after 600s.")
+        except Exception as e:
+            log_message(f"Error running agent: {e}")
+
+        # After agent runs: check if it called unschedule_task (deleted the file)
+        # If so, exit immediately — don't loop back for another sleep.
+        if run_once or not os.path.exists(task_file):
+            log_message("Task file gone after agent run. Exiting scheduler loop.")
+            break
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: ai_mcp.py [list-tools | call-tool | render-markdown | trim-messages]", file=sys.stderr)
@@ -1618,11 +1838,21 @@ def main():
     action = sys.argv[1]
     mcp_servers = load_config()
 
+    if action == "run-scheduler":
+        if len(sys.argv) < 3:
+            sys.exit(1)
+        task_id = sys.argv[2]
+        run_scheduler_loop(task_id)
+        sys.exit(0)
+
     if action == "render-markdown":
         if len(sys.argv) < 3:
             sys.exit(0)
         text = sys.argv[2]
-        print(render_markdown(text))
+        if os.environ.get("INFER_RAW_OUTPUT") == "1":
+            print(text)
+        else:
+            print(render_markdown(text))
         sys.exit(0)
 
     if action == "trim-messages":
@@ -2048,6 +2278,11 @@ def main():
                             "type": "integer",
                             "description": "Maximum number of events to return. Defaults to 20.",
                             "default": 20
+                        },
+                        "calendar_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of calendar IDs to search. Omit or set to ['all'] to search all of your selected Google calendars."
                         }
                     }
                 }
@@ -2086,6 +2321,10 @@ def main():
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Optional list of attendee emails."
+                        },
+                        "calendar_id": {
+                            "type": "string",
+                            "description": "Optional ID of the calendar to create the event in. Defaults to 'primary' (your main calendar)."
                         }
                     },
                     "required": ["summary", "start_time", "end_time"]
@@ -2116,6 +2355,108 @@ def main():
                         }
                     },
                     "required": ["time_min", "time_max"]
+                }
+            }
+        })
+
+        # 11b. check_time
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "check_time",
+                "description": "Returns the current local date and time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        })
+
+        # schedule_task
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "schedule_task",
+                "description": (
+                    "MANDATORY replacement for `sleep` delays. NEVER use execute_command with sleep for timed work — "
+                    "it blocks the terminal and the Zulip bridge, hanging the session with no response. "
+                    "Use this tool instead for ANY deferred, timed, or periodic work: desktop notifications, "
+                    "reminders, polling folders, checking job status, sending messages when a condition is met. "
+                    "This returns IMMEDIATELY — the task runs in a fully detached background process. "
+                    "For ONE-SHOT reminders: set interval_seconds to the desired delay (e.g. 300 for 5 min), "
+                    "and include 'then call unschedule_task(task_id)' at the end of the prompt so it runs exactly once. "
+                    "For POLLING tasks: set a shorter interval and only call unschedule_task when the condition is met. "
+                    "After calling this, immediately call task_complete to confirm the schedule to the user."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "A unique snake_case identifier, e.g. 'notify_go_home' or 'check_binders_done'."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": (
+                                "Full self-contained instruction for the background agent. Must include everything it needs. "
+                                "For one-shot: end with 'then call unschedule_task({task_id})' to stop after one run. "
+                                "Example one-shot: 'Run: execute_command(\"notify-send \\\"Go home!\\\" \\\"Time to leave 🏠\\\"\"); "
+                                "then call unschedule_task(notify_go_home).' "
+                                "Example polling: 'Count files in /data/results. If count >= 10000: send Zulip private message "
+                                "to user@example.com saying how many passed filters; then call unschedule_task(check_binders). Else do nothing.'"
+                            )
+                        },
+                        "interval_seconds": {
+                            "type": "integer",
+                            "description": (
+                                "How often to run (minimum 10s). "
+                                "For one-shot reminders, set this to the full delay (e.g. 300 for 5 minutes). "
+                                "For polling, set to a shorter check interval (e.g. 120 for every 2 min)."
+                            )
+                        },
+                        "run_once": {
+                            "type": "boolean",
+                            "description": (
+                                "If true, the task is guaranteed to run exactly once after interval_seconds and then stop — "
+                                "no matter what the sub-agent does. Use this for simple one-shot reminders/notifications "
+                                "instead of relying on the sub-agent to call unschedule_task. Default is false."
+                            )
+                        }
+                    },
+                    "required": ["task_id", "prompt", "interval_seconds"]
+                }
+            }
+        })
+
+
+        # unschedule_task
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "unschedule_task",
+                "description": "Cancel a previously scheduled background task and stop its recurring execution.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The unique identifier of the task to cancel/stop."
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        })
+
+        # list_scheduled_tasks
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_scheduled_tasks",
+                "description": "List all currently scheduled background tasks with their ID, prompt, interval, and last run time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
                 }
             }
         })
@@ -2191,6 +2532,24 @@ def main():
         elif tool_name == "task_complete" or server_name == "task_complete":
             # Handled natively in C; this is a safety fallback
             print('{"ok": true}')
+        elif tool_name == "check_time" or server_name == "check_time":
+            import datetime
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(now)
+        elif tool_name == "schedule_task" or server_name == "schedule_task":
+            task_id = arguments.get("task_id")
+            prompt = arguments.get("prompt")
+            interval_seconds = arguments.get("interval_seconds", 300)
+            run_once = arguments.get("run_once", False)
+            result = schedule_task(task_id, prompt, interval_seconds, run_once=run_once)
+            print(result)
+        elif tool_name == "unschedule_task" or server_name == "unschedule_task":
+            task_id = arguments.get("task_id")
+            result = unschedule_task(task_id)
+            print(result)
+        elif tool_name == "list_scheduled_tasks" or server_name == "list_scheduled_tasks":
+            result = list_scheduled_tasks()
+            print(result)
         elif tool_name == "list_directory" or server_name == "list_directory":
             path = arguments.get("path", ".")
             result = list_directory(path)
@@ -2410,7 +2769,8 @@ def main():
                 result = gcal.list_events(
                     time_min=arguments.get("time_min"),
                     time_max=arguments.get("time_max"),
-                    max_results=arguments.get("max_results", 20)
+                    max_results=arguments.get("max_results", 20),
+                    calendar_ids=arguments.get("calendar_ids")
                 )
                 print(result)
             except Exception as e:
@@ -2424,7 +2784,8 @@ def main():
                     end_time=arguments.get("end_time"),
                     description=arguments.get("description"),
                     location=arguments.get("location"),
-                    attendees=arguments.get("attendees")
+                    attendees=arguments.get("attendees"),
+                    calendar_id=arguments.get("calendar_id", 'primary')
                 )
                 print(result)
             except Exception as e:

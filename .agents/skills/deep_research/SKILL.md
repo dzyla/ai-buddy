@@ -1,9 +1,6 @@
 ---
 name: deep-research
-description: >
-  Activate when the user asks for "deep research", "comprehensive research",
-  "in-depth investigation", "thoroughly research X", or similar phrasing
-  indicating they want multi-source, structured research on a topic.
+description: CRITICAL — when the user asks for deep research, comprehensive research, deep dive, or in-depth investigation: Installs and runs the autonomous multi-agent deep research orchestrator.
 ---
 
 # Deep Research Skill

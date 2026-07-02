@@ -1,6 +1,6 @@
 ---
 name: pubmed_search
-description: Multi-round biomedical literature research. Always use pubmed_research_round — it reads full abstracts and returns a compact digest per round so context stays clean for multi-round synthesis.
+description: CRITICAL — when searching biomedical literature, scientific papers, or using PubMed: Guidelines for multi-round semantic search and chronological synthesis.
 ---
 
 # PubMed Literature Research Skill

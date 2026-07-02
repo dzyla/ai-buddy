@@ -1,6 +1,6 @@
 ---
 name: structure-based-design
-description: Guides structure-based drug discovery — receptor prep, binding site detection, AutoDock Vina docking (Python API), interaction fingerprints (PLIP/ProLIF), ADME filters. Execute Python directly.
+description: CRITICAL — when performing docking simulations (AutoDock Vina), binding site detection, or ADME/Ro5 filtering: Guidelines for receptor/ligand prep, Vina docking, and PLIP fingerprints.
 ---
 
 # Structure-Based Drug Design

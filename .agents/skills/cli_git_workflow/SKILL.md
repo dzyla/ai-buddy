@@ -1,6 +1,6 @@
 ---
 name: cli-git-workflow
-description: Guidelines for managing Git repository workflows inside a CLI session. Instructs the model on safe staging, commit message syntax, and checking diffs before commits.
+description: CRITICAL — when performing git operations (like commit, add, diff, status): Guidelines for safe staging, commit message syntax, and checking diffs before commits.
 ---
 
 # Git Workflow Guidelines for CLI Assistants

@@ -1,6 +1,6 @@
 ---
 name: mcp-explorer-guide
-description: Guidelines to enforce codebase exploration before modifying code. Instructs the model to list directory contents, locate functions/symbols, and read file contexts before proposing changes.
+description: CRITICAL — when exploring the codebase or investigating code file structures before editing: Rules for codebase mapping, reading headers, and style alignment.
 ---
 
 # Codebase Explorer Guidelines
