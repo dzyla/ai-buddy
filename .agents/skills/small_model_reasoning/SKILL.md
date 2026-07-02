@@ -1,6 +1,6 @@
 ---
 name: small-model-reasoning
-description: Strict guidelines for smaller models (like Gemma 4) to improve execution accuracy by forcing step-by-step thinking, plan-validation loops, and strict verification of tool arguments before execution.
+description: CRITICAL — when using local models (like Gemma, Qwen, or Llama) or solving complex reasoning, coding, or planning tasks: Strict guidelines to improve execution accuracy by forcing step-by-step thinking, plan-validation loops, and strict verification of tool arguments.
 ---
 
 # Small Model Reasoning Guidelines
@@ -23,3 +23,8 @@ Smaller models (e.g., 7B-9B parameter models like Gemma 4) can occasionally jump
 ## 4. Self-Correction Check
 - After receiving a tool's output, ask: "Does this output confirm my expectation, or does it contradict it?"
 - If the output is empty or unexpected, adapt your plan immediately instead of repeating the failed steps.
+
+## 5. Context Size & Prompt Management
+- Smaller local models are sensitive to prompt length and context limits (typically 8k to 32k tokens).
+- Avoid loading massive files using `read_file` or `view_file` with large ranges. Use targeted grep search or read specific line ranges.
+- If the context size is growing too large, proactively use the `:compact` command to summarize session history and keep the context window clear.

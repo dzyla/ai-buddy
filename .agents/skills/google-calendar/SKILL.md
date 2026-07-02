@@ -1,6 +1,6 @@
 ---
 name: google-calendar
-description: Add, view, and check schedules and availability using Google Calendar integration.
+description: CRITICAL — when checking schedules, viewing upcoming events, or managing Google Calendar: Guidelines on timestamps, timezones, and authentication setup.
 ---
 
 # Google Calendar Skill

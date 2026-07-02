@@ -1,6 +1,6 @@
 ---
 name: smart-web-fetch
-description: Guidance for choosing between fetch_smart, fetch_webpage, and fetch_webpage_js. Use whenever fetching URLs to ensure the right tool is used for bot-protected or JS-heavy sites.
+description: CRITICAL — when fetching web pages, URLs, or scraping online content: Guidance for choosing between fetch_smart, fetch_webpage, fetch_webpage_js, and parallel_fetch.
 ---
 
 # Smart Web Fetch

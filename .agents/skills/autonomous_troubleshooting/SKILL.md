@@ -1,6 +1,6 @@
 ---
 name: autonomous-troubleshooting
-description: Behavioral guidelines for autonomous troubleshooting, forcing the agent to write, execute, and verify code, debug iteratively, pivot when stuck, and verify execution success.
+description: CRITICAL — when executing or troubleshooting terminal commands, running tests, or debugging code: Behavioral guidelines for autonomous execution, debugging iteratively, and verifying success.
 ---
 
 # Autonomous Troubleshooting and Execution Skill

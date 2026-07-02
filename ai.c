@@ -71,6 +71,15 @@ static const char *SYSTEM_PROMPT =
     "- Example — multi-site comparison: parallel_fetch({\"urls\":[site1,site2,site3]}).\n"
     "- Example — parallel research: delegate_task({\"tasks\":[\"Search for X and summarise findings\",\"Search for Y and summarise findings\"]}).\n"
     "- Rule: if you would call fetch_webpage or web_search more than once for independent URLs/queries, use parallel_fetch or delegate_task instead.\n\n"
+    "SCHEDULING AND DEFERRED TASKS (CRITICAL):\n"
+    "- NEVER use `sleep` inside execute_command for delays. `sleep 60 && ...` blocks the terminal or chat bridge and makes the user wait with no response. It is FORBIDDEN.\n"
+    "- For ANY request that involves waiting, timing, or checking something later (e.g. 'remind me in 5 min', 'notify me when done', 'check the folder every hour', 'send a message when job finishes') you MUST use schedule_task.\n"
+    "- schedule_task runs the agent loop in a fully detached background process — the current session returns immediately.\n"
+    "- Inside the scheduled prompt, instruct the sub-agent to call unschedule_task(task_id) once its condition is satisfied so the loop stops.\n"
+    "- Examples:\n"
+    "  * 'Show notification in 5 min' → schedule_task(task_id='notify_go_home', prompt='Run: execute_command(notify-send ...); then unschedule_task(notify_go_home).', interval_seconds=300)\n"
+    "  * 'Tell me when /data has 1000 files' → schedule_task(task_id='check_data_files', prompt='Count files in /data. If >= 1000: send Zulip message with count, then unschedule_task(check_data_files). Else do nothing.', interval_seconds=120)\n"
+    "- After calling schedule_task, immediately call task_complete telling the user the task is scheduled and when/how they will be notified.\n\n"
     "SKILLS:\n"
     "- Domain skills exist. Call load_skill() to list them, load_skill(name) to read one.\n"
     "- Additional CRITICAL triggers may follow in the system context — obey them exactly.";
@@ -625,6 +634,7 @@ static char *g_system_message_json = NULL;
 static volatile int g_compact_in_progress = 0;
 static int g_compact_dot_timer = 0;
 static int g_auto_approve = 0;
+static int g_continue_until_done = 0;
 static volatile int g_agent_loop_active = 0; /* 1 while the has_more agent loop runs */
 
 /* Shared stdin accumulation buffer for :btw detection (used by progress_cb + poll) */
@@ -1352,6 +1362,479 @@ static int json_skip_token(jsmntok_t *tokens, int r, int start_idx) {
     return i;
 }
 
+struct stream_context {
+    char *id;
+    char *object;
+    long created;
+    char *model_name;
+    char *finish_reason;
+
+    char *accumulated_reasoning;
+    size_t reasoning_len;
+    size_t reasoning_cap;
+
+    char *accumulated_content;
+    size_t content_len;
+    size_t content_cap;
+
+    struct {
+        int index;
+        char *id;
+        char *name;
+        char *arguments;
+        size_t arguments_len;
+        size_t arguments_cap;
+    } tool_calls[64];
+    int num_tool_calls;
+
+    int prompt_tokens;
+    int completion_tokens;
+    int total_tokens;
+
+    int quiet_mode;
+    int printed_thinking_header;
+    int printed_thinking_footer;
+
+    char *line_buf;
+    size_t line_len;
+    size_t line_cap;
+
+    struct response *original_chunk;
+};
+
+static void init_stream_context(struct stream_context *ctx, struct response *original_chunk, int quiet_mode) {
+    memset(ctx, 0, sizeof(struct stream_context));
+    ctx->original_chunk = original_chunk;
+    ctx->quiet_mode = quiet_mode;
+}
+
+static void free_stream_context(struct stream_context *ctx) {
+    if (ctx->id) free(ctx->id);
+    if (ctx->object) free(ctx->object);
+    if (ctx->model_name) free(ctx->model_name);
+    if (ctx->finish_reason) free(ctx->finish_reason);
+    if (ctx->accumulated_reasoning) free(ctx->accumulated_reasoning);
+    if (ctx->accumulated_content) free(ctx->accumulated_content);
+    for (int i = 0; i < ctx->num_tool_calls; i++) {
+        if (ctx->tool_calls[i].id) free(ctx->tool_calls[i].id);
+        if (ctx->tool_calls[i].name) free(ctx->tool_calls[i].name);
+        if (ctx->tool_calls[i].arguments) free(ctx->tool_calls[i].arguments);
+    }
+    if (ctx->line_buf) free(ctx->line_buf);
+}
+
+static void buf_append_str(char **buf, size_t *len, size_t *cap, const char *str, size_t str_len) {
+    if (!str || str_len == 0) return;
+    if (*len + str_len >= *cap) {
+        *cap = (*cap == 0) ? (str_len + 1024) : (*cap + str_len + 1024) * 2;
+        char *new_buf = realloc(*buf, *cap);
+        if (!new_buf) return;
+        *buf = new_buf;
+    }
+    memcpy((*buf) + *len, str, str_len);
+    *len += str_len;
+    (*buf)[*len] = '\0';
+}
+
+static int get_tool_call_idx(struct stream_context *ctx, int index) {
+    for (int i = 0; i < ctx->num_tool_calls; i++) {
+        if (ctx->tool_calls[i].index == index) {
+            return i;
+        }
+    }
+    if (ctx->num_tool_calls < 64) {
+        int i = ctx->num_tool_calls++;
+        ctx->tool_calls[i].index = index;
+        ctx->tool_calls[i].id = NULL;
+        ctx->tool_calls[i].name = NULL;
+        ctx->tool_calls[i].arguments = NULL;
+        ctx->tool_calls[i].arguments_len = 0;
+        ctx->tool_calls[i].arguments_cap = 0;
+        return i;
+    }
+    return -1;
+}
+
+static void process_sse_json(struct stream_context *ctx, const char *json_str, size_t len) {
+    jsmn_parser parser;
+    jsmntok_t tokens[256];
+    jsmn_init(&parser);
+    int r = jsmn_parse(&parser, json_str, len, tokens, 256);
+    if (r < 0) return;
+    
+    int choices_tok = -1;
+    int usage_tok = -1;
+    int id_tok = -1;
+    int object_tok = -1;
+    int created_tok = -1;
+    int model_tok = -1;
+
+    for (int i = 1; i < r; i++) {
+        if (tokens[i].type == JSMN_STRING) {
+            int tlen = tokens[i].end - tokens[i].start;
+            if (tlen == 7 && strncmp(json_str + tokens[i].start, "choices", 7) == 0) {
+                choices_tok = i + 1;
+            } else if (tlen == 5 && strncmp(json_str + tokens[i].start, "usage", 5) == 0) {
+                usage_tok = i + 1;
+            } else if (tlen == 2 && strncmp(json_str + tokens[i].start, "id", 2) == 0) {
+                id_tok = i + 1;
+            } else if (tlen == 6 && strncmp(json_str + tokens[i].start, "object", 6) == 0) {
+                object_tok = i + 1;
+            } else if (tlen == 7 && strncmp(json_str + tokens[i].start, "created", 7) == 0) {
+                created_tok = i + 1;
+            } else if (tlen == 5 && strncmp(json_str + tokens[i].start, "model", 5) == 0) {
+                model_tok = i + 1;
+            }
+        }
+    }
+
+    if (id_tok != -1 && tokens[id_tok].type == JSMN_STRING && !ctx->id) {
+        ctx->id = unescape_json_string(json_str + tokens[id_tok].start, tokens[id_tok].end - tokens[id_tok].start);
+    }
+    if (object_tok != -1 && tokens[object_tok].type == JSMN_STRING && !ctx->object) {
+        ctx->object = unescape_json_string(json_str + tokens[object_tok].start, tokens[object_tok].end - tokens[object_tok].start);
+    }
+    if (created_tok != -1 && tokens[created_tok].type == JSMN_PRIMITIVE && ctx->created == 0) {
+        ctx->created = atol(json_str + tokens[created_tok].start);
+    }
+    if (model_tok != -1 && tokens[model_tok].type == JSMN_STRING && !ctx->model_name) {
+        ctx->model_name = unescape_json_string(json_str + tokens[model_tok].start, tokens[model_tok].end - tokens[model_tok].start);
+    }
+
+    if (usage_tok != -1 && tokens[usage_tok].type == JSMN_OBJECT) {
+        int u_end = tokens[usage_tok].end;
+        int k = usage_tok + 1;
+        while (k < r && tokens[k].start < u_end) {
+            if (tokens[k].type == JSMN_STRING) {
+                int ulen = tokens[k].end - tokens[k].start;
+                if (ulen == 13 && strncmp(json_str + tokens[k].start, "prompt_tokens", 13) == 0)
+                    ctx->prompt_tokens = atoi(json_str + tokens[k+1].start);
+                else if (ulen == 17 && strncmp(json_str + tokens[k].start, "completion_tokens", 17) == 0)
+                    ctx->completion_tokens = atoi(json_str + tokens[k+1].start);
+                else if (ulen == 12 && strncmp(json_str + tokens[k].start, "total_tokens", 12) == 0)
+                    ctx->total_tokens = atoi(json_str + tokens[k+1].start);
+            }
+            k = json_skip_token(tokens, r, k + 2);
+        }
+    }
+
+    if (choices_tok != -1 && tokens[choices_tok].type == JSMN_ARRAY && tokens[choices_tok].size > 0) {
+        int choice_tok = choices_tok + 1;
+        if (tokens[choice_tok].type == JSMN_OBJECT) {
+            int c_end = tokens[choice_tok].end;
+            int delta_tok = -1;
+            int finish_reason_tok = -1;
+            
+            int k = choice_tok + 1;
+            while (k < r && tokens[k].start < c_end) {
+                if (tokens[k].type == JSMN_STRING) {
+                    int clen = tokens[k].end - tokens[k].start;
+                    if (clen == 5 && strncmp(json_str + tokens[k].start, "delta", 5) == 0) {
+                        delta_tok = k + 1;
+                    } else if (clen == 13 && strncmp(json_str + tokens[k].start, "finish_reason", 13) == 0) {
+                        finish_reason_tok = k + 1;
+                    }
+                }
+                k = json_skip_token(tokens, r, k + 2);
+            }
+
+            if (finish_reason_tok != -1 && tokens[finish_reason_tok].type == JSMN_STRING && !ctx->finish_reason) {
+                ctx->finish_reason = unescape_json_string(json_str + tokens[finish_reason_tok].start, tokens[finish_reason_tok].end - tokens[finish_reason_tok].start);
+            }
+
+            if (delta_tok != -1 && tokens[delta_tok].type == JSMN_OBJECT) {
+                int d_end = tokens[delta_tok].end;
+                int content_tok = -1;
+                int reasoning_content_tok = -1;
+                int tool_calls_tok = -1;
+
+                k = delta_tok + 1;
+                while (k < r && tokens[k].start < d_end) {
+                    if (tokens[k].type == JSMN_STRING) {
+                        int dlen = tokens[k].end - tokens[k].start;
+                        if (dlen == 7 && strncmp(json_str + tokens[k].start, "content", 7) == 0) {
+                            content_tok = k + 1;
+                        } else if (dlen == 17 && strncmp(json_str + tokens[k].start, "reasoning_content", 17) == 0) {
+                            reasoning_content_tok = k + 1;
+                        } else if (dlen == 10 && strncmp(json_str + tokens[k].start, "tool_calls", 10) == 0) {
+                            tool_calls_tok = k + 1;
+                        }
+                    }
+                    k = json_skip_token(tokens, r, k + 2);
+                }
+
+                if (reasoning_content_tok != -1 && tokens[reasoning_content_tok].type == JSMN_STRING) {
+                    char *reasoning_chunk = unescape_json_string(json_str + tokens[reasoning_content_tok].start, tokens[reasoning_content_tok].end - tokens[reasoning_content_tok].start);
+                    if (reasoning_chunk) {
+                        buf_append_str(&ctx->accumulated_reasoning, &ctx->reasoning_len, &ctx->reasoning_cap, reasoning_chunk, strlen(reasoning_chunk));
+                        if (!ctx->quiet_mode) {
+                            if (!ctx->printed_thinking_header) {
+                                fprintf(stderr, "\r\033[2K");
+                                fprintf(stderr, "\033[2m[thinking]\n");
+                                ctx->printed_thinking_header = 1;
+                            }
+                            fprintf(stderr, "%s", reasoning_chunk);
+                            fflush(stderr);
+                        }
+                        free(reasoning_chunk);
+                    }
+                }
+
+                if (content_tok != -1 && tokens[content_tok].type == JSMN_STRING) {
+                    char *content_chunk = unescape_json_string(json_str + tokens[content_tok].start, tokens[content_tok].end - tokens[content_tok].start);
+                    if (content_chunk) {
+                        buf_append_str(&ctx->accumulated_content, &ctx->content_len, &ctx->content_cap, content_chunk, strlen(content_chunk));
+                        if (ctx->printed_thinking_header && !ctx->printed_thinking_footer) {
+                            fprintf(stderr, "\033[0m\n");
+                            fflush(stderr);
+                            ctx->printed_thinking_footer = 1;
+                        } else if (!ctx->printed_thinking_header) {
+                            fprintf(stderr, "\r\033[2K");
+                            fflush(stderr);
+                            ctx->printed_thinking_header = 1;
+                        }
+                        free(content_chunk);
+                    }
+                }
+
+                if (tool_calls_tok != -1 && tokens[tool_calls_tok].type == JSMN_ARRAY) {
+                    if (ctx->printed_thinking_header && !ctx->printed_thinking_footer) {
+                        fprintf(stderr, "\033[0m\n");
+                        fflush(stderr);
+                        ctx->printed_thinking_footer = 1;
+                    } else if (!ctx->printed_thinking_header) {
+                        fprintf(stderr, "\r\033[2K");
+                        fflush(stderr);
+                        ctx->printed_thinking_header = 1;
+                    }
+
+                    int tc_size = tokens[tool_calls_tok].size;
+                    int tc_tok = tool_calls_tok + 1;
+                    for (int tc = 0; tc < tc_size; tc++) {
+                        if (tokens[tc_tok].type != JSMN_OBJECT) break;
+                        int tc_end = tokens[tc_tok].end;
+                        
+                        int idx_tok = -1;
+                        int id_tok2 = -1;
+                        int func_tok = -1;
+
+                        int j = tc_tok + 1;
+                        while (j < r && tokens[j].start < tc_end) {
+                            if (tokens[j].type == JSMN_STRING) {
+                                int len = tokens[j].end - tokens[j].start;
+                                if (len == 5 && strncmp(json_str + tokens[j].start, "index", 5) == 0) {
+                                    idx_tok = j + 1;
+                                } else if (len == 2 && strncmp(json_str + tokens[j].start, "id", 2) == 0) {
+                                    id_tok2 = j + 1;
+                                } else if (len == 8 && strncmp(json_str + tokens[j].start, "function", 8) == 0) {
+                                    func_tok = j + 1;
+                                }
+                            }
+                            j = json_skip_token(tokens, r, j + 2);
+                        }
+
+                        if (idx_tok != -1 && tokens[idx_tok].type == JSMN_PRIMITIVE) {
+                            int tc_index = atoi(json_str + tokens[idx_tok].start);
+                            int internal_idx = get_tool_call_idx(ctx, tc_index);
+                            if (internal_idx != -1) {
+                                if (id_tok2 != -1 && tokens[id_tok2].type == JSMN_STRING) {
+                                    if (ctx->tool_calls[internal_idx].id) free(ctx->tool_calls[internal_idx].id);
+                                    ctx->tool_calls[internal_idx].id = unescape_json_string(json_str + tokens[id_tok2].start, tokens[id_tok2].end - tokens[id_tok2].start);
+                                }
+                                if (func_tok != -1 && tokens[func_tok].type == JSMN_OBJECT) {
+                                    int f_end = tokens[func_tok].end;
+                                    int name_tok = -1;
+                                    int args_tok = -1;
+                                    
+                                    int k_f = func_tok + 1;
+                                    while (k_f < r && tokens[k_f].start < f_end) {
+                                        if (tokens[k_f].type == JSMN_STRING) {
+                                            int len = tokens[k_f].end - tokens[k_f].start;
+                                            if (len == 4 && strncmp(json_str + tokens[k_f].start, "name", 4) == 0) {
+                                                name_tok = k_f + 1;
+                                            } else if (len == 9 && strncmp(json_str + tokens[k_f].start, "arguments", 9) == 0) {
+                                                args_tok = k_f + 1;
+                                            }
+                                        }
+                                        k_f = json_skip_token(tokens, r, k_f + 2);
+                                    }
+
+                                    if (name_tok != -1 && tokens[name_tok].type == JSMN_STRING) {
+                                        if (ctx->tool_calls[internal_idx].name) free(ctx->tool_calls[internal_idx].name);
+                                        ctx->tool_calls[internal_idx].name = unescape_json_string(json_str + tokens[name_tok].start, tokens[name_tok].end - tokens[name_tok].start);
+                                    }
+                                    if (args_tok != -1 && tokens[args_tok].type == JSMN_STRING) {
+                                        char *args_chunk = unescape_json_string(json_str + tokens[args_tok].start, tokens[args_tok].end - tokens[args_tok].start);
+                                        if (args_chunk) {
+                                            buf_append_str(&ctx->tool_calls[internal_idx].arguments,
+                                                           &ctx->tool_calls[internal_idx].arguments_len,
+                                                           &ctx->tool_calls[internal_idx].arguments_cap,
+                                                           args_chunk, strlen(args_chunk));
+                                            free(args_chunk);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tc_tok = json_skip_token(tokens, r, tc_tok + 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void process_sse_line(struct stream_context *ctx, const char *line, size_t len) {
+    while (len > 0 && isspace((unsigned char)*line)) {
+        line++;
+        len--;
+    }
+    while (len > 0 && isspace((unsigned char)line[len - 1])) {
+        len--;
+    }
+    if (len == 0) return;
+
+    if (strncmp(line, "data:", 5) == 0) {
+        const char *data_ptr = line + 5;
+        size_t data_len = len - 5;
+        while (data_len > 0 && isspace((unsigned char)*data_ptr)) {
+            data_ptr++;
+            data_len--;
+        }
+        if (data_len == 0) return;
+        if (strncmp(data_ptr, "[DONE]", 6) == 0) {
+            return;
+        }
+        process_sse_json(ctx, data_ptr, data_len);
+    }
+}
+
+static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t realsize = size * nmemb;
+    struct stream_context *ctx = (struct stream_context *)userdata;
+
+    if (ctx->original_chunk && ctx->original_chunk->data == NULL && ctx->line_len > 0) {
+        int q = ctx->quiet_mode;
+        struct response *orig = ctx->original_chunk;
+        free_stream_context(ctx);
+        init_stream_context(ctx, orig, q);
+    }
+
+    buf_append_str(&ctx->line_buf, &ctx->line_len, &ctx->line_cap, (const char *)ptr, realsize);
+
+    if (strstr(ctx->line_buf, "Loading model")) {
+        if (ctx->original_chunk->data) free(ctx->original_chunk->data);
+        ctx->original_chunk->data = strdup(ctx->line_buf);
+        ctx->original_chunk->size = strlen(ctx->line_buf);
+    }
+
+    size_t scan_pos = 0;
+    while (scan_pos < ctx->line_len) {
+        char *newline_ptr = strchr(ctx->line_buf + scan_pos, '\n');
+        if (!newline_ptr) break;
+        size_t line_length = newline_ptr - (ctx->line_buf + scan_pos);
+        process_sse_line(ctx, ctx->line_buf + scan_pos, line_length);
+        scan_pos += line_length + 1;
+    }
+
+    if (scan_pos > 0) {
+        if (scan_pos < ctx->line_len) {
+            memmove(ctx->line_buf, ctx->line_buf + scan_pos, ctx->line_len - scan_pos);
+            ctx->line_len -= scan_pos;
+            ctx->line_buf[ctx->line_len] = '\0';
+        } else {
+            ctx->line_len = 0;
+            ctx->line_buf[0] = '\0';
+        }
+    }
+
+    return realsize;
+}
+
+static void reconstruct_final_json(struct stream_context *ctx) {
+    char *tool_calls_json = NULL;
+    size_t tc_len = 0;
+    size_t tc_cap = 0;
+    
+    if (ctx->num_tool_calls > 0) {
+        buf_append_str(&tool_calls_json, &tc_len, &tc_cap, "[", 1);
+        for (int i = 0; i < ctx->num_tool_calls; i++) {
+            if (i > 0) {
+                buf_append_str(&tool_calls_json, &tc_len, &tc_cap, ",", 1);
+            }
+            char *safe_id = ctx->tool_calls[i].id ? json_escape(ctx->tool_calls[i].id) : strdup("");
+            char *safe_name = ctx->tool_calls[i].name ? json_escape(ctx->tool_calls[i].name) : strdup("");
+            char *safe_args = ctx->tool_calls[i].arguments ? json_escape(ctx->tool_calls[i].arguments) : strdup("");
+            
+            size_t item_cap = strlen(safe_id) + strlen(safe_name) + strlen(safe_args) + 128;
+            char *tc_item = malloc(item_cap);
+            int tc_item_len = snprintf(tc_item, item_cap,
+                "{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}",
+                safe_id, safe_name, safe_args);
+            
+            buf_append_str(&tool_calls_json, &tc_len, &tc_cap, tc_item, tc_item_len);
+            
+            free(tc_item);
+            free(safe_id);
+            free(safe_name);
+            free(safe_args);
+        }
+        buf_append_str(&tool_calls_json, &tc_len, &tc_cap, "]", 1);
+    }
+
+    char *safe_reasoning = ctx->accumulated_reasoning ? json_escape(ctx->accumulated_reasoning) : strdup("");
+    char *safe_content = ctx->accumulated_content ? json_escape(ctx->accumulated_content) : strdup("");
+    
+    size_t final_cap = (ctx->id ? strlen(ctx->id) : 0) +
+                       (ctx->object ? strlen(ctx->object) : 0) +
+                       (ctx->model_name ? strlen(ctx->model_name) : 0) +
+                       strlen(safe_reasoning) +
+                       strlen(safe_content) +
+                       (tool_calls_json ? strlen(tool_calls_json) : 0) +
+                       (ctx->finish_reason ? strlen(ctx->finish_reason) : 0) +
+                       1024;
+    char *final_json = malloc(final_cap);
+    
+    char *message_fields = malloc(final_cap);
+    size_t mf_len = 0;
+    mf_len += sprintf(message_fields + mf_len, "\"role\":\"assistant\"");
+    if (ctx->accumulated_content) {
+        mf_len += sprintf(message_fields + mf_len, ",\"content\":\"%s\"", safe_content);
+    } else {
+        mf_len += sprintf(message_fields + mf_len, ",\"content\":null");
+    }
+    if (ctx->accumulated_reasoning) {
+        mf_len += sprintf(message_fields + mf_len, ",\"reasoning_content\":\"%s\"", safe_reasoning);
+    }
+    if (tool_calls_json) {
+        mf_len += sprintf(message_fields + mf_len, ",\"tool_calls\":%s", tool_calls_json);
+    }
+
+    snprintf(final_json, final_cap,
+        "{\"id\":\"%s\",\"object\":\"%s\",\"created\":%ld,\"model\":\"%s\","
+        "\"choices\":[{\"index\":0,\"message\":{%s},\"finish_reason\":%s%s%s}],"
+        "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+        ctx->id ? ctx->id : "chatcmpl-reconstructed",
+        ctx->object ? ctx->object : "chat.completion",
+        ctx->created,
+        ctx->model_name ? ctx->model_name : "unknown",
+        message_fields,
+        ctx->finish_reason ? "\"" : "",
+        ctx->finish_reason ? ctx->finish_reason : "null",
+        ctx->finish_reason ? "\"" : "",
+        ctx->prompt_tokens,
+        ctx->completion_tokens,
+        ctx->total_tokens);
+
+    ctx->original_chunk->data = final_json;
+    ctx->original_chunk->size = strlen(final_json);
+
+    free(message_fields);
+    if (tool_calls_json) free(tool_calls_json);
+    free(safe_reasoning);
+    free(safe_content);
+}
+
 static char* append_message(char *messages_json, const char *msg_to_append) {
     size_t orig_len = strlen(messages_json);
     if (orig_len < 2) return messages_json;
@@ -1934,7 +2417,7 @@ static char* compact_session(char *messages_json, const char *mcp_script,
                         break;
                     }
                 }
-                k = json_skip_token(ctok, cr, k + 1);
+                k = json_skip_token(ctok, cr, k + 2);
             }
         }
     }
@@ -2140,6 +2623,7 @@ int main(int argc, char **argv) {
             printf("Options:\n");
             printf("  -i, --interactive    Start an interactive multi-turn chat session.\n");
             printf("  -y, --yes            Auto-approve all command execution requests without prompting.\n");
+            printf("  -c, --continue       Continue working without turn limits until the job is done.\n");
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
             printf("  -n, --no-tools       Skip the agent loop — get a direct text response (fast).\n");
             printf("  -t, --temperature N  Set sampling temperature (e.g. 0.0 for deterministic, 1.0 for creative).\n");
@@ -2220,6 +2704,8 @@ int main(int argc, char **argv) {
             interactive_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
             g_auto_approve = 1;
+        } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) {
+            g_continue_until_done = 1;
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet_mode = 1;
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) {
@@ -2243,6 +2729,11 @@ int main(int argc, char **argv) {
         quiet_mode = 1;
     }
 
+    char *env_continue = getenv("INFER_CONTINUE");
+    if (env_continue && (strcmp(env_continue, "1") == 0 || strcasecmp(env_continue, "true") == 0)) {
+        g_continue_until_done = 1;
+    }
+
     // Export resolved settings back to environment variables so subagents inherit them
     if (g_auto_approve) {
         setenv("INFER_AUTO_APPROVE", "1", 1);
@@ -2253,6 +2744,11 @@ int main(int argc, char **argv) {
         setenv("INFER_QUIET", "1", 1);
     } else {
         unsetenv("INFER_QUIET");
+    }
+    if (g_continue_until_done) {
+        setenv("INFER_CONTINUE", "1", 1);
+    } else {
+        unsetenv("INFER_CONTINUE");
     }
 
     char *env_temp = getenv("INFER_TEMPERATURE");
@@ -2361,6 +2857,7 @@ int main(int argc, char **argv) {
             for (int i = 1; i < argc; i++) {
                 if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
                 if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+                if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
                 if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
                 if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
                 if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
@@ -2388,6 +2885,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
@@ -2406,6 +2904,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
@@ -2424,6 +2923,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
@@ -2736,7 +3236,8 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
-            int step_limit = 30;
+            int step_limit = g_continue_until_done ? 999999 : 30;
+            int think_count = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
             struct timespec task_start;
@@ -2779,10 +3280,10 @@ step_limit_check:
                 size_t plen = strlen(esc_model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
                 payload = malloc(plen);
                 if (tools_json && strlen(tools_json) > 10) {
-                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
+                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
                              esc_model, opt_fields, messages_json, tools_json, tool_choice_val);
                 } else {
-                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
+                    snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s}",
                              esc_model, opt_fields, messages_json);
                 }
                 free(esc_model);
@@ -2792,8 +3293,18 @@ step_limit_check:
                 }
 
                 struct response chunk = {0};
+                struct stream_context s_ctx;
+                init_stream_context(&s_ctx, &chunk, quiet_mode);
+
+                // Show thinking indicator here!
+                if (!quiet_mode) {
+                    fprintf(stderr, "\033[2m[thinking]...\033[0m");
+                    fflush(stderr);
+                }
+
                 curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
-                curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&chunk);
+                curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, stream_write_cb);
+                curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&s_ctx);
 
                 g_esc_requested = 0;
                 if (interactive_mode) enable_raw_mode();
@@ -2845,16 +3356,26 @@ step_limit_check:
                             if (context_window == 0) {
                                 context_window = detect_context_window(c, api_url);
                             }
-                            curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&chunk);
+
+                            free_stream_context(&s_ctx);
+                            init_stream_context(&s_ctx, &chunk, quiet_mode);
+
+                            if (!quiet_mode) {
+                                fprintf(stderr, "\033[2m[thinking]...\033[0m");
+                                fflush(stderr);
+                            }
+
+                            curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, stream_write_cb);
+                            curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&s_ctx);
                             
                             free(payload);
                             size_t new_plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
                             payload = malloc(new_plen);
                             if (tools_json && strlen(tools_json) > 10) {
-                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
+                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
                                          model, opt_fields, messages_json, tools_json, tool_choice_val);
                             } else {
-                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":false%s,\"messages\":%s}",
+                                snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s}",
                                          model, opt_fields, messages_json);
                             }
                             curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
@@ -2876,6 +3397,30 @@ step_limit_check:
                         }
                     }
                 }
+
+                if (!quiet_mode) {
+                    if (s_ctx.printed_thinking_header && !s_ctx.printed_thinking_footer) {
+                        fprintf(stderr, "\033[0m\n");
+                        fflush(stderr);
+                    } else if (!s_ctx.printed_thinking_header) {
+                        // Clear the "[thinking]..." message
+                        fprintf(stderr, "\r\033[2K");
+                        fflush(stderr);
+                    }
+                }
+
+                if (res == CURLE_OK) {
+                    if (s_ctx.line_len > 0) {
+                        process_sse_line(&s_ctx, s_ctx.line_buf, s_ctx.line_len);
+                    }
+                    reconstruct_final_json(&s_ctx);
+                }
+
+                // Restore default write function
+                curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+                curl_easy_setopt(c, CURLOPT_WRITEDATA, NULL);
+
+                free_stream_context(&s_ctx);
 
                 /* ESC pressed during LLM request */
                 if (g_esc_requested) {
@@ -2928,7 +3473,9 @@ step_limit_check:
                         } else if (len == 7 && strncmp(chunk.data + tok[i].start, "message", 7) == 0) {
                             message_tok = i + 1;
                         } else if (len == 10 && strncmp(chunk.data + tok[i].start, "tool_calls", 10) == 0) {
-                            tool_calls_tok = i + 1;
+                            if (i + 1 < r && tok[i + 1].type == JSMN_ARRAY) {
+                                tool_calls_tok = i + 1;
+                            }
                         } else if (len == 5 && strncmp(chunk.data + tok[i].start, "error", 5) == 0) {
                             error_tok = i + 1;
                         } else if (len == 5 && strncmp(chunk.data + tok[i].start, "usage", 5) == 0) {
@@ -2958,7 +3505,7 @@ step_limit_check:
                             else if (ulen == 12 && strncmp(chunk.data + tok[k].start, "total_tokens", 12) == 0)
                                 total_tokens = atoi(chunk.data + tok[k+1].start);
                         }
-                        k = json_skip_token(tok, r, k + 1);
+                        k = json_skip_token(tok, r, k + 2);
                     }
                 }
 
@@ -2975,10 +3522,23 @@ step_limit_check:
                                     break;
                                 }
                             }
-                            k = json_skip_token(tok, r, k + 1);
+                            k = json_skip_token(tok, r, k + 2);
                         }
                     }
                     if (err_msg) {
+                        /* Recoverable: model returned empty output — nudge it to call task_complete */
+                        if (strstr(err_msg, "model output must contain") != NULL ||
+                            strstr(err_msg, "output text or tool calls") != NULL) {
+                            fprintf(stderr, "\033[1;33m[ai] Warning: model returned empty output — nudging to call task_complete.\033[0m\n");
+                            messages_json = append_message(messages_json,
+                                "{\"role\":\"user\",\"content\":\"Your last response was empty. "
+                                "Please call task_complete now with a summary of what you just did.\"}");
+                            has_more = 1;
+                            free(err_msg);
+                            free(payload);
+                            free(chunk.data);
+                            break;
+                        }
                         fprintf(stderr, "\n\033[1;31m[ai Error]\033[0m %s\n", err_msg);
                         free(err_msg);
                     } else {
@@ -2989,6 +3549,7 @@ step_limit_check:
                     free(chunk.data);
                     break;
                 }
+
 
                 if (message_tok != -1) {
                     char *msg_str = malloc(tok[message_tok].end - tok[message_tok].start + 1);
@@ -3036,7 +3597,7 @@ step_limit_check:
                                     func_tok = j + 1;
                                 }
                             }
-                            j = json_skip_token(tok, r, j + 1);
+                            j = json_skip_token(tok, r, j + 2);
                         }
 
                         int name_tok = -1;
@@ -3053,7 +3614,7 @@ step_limit_check:
                                         args_tok = k + 1;
                                     }
                                 }
-                                k = json_skip_token(tok, r, k + 1);
+                                k = json_skip_token(tok, r, k + 2);
                               }
                           }
 
@@ -3075,26 +3636,31 @@ step_limit_check:
                               char *tool_output = NULL;
 
                                if (strcmp(unescaped_name, "think") == 0) {
-                                   jsmn_parser arg_parser;
-                                   jsmntok_t arg_toks[256];
-                                   jsmn_init(&arg_parser);
-                                   int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 256);
-                                   char *reasoning = NULL;
-                                   for (int a = 1; a < arg_r; a++) {
-                                       if (arg_toks[a].type == JSMN_STRING &&
-                                           arg_toks[a].end - arg_toks[a].start == 9 &&
-                                           strncmp(unescaped_args + arg_toks[a].start, "reasoning", 9) == 0) {
-                                           reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
-                                                                            arg_toks[a+1].end - arg_toks[a+1].start);
-                                           break;
+                                   think_count++;
+                                   if (think_count > 1) {
+                                       tool_output = strdup("Error: You have already called the 'think' tool once to plan. Do not call it again. You must call 'task_complete' to report your final answer/summary to the user, or call other action tools if there is more work to do. Calling 'think' repeatedly causes infinite loops.");
+                                   } else {
+                                       jsmn_parser arg_parser;
+                                       jsmntok_t arg_toks[256];
+                                       jsmn_init(&arg_parser);
+                                       int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 256);
+                                       char *reasoning = NULL;
+                                       for (int a = 1; a < arg_r; a++) {
+                                           if (arg_toks[a].type == JSMN_STRING &&
+                                               arg_toks[a].end - arg_toks[a].start == 9 &&
+                                               strncmp(unescaped_args + arg_toks[a].start, "reasoning", 9) == 0) {
+                                               reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                                arg_toks[a+1].end - arg_toks[a+1].start);
+                                               break;
+                                           }
                                        }
+                                       if (!quiet_mode && reasoning) {
+                                           fprintf(stderr, "\033[2m[thinking] %s\033[0m\n", reasoning);
+                                           fflush(stderr);
+                                       }
+                                       if (reasoning) free(reasoning);
+                                       tool_output = strdup("{\"ok\":true}");
                                    }
-                                   if (!quiet_mode && reasoning) {
-                                       fprintf(stderr, "\033[2m[thinking] %s\033[0m\n", reasoning);
-                                       fflush(stderr);
-                                   }
-                                   if (reasoning) free(reasoning);
-                                   tool_output = strdup("{\"ok\":true}");
                                } else if (strcmp(unescaped_name, "task_complete") == 0) {
                                    jsmn_parser arg_parser;
                                    jsmntok_t arg_toks[2048];
@@ -3152,19 +3718,102 @@ step_limit_check:
                                       if (!approved) {
                                           FILE *tty = fopen("/dev/tty", "r+");
                                           if (tty) {
-                                              fprintf(tty, "\n\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
-                                              fprintf(tty, "\033[1;36mConfirm execution? [Y/n]:\033[0m ");
-                                              fflush(tty);
-                                              
-                                              char response[64] = {0};
-                                              if (fgets(response, sizeof(response), tty)) {
-                                                  char *p_resp = response;
-                                                  while (*p_resp && isspace((unsigned char)*p_resp)) p_resp++;
-                                                  if (*p_resp == '\0' || *p_resp == 'y' || *p_resp == 'Y' || strncasecmp(p_resp, "yes", 3) == 0) {
-                                                      approved = 1;
-                                                  }
-                                              }
-                                              fclose(tty);
+                                               fprintf(tty, "\n\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
+                                               fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
+                                               fflush(tty);
+                                               
+                                               int fd = fileno(tty);
+                                               struct termios orig_tty_termios;
+                                               int has_termios = (tcgetattr(fd, &orig_tty_termios) >= 0);
+                                               
+                                               if (has_termios) {
+                                                   struct termios raw = orig_tty_termios;
+                                                   raw.c_lflag &= ~(ECHO | ICANON);
+                                                   raw.c_cc[VMIN] = 1;
+                                                   raw.c_cc[VTIME] = 0;
+                                                   tcsetattr(fd, TCSANOW, &raw);
+                                               }
+                                               
+                                               char ch = 0;
+                                               while (1) {
+                                                   if (read(fd, &ch, 1) != 1) {
+                                                       break;
+                                                   }
+                                                   
+                                                   if (ch == 27) { // ESC
+                                                       if (has_termios) {
+                                                           struct termios timeout_raw = orig_tty_termios;
+                                                           timeout_raw.c_lflag &= ~(ECHO | ICANON);
+                                                           timeout_raw.c_cc[VMIN] = 0;
+                                                           timeout_raw.c_cc[VTIME] = 1; // 100ms
+                                                           tcsetattr(fd, TCSANOW, &timeout_raw);
+                                                       }
+                                                       
+                                                       char seq[2] = {0, 0};
+                                                       int n1 = read(fd, &seq[0], 1);
+                                                       int n2 = 0;
+                                                       if (n1 == 1) {
+                                                           n2 = read(fd, &seq[1], 1);
+                                                       }
+                                                       
+                                                       if (has_termios) {
+                                                           struct termios raw = orig_tty_termios;
+                                                           raw.c_lflag &= ~(ECHO | ICANON);
+                                                           raw.c_cc[VMIN] = 1;
+                                                           raw.c_cc[VTIME] = 0;
+                                                           tcsetattr(fd, TCSANOW, &raw);
+                                                       }
+                                                       
+                                                       if (n1 == 1 && n2 == 1 && seq[0] == '[' && seq[1] == 'Z') {
+                                                           g_auto_approve ^= 1;
+                                                           if (g_auto_approve) {
+                                                               setenv("INFER_AUTO_APPROVE", "1", 1);
+                                                               fprintf(tty, "\n\033[2mauto-approve on\033[0m\n");
+                                                               fflush(tty);
+                                                               approved = 1;
+                                                               break;
+                                                           } else {
+                                                               unsetenv("INFER_AUTO_APPROVE");
+                                                               fprintf(tty, "\n\033[2mauto-approve off\033[0m\n");
+                                                               fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
+                                                               fflush(tty);
+                                                           }
+                                                           continue;
+                                                       }
+                                                       continue;
+                                                   }
+                                                   
+                                                   if (ch == '\n' || ch == '\r') {
+                                                       fprintf(tty, "\n");
+                                                       fflush(tty);
+                                                       approved = 1;
+                                                       break;
+                                                   }
+                                                   if (ch == 'y' || ch == 'Y') {
+                                                       fprintf(tty, "%c\n", ch);
+                                                       fflush(tty);
+                                                       approved = 1;
+                                                       break;
+                                                   }
+                                                   if (ch == 'n' || ch == 'N') {
+                                                       fprintf(tty, "%c\n", ch);
+                                                       fflush(tty);
+                                                       approved = 0;
+                                                       break;
+                                                   }
+                                                   if (ch == 3) { // Ctrl+C
+                                                       fprintf(tty, "^C\n");
+                                                       fflush(tty);
+                                                       approved = 0;
+                                                       g_esc_requested = 1;
+                                                       break;
+                                                   }
+                                               }
+                                               
+                                               if (has_termios) {
+                                                   tcsetattr(fd, TCSAFLUSH, &orig_tty_termios);
+                                               }
+                                               fclose(tty);
                                           } else {
                                               fprintf(stderr, "[ai] Warning: cannot open /dev/tty for confirmation. Skipping command execution for safety.\n");
                                           }
@@ -3359,7 +4008,7 @@ step_limit_check:
                               if (task_done) break;
                           }
 
-                          current_tok = json_skip_token(tok, r, current_tok);
+                          current_tok = json_skip_token(tok, r, current_tok + 1);
                       }
 
                       /* Poll stdin for Shift-Tab / :btw typed while tools were executing */
@@ -3396,18 +4045,11 @@ step_limit_check:
                                       reasoning_content_tok = k + 1;
                                   }
                               }
-                              k = json_skip_token(tok, r, k + 1);
+                              k = json_skip_token(tok, r, k + 2);
                           }
                       }
 
-                      if (!quiet_mode && reasoning_content_tok != -1 && tok[reasoning_content_tok].type == JSMN_STRING) {
-                          char *unescaped_reasoning = unescape_json_string(chunk.data + tok[reasoning_content_tok].start, tok[reasoning_content_tok].end - tok[reasoning_content_tok].start);
-                          if (unescaped_reasoning && strlen(unescaped_reasoning) > 0) {
-                              fprintf(stderr, "\033[2m[thinking]\n%s\033[0m\n", unescaped_reasoning);
-                              fflush(stderr);
-                          }
-                          free(unescaped_reasoning);
-                      }
+                      // Skip printing reasoning_content here since it was already streamed in real-time
 
                       if (content_tok != -1 && tok[content_tok].type == JSMN_STRING) {
                           char *unescaped_content = unescape_json_string(chunk.data + tok[content_tok].start, tok[content_tok].end - tok[content_tok].start);
