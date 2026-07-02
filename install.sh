@@ -150,36 +150,70 @@ if [ "${1:-}" = "llama" ]; then
         echo "==> llama.cpp already cloned — skipping."
     fi
 
-    # Build with best available GPU backend
-    if [ ! -f "${BIN_DIR}/llama-server" ]; then
-        GPU_FLAGS="-DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_VULKAN=OFF"
-        # Robust CUDA detection
-        NVCC_BIN=""
-        if command -v nvcc &>/dev/null; then
-            NVCC_BIN=$(command -v nvcc)
-        else
-            for path in /usr/local/cuda/bin/nvcc /usr/local/cuda-13.3/bin/nvcc /usr/local/cuda-12.8/bin/nvcc /usr/local/cuda-12.5/bin/nvcc /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12.2/bin/nvcc /usr/local/cuda-12.1/bin/nvcc /usr/local/cuda-12.0/bin/nvcc /usr/local/cuda-11.*/bin/nvcc; do
-                if [ -x "$path" ]; then
-                    NVCC_BIN="$path"
-                    break
-                fi
-            done
+    # Robust CUDA / GPU detection
+    NVCC_BIN=""
+    CUDA_BIN_DIR=""
+    CUDA_ROOT=""
+    CUDA_LIB_DIR=""
+    GPU_FLAGS="-DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_VULKAN=OFF"
+    
+    if command -v nvcc &>/dev/null; then
+        NVCC_BIN=$(command -v nvcc)
+    else
+        for path in /usr/local/cuda/bin/nvcc /usr/local/cuda-13.3/bin/nvcc /usr/local/cuda-12.8/bin/nvcc /usr/local/cuda-12.5/bin/nvcc /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12.2/bin/nvcc /usr/local/cuda-12.1/bin/nvcc /usr/local/cuda-12.0/bin/nvcc /usr/local/cuda-11.*/bin/nvcc; do
+            if [ -x "$path" ]; then
+                NVCC_BIN="$path"
+                break
+            fi
+        done
+    fi
+    
+    if [ -n "$NVCC_BIN" ]; then
+        echo "==> CUDA detected at ${NVCC_BIN} — configuring CUDA paths."
+        CUDA_BIN_DIR="$(dirname "$NVCC_BIN")"
+        CUDA_ROOT="$(dirname "$CUDA_BIN_DIR")"
+        
+        # Build library path list
+        if [ -d "${CUDA_ROOT}/lib64" ]; then
+            CUDA_LIB_DIR="${CUDA_ROOT}/lib64"
+        fi
+        if [ -d "${CUDA_ROOT}/targets/x86_64-linux/lib" ]; then
+            if [ -n "$CUDA_LIB_DIR" ]; then
+                CUDA_LIB_DIR="${CUDA_LIB_DIR}:${CUDA_ROOT}/targets/x86_64-linux/lib"
+            else
+                CUDA_LIB_DIR="${CUDA_ROOT}/targets/x86_64-linux/lib"
+            fi
         fi
         
-        if [ -n "$NVCC_BIN" ]; then
-            echo "==> CUDA detected at ${NVCC_BIN} — building with CUDA support."
-            export PATH="$(dirname "$NVCC_BIN"):$PATH"
-            GPU_FLAGS="-DGGML_CUDA=ON"
-        elif command -v hipcc &>/dev/null; then
-            echo "==> ROCm detected — building with HIP support."
-            GPU_FLAGS="-DGGML_HIP=ON"
-        elif pkg-config --exists vulkan 2>/dev/null || [ -f /usr/include/vulkan/vulkan.h ]; then
-            echo "==> Vulkan detected — building with Vulkan support."
+        # Set environment variables for the compile process
+        export PATH="${CUDA_BIN_DIR}:$PATH"
+        export CUDACXX="$NVCC_BIN"
+        export CUDA_PATH="$CUDA_ROOT"
+        if [ -n "$CUDA_LIB_DIR" ]; then
+            export LD_LIBRARY_PATH="${CUDA_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+        fi
+        
+        GPU_FLAGS="-DGGML_CUDA=ON -DCUDAToolkit_ROOT=${CUDA_ROOT}"
+    elif command -v hipcc &>/dev/null; then
+        echo "==> ROCm detected — building with HIP support."
+        GPU_FLAGS="-DGGML_HIP=ON"
+    elif pkg-config --exists vulkan 2>/dev/null || [ -f /usr/include/vulkan/vulkan.h ]; then
+        if find /usr/share/cmake /usr/lib/cmake /usr/local/share/cmake /usr/local/lib/cmake -name "*SPIRV-HeadersConfig.cmake*" -o -name "*spirv-headers-config.cmake*" 2>/dev/null | grep -q .; then
+            echo "==> Vulkan and SPIRV-Headers detected — building with Vulkan support."
             GPU_FLAGS="-DGGML_VULKAN=ON"
         else
-            echo "==> No GPU backend found — building CPU-only."
+            echo "==> Vulkan detected, but SPIRV-Headers CMake package is missing."
+            echo "    To build with Vulkan support, please install 'spirv-headers'."
+            echo "    Falling back to CPU-only build."
         fi
+    else
+        echo "==> No GPU backend found — building CPU-only."
+    fi
+
+    # Build with best available GPU backend
+    if [ ! -f "${BIN_DIR}/llama-server" ]; then
         echo "==> Building llama-server (this takes a few minutes)..."
+        rm -rf "${LLAMA_SRC}/build"
         cmake -B "${LLAMA_SRC}/build" -S "$LLAMA_SRC" \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $GPU_FLAGS
         cmake --build "${LLAMA_SRC}/build" --config Release \
@@ -268,6 +302,19 @@ print(lines[idx].split(') ', 1)[1])
     # Stop existing socket/service before writing new configs to avoid "Socket unit configuration has changed" issues
     systemctl --user stop llama-server.service llama-server.socket 2>/dev/null || true
 
+    # Prepare environment lines for systemd
+    SYSTEMD_ENV=""
+    if [ -n "${CUDA_BIN_DIR:-}" ]; then
+        SYSTEMD_ENV="Environment=PATH=${BIN_DIR}:${CUDA_BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=CUDA_PATH=${CUDA_ROOT}"
+        if [ -n "${CUDA_LIB_DIR:-}" ]; then
+            SYSTEMD_ENV="${SYSTEMD_ENV}
+Environment=LD_LIBRARY_PATH=${CUDA_LIB_DIR}"
+        fi
+    else
+        SYSTEMD_ENV="Environment=PATH=${BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    fi
+
     # Write systemd units
     cat > "${SYSTEMD_DIR}/llama-server.socket" <<SOCKET_EOF
 [Unit]
@@ -288,7 +335,7 @@ After=llama-server.socket
 
 [Service]
 Type=simple
-Environment=PATH=${BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+${SYSTEMD_ENV}
 Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
 ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
@@ -305,6 +352,26 @@ SERVICE_EOF
 
     # Configure backend
     "${BIN_DIR}/ai-backend" llama "$MODEL_PATH"
+
+    # Append CUDA environment variables to env file if CUDA was detected
+    if [ -n "${CUDA_BIN_DIR:-}" ]; then
+        # Check if they are already in the file to avoid duplicates
+        if ! grep -q "CUDA_PATH" "${DATA_DIR}/env" 2>/dev/null; then
+            cat >> "${DATA_DIR}/env" <<ENV_EOF
+
+# CUDA Environment Paths
+export PATH="${CUDA_BIN_DIR}:${PATH}"
+export CUDA_PATH="${CUDA_ROOT}"
+ENV_EOF
+            if [ -n "${CUDA_LIB_DIR:-}" ]; then
+                if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+                    echo "export LD_LIBRARY_PATH=\"${CUDA_LIB_DIR}:${LD_LIBRARY_PATH}\"" >> "${DATA_DIR}/env"
+                else
+                    echo "export LD_LIBRARY_PATH=\"${CUDA_LIB_DIR}\"" >> "${DATA_DIR}/env"
+                fi
+            fi
+        fi
+    fi
 
     echo ""
     echo "========================================"
