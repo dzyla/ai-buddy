@@ -66,8 +66,8 @@ def get_calendar_service():
 
     return build('calendar', 'v3', credentials=creds)
 
-def list_events(time_min=None, time_max=None, max_results=20):
-    """Lists calendar events."""
+def list_events(time_min=None, time_max=None, max_results=20, calendar_ids=None):
+    """Lists calendar events across one or more calendars."""
     try:
         service = get_calendar_service()
         
@@ -82,33 +82,70 @@ def list_events(time_min=None, time_max=None, max_results=20):
             if not time_max.endswith('Z') and '+' not in time_max and '-' not in time_max:
                 time_max += 'Z'
 
-        events_result = service.events().list(
-            calendarId='primary',
-            timeMin=time_min,
-            timeMax=time_max,
-            maxResults=max_results,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        events = events_result.get('items', [])
-        if not events:
-            return f"No events found between {time_min} and {time_max}."
+        # Fetch list of user calendars to find summaries and check selection status
+        cal_summaries = {}
+        selected_ids = []
+        try:
+            cal_list = service.calendarList().list().execute()
+            for item in cal_list.get('items', []):
+                cal_summaries[item['id']] = item.get('summary', item['id'])
+                if item.get('selected'):
+                    selected_ids.append(item['id'])
+        except Exception as ex:
+            print(f"Warning: Failed to fetch calendar list: {ex}", file=sys.stderr)
+
+        # Default to all selected calendars if calendar_ids is not provided or set to 'all'
+        if not calendar_ids:
+            calendar_ids = selected_ids if selected_ids else ['primary']
+        elif isinstance(calendar_ids, str):
+            if calendar_ids.strip().lower() == 'all':
+                calendar_ids = selected_ids if selected_ids else ['primary']
+            else:
+                calendar_ids = [calendar_ids]
+
+        all_events = []
+        for cid in calendar_ids:
+            try:
+                events_result = service.events().list(
+                    calendarId=cid,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    maxResults=max_results,
+                    singleEvents=True,
+                    orderBy='startTime'
+                ).execute()
+                for item in events_result.get('items', []):
+                    item['_calendar_id'] = cid
+                    all_events.append(item)
+            except Exception as e:
+                # Silently skip calendars we lack access to (like public holidays with restricted permissions)
+                pass
+
+        if not all_events:
+            return f"No events found between {time_min} and {time_max} across calendars: {', '.join([cal_summaries.get(cid, cid) for cid in calendar_ids])}."
+
+        # Sort all events chronologically by start time
+        def get_start_time(event):
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            return start
+        all_events.sort(key=get_start_time)
 
         result_lines = [f"Schedule from {time_min} to {time_max}:"]
-        for idx, event in enumerate(events, 1):
+        for idx, event in enumerate(all_events, 1):
             start = event['start'].get('dateTime', event['start'].get('date'))
             end = event['end'].get('dateTime', event['end'].get('date'))
             summary = event.get('summary', '(No Title)')
+            cid = event.get('_calendar_id', 'primary')
+            cal_name = cal_summaries.get(cid, cid)
             loc = f" | Location: {event['location']}" if 'location' in event else ""
             desc = f"\n    Description: {event['description']}" if 'description' in event else ""
-            result_lines.append(f"[{idx}] {start} to {end} - {summary}{loc}{desc}")
+            result_lines.append(f"[{idx}] {start} to {end} - {summary} (Calendar: {cal_name}){loc}{desc}")
             
         return "\n".join(result_lines)
     except Exception as e:
         return f"Error listing events: {e}"
 
-def create_event(summary, start_time, end_time, description=None, location=None, attendees=None):
+def create_event(summary, start_time, end_time, description=None, location=None, attendees=None, calendar_id='primary'):
     """Creates a calendar event."""
     try:
         service = get_calendar_service()
@@ -125,10 +162,10 @@ def create_event(summary, start_time, end_time, description=None, location=None,
         if attendees:
             event_body['attendees'] = [{'email': email.strip()} for email in attendees if email.strip()]
 
-        created_event = service.events().insert(calendarId='primary', body=event_body).execute()
+        created_event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
         link = created_event.get('htmlLink', '')
         return (
-            f"Successfully created event: '{summary}'\n"
+            f"Successfully created event: '{summary}' in calendar '{calendar_id}'\n"
             f"Start: {start_time}\n"
             f"End: {end_time}\n"
             f"Event Link: {link}"
@@ -183,17 +220,19 @@ def main():
     elif action == "list":
         time_min = sys.argv[2] if len(sys.argv) > 2 else None
         time_max = sys.argv[3] if len(sys.argv) > 3 else None
-        print(list_events(time_min, time_max))
+        calendar_ids = sys.argv[4].split(",") if len(sys.argv) > 4 else None
+        print(list_events(time_min, time_max, calendar_ids=calendar_ids))
     elif action == "create":
         if len(sys.argv) < 5:
-            print("Usage: gcal.py create <summary> <start_time> <end_time> [description] [location]")
+            print("Usage: gcal.py create <summary> <start_time> <end_time> [description] [location] [calendar_id]")
             sys.exit(1)
         summary = sys.argv[2]
         start_time = sys.argv[3]
         end_time = sys.argv[4]
         desc = sys.argv[5] if len(sys.argv) > 5 else None
         loc = sys.argv[6] if len(sys.argv) > 6 else None
-        print(create_event(summary, start_time, end_time, desc, loc))
+        calendar_id = sys.argv[7] if len(sys.argv) > 7 else 'primary'
+        print(create_event(summary, start_time, end_time, desc, loc, calendar_id=calendar_id))
     elif action == "availability":
         if len(sys.argv) < 4:
             print("Usage: gcal.py availability <time_min> <time_max>")
