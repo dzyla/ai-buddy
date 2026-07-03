@@ -173,8 +173,25 @@ dmesg | tail -20 | ai "any hardware warnings?"
 |------|------|---------|--------|
 | `-i` | `--interactive` | | Start REPL |
 | `-y` | `--yes` | `INFER_AUTO_APPROVE=1` | Auto-approve shell commands |
+| `-c` | `--continue` | `INFER_CONTINUE=1` | Run without turn limit until done |
+| `-r` | `--resume` | `INFER_RESUME=1` | Resume the previous conversation |
 | `-q` | `--quiet` | `INFER_QUIET=1` | Suppress thinking output |
+| `-n` | `--no-tools` | | Direct answer, skip the agent loop |
 | `-h` | `--help` | | Print help |
+
+### Resume a conversation
+
+Every run is saved to `~/.cache/ai/sessions/last.json`. Continue it later from any terminal:
+
+```bash
+ai "clone github.com/foo/bar and summarise its architecture"
+# ... later ...
+ai -r "now add a Dockerfile for it"     # remembers the previous turn
+```
+
+### Customize the system prompt
+
+Drop a `~/.config/ai/system_prompt.md` file to override the built-in agent prompt without recompiling (or point `INFER_SYSTEM_PROMPT_FILE` at any path). Delete the file to revert to the default.
 
 ### Images
 

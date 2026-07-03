@@ -23,7 +23,12 @@ ai-backend qwen3-6             # switch to qwen3-6 snap
 ai-backend llama /path/to.gguf # switch to llama-server with specific model
 ```
 
-There is no test suite, linter, or package manifest. Verify changes by running the binary directly (e.g. `INFER_* env vars set; echo "hi" | ./ai "say hello"`).
+Tests (pytest):
+- `test_ai.py` — integration tests; several need a **live backend** reachable at the active `INFER_BASE_URL`.
+- `tests/test_offline.py` — **offline** suite (no backend). Drives the binary against a mock OpenAI server (`tests/mock_llm_server.py`, supports both `stream:false` and SSE) and asserts on the exact request the binary sent. Also unit-tests `ai_mcp.py` pure functions (fetch routing, `session-transcript`). Run: `python3 -m pytest tests/test_offline.py -v`.
+- The mock server keys off `MOCK_TASK_COMPLETE` (return a `task_complete` tool call so the agent loop ends in one turn) and `MOCK_CAPTURE` (append each received request as one JSON line). Integration tests use an isolated `HOME` so `load_env_file()` can't override the mock `INFER_*` vars.
+
+No linter or package manifest. For quick manual checks, run the binary directly (e.g. `INFER_* env vars set; echo "hi" | ./ai "say hello"`).
 
 Required environment variables (the binary exits early without all three):
 - `INFER_BASE_URL` — must end in `/v1/`; the C code appends `chat/completions`
@@ -37,6 +42,9 @@ Optional environment variables:
 - `INFER_MAX_TOOL_OUTPUT` — caps individual tool output (default: 65536).
 - `INFER_TRIM_THRESHOLD` — triggers message trimming if context exceeds this size (default: 100000).
 - `INFER_STUB_THRESHOLD` — stubs subsequent tool results once context size exceeds this (default: 250000).
+- `INFER_RESUME=1` — resume the previous conversation (same as `-r`/`--resume`). See "Session persistence" below.
+- `INFER_SYSTEM_PROMPT_FILE` — path to a system-prompt override file. Defaults to `~/.config/ai/system_prompt.md` if that exists; otherwise the compiled-in `SYSTEM_PROMPT` is used. Lets you tune agent behavior without recompiling.
+- `INFER_FETCH_BASIC=1` — force `fetch_webpage` to use the plain urllib+trafilatura path instead of the default robust `fetch_smart` cascade (curl_cffi TLS impersonation → Playwright+stealth → urllib).
 
 ## Architecture: two cooperating processes
 
@@ -62,10 +70,13 @@ The system is split across two files that talk to each other by **shell-invoking
 - In interactive mode handles `:compact`, `:clear`, `:status`, `:memory`, `:auto`, and `:help` colon-commands, and Shift-Tab (`ESC [ Z`) to toggle `g_auto_approve` both at the prompt and during agent execution (raw mode via the libcurl progress callback). The `ai>` prompt changes to `ai(auto)>` while auto-approve is active.
 - The interactive prompt uses a self-contained line editor (`read_line_interactive` / `lineed_*` in `ai.c`): arrow keys navigate history (up/down) and move the cursor (left/right), with Ctrl+A/E (line start/end), Ctrl+K/U (kill to end/start), Ctrl+W (kill word), Ctrl+L (clear screen), Home/End, Delete. History is persisted to `~/.cache/ai/input_history` across sessions.
 - `compact_session`: sends the full conversation to the LLM for summarisation, prints progress dots via the libcurl progress callback while waiting, and only replaces the conversation history if the LLM returns a usable summary (≥20 chars).
+- **Session persistence:** at the end of every run the full `messages_json` is written to `~/.cache/ai/sessions/last.json`. `-r`/`--resume` (or `INFER_RESUME=1`) reloads it: `ai.c` shells to `python3 ai_mcp.py session-transcript <file>`, which converts the raw array into a clean user/assistant transcript (JSONL, one message per line) — old system message, tool churn, and internal nudges are dropped, and `task_complete` summaries become assistant text. Each line is spliced in via `append_message` between the fresh system message and the new user turn, avoiding dangling-tool_call API errors.
+- **System prompt** is assembled from `load_system_prompt()` (file override → compiled-in `SYSTEM_PROMPT` fallback) plus live context, memory, and skills.
 
-**`ai_mcp.py` — the tool backend (Python).** Three subcommands matching how `ai.c` calls it: `list-tools`, `call-tool`, `render-markdown`. It:
+**`ai_mcp.py` — the tool backend (Python).** Subcommands matching how `ai.c` calls it: `list-tools`, `call-tool`, `render-markdown`, `trim-messages`, `session-transcript`, `run-scheduler`. It:
 - Defines **12 native tools** as OpenAI function schemas in `list-tools` (in schema order): `think`, `execute_command`, `web_search`, `fetch_webpage`, `read_file`, `write_file`, `edit_file`, `list_directory`, `save_memory`, `delegate_task`, `computer_control`, `task_complete`.
 - Implements the actual logic for each (DuckDuckGo Lite scraping, HTML→text, PDF extraction via pdftotext/pypdf/pdfplumber fallback chain, binary-file heuristic rejection, etc.). `edit_file`: search-and-replace on an existing file. Falls back to a trailing-whitespace-tolerant fuzzy match if the exact string is not found.
+- **Web fetching:** the public `fetch_webpage` tool (and `parallel_fetch`, and the search auto-fetch of the top result) route through `fetch_smart` — a cascade of curl_cffi TLS impersonation → Playwright+stealth → plain urllib (`fetch_webpage_basic`). `fetch_webpage_basic` is the plain rung and the only thing `fetch_smart` falls back to (never the public `fetch_webpage`, which would recurse). `INFER_FETCH_BASIC=1` forces the plain path.
 - Acts as a generic **MCP client**: any server in `mcp.json` is started over stdio JSON-RPC and its tools are namespaced `<server>__<tool>`. `ai.c` splits on `__` to route calls back.
 - `render-markdown` does all terminal ANSI rendering: headers, ordered/unordered lists, fenced code blocks with per-language syntax highlighting, bordered tables with column alignment, inline bold/italic/code, and LaTeX→Unicode math symbols with super/subscript conversion.
 

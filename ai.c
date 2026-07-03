@@ -33,6 +33,7 @@ static char  model[MAX_VAL];
 static float temperature_val  = -1.0f;
 static int   max_tokens_val   = -1;
 static int   no_tools_mode    = 0;
+static int   resume_mode      = 0;    /* -r/--resume or INFER_RESUME: continue last session */
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
 static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
@@ -1973,14 +1974,122 @@ static char* read_memory_file() {
     return buf;
 }
 
+/* Return the active system prompt as a malloc'd string the caller must free.
+   Reads an override file (INFER_SYSTEM_PROMPT_FILE, else ~/.config/ai/system_prompt.md)
+   when it exists and is non-empty; otherwise returns a copy of the compiled-in
+   SYSTEM_PROMPT. Lets users tune agent behavior without recompiling. */
+static char* load_system_prompt() {
+    char path[1024];
+    const char *override = getenv("INFER_SYSTEM_PROMPT_FILE");
+    if (override && override[0]) {
+        snprintf(path, sizeof(path), "%s", override);
+    } else {
+        char *home = getenv("HOME");
+        if (!home) return strdup(SYSTEM_PROMPT);
+        snprintf(path, sizeof(path), "%s/.config/ai/system_prompt.md", home);
+    }
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return strdup(SYSTEM_PROMPT);
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (size <= 0) { fclose(fp); return strdup(SYSTEM_PROMPT); }
+    if (size > 65536) size = 65536; /* cap to keep context sane */
+
+    char *buf = malloc(size + 1);
+    if (!buf) { fclose(fp); return strdup(SYSTEM_PROMPT); }
+    size_t read_bytes = fread(buf, 1, size, fp);
+    buf[read_bytes] = '\0';
+    fclose(fp);
+
+    /* Ignore a file that is only whitespace */
+    char *p = buf;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!*p) { free(buf); return strdup(SYSTEM_PROMPT); }
+    return buf;
+}
+
+/* Return the path to the saved-session file (~/.cache/ai/sessions/last.json),
+   creating parent dirs. Writes into `out`; returns 0 on success. */
+static int session_file_path(char *out, size_t out_len) {
+    char *home = getenv("HOME");
+    if (!home) return -1;
+    char dir[1024];
+    /* mkdir each level — mkdir(2) is not recursive and ~/.cache may not exist. */
+    snprintf(dir, sizeof(dir), "%s/.cache", home);
+    mkdir(dir, 0700);
+    snprintf(dir, sizeof(dir), "%s/.cache/ai", home);
+    mkdir(dir, 0700);
+    snprintf(dir, sizeof(dir), "%s/.cache/ai/sessions", home);
+    mkdir(dir, 0700);
+    snprintf(out, out_len, "%s/last.json", dir);
+    return 0;
+}
+
+/* Persist the raw messages array so a later `ai -r` can resume this conversation. */
+static void save_session(const char *messages_json) {
+    char path[1200];
+    if (session_file_path(path, sizeof(path)) != 0) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) return;
+    fputs(messages_json, fp);
+    fclose(fp);
+}
+
+/* Load the previous session as a clean user/assistant transcript and append each
+   message to messages_json via append_message. mcp_script routes to the Python
+   session-transcript transformer. Returns the (possibly grown) messages_json. */
+static char* append_message(char *messages_json, const char *msg_to_append);
+static char* load_session_transcript(char *messages_json, const char *mcp_script) {
+    char path[1200];
+    if (session_file_path(path, sizeof(path)) != 0) return messages_json;
+    if (access(path, R_OK) != 0) {
+        fprintf(stderr, "\033[2m[ai] --resume: no previous session found.\033[0m\n");
+        return messages_json;
+    }
+    char cmd[1400];
+    snprintf(cmd, sizeof(cmd), "python3 %s session-transcript %s", mcp_script, path);
+    char *out = run_shell_command(cmd, NULL);
+    if (!out) return messages_json;
+    /* Each line is one compact JSON message object. Append each. */
+    int appended = 0;
+    char *line = out;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        /* skip empty/whitespace lines */
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '{') {
+            messages_json = append_message(messages_json, line);
+            appended++;
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(out);
+    if (appended > 0)
+        fprintf(stderr, "\033[2m[ai] --resume: restored %d message(s) from last session.\033[0m\n", appended);
+    return messages_json;
+}
+
 /* Write messages_json to a temp file, ask Python to trim it, return trimmed version.
    Keeps: messages[0] (system), messages[1] (first user), last 20 messages. */
 static char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
     if ((int)strlen(messages_json) <= trim_threshold) return messages_json;
-    char tmpfile[128];
-    snprintf(tmpfile, sizeof(tmpfile), "/tmp/ai_msgs_%d.json", (int)getpid());
-    FILE *fp = fopen(tmpfile, "w");
-    if (!fp) return messages_json;
+    /* Use mkstemp for an unpredictable, private (0600) temp file — the
+       conversation may contain sensitive content and a fixed name is a
+       symlink-race / info-leak hazard on a shared /tmp. */
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+    char tmpfile[256];
+    snprintf(tmpfile, sizeof(tmpfile), "%s/ai_msgs_XXXXXX", tmpdir);
+    int tfd = mkstemp(tmpfile);
+    if (tfd < 0) return messages_json;
+    FILE *fp = fdopen(tfd, "w");
+    if (!fp) { close(tfd); unlink(tmpfile); return messages_json; }
     fputs(messages_json, fp);
     fclose(fp);
     char cmd[512];
@@ -2624,6 +2733,7 @@ int main(int argc, char **argv) {
             printf("  -i, --interactive    Start an interactive multi-turn chat session.\n");
             printf("  -y, --yes            Auto-approve all command execution requests without prompting.\n");
             printf("  -c, --continue       Continue working without turn limits until the job is done.\n");
+            printf("  -r, --resume         Resume the previous conversation (from the last `ai` run).\n");
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
             printf("  -n, --no-tools       Skip the agent loop — get a direct text response (fast).\n");
             printf("  -t, --temperature N  Set sampling temperature (e.g. 0.0 for deterministic, 1.0 for creative).\n");
@@ -2710,6 +2820,8 @@ int main(int argc, char **argv) {
             quiet_mode = 1;
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) {
             no_tools_mode = 1;
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
+            resume_mode = 1;
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
             temperature_val = (float)atof(argv[i+1]);
             i++;
@@ -2727,6 +2839,11 @@ int main(int argc, char **argv) {
     char *env_quiet = getenv("INFER_QUIET");
     if (env_quiet && (strcmp(env_quiet, "1") == 0 || strcasecmp(env_quiet, "true") == 0)) {
         quiet_mode = 1;
+    }
+
+    char *env_resume = getenv("INFER_RESUME");
+    if (env_resume && (strcmp(env_resume, "1") == 0 || strcasecmp(env_resume, "true") == 0)) {
+        resume_mode = 1;
     }
 
     char *env_continue = getenv("INFER_CONTINUE");
@@ -2860,6 +2977,7 @@ int main(int argc, char **argv) {
                 if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
                 if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
                 if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
                 if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
                 if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
                      strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
@@ -2888,6 +3006,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
@@ -2907,6 +3026,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
@@ -2926,6 +3046,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
@@ -2962,7 +3083,8 @@ int main(int argc, char **argv) {
     char *sys_ctx = get_system_context();
     char *triggers = load_critical_triggers();
 
-    char *safe_system = json_escape(SYSTEM_PROMPT);
+    char *active_system_prompt = load_system_prompt();
+    char *safe_system = json_escape(active_system_prompt);
     char *safe_ctx = json_escape(sys_ctx);
     char *safe_mem = memory ? json_escape(memory) : NULL;
     char *safe_triggers = triggers ? json_escape(triggers) : NULL;
@@ -2975,7 +3097,7 @@ int main(int argc, char **argv) {
 
     /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
     char *content = malloc(mlen);
-    int clen = snprintf(content, mlen, "%s\n\n%s", SYSTEM_PROMPT, sys_ctx);
+    int clen = snprintf(content, mlen, "%s\n\n%s", active_system_prompt, sys_ctx);
     if (triggers && strlen(triggers) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nCRITICAL SKILL TRIGGERS (obey BEFORE any other tool):\n%s", triggers);
@@ -3003,6 +3125,12 @@ int main(int argc, char **argv) {
     free(safe_system);
     free(safe_ctx);
     free(sys_msg);
+    free(active_system_prompt);
+
+    /* --resume: splice the previous conversation (as a clean user/assistant
+       transcript) between the fresh system message and this turn's user prompt. */
+    if (resume_mode)
+        messages_json = load_session_transcript(messages_json, mcp_script);
 
     // Add User Prompt
     char *safe_prompt = json_escape(prompt);
@@ -4196,6 +4324,8 @@ step_limit_check:
     free(pipe_in);
     if (pipe_writer) free(pipe_writer);
     free(prompt);
+    /* Persist this conversation so a later `ai -r` / `ai --resume` can continue it. */
+    save_session(messages_json);
     free(messages_json);
     if (tools_json) free(tools_json);
     if (current_prompt) free(current_prompt);

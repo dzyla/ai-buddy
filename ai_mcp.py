@@ -364,7 +364,9 @@ def _html_to_text_fallback(html, url):
     return text
 
 
-def fetch_webpage(url):
+def fetch_webpage_basic(url):
+    """Plain fetch: trafilatura extraction → urllib + regex fallback (no TLS
+    impersonation, no JS). Used as the final fallback rung of fetch_smart."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
@@ -401,6 +403,17 @@ def fetch_webpage(url):
         return f"[Source: {url}]\n\n{text}"
     except Exception as e:
         return f"Error fetching webpage: {e}"
+
+
+def fetch_webpage(url):
+    """Default page fetch. Routes through the robust fetch_smart cascade
+    (curl_cffi TLS impersonation → Playwright+stealth → plain urllib) so the
+    model's everyday fetch handles bot-walls and JS-heavy sites, not just
+    static HTML. Set INFER_FETCH_BASIC=1 to force the plain path."""
+    if os.environ.get("INFER_FETCH_BASIC") == "1":
+        return fetch_webpage_basic(url)
+    return fetch_smart(url)
+
 
 def fetch_webpage_js(url, wait_for="networkidle", timeout_ms=30000):
     """Fetch a JS-rendered page via Playwright and return its content as markdown."""
@@ -541,7 +554,7 @@ def fetch_smart(url):
         # blocked — fall through to Playwright
     except ImportError:
         # curl_cffi not installed — fall back to urllib path
-        return fetch_webpage(url)
+        return fetch_webpage_basic(url)
     except Exception:
         pass  # network error or parse failure — try Playwright
 
@@ -555,7 +568,7 @@ def fetch_smart(url):
         pass
 
     # ── Step 3: Final urllib fallback ────────────────────────────────────────
-    result = fetch_webpage(url)
+    result = fetch_webpage_basic(url)
     body_part = result.split('\n\n', 1)[-1] if '\n\n' in result else result
     if _is_blocked(body_part):
         result = f"[FETCH_WARN: site resisted all fetch methods — content may be incomplete]\n\n{result}"
@@ -1891,6 +1904,78 @@ def main():
             print("[]")
         sys.exit(0)
 
+    if action == "session-transcript":
+        # Convert a saved raw messages array (from a previous run) into a clean
+        # user/assistant transcript suitable for resuming a conversation. Emits
+        # one compact JSON message object per line (JSONL) so the C caller can
+        # append each via its existing append_message(). Dropping the old system
+        # message, intermediate tool churn, and dangling tool_calls avoids the
+        # "assistant tool_call without tool response" API errors on the next turn.
+        if len(sys.argv) < 3:
+            sys.exit(0)
+        try:
+            with open(sys.argv[2]) as f:
+                messages = json.load(f)
+        except Exception:
+            sys.exit(0)
+
+        def _text_of(content):
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):  # multimodal: keep text parts only
+                parts = [p.get("text", "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "text"]
+                return "\n".join(t for t in parts if t)
+            return ""
+
+        # User-role messages that ai.c injects internally to steer a stalling
+        # model — never real user turns, so drop them from a resumed transcript.
+        _INTERNAL_NUDGES = (
+            "Please call task_complete",
+            "Your last response was empty",
+            "[TIMEOUT]",
+        )
+
+        out = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "user":
+                txt = _text_of(msg.get("content"))
+                if txt.strip() and not any(txt.lstrip().startswith(n) for n in _INTERNAL_NUDGES):
+                    out.append({"role": "user", "content": txt})
+            elif role == "assistant":
+                # Prefer a task_complete summary (the model's real final answer),
+                # otherwise any assistant text. Ignore other tool_calls.
+                summary = None
+                for call in (msg.get("tool_calls") or []):
+                    fn = call.get("function", {})
+                    if fn.get("name") == "task_complete":
+                        try:
+                            summary = json.loads(fn.get("arguments", "{}")).get("summary")
+                        except Exception:
+                            summary = None
+                txt = summary or _text_of(msg.get("content"))
+                if txt and txt.strip():
+                    out.append({"role": "assistant", "content": txt})
+            # system / tool roles are dropped
+
+        # Collapse consecutive same-role messages defensively and cap length so a
+        # huge prior run cannot blow up the next request's context.
+        MAX_TRANSCRIPT = 40000
+        total = 0
+        emitted = []
+        for m in out:
+            total += len(m["content"])
+            if total > MAX_TRANSCRIPT:
+                break
+            emitted.append(m)
+        # Keep the most recent turns if we had to truncate from the front
+        if len(emitted) < len(out):
+            emitted = out[-len(emitted):] if emitted else out[-1:]
+        for m in emitted:
+            print(json.dumps(m, ensure_ascii=False))
+        sys.exit(0)
+
     if action == "list-tools":
         openai_tools = []
 
@@ -1956,7 +2041,7 @@ def main():
             "type": "function",
             "function": {
                 "name": "fetch_webpage",
-                "description": "Download and read a static, unprotected URL quickly. For any URL that might be JS-rendered or bot-protected, use fetch_smart instead. Required before task_complete if search returned URLs — never present links without reading them.",
+                "description": "Download and read any URL. This is the robust default: it uses a browser TLS fingerprint (curl_cffi) to get past Cloudflare and bot-walls, and auto-escalates to a headless browser for JS-rendered pages when needed. Use it for essentially every page. Required before task_complete if search returned URLs — never present links without reading them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
