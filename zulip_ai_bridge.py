@@ -145,6 +145,11 @@ class ZulipAiBridge:
         run_env = os.environ.copy()
         run_env["INFER_AUTO_APPROVE"] = "1"
         run_env["INFER_RAW_OUTPUT"] = "1"
+        # Let set_reminder default the reminder recipient back to whoever asked,
+        # so "remind me tomorrow to ..." works with no email needed.
+        sender_email = msg.get("sender_email")
+        if sender_email:
+            run_env["AI_REMINDER_ZULIP_TO"] = sender_email
 
         # Run the local `ai` CLI in quiet + auto-approve mode.
         # With schedule_task properly used, the agent returns immediately for timed work.

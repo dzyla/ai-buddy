@@ -1626,27 +1626,27 @@ def repair_json(s):
         s += '}' * max(0, depth)
     return s
 
-def schedule_task(task_id, prompt, interval_seconds, run_once=False):
+def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None):
     import json
     import os
     import subprocess
     import sys
     import time
-    
+
     safe_task_id = "".join(c for c in task_id if c.isalnum() or c in ("_", "-"))
     if not safe_task_id:
         return "Error: task_id must contain alphanumeric characters, hyphens, or underscores."
-        
+
     task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
     os.makedirs(task_dir, exist_ok=True)
-    
+
     task_file = os.path.join(task_dir, f"{safe_task_id}.json")
-    
+
     saved_env = {}
     for k, v in os.environ.items():
-        if k.startswith("INFER_") or k.startswith("ZULIP_") or k == "PATH":
+        if k.startswith("INFER_") or k.startswith("ZULIP_") or k.startswith("AI_REMINDER_") or k == "PATH":
             saved_env[k] = v
-            
+
     task_data = {
         "task_id": safe_task_id,
         "prompt": prompt,
@@ -1656,6 +1656,8 @@ def schedule_task(task_id, prompt, interval_seconds, run_once=False):
         "last_run": "never",
         "env": saved_env
     }
+    if extra:
+        task_data.update(extra)
     
     existed = os.path.exists(task_file)
     
@@ -1685,6 +1687,106 @@ def schedule_task(task_id, prompt, interval_seconds, run_once=False):
             return f"Error spawning scheduler process: {e}"
     else:
         return f"Updated scheduled task '{safe_task_id}' (running every {interval_seconds}s in the background)."
+
+def set_reminder(message, when=None, delay_seconds=None, zulip_to=None,
+                 zulip_stream=None, zulip_topic=None, task_id=None):
+    """Schedule a one-shot reminder delivered directly to Zulip (no LLM spawn).
+
+    Provide either `when` (an ISO 8601 timestamp, e.g. '2026-07-05T09:00:00' —
+    convert phrases like 'tomorrow 9am' to ISO yourself using the current time)
+    or `delay_seconds` (relative). The reminder is sent to a Zulip DM (`zulip_to`
+    email) or a stream (`zulip_stream` + `zulip_topic`). If no recipient is
+    given, it falls back to the AI_REMINDER_ZULIP_TO env var (set by the Zulip
+    bridge to the requester) so 'remind me ...' just works from chat."""
+    import datetime
+    import time as _time
+
+    if not message or not str(message).strip():
+        return "Error: reminder 'message' is required."
+
+    # Resolve delay
+    if delay_seconds is not None:
+        try:
+            delay = float(delay_seconds)
+        except (TypeError, ValueError):
+            return "Error: delay_seconds must be a number."
+    elif when:
+        try:
+            when_dt = datetime.datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+        except ValueError:
+            return (f"Error: could not parse when='{when}'. Use ISO 8601, e.g. "
+                    "'2026-07-05T09:00:00'.")
+        if when_dt.tzinfo is None:
+            now = datetime.datetime.now()
+        else:
+            now = datetime.datetime.now(when_dt.tzinfo)
+        delay = (when_dt - now).total_seconds()
+    else:
+        return "Error: provide either 'when' (ISO timestamp) or 'delay_seconds'."
+
+    if delay < 5:
+        return (f"Error: reminder time is in the past or too soon ({int(delay)}s). "
+                "Pick a future time.")
+
+    # Resolve recipient
+    zulip_to = zulip_to or os.environ.get("AI_REMINDER_ZULIP_TO")
+    if not zulip_to and not zulip_stream:
+        return ("Error: no Zulip recipient. Provide zulip_to (email for a DM) or "
+                "zulip_stream + zulip_topic. From the Zulip bridge this is filled "
+                "in automatically.")
+    if zulip_stream and not zulip_topic:
+        zulip_topic = "Reminders"
+
+    # Build a unique-ish task id
+    if not task_id:
+        task_id = "reminder_" + _time.strftime("%Y%m%d_%H%M%S")
+
+    extra = {
+        "kind": "reminder",
+        "message": str(message),
+        "zulip_to": zulip_to,
+        "zulip_stream": zulip_stream,
+        "zulip_topic": zulip_topic,
+        "when": when,
+    }
+    label = f"[reminder] {str(message)[:60]}"
+    result = schedule_task(task_id, label, delay, run_once=True, extra=extra)
+    if result.startswith("Error"):
+        return result
+
+    # Friendly confirmation with the local delivery time
+    fire_at = datetime.datetime.now() + datetime.timedelta(seconds=delay)
+    dest = f"DM to {zulip_to}" if zulip_to else f"#{zulip_stream} > {zulip_topic}"
+    mins = int(delay // 60)
+    when_str = fire_at.strftime("%Y-%m-%d %H:%M")
+    return (f"⏰ Reminder set for {when_str} (in ~{mins} min) → {dest}: "
+            f"\"{str(message)[:80]}\" (task id: {task_id})")
+
+
+def _deliver_reminder(task_data):
+    """Send a scheduled reminder straight to Zulip. Returns a status string."""
+    message = task_data.get("message", "")
+    text = f"⏰ **Reminder:** {message}"
+    zulip_to = task_data.get("zulip_to")
+    zulip_stream = task_data.get("zulip_stream")
+    zulip_topic = task_data.get("zulip_topic") or "Reminders"
+    try:
+        import zulip_mcp_server as zms
+        if zulip_stream:
+            args = {"message_type": "stream", "to": zulip_stream,
+                    "topic": zulip_topic, "content": text}
+        else:
+            args = {"message_type": "private", "to": zulip_to, "content": text}
+        return zms.do_send_message(args)
+    except Exception as e:
+        # Fallback: desktop notification so the reminder is not silently lost.
+        try:
+            import subprocess
+            subprocess.run(["notify-send", "AI Reminder", message], timeout=10)
+            return f"Zulip delivery failed ({e}); sent desktop notification instead."
+        except Exception:
+            return f"Error: could not deliver reminder: {e}"
+
 
 def unschedule_task(task_id):
     import os
@@ -1809,6 +1911,24 @@ def run_scheduler_loop(task_id):
                 log_message("run_once task: task file removed before agent spawn.")
             except Exception as e:
                 log_message(f"run_once: could not remove task file: {e}")
+
+        # Reminders are delivered deterministically (direct Zulip send), not via
+        # an LLM agent — faster and can't be mangled by the model.
+        if task_data.get("kind") == "reminder":
+            run_env = os.environ.copy()
+            run_env.update(saved_env)
+            _saved_environ = dict(os.environ)
+            try:
+                os.environ.update({k: v for k, v in saved_env.items() if isinstance(v, str)})
+                status = _deliver_reminder(task_data)
+            finally:
+                os.environ.clear()
+                os.environ.update(_saved_environ)
+            log_message(f"Reminder delivered: {status}")
+            if run_once or not os.path.exists(task_file):
+                log_message("Reminder run_once: exiting scheduler loop.")
+                break
+            continue
 
         ai_bin = _resolve_ai_bin()
         cmd = [ai_bin, "-y", "-q", prompt]
@@ -2378,7 +2498,7 @@ def main():
             "type": "function",
             "function": {
                 "name": "gcal_create_event",
-                "description": "Create a new event in Google Calendar.",
+                "description": "Create a new event in Google Calendar with exact start/end times. For natural-language phrases ('lunch with Sam tomorrow 1pm'), prefer gcal_quick_add instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2388,11 +2508,15 @@ def main():
                         },
                         "start_time": {
                             "type": "string",
-                            "description": "Start time in ISO 8601 format (must include timezone offset, e.g. '2026-07-01T14:00:00-06:00')."
+                            "description": "Start time, ISO 8601 (e.g. '2026-07-01T14:00:00'). A timezone offset is optional — without one it is interpreted in the user's local timezone (or the time_zone arg). Use a bare date ('2026-07-01') for an all-day event."
                         },
                         "end_time": {
                             "type": "string",
-                            "description": "End time in ISO 8601 format (must include timezone offset, e.g. '2026-07-01T15:00:00-06:00')."
+                            "description": "End time, ISO 8601 (e.g. '2026-07-01T15:00:00'). Offset optional. Use a bare date for all-day events."
+                        },
+                        "time_zone": {
+                            "type": "string",
+                            "description": "Optional IANA timezone name (e.g. 'America/New_York') for naive start/end times. Defaults to the system local timezone."
                         },
                         "description": {
                             "type": "string",
@@ -2440,6 +2564,67 @@ def main():
                         }
                     },
                     "required": ["time_min", "time_max"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "gcal_quick_add",
+                "description": "Create a Google Calendar event from a natural-language phrase — Google parses the date/time/title for you. Best default for casual event creation, e.g. 'Dentist appointment next Tuesday at 3pm' or 'Lunch with Sam tomorrow 12-1pm'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Natural-language description including when and what, e.g. 'Team sync Friday 10am'."
+                        },
+                        "calendar_id": {
+                            "type": "string",
+                            "description": "Optional calendar ID. Defaults to 'primary'."
+                        }
+                    },
+                    "required": ["text"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "gcal_update_event",
+                "description": "Reschedule or modify an existing Google Calendar event. Only the fields you pass are changed. Call gcal_list_events first to get the event_id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "event_id": {"type": "string", "description": "ID of the event to update (from gcal_list_events)."},
+                        "summary": {"type": "string", "description": "New title (optional)."},
+                        "start_time": {"type": "string", "description": "New start time, ISO 8601 (optional). Offset optional; naive times use time_zone or local tz."},
+                        "end_time": {"type": "string", "description": "New end time, ISO 8601 (optional)."},
+                        "description": {"type": "string", "description": "New description (optional)."},
+                        "location": {"type": "string", "description": "New location (optional)."},
+                        "attendees": {"type": "array", "items": {"type": "string"}, "description": "Replacement attendee email list (optional)."},
+                        "time_zone": {"type": "string", "description": "Optional IANA timezone for naive start/end times."},
+                        "calendar_id": {"type": "string", "description": "Optional calendar ID. Defaults to 'primary'."}
+                    },
+                    "required": ["event_id"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "gcal_delete_event",
+                "description": "Cancel/delete a Google Calendar event by its ID. Call gcal_list_events first to get the event_id. This is irreversible.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "event_id": {"type": "string", "description": "ID of the event to delete (from gcal_list_events)."},
+                        "calendar_id": {"type": "string", "description": "Optional calendar ID. Defaults to 'primary'."}
+                    },
+                    "required": ["event_id"]
                 }
             }
         })
@@ -2509,6 +2694,53 @@ def main():
                         }
                     },
                     "required": ["task_id", "prompt", "interval_seconds"]
+                }
+            }
+        })
+
+        # set_reminder
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "set_reminder",
+                "description": (
+                    "Set a one-shot reminder that is delivered straight to Zulip at a future time — "
+                    "use this for 'remind me tomorrow to ...', 'ping me in 2 hours to ...', etc. "
+                    "Preferred over schedule_task for reminders: delivery is deterministic (no LLM run) so it "
+                    "can't be garbled. Convert natural phrases like 'tomorrow 9am' into an ISO timestamp yourself "
+                    "using the current local time from the system context, and pass it as `when`. "
+                    "When the request comes from Zulip chat, the recipient is filled in automatically — you only "
+                    "need `message` and `when`. After calling this, call task_complete to confirm."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "The reminder text to send back to the user, e.g. 'Submit the grant report'."
+                        },
+                        "when": {
+                            "type": "string",
+                            "description": "Absolute delivery time as an ISO 8601 timestamp, e.g. '2026-07-05T09:00:00'. Convert 'tomorrow 9am' etc. yourself from the current time. Provide this OR delay_seconds."
+                        },
+                        "delay_seconds": {
+                            "type": "integer",
+                            "description": "Alternative to `when`: how many seconds from now to fire (e.g. 7200 for 2 hours)."
+                        },
+                        "zulip_to": {
+                            "type": "string",
+                            "description": "Recipient email for a Zulip DM. Optional — from the Zulip bridge this defaults to the requester automatically."
+                        },
+                        "zulip_stream": {
+                            "type": "string",
+                            "description": "Alternatively, a Zulip stream/channel name to post the reminder to."
+                        },
+                        "zulip_topic": {
+                            "type": "string",
+                            "description": "Topic for the stream message (defaults to 'Reminders'). Only used with zulip_stream."
+                        }
+                    },
+                    "required": ["message"]
                 }
             }
         })
@@ -2627,6 +2859,17 @@ def main():
             interval_seconds = arguments.get("interval_seconds", 300)
             run_once = arguments.get("run_once", False)
             result = schedule_task(task_id, prompt, interval_seconds, run_once=run_once)
+            print(result)
+        elif tool_name == "set_reminder" or server_name == "set_reminder":
+            result = set_reminder(
+                message=arguments.get("message"),
+                when=arguments.get("when"),
+                delay_seconds=arguments.get("delay_seconds"),
+                zulip_to=arguments.get("zulip_to"),
+                zulip_stream=arguments.get("zulip_stream"),
+                zulip_topic=arguments.get("zulip_topic"),
+                task_id=arguments.get("task_id"),
+            )
             print(result)
         elif tool_name == "unschedule_task" or server_name == "unschedule_task":
             task_id = arguments.get("task_id")
@@ -2886,6 +3129,43 @@ def main():
                 print(result)
             except Exception as e:
                 print(f"Error in gcal_check_availability: {e}")
+        elif tool_name == "gcal_quick_add" or server_name == "gcal_quick_add":
+            try:
+                import gcal
+                result = gcal.quick_add(
+                    text=arguments.get("text", ""),
+                    calendar_id=arguments.get("calendar_id", 'primary')
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in gcal_quick_add: {e}")
+        elif tool_name == "gcal_update_event" or server_name == "gcal_update_event":
+            try:
+                import gcal
+                result = gcal.update_event(
+                    event_id=arguments.get("event_id"),
+                    summary=arguments.get("summary"),
+                    start_time=arguments.get("start_time"),
+                    end_time=arguments.get("end_time"),
+                    description=arguments.get("description"),
+                    location=arguments.get("location"),
+                    attendees=arguments.get("attendees"),
+                    time_zone=arguments.get("time_zone"),
+                    calendar_id=arguments.get("calendar_id", 'primary')
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in gcal_update_event: {e}")
+        elif tool_name == "gcal_delete_event" or server_name == "gcal_delete_event":
+            try:
+                import gcal
+                result = gcal.delete_event(
+                    event_id=arguments.get("event_id"),
+                    calendar_id=arguments.get("calendar_id", 'primary')
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in gcal_delete_event: {e}")
         else:
             # Route to MCP server
             cfg = mcp_servers.get(server_name)

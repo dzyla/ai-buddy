@@ -75,6 +75,7 @@ static const char *SYSTEM_PROMPT =
     "SCHEDULING AND DEFERRED TASKS (CRITICAL):\n"
     "- NEVER use `sleep` inside execute_command for delays. `sleep 60 && ...` blocks the terminal or chat bridge and makes the user wait with no response. It is FORBIDDEN.\n"
     "- For ANY request that involves waiting, timing, or checking something later (e.g. 'remind me in 5 min', 'notify me when done', 'check the folder every hour', 'send a message when job finishes') you MUST use schedule_task.\n"
+    "- For plain 'remind me ...' / 'ping me at/in ... to ...' requests, prefer set_reminder — it delivers the reminder straight to Zulip at the given time (convert 'tomorrow 9am' to an ISO timestamp using the current time). From Zulip chat the recipient is auto-filled; just pass message + when.\n"
     "- schedule_task runs the agent loop in a fully detached background process — the current session returns immediately.\n"
     "- Inside the scheduled prompt, instruct the sub-agent to call unschedule_task(task_id) once its condition is satisfied so the loop stops.\n"
     "- Examples:\n"

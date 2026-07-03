@@ -236,9 +236,34 @@ Re-run `./install.sh` after adding skills to sync project skills to the global l
 
 ---
 
+## Google Calendar
+
+With Google Calendar credentials configured (`python3 gcal.py auth`), the agent can manage your schedule end-to-end:
+
+- `gcal_list_events` — read your schedule across calendars.
+- `gcal_check_availability` — free/busy lookup.
+- `gcal_quick_add` — create an event from a natural-language phrase ("lunch with Sam tomorrow 1pm"); Google parses the date/time.
+- `gcal_create_event` — create with explicit times. Timezone offsets are optional — naive times use your local timezone (or a `time_zone` arg), and bare dates (`2026-07-05`) create all-day events.
+- `gcal_update_event` — reschedule or modify an event (only the fields you pass change).
+- `gcal_delete_event` — cancel an event.
+
+```bash
+ai "am I free Thursday afternoon? if so, book a 1h focus block at 2pm"
+ai "move my 3pm dentist appointment to Friday same time"
+```
+
 ## Zulip Integration
 
-You can integrate `ai` with Zulip to chat with the local agent directly from your mobile device or desktop.
+You can integrate `ai` with Zulip to chat with the local agent directly from your mobile device or desktop. The Zulip MCP server exposes `zulip_send_message`, `zulip_get_messages`, `zulip_add_reaction`, and `zulip_edit_message`.
+
+**Reminders.** Ask the agent (in Zulip chat or the terminal) to remind you later, and it schedules a one-shot reminder delivered straight back to your Zulip DM at the requested time — no LLM runs at delivery, so it can't be garbled:
+
+```
+you:  hey, remind me tomorrow at 9am to submit the grant report
+ai:   ⏰ Reminder set for 2026-07-04 09:00 (in ~840 min) → DM to you@…: "submit the grant report"
+```
+
+From Zulip the recipient is auto-filled (the requester). In the terminal, pass a recipient (`zulip_to` email, or a `zulip_stream`). Under the hood this is the `set_reminder` tool.
 
 For complete configuration instructions, bot creation, and setting up the systemd user service background daemon, see [docs/zulip-setup.md](docs/zulip-setup.md).
 

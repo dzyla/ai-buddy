@@ -74,6 +74,48 @@ TOOL_GET_MESSAGES = {
     }
 }
 
+TOOL_ADD_REACTION = {
+    "name": "zulip_add_reaction",
+    "description": "Add an emoji reaction to a Zulip message (e.g. acknowledge a request with a thumbs up). Get the message_id from zulip_get_messages.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "integer",
+                "description": "The ID of the message to react to (from zulip_get_messages)."
+            },
+            "emoji_name": {
+                "type": "string",
+                "description": "The Zulip emoji name without colons, e.g. 'thumbs_up', 'check', 'eyes', 'tada'."
+            }
+        },
+        "required": ["message_id", "emoji_name"]
+    }
+}
+
+TOOL_EDIT_MESSAGE = {
+    "name": "zulip_edit_message",
+    "description": "Edit the content and/or move the topic of a Zulip message you sent. Get the message_id from zulip_get_messages.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "integer",
+                "description": "The ID of the message to edit."
+            },
+            "content": {
+                "type": "string",
+                "description": "The new Markdown content. Optional if only changing the topic."
+            },
+            "topic": {
+                "type": "string",
+                "description": "New topic name (stream messages only). Optional."
+            }
+        },
+        "required": ["message_id"]
+    }
+}
+
 def get_zulip_client():
     if "zulip" not in sys.modules:
         raise Exception("The 'zulip' Python package is not installed. Please run: pip install zulip")
@@ -126,6 +168,38 @@ def do_send_message(arguments):
         return f"Successfully sent message (ID: {result.get('id')}) to {to}."
     else:
         return f"Error sending message: {result.get('msg', 'Unknown error')}"
+
+def do_add_reaction(arguments):
+    client = get_zulip_client()
+    message_id = arguments.get("message_id")
+    emoji_name = arguments.get("emoji_name")
+    if message_id is None or not emoji_name:
+        return "Error: both 'message_id' and 'emoji_name' are required."
+    emoji_name = str(emoji_name).strip().strip(":")
+    result = client.add_reaction({"message_id": int(message_id), "emoji_name": emoji_name})
+    if result.get("result") == "success":
+        return f"Successfully added :{emoji_name}: reaction to message {message_id}."
+    return f"Error adding reaction: {result.get('msg', 'Unknown error')}"
+
+def do_edit_message(arguments):
+    client = get_zulip_client()
+    message_id = arguments.get("message_id")
+    if message_id is None:
+        return "Error: 'message_id' is required."
+    content = arguments.get("content")
+    topic = arguments.get("topic")
+    if not content and not topic:
+        return "Error: provide 'content' and/or 'topic' to change."
+    payload = {"message_id": int(message_id)}
+    if content:
+        payload["content"] = content
+    if topic:
+        payload["topic"] = topic
+    result = client.update_message(payload)
+    if result.get("result") == "success":
+        changed = " and ".join([p for p in (["content"] if content else []) + (["topic"] if topic else [])])
+        return f"Successfully edited {changed} of message {message_id}."
+    return f"Error editing message: {result.get('msg', 'Unknown error')}"
 
 def do_get_messages(arguments):
     client = get_zulip_client()
@@ -273,7 +347,8 @@ def main():
                 _send({
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"tools": [TOOL_SEND_MESSAGE, TOOL_GET_MESSAGES]}
+                    "result": {"tools": [TOOL_SEND_MESSAGE, TOOL_GET_MESSAGES,
+                                         TOOL_ADD_REACTION, TOOL_EDIT_MESSAGE]}
                 })
 
             elif method == "tools/call":
@@ -284,6 +359,10 @@ def main():
                     result = do_send_message(arguments)
                 elif tool_name == "zulip_get_messages":
                     result = do_get_messages(arguments)
+                elif tool_name == "zulip_add_reaction":
+                    result = do_add_reaction(arguments)
+                elif tool_name == "zulip_edit_message":
+                    result = do_edit_message(arguments)
                 else:
                     _send_error(req_id, -32601, f"Unknown tool: {tool_name}")
                     continue
