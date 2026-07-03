@@ -14,6 +14,46 @@ CONFIG_DIR = os.path.expanduser('~/.config/ai')
 TOKEN_PATH = os.path.join(CONFIG_DIR, 'gcal_token.json')
 CREDS_PATH = os.path.join(CONFIG_DIR, 'gcal_credentials.json')
 
+
+def _utc_now_iso():
+    """Current UTC time as an RFC3339 'Z' string (timezone-aware; utcnow() is
+    deprecated in Python 3.12+)."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def local_tz_name():
+    """Best-effort IANA name of the system timezone (e.g. 'America/New_York').
+    Falls back to 'UTC'. Used so naive datetimes passed to create/update events
+    are interpreted in the user's local zone rather than rejected by Google."""
+    tz = os.environ.get('TZ')
+    if tz:
+        return tz
+    # Debian/Ubuntu keep the name in /etc/timezone
+    try:
+        with open('/etc/timezone') as f:
+            name = f.read().strip()
+            if name:
+                return name
+    except Exception:
+        pass
+    # Most distros symlink /etc/localtime -> .../zoneinfo/<Area>/<City>
+    try:
+        link = os.readlink('/etc/localtime')
+        if 'zoneinfo/' in link:
+            return link.split('zoneinfo/', 1)[1]
+    except Exception:
+        pass
+    return 'UTC'
+
+
+def _event_time(dt_str, time_zone):
+    """Build a Google Calendar start/end object. All-day dates (YYYY-MM-DD, no
+    'T') use the 'date' field; timestamps use 'dateTime' + an explicit timeZone
+    so naive values are unambiguous."""
+    if dt_str and len(dt_str) == 10 and 'T' not in dt_str:
+        return {'date': dt_str}
+    return {'dateTime': dt_str, 'timeZone': time_zone}
+
 def get_calendar_service():
     """Initializes and returns the Google Calendar API service."""
     creds = None
@@ -73,7 +113,7 @@ def list_events(time_min=None, time_max=None, max_results=20, calendar_ids=None)
         
         # Default timeMin to current time if not provided
         if not time_min:
-            time_min = datetime.datetime.utcnow().isoformat() + 'Z'
+            time_min = _utc_now_iso()
             
         # Default timeMax to 7 days from now if not provided
         if not time_max:
@@ -145,33 +185,109 @@ def list_events(time_min=None, time_max=None, max_results=20, calendar_ids=None)
     except Exception as e:
         return f"Error listing events: {e}"
 
-def create_event(summary, start_time, end_time, description=None, location=None, attendees=None, calendar_id='primary'):
-    """Creates a calendar event."""
+def create_event(summary, start_time, end_time, description=None, location=None,
+                 attendees=None, calendar_id='primary', time_zone=None):
+    """Creates a calendar event. start_time/end_time are RFC3339 timestamps
+    (e.g. 2026-07-05T14:00:00) or all-day dates (2026-07-05). Naive timestamps
+    are interpreted in time_zone (defaults to the system local zone)."""
     try:
         service = get_calendar_service()
-        
+        tz = time_zone or local_tz_name()
+
         event_body = {
             'summary': summary,
-            'start': {'dateTime': start_time},
-            'end': {'dateTime': end_time},
+            'start': _event_time(start_time, tz),
+            'end': _event_time(end_time, tz),
         }
         if description:
             event_body['description'] = description
         if location:
             event_body['location'] = location
         if attendees:
+            if isinstance(attendees, str):
+                attendees = [a for a in attendees.split(',')]
             event_body['attendees'] = [{'email': email.strip()} for email in attendees if email.strip()]
 
         created_event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
         link = created_event.get('htmlLink', '')
         return (
             f"Successfully created event: '{summary}' in calendar '{calendar_id}'\n"
-            f"Start: {start_time}\n"
+            f"Start: {start_time} ({tz})\n"
             f"End: {end_time}\n"
+            f"Event ID: {created_event.get('id', '')}\n"
             f"Event Link: {link}"
         )
     except Exception as e:
         return f"Error creating event: {e}"
+
+
+def update_event(event_id, summary=None, start_time=None, end_time=None,
+                 description=None, location=None, attendees=None,
+                 calendar_id='primary', time_zone=None):
+    """Reschedule or modify an existing event. Only the fields you pass are
+    changed (patch semantics). Use gcal_list_events first to get the event_id."""
+    try:
+        service = get_calendar_service()
+        tz = time_zone or local_tz_name()
+
+        patch = {}
+        if summary is not None:
+            patch['summary'] = summary
+        if description is not None:
+            patch['description'] = description
+        if location is not None:
+            patch['location'] = location
+        if start_time:
+            patch['start'] = _event_time(start_time, tz)
+        if end_time:
+            patch['end'] = _event_time(end_time, tz)
+        if attendees:
+            if isinstance(attendees, str):
+                attendees = [a for a in attendees.split(',')]
+            patch['attendees'] = [{'email': e.strip()} for e in attendees if e.strip()]
+
+        if not patch:
+            return "Error: nothing to update — provide at least one field to change."
+
+        updated = service.events().patch(
+            calendarId=calendar_id, eventId=event_id, body=patch).execute()
+        changed = ', '.join(sorted(patch.keys()))
+        return (
+            f"Successfully updated event '{updated.get('summary', event_id)}' "
+            f"(ID: {event_id}) in calendar '{calendar_id}'.\n"
+            f"Changed: {changed}\n"
+            f"Event Link: {updated.get('htmlLink', '')}"
+        )
+    except Exception as e:
+        return f"Error updating event: {e}"
+
+
+def delete_event(event_id, calendar_id='primary'):
+    """Cancel/delete an event by its ID. Use gcal_list_events to find the ID."""
+    try:
+        service = get_calendar_service()
+        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        return f"Successfully deleted event (ID: {event_id}) from calendar '{calendar_id}'."
+    except Exception as e:
+        return f"Error deleting event: {e}"
+
+
+def quick_add(text, calendar_id='primary'):
+    """Create an event from a natural-language phrase using Google's parser,
+    e.g. 'Lunch with Sam tomorrow at 12pm' or 'Dentist July 9 3-4pm'."""
+    try:
+        service = get_calendar_service()
+        created = service.events().quickAdd(calendarId=calendar_id, text=text).execute()
+        start = created.get('start', {})
+        when = start.get('dateTime', start.get('date', '?'))
+        return (
+            f"Created event: '{created.get('summary', text)}'\n"
+            f"When: {when}\n"
+            f"Event ID: {created.get('id', '')}\n"
+            f"Event Link: {created.get('htmlLink', '')}"
+        )
+    except Exception as e:
+        return f"Error in quick_add: {e}"
 
 def check_availability(time_min, time_max, calendar_ids=None):
     """Checks free/busy availability."""
@@ -240,6 +356,31 @@ def main():
         time_min = sys.argv[2]
         time_max = sys.argv[3]
         print(check_availability(time_min, time_max))
+    elif action == "quickadd":
+        if len(sys.argv) < 3:
+            print("Usage: gcal.py quickadd <natural language text> [calendar_id]")
+            sys.exit(1)
+        text = sys.argv[2]
+        calendar_id = sys.argv[3] if len(sys.argv) > 3 else 'primary'
+        print(quick_add(text, calendar_id))
+    elif action == "delete":
+        if len(sys.argv) < 3:
+            print("Usage: gcal.py delete <event_id> [calendar_id]")
+            sys.exit(1)
+        event_id = sys.argv[2]
+        calendar_id = sys.argv[3] if len(sys.argv) > 3 else 'primary'
+        print(delete_event(event_id, calendar_id))
+    elif action == "update":
+        if len(sys.argv) < 3:
+            print("Usage: gcal.py update <event_id> [summary] [start_time] [end_time] [calendar_id]")
+            sys.exit(1)
+        event_id = sys.argv[2]
+        summary = sys.argv[3] if len(sys.argv) > 3 else None
+        start_time = sys.argv[4] if len(sys.argv) > 4 else None
+        end_time = sys.argv[5] if len(sys.argv) > 5 else None
+        calendar_id = sys.argv[6] if len(sys.argv) > 6 else 'primary'
+        print(update_event(event_id, summary=summary, start_time=start_time,
+                           end_time=end_time, calendar_id=calendar_id))
     else:
         print(f"Unknown action: {action}")
         sys.exit(1)
