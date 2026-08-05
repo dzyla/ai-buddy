@@ -618,15 +618,47 @@ def save_memory(content):
     except Exception as e:
         return f"Error saving memory: {e}"
 
-def remember(content):
-    """Save a piece of information to the FTS5 memory database."""
+def _ensure_memories_schema(conn):
+    """Ensure the memories FTS5 table has a metadata column.
+    FTS5 virtual tables cannot be ALTERED, so we rebuild if needed."""
+    # First, make sure the table exists at all (old schema with just content)
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(content)")
+    # Check if metadata column exists
+    try:
+        cursor = conn.execute("PRAGMA table_info(memories)")
+        columns = {row[1] for row in cursor.fetchall()}
+    except Exception:
+        columns = set()
+    if "metadata" in columns:
+        return  # Already has the column
+    # Rebuild: backup content, drop table, recreate with metadata, reinsert
+    old_rows = conn.execute("SELECT content FROM memories").fetchall()
+    conn.execute("DROP TABLE IF EXISTS memories")
+    conn.execute(
+        "CREATE VIRTUAL TABLE memories USING fts5(content, metadata)"
+    )
+    for (content,) in old_rows:
+        conn.execute(
+            "INSERT INTO memories(content, metadata) VALUES (?, ?)",
+            (content, ""),
+        )
+    conn.commit()
+
+
+def remember(content, metadata=""):
+    """Save a piece of information to the FTS5 memory database with optional metadata."""
     try:
         os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
         conn = sqlite3.connect(MEMORY_DB)
-        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(content)")
+        _ensure_memories_schema(conn)
         if len(content) > 4000:
             content = content[-4000:]
-        conn.execute("INSERT INTO memories(content) VALUES (?)", (content,))
+        if metadata:
+            metadata = str(metadata)[:200]
+        conn.execute(
+            "INSERT INTO memories(content, metadata) VALUES (?, ?)",
+            (content, metadata),
+        )
         conn.commit()
         conn.close()
         return f"Remembered: {content[:80]}{'...' if len(content) > 80 else ''}"
@@ -635,22 +667,26 @@ def remember(content):
 
 
 def recall(query):
-    """Search memories using FTS5 full-text search."""
+    """Search memories using FTS5 full-text search. Returns content and metadata."""
     try:
         os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
         conn = sqlite3.connect(MEMORY_DB)
-        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(content)")
+        _ensure_memories_schema(conn)
         # Escape single quotes in user query for safe FTS5 usage
         safe_query = query.replace("'", "''")
         rows = conn.execute(
-            "SELECT content FROM memories WHERE memories MATCH ?", (safe_query,)
+            "SELECT content, metadata FROM memories WHERE memories MATCH ?",
+            (safe_query,),
         ).fetchall()
         conn.close()
         if not rows:
             return "No memories found matching that query."
         results = []
-        for row in rows:
-            results.append(row[0])
+        for content, meta in rows:
+            entry = content
+            if meta:
+                entry += f"\n[metadata: {meta}]"
+            results.append(entry)
         return "\n---\n".join(results)
     except Exception as e:
         return f"Error searching memories: {e}"
@@ -1578,6 +1614,25 @@ def get_clipboard():
             pass
     return "Error: could not read clipboard (no xclip/wl-paste/xsel available or clipboard is empty)."
 
+
+def list_processes():
+    """Return the top 10 running processes sorted by CPU usage."""
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["ps", "aux", "--sort=-%cpu"],
+            capture_output=True, text=True, check=True, timeout=10
+        )
+        lines = out.stdout.strip().splitlines()
+        header = lines[0] if lines else ""
+        body = lines[1:11]  # top 10 (excluding header)
+        if not body:
+            return "No running processes found."
+        result_lines = [header] + body
+        return "\n".join(result_lines)
+    except Exception as e:
+        return f"Error listing processes: {e}"
+
 TOOL_REQUIRED_ARGS = {
     "execute_command": ["command"],
     "web_search":      ["query"],
@@ -1602,6 +1657,7 @@ TOOL_REQUIRED_ARGS = {
     "list_scheduled_tasks": [],
     "get_system_status": [],
     "get_clipboard": [],
+    "list_processes":   [],
 }
 
 # Per-agent and per-URL output caps for parallel tools
@@ -2522,6 +2578,20 @@ def main():
             }
         })
 
+        # 10c. list_processes — top 10 running processes
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_processes",
+                "description": "Return the top 10 running processes sorted by CPU usage.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        })
+
         # 11. delegate_task
         openai_tools.append({
             "type": "function",
@@ -3139,11 +3209,15 @@ def main():
             print(result)
         elif tool_name == "remember" or server_name == "remember":
             content = arguments.get("content", "")
-            result = remember(content)
+            metadata = arguments.get("metadata", "")
+            result = remember(content, metadata=metadata)
             print(result)
         elif tool_name == "recall" or server_name == "recall":
             query = arguments.get("query", "")
             result = recall(query)
+            print(result)
+        elif tool_name == "list_processes" or server_name == "list_processes":
+            result = list_processes()
             print(result)
         elif tool_name == "read_file" or server_name == "read_file":
             path = arguments.get("path", "")
