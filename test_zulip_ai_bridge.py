@@ -216,6 +216,52 @@ def test_process_message_raw_output_env(mock_sub_run, mock_client_class):
     assert kwargs["env"]["INFER_AUTO_APPROVE"] == "1"
 
 @patch('zulip.Client')
+@patch('threading.Thread')
+@patch('requests.get')
+def test_handle_message_downloads_uploads(mock_get, mock_thread, mock_client_class):
+    mock_client = mock_client_class.return_value
+    mock_client.email = "bot@example.com"
+    mock_client.base_url = "https://zulip.example.com/api/"
+    mock_client.api_key = "secret"
+
+    with patch('zulip_ai_bridge.ZulipAiBridge._detect_owner', return_value=None):
+        bridge = zulip_ai_bridge.ZulipAiBridge()
+
+    mock_get.return_value = MagicMock(status_code=200, content=b"file-bytes")
+
+    with patch.dict('os.environ', {'ZULIP_USER': 'user@example.com'}):
+        # Modern 4-segment upload path with a URL-encoded filename
+        msg = {
+            "id": 100,
+            "type": "private",
+            "sender_email": "user@example.com",
+            "content": "look at [my report.pdf](/user_uploads/2/ce/hLbH-oDBjB_NUp3wcNvWi9OB/my%20report.pdf)"
+        }
+        bridge.handle_message(msg)
+
+        mock_get.assert_called_once()
+        assert mock_get.call_args[0][0] == (
+            "https://zulip.example.com/user_uploads/2/ce/hLbH-oDBjB_NUp3wcNvWi9OB/my%20report.pdf"
+        )
+        prompt_content = mock_thread.call_args[1]["args"][1]
+        assert "/tmp/zulip_uploads/my report.pdf" in prompt_content
+        assert "/user_uploads/" not in prompt_content
+
+        # Legacy 3-segment path still works
+        mock_get.reset_mock()
+        mock_thread.reset_mock()
+        msg = {
+            "id": 101,
+            "type": "private",
+            "sender_email": "user@example.com",
+            "content": "[old.txt](/user_uploads/2/abc123/old.txt)"
+        }
+        bridge.handle_message(msg)
+        assert mock_get.call_args[0][0] == "https://zulip.example.com/user_uploads/2/abc123/old.txt"
+        prompt_content = mock_thread.call_args[1]["args"][1]
+        assert "/tmp/zulip_uploads/old.txt" in prompt_content
+
+@patch('zulip.Client')
 def test_detect_owner(mock_client_class):
     mock_client = mock_client_class.return_value
     mock_client.email = "bot@example.com"
