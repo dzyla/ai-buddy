@@ -2721,7 +2721,7 @@ def main():
         })
 
         # Continuous Local Learning
-        {
+        openai_tools.append({
             "type": "function",
             "function": {
                 "name": "learn_rule",
@@ -2737,9 +2737,9 @@ def main():
                     "required": ["rule_text"]
                 }
             }
-        },
+        })
         # Scheduled Context Resets
-        {
+        openai_tools.append({
             "type": "function",
             "function": {
                 "name": "reset_context",
@@ -2750,7 +2750,7 @@ def main():
                     "required": []
                 }
             }
-        },
+        })
         # pubmed_search
         openai_tools.append({
             "type": "function",
