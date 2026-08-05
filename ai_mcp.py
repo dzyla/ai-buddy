@@ -39,6 +39,8 @@ CONFIG_PATHS = [
     os.path.expanduser("~/.lmstudio/mcp.json"),
 ]
 
+VAULT_DIR = os.path.expanduser("~/.config/ai/vault")
+
 def load_config():
     for path in CONFIG_PATHS:
         if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -643,6 +645,101 @@ def _ensure_memories_schema(conn):
             (content, ""),
         )
     conn.commit()
+
+
+def _ensure_vault_schema(conn):
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vault_fts USING fts5(title, content);"
+    )
+
+def vault_write(title, content, links=""):
+    try:
+        os.makedirs(VAULT_DIR, exist_ok=True)
+        title = title.replace("/", "_").replace("\\\\", "_")
+        if not title.endswith(".md"):
+            title += ".md"
+        
+        path = os.path.join(VAULT_DIR, title)
+        
+        full_content = content
+        if links:
+            # Parse links (comma separated) and format as [[Link]]
+            link_list = [l.strip() for l in links.split(",") if l.strip()]
+            if link_list:
+                full_content += "\\n\\n---\\n**Links:** " + ", ".join([f"[[{l}]]" for l in link_list])
+                
+        with open(path, "w") as f:
+            f.write(full_content)
+            
+        # Update SQLite index
+        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
+        conn = sqlite3.connect(MEMORY_DB)
+        _ensure_vault_schema(conn)
+        conn.execute("DELETE FROM vault_fts WHERE title = ?", (title,))
+        conn.execute("INSERT INTO vault_fts(title, content) VALUES (?, ?)", (title, full_content))
+        conn.commit()
+        conn.close()
+        return f"Successfully wrote note '{title}' to vault."
+    except Exception as e:
+        return f"Error writing to vault: {e}"
+
+def vault_read(title):
+    try:
+        if not title.endswith(".md"):
+            title += ".md"
+        path = os.path.join(VAULT_DIR, title)
+        if not os.path.exists(path):
+            return f"Note '{title}' not found in vault."
+        with open(path, "r") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading vault note: {e}"
+
+def vault_search(query):
+    try:
+        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
+        conn = sqlite3.connect(MEMORY_DB)
+        _ensure_vault_schema(conn)
+        safe_query = query.replace("'", "''")
+        rows = conn.execute(
+            "SELECT title, content FROM vault_fts WHERE vault_fts MATCH ? LIMIT 10",
+            (safe_query,),
+        ).fetchall()
+        conn.close()
+        
+        if not rows:
+            return "No matching notes found."
+            
+        results = []
+        for t, c in rows:
+            preview = c[:200].replace("\\n", " ") + ("..." if len(c) > 200 else "")
+            results.append(f"- **{t}**: {preview}")
+        return "\\n".join(results)
+    except Exception as e:
+        return f"Error searching vault: {e}"
+
+def vault_backlinks(title):
+    try:
+        if title.endswith(".md"):
+            title = title[:-3] # Remove .md for backlink search
+        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
+        conn = sqlite3.connect(MEMORY_DB)
+        _ensure_vault_schema(conn)
+        # Search for [[title]] using exact phrase match
+        safe_query = f'"{title}"' 
+        rows = conn.execute(
+            "SELECT title FROM vault_fts WHERE content MATCH ? LIMIT 20",
+            (safe_query,),
+        ).fetchall()
+        conn.close()
+        
+        if not rows:
+            return f"No backlinks found for '{title}'."
+            
+        results = [f"- [[{t[0]}]]" for t in rows]
+        return f"Notes linking to '{title}':\\n" + "\\n".join(results)
+    except Exception as e:
+        return f"Error finding backlinks: {e}"
 
 
 def remember(content, metadata=""):
@@ -1652,6 +1749,10 @@ TOOL_REQUIRED_ARGS = {
     "computer_control": ["action"],
     "learn_rule":             ["rule_text"],
     "reset_context":          [],
+    "vault_write":            ["title", "content"],
+    "vault_read":             ["title"],
+    "vault_search":           ["query"],
+    "vault_backlinks":        ["title"],
     "pubmed_search":          ["query"],
     "pubmed_research_round":  ["query"],
     "schedule_task":   ["task_id", "prompt", "interval_seconds"],
@@ -2751,6 +2852,66 @@ def main():
                 }
             }
         })
+        # Graph Vault Tools
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "vault_write",
+                "description": "Create or update a Markdown note in the Obsidian Graph Vault. Used to store long-term structured knowledge, agentic state, and plans.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "The title of the note (will become the filename)."},
+                        "content": {"type": "string", "description": "The Markdown content of the note."},
+                        "links": {"type": "string", "description": "Optional comma-separated list of other note titles to link to (e.g. 'Project Alpha, Database Schema')."}
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "vault_read",
+                "description": "Read the full Markdown content of a specific note from the Graph Vault.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"}
+                    },
+                    "required": ["title"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "vault_search",
+                "description": "Perform a full-text FTS5 search across all notes in the Graph Vault.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "vault_backlinks",
+                "description": "Traverse the Knowledge Graph by finding all notes that link to (mention) a specific note title via [[WikiLinks]].",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"}
+                    },
+                    "required": ["title"]
+                }
+            }
+        })
+
         # pubmed_search
         openai_tools.append({
             "type": "function",
@@ -3452,6 +3613,34 @@ def main():
                 print(f"Error in learn_rule: {e}")
         elif tool_name == "reset_context" or server_name == "reset_context":
             print("Context reset initiated. ai.c will process this and clear the message array.")
+        elif tool_name == "vault_write" or server_name == "vault_write":
+            try:
+                res = vault_write(arguments.get("title", ""), arguments.get("content", ""), arguments.get("links", ""))
+                print(res)
+            except Exception as e:
+                import traceback
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+        elif tool_name == "vault_read" or server_name == "vault_read":
+            try:
+                res = vault_read(arguments.get("title", ""))
+                print(res)
+            except Exception as e:
+                import traceback
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+        elif tool_name == "vault_search" or server_name == "vault_search":
+            try:
+                res = vault_search(arguments.get("query", ""))
+                print(res)
+            except Exception as e:
+                import traceback
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+        elif tool_name == "vault_backlinks" or server_name == "vault_backlinks":
+            try:
+                res = vault_backlinks(arguments.get("title", ""))
+                print(res)
+            except Exception as e:
+                import traceback
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
         elif tool_name == "pubmed_search" or server_name == "pubmed_search":
             result = pubmed_search(
                 query=arguments.get("query", ""),
