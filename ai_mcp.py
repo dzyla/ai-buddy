@@ -1650,6 +1650,8 @@ TOOL_REQUIRED_ARGS = {
     "think":           ["reasoning"],
     "task_complete":   ["summary"],
     "computer_control": ["action"],
+    "learn_rule":             ["rule_text"],
+    "reset_context":          [],
     "pubmed_search":          ["query"],
     "pubmed_research_round":  ["query"],
     "schedule_task":   ["task_id", "prompt", "interval_seconds"],
@@ -2718,6 +2720,37 @@ def main():
             }
         })
 
+        # Continuous Local Learning
+        {
+            "type": "function",
+            "function": {
+                "name": "learn_rule",
+                "description": "Save a permanent system rule or constraint to your dynamic rules file. These rules are injected into your system prompt on all future runs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "rule_text": {
+                            "type": "string",
+                            "description": "The exact text of the rule to learn."
+                        }
+                    },
+                    "required": ["rule_text"]
+                }
+            }
+        },
+        # Scheduled Context Resets
+        {
+            "type": "function",
+            "function": {
+                "name": "reset_context",
+                "description": "Clear your conversational history to prevent context window bloat. Use this after completing a sub-task or when transitioning to a new topic to regain full reasoning capacity.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
         # pubmed_search
         openai_tools.append({
             "type": "function",
@@ -3404,6 +3437,21 @@ def main():
         elif tool_name == "get_clipboard" or server_name == "get_clipboard":
             result = get_clipboard()
             print(result)
+        elif tool_name == "learn_rule" or server_name == "learn_rule":
+            try:
+                rule_text = arguments.get("rule_text", "")
+                if not rule_text:
+                    print("Error: rule_text required")
+                else:
+                    rules_file = os.path.expanduser("~/.config/ai/rules.txt")
+                    os.makedirs(os.path.dirname(rules_file), exist_ok=True)
+                    with open(rules_file, "a") as f:
+                        f.write(rule_text.strip() + "\n")
+                    print(f"Rule successfully saved to {rules_file}")
+            except Exception as e:
+                print(f"Error in learn_rule: {e}")
+        elif tool_name == "reset_context" or server_name == "reset_context":
+            print("Context reset initiated. ai.c will process this and clear the message array.")
         elif tool_name == "pubmed_search" or server_name == "pubmed_search":
             result = pubmed_search(
                 query=arguments.get("query", ""),

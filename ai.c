@@ -3089,6 +3089,34 @@ int main(int argc, char **argv) {
     char *triggers = load_critical_triggers();
 
     char *active_system_prompt = load_system_prompt();
+    /* Continuous Local Learning: load and append rules */
+    {
+        char rules_path[1024];
+        char *home = getenv("HOME");
+        snprintf(rules_path, sizeof(rules_path), "%s/.config/ai/rules.txt", home ? home : "");
+        FILE *rfp = fopen(rules_path, "r");
+        if (rfp) {
+            fseek(rfp, 0, SEEK_END);
+            long rlen = ftell(rfp);
+            fseek(rfp, 0, SEEK_SET);
+            if (rlen > 0 && rlen < 65536) {
+                char *rules_buf = malloc(rlen + 1);
+                if (rules_buf) {
+                    size_t rb = fread(rules_buf, 1, rlen, rfp);
+                    rules_buf[rb] = '\0';
+                    size_t new_len = strlen(active_system_prompt) + rb + 256;
+                    char *new_ap = malloc(new_len);
+                    if (new_ap) {
+                        snprintf(new_ap, new_len, "%s\n\n--- User-Defined Rules (Continuous Local Learning) ---\n%s", active_system_prompt, rules_buf);
+                        free(active_system_prompt);
+                        active_system_prompt = new_ap;
+                    }
+                    free(rules_buf);
+                }
+            }
+            fclose(rfp);
+        }
+    }
     char *safe_system = json_escape(active_system_prompt);
     char *safe_ctx = json_escape(sys_ctx);
     char *safe_mem = memory ? json_escape(memory) : NULL;
@@ -4117,6 +4145,28 @@ step_limit_check:
                                   tool_output = strdup("[context limit reached \xe2\x80\x94 result omitted to preserve model focus]");
                               }
 
+                              /* Scheduled Context Reset */
+                              if (strcmp(unescaped_name, "reset_context") == 0) {
+                                  fprintf(stderr, "[ai] Context reset requested — truncating message history to system prompt.\n");
+                                  free(messages_json);
+                                  messages_json = strdup("[]");
+                                  if (g_system_message_json) {
+                                      messages_json = append_message(messages_json, g_system_message_json);
+                                  }
+                                  
+                                  free(tool_output);
+                                  tool_output = NULL;
+                                  
+                                  char *reset_msg = strdup("{\"role\":\"user\",\"content\":\"[SYSTEM] Context successfully reset. The history has been cleared to preserve reasoning capacity. Please continue your plan from here.\"}");
+                                  messages_json = append_message(messages_json, reset_msg);
+                                  free(reset_msg);
+                                  
+                                  free(unescaped_id);
+                                  free(unescaped_name);
+                                  free(unescaped_args);
+                                  goto end_tool_iter;
+                              }
+
                               char *safe_output = json_escape(tool_output);
                               size_t tool_resp_len = strlen(safe_output) + strlen(unescaped_id) + strlen(unescaped_name) + 256;
                               char *tool_resp = malloc(tool_resp_len);
@@ -4154,6 +4204,7 @@ step_limit_check:
                               if (task_done) break;
                           }
 
+                          end_tool_iter:
                           current_tok = json_skip_token(tok, r, current_tok + 1);
                       }
 
