@@ -2405,13 +2405,13 @@ def main():
             "type": "function",
             "function": {
                 "name": "think",
-                "description": "Plan before a multi-step task. Call ONCE before your first action — never again after any non-think tool has been called. Keep reasoning under 50 words.",
+                "description": "Plan, reflect, or analyze before taking action. Use this tool before complex steps, to verify your previous actions, or to correct course. Highly recommended for multi-step tasks. Keep reasoning concise.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "reasoning": {
                             "type": "string",
-                            "description": "Brief plan (≤50 words): what steps you will take and in what order."
+                            "description": "Brief plan or reflection (≤100 words): what you are analyzing and what steps you will take next."
                         }
                     },
                     "required": ["reasoning"]
@@ -2434,6 +2434,28 @@ def main():
                         }
                     },
                     "required": ["command"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "execute_remote_command",
+                "description": "Run a command on a remote host via SSH. You must have passwordless SSH access (e.g. key-based) already configured for the host.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "host": {
+                            "type": "string",
+                            "description": "The SSH host (e.g., user@hostname or just hostname)."
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to run remotely."
+                        }
+                    },
+                    "required": ["host", "command"]
                 }
             }
         })
@@ -3342,6 +3364,20 @@ def main():
         elif tool_name == "task_complete" or server_name == "task_complete":
             # Handled natively in C; this is a safety fallback
             print('{"ok": true}')
+        elif tool_name == "execute_remote_command" or server_name == "execute_remote_command":
+            host = arguments.get("host", "")
+            cmd = arguments.get("command", "")
+            if not host or not cmd:
+                print(json.dumps({"error": "Missing host or command"}))
+            else:
+                try:
+                    res = subprocess.run(["ssh", host, cmd], capture_output=True, text=True, timeout=120)
+                    out = res.stdout + res.stderr
+                    if res.returncode != 0:
+                        out = f"[Command Failed with exit status {res.returncode}]\n" + out
+                    print(out if out else "[Command Success, no output]")
+                except Exception as e:
+                    print(json.dumps({"error": str(e)}))
         elif tool_name == "check_time" or server_name == "check_time":
             import datetime
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
