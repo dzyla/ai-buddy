@@ -1509,6 +1509,75 @@ def render_markdown(text):
         
     return "\n".join(rendered)
 
+def get_system_status():
+    """Return a compact one-line CPU/RAM/disk summary for quick status checks."""
+    import re as _re
+    # CPU: parse /proc/stat for aggregate idle fraction
+    try:
+        with open("/proc/stat") as _f:
+            line = _f.readline()
+        parts = line.split()
+        vals = [int(x) for x in parts[1:]]
+        idle = vals[3] + vals[4]  # idle + iowait
+        total = sum(vals)
+        usage_pct = round(100.0 - (idle * 100.0 / total), 1) if total else 0
+    except Exception:
+        usage_pct = "?"
+    # RAM
+    try:
+        mem = {}
+        with open("/proc/meminfo") as _f:
+            for ln in _f:
+                k, _, v = ln.partition(":")
+                mem[k.strip()] = int(v.split()[0])
+        total_kb = mem["MemTotal"]
+        avail_kb = mem["MemAvailable"]
+        used_pct = round((1 - avail_kb / total_kb) * 100, 1) if total_kb else 0
+        used_mb = (total_kb - avail_kb) // 1024
+        total_mb = total_kb // 1024
+    except Exception:
+        used_pct = "?"
+        used_mb = "?"
+        total_mb = "?"
+    # Disk (root)
+    try:
+        import subprocess as _sp
+        out = _sp.run(["df", "-h", "/"], capture_output=True, text=True, check=True)
+        disk_line = out.stdout.strip().splitlines()[-1]
+        parts = disk_line.split()
+        disk_total = parts[1]
+        disk_used = parts[2]
+        disk_pct = parts[4]
+    except Exception:
+        disk_total = "?"
+        disk_used = "?"
+        disk_pct = "?"
+    # nproc
+    try:
+        nproc = os.cpu_count() or "?"
+    except Exception:
+        nproc = "?"
+    return (
+        f"CPU: {usage_pct}% | "
+        f"RAM: {used_mb}/{total_mb} MB ({used_pct}%) | "
+        f"Disk: {disk_used}/{disk_total} ({disk_pct}) | "
+        f"Cores: {nproc}"
+    )
+
+def get_clipboard():
+    """Read the current X/Wayland clipboard content."""
+    import subprocess as _sp
+    for cmd in [["xclip", "-selection", "clipboard", "-o"],
+                ["wl-paste"],
+                ["xsel", "--clipboard", "--output"]]:
+        try:
+            out = _sp.run(cmd, capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                return out.stdout
+        except Exception:
+            pass
+    return "Error: could not read clipboard (no xclip/wl-paste/xsel available or clipboard is empty)."
+
 TOOL_REQUIRED_ARGS = {
     "execute_command": ["command"],
     "web_search":      ["query"],
@@ -1531,6 +1600,8 @@ TOOL_REQUIRED_ARGS = {
     "schedule_task":   ["task_id", "prompt", "interval_seconds"],
     "unschedule_task": ["task_id"],
     "list_scheduled_tasks": [],
+    "get_system_status": [],
+    "get_clipboard": [],
 }
 
 # Per-agent and per-URL output caps for parallel tools
@@ -2551,6 +2622,32 @@ def main():
             }
         })
 
+        # 14. get_system_status — quick CPU/RAM/disk snapshot
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_system_status",
+                "description": "Return a compact one-line summary of CPU usage, RAM, and disk. Useful for quickly checking system resources before running heavy operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        })
+
+        # 15. get_clipboard — read X11/Wayland clipboard
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_clipboard",
+                "description": "Read the current system clipboard content (X11 via xclip or Wayland via wl-paste). Returns the plain text currently on the clipboard, or an error if nothing is available.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        })
+
         # pubmed_search
         openai_tools.append({
             "type": "function",
@@ -3226,6 +3323,12 @@ def main():
                 start_date=arguments.get("start_date"),
                 end_date=arguments.get("end_date"),
             )
+            print(result)
+        elif tool_name == "get_system_status" or server_name == "get_system_status":
+            result = get_system_status()
+            print(result)
+        elif tool_name == "get_clipboard" or server_name == "get_clipboard":
+            result = get_clipboard()
             print(result)
         elif tool_name == "pubmed_search" or server_name == "pubmed_search":
             result = pubmed_search(
