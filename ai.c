@@ -4101,10 +4101,16 @@ step_limit_check:
                                   int is_err = (strncmp(tool_output, "Error:", 6) == 0 ||
                                                 strncmp(tool_output, "[Command Failed", 15) == 0 ||
                                                 strncmp(tool_output, "{\"error\"", 8) == 0);
-                                  size_t hlen = strlen(unescaped_name) + strlen(tool_output) + 48;
+                                                
+                                  const char *graph_enforcement = "";
+                                  if (is_err && strncmp(tool_output, "[Command Failed", 15) != 0) {
+                                      graph_enforcement = "\n\n[GRAPH ENFORCEMENT: Middleware intercepted an exception. You must pause, recalculate your approach, and try a different strategy.]";
+                                  }
+                                  
+                                  size_t hlen = strlen(unescaped_name) + strlen(tool_output) + strlen(graph_enforcement) + 64;
                                   char *hout = malloc(hlen);
-                                  snprintf(hout, hlen, "[Tool: %s | Status: %s]\n%s",
-                                           unescaped_name, is_err ? "error" : "ok", tool_output);
+                                  snprintf(hout, hlen, "[Tool: %s | Status: %s]\n%s%s",
+                                           unescaped_name, is_err ? "error" : "ok", tool_output, graph_enforcement);
                                   free(tool_output);
                                   tool_output = hout;
                               }
