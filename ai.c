@@ -1595,6 +1595,10 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                             fflush(stderr);
                             ctx->printed_thinking_header = 1;
                         }
+                        if (!ctx->quiet_mode) {
+                            fprintf(stderr, "\033[1;36m%s\033[0m", content_chunk);
+                            fflush(stderr);
+                        }
                         free(content_chunk);
                     }
                 }
@@ -3962,11 +3966,11 @@ step_limit_check:
 
                                           if (raw_output) {
                                               size_t out_len = strlen(raw_output);
-                                              tool_output = malloc(out_len + 128);
+                                              tool_output = malloc(out_len + 512);
                                               if (exit_code == 0) {
                                                   sprintf(tool_output, "[Command Success]\n%s", raw_output);
                                               } else {
-                                                  sprintf(tool_output, "[Command Failed with exit status %d]\n%s", exit_code, raw_output);
+                                                  sprintf(tool_output, "[Command Failed with exit status %d]\n%s\n[SYSTEM WARNING: Command failed. Stop and reflect. Read the error carefully. Use web_search or fetch_webpage to find documentation before trying again.]", exit_code, raw_output);
                                               }
                                               free(raw_output);
                                           } else {
@@ -4080,15 +4084,28 @@ step_limit_check:
                               /* Cap individual tool output to prevent context blowup */
                               if ((int)strlen(tool_output) > max_tool_output) {
                                   size_t orig_len = strlen(tool_output);
-                                  char suffix[350];
-                                  snprintf(suffix, sizeof(suffix), 
-                                           "\n\n... [TRUNCATED: Tool output was %zu bytes. Capped at %d bytes. The model should decide if it wants to use a different tool/command to narrow down the query (e.g. grep, find, head/tail, line-range read_file), or run the command with pagination, or proceed with the truncated context.]", 
-                                           orig_len, max_tool_output);
+                                  char suffix[1024];
+                                  int display_len = max_tool_output;
+                                  
+                                  if (orig_len > max_tool_output * 1.5) {
+                                      display_len = 2000;
+                                      snprintf(suffix, sizeof(suffix), 
+                                               "\n\n... [CRITICAL ERROR: Tool output was %zu bytes! This massively exceeds the safety limit of %d bytes.\n"
+                                               "To prevent context window overflow and immediate failure, the output has been BLOCKED.\n"
+                                               "YOU MUST REDO THIS ACTION using a targeted approach. DO NOT attempt to load large datasets into context.\n"
+                                               "Write targeted Python scripts, or use 'head', 'tail', 'grep' to filter the data.]", 
+                                               orig_len, max_tool_output);
+                                  } else {
+                                      snprintf(suffix, sizeof(suffix), 
+                                               "\n\n... [TRUNCATED: Tool output was %zu bytes. Capped at %d bytes. The model should decide if it wants to use a different tool/command to narrow down the query (e.g. grep, find, head/tail, line-range read_file), or run the command with pagination, or proceed with the truncated context.]", 
+                                               orig_len, max_tool_output);
+                                  }
+                                  
                                   size_t suffix_len = strlen(suffix);
-                                  char *capped = malloc(max_tool_output + suffix_len + 1);
+                                  char *capped = malloc(display_len + suffix_len + 1);
                                   if (capped) {
-                                      memcpy(capped, tool_output, max_tool_output);
-                                      strcpy(capped + max_tool_output, suffix);
+                                      memcpy(capped, tool_output, display_len);
+                                      strcpy(capped + display_len, suffix);
                                       free(tool_output);
                                       tool_output = capped;
                                   }
