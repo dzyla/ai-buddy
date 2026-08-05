@@ -181,12 +181,13 @@ dmesg | tail -20 | ai "any hardware warnings?"
 
 ### Resume a conversation
 
-Every run is saved to `~/.cache/ai/sessions/last.json`. Continue it later from any terminal:
+Every run is saved to `~/.cache/ai/sessions/<session_id>.json` and also as `last.json`. The session ID is printed when you exit (`[ai] Session ended. To resume: ai -r sess_123456789`). Continue it later from any terminal:
 
 ```bash
 ai "clone github.com/foo/bar and summarise its architecture"
 # ... later ...
-ai -r "now add a Dockerfile for it"     # remembers the previous turn
+ai -r "now add a Dockerfile for it"     # resumes the last turn
+ai -r sess_123456789 "continue this"  # resumes a specific past session
 ```
 
 ### Customize the system prompt
