@@ -2,10 +2,11 @@
 # install.sh — build and install the ai CLI
 #
 # Usage:
-#   ./install.sh          Build and install ai CLI to ~/.local/bin
-#   ./install.sh llama    Also set up a local llama.cpp inference server
-#   ./install.sh snap     Also detect and configure an installed AI snap
-#   ./install.sh uninstall Uninstall the CLI, systemd services, and wrapper scripts
+#   ./install.sh              Build and install ai CLI to ~/.local/bin
+#   ./install.sh --update-llama Pull latest llama.cpp and rebuild llama-server
+#   ./install.sh llama         Also set up a local llama.cpp inference server
+#   ./install.sh snap          Also detect and configure an installed AI snap
+#   ./install.sh uninstall     Uninstall the CLI, systemd services, and wrapper scripts
 #
 # Everything installs to ~/.local/bin — no sudo required.
 # To uninstall: ./install.sh uninstall
@@ -61,6 +62,105 @@ if [ "${1:-}" = "uninstall" ]; then
     echo "To remove them manually, run:"
     echo "  rm -rf ${DATA_DIR} ~/.config/ai"
     echo "Also, remember to remove any 'config/ai/env' sourcing lines from your ~/.bashrc or ~/.zshrc."
+    exit 0
+fi
+
+# ── Flag: --update-llama — pull latest llama.cpp and rebuild ──────────────────
+if [ "${1:-}" = "--update-llama" ]; then
+    echo "==> Updating llama.cpp to the latest version..."
+
+    # Ensure build deps
+    missing_ullama=()
+    for cmd in cmake git; do
+        command -v "$cmd" &>/dev/null || missing_ullama+=("$cmd")
+    done
+    if [ "${#missing_ullama[@]}" -gt 0 ]; then
+        echo "==> Installing: ${missing_ullama[*]}"
+        sudo apt-get install -y "${missing_ullama[@]}"
+    fi
+
+    if [ -d "${LLAMA_SRC}/.git" ]; then
+        echo "--> Fetching latest from upstream..."
+        cd "${LLAMA_SRC}"
+        git fetch --all --tags --prune
+        git pull origin master
+        echo "--> Pull complete."
+    else
+        echo "--> llama.cpp not found at ${LLAMA_SRC} — nothing to update."
+        echo "   Run './install.sh llama' first to clone and build it."
+        exit 0
+    fi
+
+    # Re-detect GPU backend (same logic as the llama subcommand)
+    NVCC_BIN=""
+    CUDA_BIN_DIR=""
+    CUDA_ROOT=""
+    CUDA_LIB_DIR=""
+    GPU_FLAGS="-DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_VULKAN=OFF"
+
+    if command -v nvcc &>/dev/null; then
+        NVCC_BIN=$(command -v nvcc)
+    else
+        for path in /usr/local/cuda/bin/nvcc /usr/local/cuda-13.3/bin/nvcc /usr/local/cuda-12.8/bin/nvcc /usr/local/cuda-12.5/bin/nvcc /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12.2/bin/nvcc /usr/local/cuda-12.1/bin/nvcc /usr/local/cuda-12.0/bin/nvcc /usr/local/cuda-11.*/bin/nvcc; do
+            if [ -x "$path" ]; then
+                NVCC_BIN="$path"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$NVCC_BIN" ]; then
+        echo "==> CUDA detected at ${NVCC_BIN} — configuring CUDA paths."
+        CUDA_BIN_DIR="$(dirname "$NVCC_BIN")"
+        CUDA_ROOT="$(dirname "$CUDA_BIN_DIR")"
+        if [ -d "${CUDA_ROOT}/lib64" ]; then
+            CUDA_LIB_DIR="${CUDA_ROOT}/lib64"
+        fi
+        if [ -d "${CUDA_ROOT}/targets/x86_64-linux/lib" ]; then
+            if [ -n "$CUDA_LIB_DIR" ]; then
+                CUDA_LIB_DIR="${CUDA_LIB_DIR}:${CUDA_ROOT}/targets/x86_64-linux/lib"
+            else
+                CUDA_LIB_DIR="${CUDA_ROOT}/targets/x86_64-linux/lib"
+            fi
+        fi
+        export PATH="${CUDA_BIN_DIR}:$PATH"
+        export CUDACXX="$NVCC_BIN"
+        export CUDA_PATH="$CUDA_ROOT"
+        if [ -n "$CUDA_LIB_DIR" ]; then
+            export LD_LIBRARY_PATH="${CUDA_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+        fi
+        GPU_FLAGS="-DGGML_CUDA=ON -DCUDAToolkit_ROOT=${CUDA_ROOT}"
+    elif command -v hipcc &>/dev/null; then
+        echo "==> ROCm detected — building with HIP support."
+        GPU_FLAGS="-DGGML_HIP=ON"
+    elif pkg-config --exists vulkan 2>/dev/null || [ -f /usr/include/vulkan/vulkan.h ]; then
+        if find /usr/share/cmake /usr/lib/cmake /usr/local/share/cmake /usr/local/lib/cmake -name "*SPIRV-HeadersConfig.cmake*" -o -name "*spirv-headers-config.cmake*" 2>/dev/null | grep -q .; then
+            echo "==> Vulkan and SPIRV-Headers detected — building with Vulkan support."
+            GPU_FLAGS="-DGGML_VULKAN=ON"
+        else
+            echo "==> Vulkan detected, but SPIRV-Headers CMake package is missing. Falling back to CPU."
+        fi
+    else
+        echo "==> No GPU backend found — building CPU-only."
+    fi
+
+    echo "==> Rebuilding llama-server..."
+    rm -rf "${LLAMA_SRC}/build"
+    cmake -B "${LLAMA_SRC}/build" -S "${LLAMA_SRC}" \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $GPU_FLAGS
+    cmake --build "${LLAMA_SRC}/build" --config Release \
+        --target llama-server -j"$(nproc)"
+
+    # Stop existing llama-server if running to avoid "Text file busy" on copy
+    if pgrep -x llama-server &>/dev/null; then
+        echo "--> Stopping existing llama-server process..."
+        pkill -x llama-server || true
+        sleep 1
+    fi
+
+    cp "${LLAMA_SRC}/build/bin/llama-server" "${BIN_DIR}/"
+    chmod +x "${BIN_DIR}/llama-server"
+    echo "==> llama-server updated and installed to ${BIN_DIR}/llama-server"
     exit 0
 fi
 
