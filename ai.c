@@ -33,7 +33,8 @@ static char  model[MAX_VAL];
 static float temperature_val  = -1.0f;
 static int   max_tokens_val   = -1;
 static int   no_tools_mode    = 0;
-static int   resume_mode      = 0;    /* -r/--resume or INFER_RESUME: continue last session */
+static char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
+static char  current_session_id[64] = "";
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
 static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
@@ -42,11 +43,12 @@ static int   stub_threshold   = 250000;/* set via INFER_STUB_THRESHOLD; default 
 
 static const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
-    "EFFICIENCY (highest priority — every extra tool call costs 15-30 seconds on local hardware):\n"
-    "- Single-step tasks (list files, read one file, run one command, factual question) = ONE tool call then task_complete. No think.\n"
-    "- Routine sequences (git operations, file edits, package installs, shell scripts): skip think. Start with the first command directly.\n"
-    "- Only use think for genuinely complex planning (3+ interdependent unknowns). If you use it, call it ONCE before your first action. After ANY non-think tool call, NEVER call think again.\n"
-    "- Once ALL requested operations succeed (exit 0, file saved, git pushed), call task_complete IMMEDIATELY. Do NOT verify, re-read, or run extra diagnostics.\n\n"
+    "SCIENTIFIC ADVISOR RIGOR (highest priority):\n"
+    "- You are an elite scientific advisor. You must use the `think` tool to reason step-by-step before EVERY major action. Do NOT guess.\n"
+    "- For small models to succeed, rigorous chain-of-thought is required. Always analyze the current state, form a hypothesis, and plan your next tool call using `think`.\n"
+    "- When a command fails, you MUST call `think` to analyze the error log before retrying.\n"
+    "- Verify your results. After writing a script, run it. If it produces output, read the output carefully.\n"
+    "- Once all requested operations succeed and are empirically verified, call task_complete.\n\n"
     "TOOL USE:\n"
     "- For facts you already know (e.g. definitions, formulas, capitals), call task_complete directly — no tools needed.\n"
     "- For scientific databases, public APIs, or structured data (PDB, UniProt, NCBI, NASA, arXiv, etc.): use execute_command with curl to query the REST API directly. DO NOT rely on web_search snippets for structured data — the API will give exact answers.\n"
@@ -2018,7 +2020,7 @@ static char* load_system_prompt() {
 
 /* Return the path to the saved-session file (~/.cache/ai/sessions/last.json),
    creating parent dirs. Writes into `out`; returns 0 on success. */
-static int session_file_path(char *out, size_t out_len) {
+static int session_file_path(char *out, size_t out_len, const char *session_id) {
     char *home = getenv("HOME");
     if (!home) return -1;
     char dir[1024];
@@ -2029,18 +2031,33 @@ static int session_file_path(char *out, size_t out_len) {
     mkdir(dir, 0700);
     snprintf(dir, sizeof(dir), "%s/.cache/ai/sessions", home);
     mkdir(dir, 0700);
-    snprintf(out, out_len, "%s/last.json", dir);
+    if (session_id && *session_id) {
+        snprintf(out, out_len, "%s/%s.json", dir, session_id);
+    } else {
+        snprintf(out, out_len, "%s/last.json", dir);
+    }
     return 0;
 }
 
 /* Persist the raw messages array so a later `ai -r` can resume this conversation. */
 static void save_session(const char *messages_json) {
     char path[1200];
-    if (session_file_path(path, sizeof(path)) != 0) return;
-    FILE *fp = fopen(path, "w");
-    if (!fp) return;
-    fputs(messages_json, fp);
-    fclose(fp);
+    /* Save to specific session id */
+    if (session_file_path(path, sizeof(path), current_session_id) == 0) {
+        FILE *fp = fopen(path, "w");
+        if (fp) {
+            fputs(messages_json, fp);
+            fclose(fp);
+        }
+    }
+    /* Also save to last.json */
+    if (session_file_path(path, sizeof(path), NULL) == 0) {
+        FILE *fp = fopen(path, "w");
+        if (fp) {
+            fputs(messages_json, fp);
+            fclose(fp);
+        }
+    }
 }
 
 /* Load the previous session as a clean user/assistant transcript and append each
@@ -2049,9 +2066,13 @@ static void save_session(const char *messages_json) {
 static char* append_message(char *messages_json, const char *msg_to_append);
 static char* load_session_transcript(char *messages_json, const char *mcp_script) {
     char path[1200];
-    if (session_file_path(path, sizeof(path)) != 0) return messages_json;
+    if (session_file_path(path, sizeof(path), resume_session_id) != 0) return messages_json;
     if (access(path, R_OK) != 0) {
-        fprintf(stderr, "\033[2m[ai] --resume: no previous session found.\033[0m\n");
+        if (resume_session_id && *resume_session_id) {
+            fprintf(stderr, "\033[2m[ai] --resume: session '%s' not found.\033[0m\n", resume_session_id);
+        } else {
+            fprintf(stderr, "\033[2m[ai] --resume: no previous session found.\033[0m\n");
+        }
         return messages_json;
     }
     char cmd[1400];
@@ -2663,6 +2684,8 @@ static void load_env_file() {
 }
 
 int main(int argc, char **argv) {
+    time_t current_time = time(NULL);
+    snprintf(current_session_id, sizeof(current_session_id), "sess_%ld", (long)current_time);
     load_env_file();
     char exe_path[512] = "";
     ssize_t r_exe = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -2826,7 +2849,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) {
             no_tools_mode = 1;
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
-            resume_mode = 1;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                resume_session_id = argv[i+1];
+                i++;
+            } else {
+                resume_session_id = "";
+            }
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
             temperature_val = (float)atof(argv[i+1]);
             i++;
@@ -2848,7 +2876,9 @@ int main(int argc, char **argv) {
 
     char *env_resume = getenv("INFER_RESUME");
     if (env_resume && (strcmp(env_resume, "1") == 0 || strcasecmp(env_resume, "true") == 0)) {
-        resume_mode = 1;
+        if (!resume_session_id) resume_session_id = "";
+    } else if (env_resume && *env_resume) {
+        if (!resume_session_id) resume_session_id = env_resume;
     }
 
     char *env_continue = getenv("INFER_CONTINUE");
@@ -3162,7 +3192,7 @@ int main(int argc, char **argv) {
 
     /* --resume: splice the previous conversation (as a clean user/assistant
        transcript) between the fresh system message and this turn's user prompt. */
-    if (resume_mode)
+    if (resume_session_id)
         messages_json = load_session_transcript(messages_json, mcp_script);
 
     // Add User Prompt
@@ -3401,6 +3431,9 @@ int main(int argc, char **argv) {
             int think_count = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
+            char *last_tool_name = NULL;
+            char *last_tool_args = NULL;
+            int same_tool_count = 0;
             struct timespec task_start;
             clock_gettime(CLOCK_MONOTONIC, &task_start);
 
@@ -3796,7 +3829,21 @@ step_limit_check:
 
                               char *tool_output = NULL;
 
-                               if (strcmp(unescaped_name, "think") == 0) {
+                              if (last_tool_name && last_tool_args &&
+                                  strcmp(last_tool_name, unescaped_name) == 0 &&
+                                  strcmp(last_tool_args, unescaped_args) == 0) {
+                                  same_tool_count++;
+                              } else {
+                                  same_tool_count = 0;
+                                  if (last_tool_name) free(last_tool_name);
+                                  if (last_tool_args) free(last_tool_args);
+                                  last_tool_name = strdup(unescaped_name);
+                                  last_tool_args = strdup(unescaped_args);
+                              }
+
+                               if (same_tool_count >= 2) {
+                                   tool_output = strdup("Error: You are stuck in a loop calling the exact same tool with the exact same arguments. Stop and try a different approach, or call task_complete.");
+                               } else if (strcmp(unescaped_name, "think") == 0) {
                                    think_count++;
                                    if (think_count > 1) {
                                        tool_output = strdup("Error: You have already called the 'think' tool once to plan. Do not call it again. You must call 'task_complete' to report your final answer/summary to the user, or call other action tools if there is more work to do. Calling 'think' repeatedly causes infinite loops.");
@@ -3998,7 +4045,7 @@ step_limit_check:
                                               if (exit_code == 0) {
                                                   sprintf(tool_output, "[Command Success]\n%s", raw_output);
                                               } else {
-                                                  sprintf(tool_output, "[Command Failed with exit status %d]\n%s\n[SYSTEM WARNING: Command failed. Stop and reflect. Read the error carefully. Use web_search or fetch_webpage to find documentation before trying again.]", exit_code, raw_output);
+                                                  sprintf(tool_output, "[Command Failed with exit status %d]\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
                                               }
                                               free(raw_output);
                                           } else {
@@ -4389,6 +4436,8 @@ step_limit_check:
                 has_more = 0;
             }
             g_agent_loop_active = 0;
+            if (last_tool_name) free(last_tool_name);
+            if (last_tool_args) free(last_tool_args);
           }
 
           if (!interactive_mode) {
@@ -4407,5 +4456,6 @@ step_limit_check:
     if (g_system_message_json) free(g_system_message_json);
     curl_slist_free_all(h);
     curl_easy_cleanup(c);
+    fprintf(stderr, "\033[2m[ai] Session ended. To resume: ai -r %s\033[0m\n", current_session_id);
     return 0;
 }
