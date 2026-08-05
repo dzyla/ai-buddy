@@ -15,6 +15,7 @@ import os
 import sys
 import re
 import requests
+from urllib.parse import unquote
 
 
 def clean_response(text):
@@ -223,15 +224,18 @@ class ZulipAiBridge:
                 if mention_end_close != -1:
                     content = content[mention_end_close + 2:].strip()
 
-        # Check for Zulip uploaded files and download them locally using Basic Auth
-        upload_pattern = re.compile(r'(/user_uploads/\d+/[a-zA-Z0-9]+/([^/\s)]+))')
+        # Check for Zulip uploaded files and download them locally using Basic Auth.
+        # Upload paths have a variable number of segments (modern servers use
+        # /user_uploads/{realm}/{2-char}/{token}/{filename}), so match any depth
+        # and take the last segment as the filename.
+        upload_pattern = re.compile(r'(/user_uploads/(?:[^/\s)]+/)+([^/\s)]+))')
         site_url = self.client.base_url.replace('/api/', '').replace('/api', '')
         tmp_dir = "/tmp/zulip_uploads"
         os.makedirs(tmp_dir, exist_ok=True)
 
         for match in upload_pattern.finditer(content):
             rel_url = match.group(1)
-            filename = match.group(2)
+            filename = os.path.basename(unquote(match.group(2)))
             local_path = os.path.join(tmp_dir, filename)
             download_url = site_url + rel_url
 

@@ -5,11 +5,12 @@ description: CRITICAL — when using local models (like Gemma, Qwen, or Llama) o
 
 # Small Model Reasoning Guidelines
 
-Smaller models (e.g., 7B-9B parameter models like Gemma 4) can occasionally jump to conclusions, skip steps, or hallucinate tool outputs. Follow these strict rules to maximize reliability:
+Smaller models (e.g., 7B-35B parameter models like Gemma 4 or Qwen 32B) can occasionally jump to conclusions, skip steps, or hallucinate tool outputs. Follow these strict rules to maximize reliability:
 
-## 1. Explicit Chain-of-Thought (CoT)
+## 1. Explicit Chain-of-Thought (CoT) and Parallel Execution
 - Always break down your logic before choosing a tool. Write 1-2 sentences of reasoning explaining *why* you are calling a specific tool and what you expect to learn or achieve.
 - Do not make multiple assumptions in a single step; gather facts sequentially.
+- **PARALLEL TOOL EXECUTION**: If your plan requires multiple independent operations (e.g., writing a file and starting a timer, or fetching two different URLs), you MUST emit multiple tool calls in the same turn to save loops. Never wait for an independent tool to finish before calling the next one.
 
 ## 2. Plan-Before-Action Loop
 - When given a non-trivial instruction, write out a 3-step checklist of what you need to inspect, modify, and verify.

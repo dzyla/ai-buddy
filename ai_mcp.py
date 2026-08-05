@@ -9,6 +9,7 @@ import urllib.error
 import re
 import time
 import xml.etree.ElementTree as ET
+import sqlite3
 
 try:
     import trafilatura
@@ -604,6 +605,7 @@ def fetch_smart(url):
 
 
 MEMORY_PATH = os.path.expanduser("~/.config/ai/memory.txt")
+MEMORY_DB = os.path.expanduser("~/.config/ai/memory.db")
 
 def save_memory(content):
     try:
@@ -615,6 +617,44 @@ def save_memory(content):
         return "Memory updated successfully."
     except Exception as e:
         return f"Error saving memory: {e}"
+
+def remember(content):
+    """Save a piece of information to the FTS5 memory database."""
+    try:
+        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
+        conn = sqlite3.connect(MEMORY_DB)
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(content)")
+        if len(content) > 4000:
+            content = content[-4000:]
+        conn.execute("INSERT INTO memories(content) VALUES (?)", (content,))
+        conn.commit()
+        conn.close()
+        return f"Remembered: {content[:80]}{'...' if len(content) > 80 else ''}"
+    except Exception as e:
+        return f"Error saving memory: {e}"
+
+
+def recall(query):
+    """Search memories using FTS5 full-text search."""
+    try:
+        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
+        conn = sqlite3.connect(MEMORY_DB)
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(content)")
+        # Escape single quotes in user query for safe FTS5 usage
+        safe_query = query.replace("'", "''")
+        rows = conn.execute(
+            "SELECT content FROM memories WHERE memories MATCH ?", (safe_query,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return "No memories found matching that query."
+        results = []
+        for row in rows:
+            results.append(row[0])
+        return "\n---\n".join(results)
+    except Exception as e:
+        return f"Error searching memories: {e}"
+
 
 def _clean_pdf_text(raw):
     # Repair soft-hyphenation at line breaks (word-\nrest -> wordrest)
@@ -1479,6 +1519,8 @@ TOOL_REQUIRED_ARGS = {
     "write_file":      ["path", "content"],
     "edit_file":       ["path", "search_content", "replace_content"],
     "save_memory":     ["content"],
+    "remember":        ["content"],
+    "recall":          ["query"],
     "delegate_task":   ["tasks"],
     "parallel_fetch":  ["urls"],
     "think":           ["reasoning"],
@@ -2371,7 +2413,45 @@ def main():
             }
         })
 
-        # 10. delegate_task
+        # 10. remember — save to FTS5 memory database
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": "Save key facts, user preferences, or context to long-term persistent memory using SQLite FTS5 full-text search. Memories can be later retrieved via the 'recall' tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The exact content to store in memory. Keep it concise."
+                        }
+                    },
+                    "required": ["content"]
+                }
+            }
+        })
+
+        # 10b. recall — search memories
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "recall",
+                "description": "Search long-term memories using natural language full-text search (SQLite FTS5). Returns matching saved memories.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query — can be a word, phrase, or FTS5 boolean expression."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+
+        # 11. delegate_task
         openai_tools.append({
             "type": "function",
             "function": {
@@ -2959,6 +3039,14 @@ def main():
         elif tool_name == "save_memory" or server_name == "save_memory":
             content = arguments.get("content", "")
             result = save_memory(content)
+            print(result)
+        elif tool_name == "remember" or server_name == "remember":
+            content = arguments.get("content", "")
+            result = remember(content)
+            print(result)
+        elif tool_name == "recall" or server_name == "recall":
+            query = arguments.get("query", "")
+            result = recall(query)
             print(result)
         elif tool_name == "read_file" or server_name == "read_file":
             path = arguments.get("path", "")
