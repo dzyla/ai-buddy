@@ -3369,7 +3369,7 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
-            int step_limit = g_continue_until_done ? 999999 : 30;
+            int step_limit = 999999; /* User requested to run forever, skip 30 trials */
             int think_count = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
