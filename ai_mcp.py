@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.error
 import re
 import time
+import xml.etree.ElementTree as ET
 
 try:
     import trafilatura
@@ -157,6 +158,33 @@ def call_tool(server_name, cfg, tool_name, arguments):
             proc.terminate()
         except:
             pass
+
+def arxiv_search(query, max_results=5):
+    try:
+        max_results = min(int(max_results), 10)
+        url = f"http://export.arxiv.org/api/query?search_query=all:{urllib.parse.quote(query)}&start=0&max_results={max_results}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            xml_data = response.read()
+        root = ET.fromstring(xml_data)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        entries = root.findall("atom:entry", ns)
+        if not entries:
+            return "No results found on arXiv."
+        
+        results = []
+        for i, entry in enumerate(entries, 1):
+            title = entry.find("atom:title", ns)
+            title = title.text.replace("\\n", " ").strip() if title is not None else "No title"
+            summary = entry.find("atom:summary", ns)
+            summary = summary.text.replace("\\n", " ").strip() if summary is not None else "No summary"
+            link = entry.find("atom:id", ns)
+            link = link.text if link is not None else ""
+            authors = [a.find("atom:name", ns).text for a in entry.findall("atom:author", ns) if a.find("atom:name", ns) is not None]
+            results.append(f"[{i}] Title: {title}\\nAuthors: {', '.join(authors)}\\nURL: {link}\\nAbstract: {summary}\\n")
+        return "\\n".join(results)
+    except Exception as e:
+        return f"Error during arXiv search: {e}"
 
 def ddg_lite_search(query):
     try:
@@ -1444,6 +1472,7 @@ def render_markdown(text):
 TOOL_REQUIRED_ARGS = {
     "execute_command": ["command"],
     "web_search":      ["query"],
+    "arxiv_search":    ["query"],
     "fetch_webpage":   ["url"],
     "fetch_smart":     ["url"],
     "read_file":       ["path"],
@@ -2149,6 +2178,29 @@ def main():
                         "query": {
                             "type": "string",
                             "description": "The search query."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+
+        # 3b. arxiv_search
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "arxiv_search",
+                "description": "Search the arXiv API for scientific papers. Returns metadata and abstracts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query. e.g. 'electron' or 'au:smith'"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Max number of results to return (default 5, max 10)."
                         }
                     },
                     "required": ["query"]
@@ -2877,6 +2929,11 @@ def main():
             print(result)
         elif tool_name == "list_scheduled_tasks" or server_name == "list_scheduled_tasks":
             result = list_scheduled_tasks()
+            print(result)
+        elif tool_name == "arxiv_search" or server_name == "arxiv_search":
+            query = arguments.get("query")
+            max_results = arguments.get("max_results", 5)
+            result = arxiv_search(query, max_results)
             print(result)
         elif tool_name == "list_directory" or server_name == "list_directory":
             path = arguments.get("path", ".")
