@@ -440,6 +440,53 @@ def validate_portfolio(stdout, stderr, exit_code, tools):
     return aapl_ok and msft_ok and exit_code == 0
 
 
+# Task 18: Office Assistant & Scheduling
+def setup_office():
+    write_temp_file("meeting_request.txt", (
+        "Hi, we need to schedule a sync on project X next week (July 6-10). "
+        "Alice is free Monday morning (9am-12pm), Bob is free Monday 9-11am. "
+        "Let's book a 1-hour slot when both are free."
+    ))
+
+def cleanup_office():
+    delete_temp_file("meeting_request.txt")
+    delete_temp_file("schedule_reply.txt")
+
+def validate_office(stdout, stderr, exit_code, tools):
+    path = os.path.join(WORKSPACE_DIR, "schedule_reply.txt")
+    if not os.path.exists(path):
+        return False
+    with open(path, "r") as f:
+        content = f.read().lower()
+    return "july 6" in content and ("9:00" in content or "10:00" in content or "9 am" in content or "10 am" in content) and exit_code == 0
+
+
+# Task 19: Digesting and Writing (No LLM cliches)
+def setup_writing():
+    write_temp_file("raw_notes.txt", (
+        "Project Y update: The backend is migrating to AWS. "
+        "Frontend needs a UI refresh by Q3. "
+        "Marketing wants to run a campaign in August. "
+        "Please digest this into a short, professional update."
+    ))
+
+def cleanup_writing():
+    delete_temp_file("raw_notes.txt")
+    delete_temp_file("professional_update.txt")
+
+def validate_writing(stdout, stderr, exit_code, tools):
+    path = os.path.join(WORKSPACE_DIR, "professional_update.txt")
+    if not os.path.exists(path):
+        return False
+    with open(path, "r") as f:
+        content = f.read().lower()
+    
+    cliches = ["here is", "in summary", "it is important to note", "delve into", "as an ai"]
+    has_cliche = any(c in content for c in cliches)
+    has_info = "aws" in content and "q3" in content and "august" in content
+    
+    return has_info and not has_cliche and exit_code == 0
+
 # ==================== TEST CASES DICT ====================
 
 TEST_CASES = [
@@ -595,9 +642,26 @@ TEST_CASES = [
         "expected_tool": "execute_command",
         "validator": validate_portfolio,
         "cleanup": cleanup_portfolio
+    },
+    {
+        "id": "18_office_scheduling",
+        "name": "Office Assistant Scheduling",
+        "setup": setup_office,
+        "prompt": "Read `meeting_request.txt`. Figure out a 1-hour slot where Alice and Bob are both free. Write a concise reply scheduling the meeting, containing the chosen date and time, to `schedule_reply.txt`, then call task_complete.",
+        "expected_tool": "write_file",
+        "validator": validate_office,
+        "cleanup": cleanup_office
+    },
+    {
+        "id": "19_digesting_writing",
+        "name": "Digesting and Writing (No LLM Cliches)",
+        "setup": setup_writing,
+        "prompt": "Read `raw_notes.txt`. Digest the notes into a short, professional update. Write it to `professional_update.txt`. You MUST strictly follow the WRITING STYLE rules in your system prompt: do not use fluff, robotic transitions, or LLM-like cliches (like 'here is the...', 'in summary', etc.). Call task_complete when done.",
+        "expected_tool": "write_file",
+        "validator": validate_writing,
+        "cleanup": cleanup_writing
     }
 ]
-
 def load_ai_env() -> Dict[str, str]:
     env = os.environ.copy()
     env_path = os.path.expanduser("~/.local/share/ai/env")

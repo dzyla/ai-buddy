@@ -800,7 +800,7 @@ def _clean_pdf_text(raw):
     raw = re.sub(r'[ \t]{2,}', ' ', raw)
     return raw.strip()
 
-def extract_text_from_pdf(path):
+def _extract_text_from_pdf_impl(path):
     source_header = f"[Source: {path}]\n\n"
     pages_text = []
 
@@ -871,7 +871,35 @@ def extract_text_from_pdf(path):
     except Exception:
         pass
 
-    return "Error: Could not parse PDF. Install 'pdfplumber' (pip install pdfplumber), 'pypdf' (pip install pypdf), or 'pdftotext' (apt install poppler-utils)."
+    return source_header + "Error: Could not extract text from PDF using any backend."
+
+def extract_text_from_pdf(path):
+    import hashlib
+    cache_dir = os.path.expanduser("~/.cache/ai/pdf_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        mtime = os.path.getmtime(path)
+    except:
+        mtime = 0
+    cache_key = hashlib.md5(f"{path}_{mtime}".encode('utf-8')).hexdigest()
+    cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
+    
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except:
+            pass
+            
+    content = _extract_text_from_pdf_impl(path)
+    
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except:
+        pass
+        
+    return content
 
 def computer_control(arguments):
     action = arguments.get("action")
@@ -1160,13 +1188,13 @@ def read_file(path, start_line=None, end_line=None):
             return f"[IMAGE_DATA_SUCCESS:{abs_path}]"
 
         if ext == '.pdf':
-            return extract_text_from_pdf(abs_path)
-
-        try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except Exception as e:
-            return f"Error reading text file: {e}"
+            content = extract_text_from_pdf(abs_path)
+        else:
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception as e:
+                return f"Error reading text file: {e}"
 
         lines = content.splitlines()
         total_lines = len(lines)
@@ -2289,6 +2317,33 @@ def main():
             print(render_markdown(text))
         sys.exit(0)
 
+    if action == "rag-memories":
+        if len(sys.argv) < 3:
+            sys.exit(0)
+        query = sys.argv[2]
+        try:
+            res = recall(query)
+            if "No memories found" not in res and not res.startswith("Error"):
+                print(res)
+        except:
+            pass
+        sys.exit(0)
+
+    if action == "save-memories":
+        if len(sys.argv) < 3:
+            sys.exit(0)
+        content = sys.argv[2]
+        try:
+            memories = json.loads(content)
+            if isinstance(memories, list):
+                for mem in memories:
+                    if isinstance(mem, str):
+                        remember(mem, "Auto-compacted memory map")
+        except:
+            # Fallback if not proper JSON
+            remember(content, "Auto-compacted memory map")
+        sys.exit(0)
+
     if action == "trim-messages":
         if len(sys.argv) < 3:
             sys.exit(1)
@@ -2431,6 +2486,10 @@ def main():
                         "command": {
                             "type": "string",
                             "description": "The exact shell command to execute."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Optional timeout in seconds. Defaults to 120s. Set a higher value (e.g. 600 or 3600) for commands you expect to take a long time to prevent premature termination."
                         }
                     },
                     "required": ["command"]
