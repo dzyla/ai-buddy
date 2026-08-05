@@ -27,3 +27,68 @@ valid_test.mmcif
 reverse_string.py
 fasta_parser.py
 create_valid_mmcif.py
+
+# ─────────────────────────────────────────
+# Non-app: data files
+# ─────────────────────────────────────────
+*.csv
+*.json
+*.txt
+
+# ─────────────────────────────────────────
+# Non-app: analysis and experiment results
+# ─────────────────────────────────────────
+nipah_analysis/
+telomere_exp/
+telomere_experiment.md
+measles_dashboard/
+data/
+casp17_*
+final_matches.json
+targets_seqs.json
+results_assistant_Unknown_Local_LLM.json
+casp_split_seqs.json
+
+# ─────────────────────────────────────────
+# Non-app: one-off scripts and utilities
+# ─────────────────────────────────────────
+analyze_nipah.py
+cap_pathway.py
+cap_structures.py
+dashboard.py
+deep_search.py
+extract_sequences.py
+ftp_query.py
+patch_vault.py
+resolve_conflict.py
+time_management_mcp.py
+verify_mapping.py
+verify_matches.py
+buggy
+buggy.c
+test_script.py
+top_procs.txt
+sun.txt
+cosmos.txt
+
+# ─────────────────────────────────────────
+# Non-app: reports, reviews, proposals
+# ─────────────────────────────────────────
+assistant_benchmark_report.md
+nih_proposal_draft.md
+papers_memory_map.md
+papers_summary.md
+science_adm8693_review.md
+run_ai_prompt.txt
+
+# ─────────────────────────────────────────
+# Non-app: test/debug scratch
+# ─────────────────────────────────────────
+.agents/scratch/
+.pytest_cache/
+
+# ─────────────────────────────────────────
+# Non-app: documentation drafts
+# ─────────────────────────────────────────
+docs/agent_loop_engineering.md
+docs/improvements/

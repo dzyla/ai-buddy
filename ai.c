@@ -31,7 +31,7 @@ static char  api_url[MAX_VAL];
 static char  api_key[MAX_VAL];
 static char  model[MAX_VAL];
 static float temperature_val  = -1.0f;
-static int   max_tokens_val   = -1;
+static int   max_tokens_val   = 8192; // Prevent infinite reasoning loops
 static int   no_tools_mode    = 0;
 static char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
 static char  current_session_id[64] = "";
@@ -56,6 +56,9 @@ static const char *SYSTEM_PROMPT =
     "- Use web_search for general questions or current news. web_search now auto-fetches the top result — check [Top result full content] first before calling fetch_webpage again.\n"
     "- Do NOT repeat web_search with slightly different queries — if the first search returns no answer, fetch the top result URL or switch to an API.\n"
     "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n"
+    "- To modify existing files, strictly use the `edit_file` tool instead of `sed`, `awk`, or interactive editors.\n"
+    "- NEVER run interactive terminal programs like `vim`, `nano`, `top`, `less`, or `ssh` via execute_command as they will hang the agent. Use provided tools instead.\n"
+    "- NEVER run `find /` or search indiscriminately from the root directory; it will hang forever. Always constrain searches to specific, relevant directories (e.g., `./` or `~/Code`).\n"
     "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
     "CITATIONS:\n"
     "- fetch_webpage and read_file (PDF) results begin with a [Source: ...] line. Track every source whose content you use.\n"
@@ -63,7 +66,7 @@ static const char *SYSTEM_PROMPT =
     "- Do not list sources you fetched but did not use in the answer.\n\n"
     "FAILURE RECOVERY:\n"
     "- If execute_command fails, read the error, fix the root cause, and retry. At least 3 attempts before giving up.\n"
-    "- If a library is missing, install it with pip/apt. If a web source is blocked or noisy, find an alternative.\n"
+    "- If a library is missing, install it non-interactively (e.g. `pip install --user` or `sudo apt-get install -y`). If a web source is blocked or noisy, find an alternative.\n"
     "- If fetch_webpage returns a WARNING about JavaScript or returns fewer than 80 words, the page is JS-only. Switch to execute_command with curl to a plain-text API instead.\n"
     "- For current weather: execute_command `curl -s 'wttr.in/Miami?format=3'` (replace city name). Never rely on weather.com/weather.gov — they require JavaScript.\n"
     "- Never tell the user to 'visit a link' or 'run a command themselves' — do it yourself.\n\n"
@@ -84,9 +87,20 @@ static const char *SYSTEM_PROMPT =
     "  * 'Show notification in 5 min' → schedule_task(task_id='notify_go_home', prompt='Run: execute_command(notify-send ...); then unschedule_task(notify_go_home).', interval_seconds=300)\n"
     "  * 'Tell me when /data has 1000 files' → schedule_task(task_id='check_data_files', prompt='Count files in /data. If >= 1000: send Zulip message with count, then unschedule_task(check_data_files). Else do nothing.', interval_seconds=120)\n"
     "- After calling schedule_task, immediately call task_complete telling the user the task is scheduled and when/how they will be notified.\n\n"
+    "VIRTUAL ASSISTANT & COMPUTER USE:\n"
+    "- You are a capable virtual assistant for scheduling, planning, organizing, and daily tasks.\n"
+    "- For Outlook without API permissions: use headless browser automation (e.g. Playwright) to interact with Outlook Web App (OWA), use IMAP/SMTP if enabled, or read public ICS links.\n"
+    "- For GUI tasks and computer use ('help me fix this error', 'fill that form'): use screenshot description tools (multimodal vision) to understand the screen, and use desktop automation (e.g. xdotool, PyAutoGUI) to navigate, click, and type.\n\n"
+    "WRITING STYLE & TONE (CRITICAL):\n"
+    "- Generate text that sounds human, direct, and professional.\n"
+    "- STRICTLY avoid 'LLM-like' clichés (e.g., 'Here is the...', 'It is important to note', 'In summary', 'As an AI', 'Delve into').\n"
+    "- Write concisely without fluff, repetitive structures, or robotic transitions. Use varied sentence lengths.\n\n"
     "SKILLS:\n"
     "- Domain skills exist. Call load_skill() to list them, load_skill(name) to read one.\n"
-    "- Additional CRITICAL triggers may follow in the system context — obey them exactly.";
+    "- Additional CRITICAL triggers may follow in the system context — obey them exactly.\n\n"
+    "SCIENTIFIC OUTPUT & REVIEW:\n"
+    "- For scientific tasks, strictly avoid markdown tables, emojis, and bullet points. Write in long, cohesive, well-reasoned paragraphs.\n"
+    "- Always employ a multi-turn review process: generate a draft, verify it against memory maps/RAG context in a second turn, and refine it into scientifically sound prose before delivering the final output.";
 
 static char* get_system_context() {
     char cwd[1024] = "Unknown";
@@ -1221,7 +1235,7 @@ static char *read_line_interactive(const char *prompt) {
     return strdup(buf);
 }
 
-static char* run_shell_command(const char *cmd, int *exit_status) {
+static char* run_shell_command_timeout(const char *cmd, int *exit_status, int timeout_sec) {
     int started_raw = 0;
     if (!raw_mode_active && isatty(STDIN_FILENO)) {
         enable_raw_mode();
@@ -1250,8 +1264,33 @@ static char* run_shell_command(const char *cmd, int *exit_status) {
     }
     buf[0] = '\0';
 
+    time_t start_time = time(NULL);
     int interrupted = 0;
     while (1) {
+        if (timeout_sec > 0 && time(NULL) - start_time > timeout_sec) {
+            interrupted = 2;
+            char kill_cmd[128];
+            snprintf(kill_cmd, sizeof(kill_cmd), "pkill -P %d 2>/dev/null", getpid());
+            system(kill_cmd);
+            
+            char timeout_msg[256];
+            snprintf(timeout_msg, sizeof(timeout_msg), "\n[SYSTEM WARNING: Command timed out after %d seconds. Process killed. Partial output above. Evaluate if script is stuck in an infinite loop, waiting for user input, or just intrinsically slow.]\n", timeout_sec);
+            size_t tlen = strlen(timeout_msg);
+            if (len + tlen >= size - 1) {
+                size += tlen + 1024;
+                char *new_buf = realloc(buf, size);
+                if (new_buf) buf = new_buf;
+            }
+            if (buf) {
+                memcpy(buf + len, timeout_msg, tlen);
+                len += tlen;
+                buf[len] = '\0';
+            }
+            if (exit_status) *exit_status = 124;
+            fprintf(stderr, "\n\033[1;31m[ai] Tool execution timed out after %ds.\033[0m\n", timeout_sec);
+            break;
+        }
+
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(pipe_fd, &fds);
@@ -1324,8 +1363,10 @@ static char* run_shell_command(const char *cmd, int *exit_status) {
     }
 
     if (exit_status) {
-        if (interrupted) {
+        if (interrupted == 1) {
             *exit_status = 130; // SIGINT / interrupted status
+        } else if (interrupted == 2) {
+            *exit_status = 124; // Timeout
         } else if (status == -1) {
             *exit_status = -1;
         } else {
@@ -1334,6 +1375,10 @@ static char* run_shell_command(const char *cmd, int *exit_status) {
     }
 
     return buf;
+}
+
+static char* run_shell_command(const char *cmd, int *exit_status) {
+    return run_shell_command_timeout(cmd, exit_status, 120);
 }
 
 /* Extract the string value of a key from a flat JSON object string. */
@@ -2496,6 +2541,8 @@ static char* compact_session(char *messages_json, const char *mcp_script,
         "{\"role\":\"user\",\"content\":\"Provide a comprehensive summary of this entire "
         "conversation so far. Include: all topics discussed, decisions made, code written "
         "or modified, commands run and their results, key findings, and any pending tasks. "
+        "Additionally, extract up to 5 standalone facts or key pieces of information from this conversation "
+        "that should be permanently remembered (the memory map). Format these memories as a JSON list of strings at the very end of your response, wrapped in <memories>...</memories> tags. "
         "Be thorough — this summary will replace the full conversation history.\"}";
 
     char *temp_msgs = strdup(messages_json);
@@ -2566,6 +2613,29 @@ static char* compact_session(char *messages_json, const char *mcp_script,
 
     char *new_msgs = malloc(4096);
     strcpy(new_msgs, "[]");
+
+    /* Extract memories */
+    char *mem_start = strstr(summary, "<memories>");
+    char *mem_end = strstr(summary, "</memories>");
+    if (mem_start && mem_end && mem_end > mem_start) {
+        mem_start += 10;
+        size_t mem_len = mem_end - mem_start;
+        char *mem_json = malloc(mem_len + 1);
+        strncpy(mem_json, mem_start, mem_len);
+        mem_json[mem_len] = '\0';
+        
+        char *safe_mem_json = shell_escape(mem_json);
+        if (safe_mem_json) {
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd), "python3 %s save-memories %s", mcp_script, safe_mem_json);
+            char *out = run_shell_command(cmd, NULL);
+            if (out) free(out);
+            free(safe_mem_json);
+        }
+        free(mem_json);
+        
+        *(mem_start - 10) = '\0';
+    }
 
     if (g_system_message_json)
         new_msgs = append_message(new_msgs, g_system_message_json);
@@ -3147,16 +3217,33 @@ int main(int argc, char **argv) {
             fclose(rfp);
         }
     }
+    char *rag_memories = NULL;
+    if (prompt && strlen(prompt) > 0) {
+        char *safe_prompt = shell_escape(prompt);
+        if (safe_prompt) {
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd), "python3 %s rag-memories %s", mcp_script, safe_prompt);
+            rag_memories = run_shell_command(cmd, NULL);
+            free(safe_prompt);
+        }
+    } else {
+        char cmd[8192];
+        snprintf(cmd, sizeof(cmd), "python3 %s rag-memories 'current context or recent tasks'", mcp_script);
+        rag_memories = run_shell_command(cmd, NULL);
+    }
+
     char *safe_system = json_escape(active_system_prompt);
     char *safe_ctx = json_escape(sys_ctx);
     char *safe_mem = memory ? json_escape(memory) : NULL;
     char *safe_triggers = triggers ? json_escape(triggers) : NULL;
+    char *safe_rag = rag_memories ? json_escape(rag_memories) : NULL;
     char *sys_msg = NULL;
 
     /* Build the content string: SYSTEM_PROMPT + ctx + optional triggers + optional memory */
     size_t mlen = strlen(safe_system) + strlen(safe_ctx)
                   + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
-                  + (safe_mem ? strlen(safe_mem) + 64 : 0) + 256;
+                  + (safe_mem ? strlen(safe_mem) + 64 : 0)
+                  + (safe_rag ? strlen(safe_rag) + 64 : 0) + 256;
 
     /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
     char *content = malloc(mlen);
@@ -3167,6 +3254,9 @@ int main(int argc, char **argv) {
     if (memory && strlen(memory) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nPersistent Memory/Preferences:\n%s", memory);
+    if (rag_memories && strlen(rag_memories) > 0)
+        clen += snprintf(content + clen, mlen - clen,
+                         "\n\nRelevant Context (RAG Memories):\n%s", rag_memories);
 
     /* json_escape can expand content significantly; allocate sys_msg after escaping */
     char *safe_content = json_escape(content);
@@ -3180,15 +3270,17 @@ int main(int argc, char **argv) {
     messages_json = append_message(messages_json, sys_msg);
     g_system_message_json = strdup(sys_msg); /* saved for compact_session */
 
-    if (safe_triggers) free(safe_triggers);
+    if (safe_system) free(safe_system);
+    if (safe_ctx) free(safe_ctx);
     if (safe_mem) free(safe_mem);
-    if (triggers) free(triggers);
+    if (safe_triggers) free(safe_triggers);
+    if (safe_rag) free(safe_rag);
+    if (rag_memories) free(rag_memories);
+    if (sys_ctx) free(sys_ctx);
+    if (active_system_prompt) free(active_system_prompt);
     if (memory) free(memory);
-    free(sys_ctx);
-    free(safe_system);
-    free(safe_ctx);
+    if (triggers) free(triggers);
     free(sys_msg);
-    free(active_system_prompt);
 
     /* --resume: splice the previous conversation (as a clean user/assistant
        transcript) between the fresh system message and this turn's user prompt. */
@@ -3427,7 +3519,7 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
-            int step_limit = g_continue_until_done ? 999999 : 30;
+            int step_limit = (g_continue_until_done || g_auto_approve || !isatty(STDIN_FILENO)) ? 999999 : 30;
             int think_count = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
@@ -3912,14 +4004,25 @@ step_limit_check:
                                    jsmn_init(&arg_parser);
                                    int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 512);
                                    char *cmd_val = NULL;
+                                   int cmd_timeout = 120; // Default timeout
                                    for (int a = 1; a < arg_r; a++) {
                                        if (arg_toks[a].type == JSMN_STRING && 
                                            arg_toks[a].end - arg_toks[a].start == 7 &&
                                            strncmp(unescaped_args + arg_toks[a].start, "command", 7) == 0) {
                                            cmd_val = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
-                                           break;
+                                       } else if (arg_toks[a].type == JSMN_STRING && 
+                                           arg_toks[a].end - arg_toks[a].start == 7 &&
+                                           strncmp(unescaped_args + arg_toks[a].start, "timeout", 7) == 0) {
+                                           if (arg_toks[a + 1].type == JSMN_PRIMITIVE) {
+                                               char *timeout_str = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
+                                               if (timeout_str) {
+                                                   cmd_timeout = atoi(timeout_str);
+                                                   free(timeout_str);
+                                               }
+                                           }
                                        }
                                    }
+
 
                                   if (cmd_val) {
                                       int approved = g_auto_approve;
@@ -4033,7 +4136,7 @@ step_limit_check:
                                           char *cmd_with_stderr = malloc(cmd_len + 16);
                                           sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
                                           int exit_code = 0;
-                                          char *raw_output = run_shell_command(cmd_with_stderr, &exit_code);
+                                          char *raw_output = run_shell_command_timeout(cmd_with_stderr, &exit_code, cmd_timeout);
                                           free(cmd_with_stderr);
 
                                           if (exit_code == 130) /* ESC / SIGINT during command */
