@@ -30,7 +30,7 @@ ai_mcp = importlib.import_module("ai_mcp")
 @pytest.fixture(scope="session", autouse=True)
 def build_binary():
     res = subprocess.run(
-        ["gcc", "-O2", "-o", AI_BIN, "ai.c", "cJSON.c", "-lcurl"],
+        ["gcc", "-O2", "-o", AI_BIN, "ai.c", "remote_harness.c", "cJSON.c", "-lcurl", "-lssl", "-lcrypto", "-lpthread", "-lm"],
         cwd=REPO, capture_output=True, text=True,
     )
     assert res.returncode == 0, f"Build failed:\n{res.stderr}"

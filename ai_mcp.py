@@ -2164,14 +2164,76 @@ def pubmed_research_round(query, known_dois=None, start_date=None, end_date=None
 
 def repair_json(s):
     """Best-effort repair of common small-model JSON mistakes."""
+    if not s:
+        return "{}"
     s = s.strip()
+
+    # Remove markdown code block markers if model wrapped JSON in ```json ... ```
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+
+    # Repair raw unescaped newlines/tabs inside JSON string literals
+    out = []
+    in_string = False
+    escape = False
+    for c in s:
+        if in_string:
+            if escape:
+                out.append(c)
+                escape = False
+            elif c == '\\':
+                out.append(c)
+                escape = True
+            elif c == '"':
+                out.append(c)
+                in_string = False
+            elif c == '\n':
+                out.append('\\n')
+            elif c == '\r':
+                out.append('\\r')
+            elif c == '\t':
+                out.append('\\t')
+            else:
+                out.append(c)
+        else:
+            if c == '"':
+                in_string = True
+            out.append(c)
+
+    if in_string:
+        out.append('"')
+
+    fixed_str = "".join(out)
+
     # Remove trailing commas before } or ]
-    s = re.sub(r',\s*([}\]])', r'\1', s)
-    # Close unclosed braces (truncated output)
-    if s and s[0] == '{':
-        depth = sum(1 if c == '{' else -1 if c == '}' else 0 for c in s)
-        s += '}' * max(0, depth)
-    return s
+    fixed_str = re.sub(r',\s*([}\]])', r'\1', fixed_str)
+
+    # Balance unclosed braces/brackets
+    in_str = False
+    esc = False
+    stack = []
+    for c in fixed_str:
+        if esc:
+            esc = False
+        elif c == '\\':
+            esc = True
+        elif c == '"':
+            in_str = not in_str
+        elif not in_str:
+            if c == '{' or c == '[':
+                stack.append('}' if c == '{' else ']')
+            elif c == '}' or c == ']':
+                if stack and stack[-1] == c:
+                    stack.pop()
+    while stack:
+        fixed_str += stack.pop()
+
+    return fixed_str
 
 def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None):
     import json

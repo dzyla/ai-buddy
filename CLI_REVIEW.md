@@ -1,302 +1,292 @@
-# CLI Harness Review — Visual & Interaction Improvements
+# AI-Buddy CLI Harness — Review & Improvement Plan
 
 ## Current Architecture
 
-The CLI (`ai.c`, ~4900 lines) is a single-file C program that:
+The harness (`ai.c`, ~5.6k lines) is a monolithic C program with:
 
-- Reads user input via a custom line editor (`lineed`) in interactive mode
-- Sends messages to an LLM via HTTP
-- Calls MCP tools via `ai_mcp.py` subprocess
-- Renders tool results in styled boxes using box-drawing characters (`┌──┐│└┘`)
-- Renders the LLM's final response in the same box format (as "💬 model_name")
-- Uses a Python `ai_mcp.py render-markdown` subprocess to convert markdown to colored terminal output
+- **Token streaming** via `print_token_stream`
+- **Tool call display** via `print_tool_box`
+- **Response rendering** via `print_response_box`
+- **User input** via `read_line_interactive` + `lineed_redraw`
+- **Markdown rendering** via `render_markdown`
 
----
-
-## Issues Identified
-
-### 1. LLM Response Uses the Same Box as Tool Calls (Major)
-
-**Location:** `ai.c:4775-4782`
-
-```c
-snprintf(box_name, sizeof(box_name), "💬 %s",
-         model[0] ? model : "model");
-if (rendered_output && *rendered_output) {
-    print_tool_box(box_name, "response", rendered_output);
-```
-
-The model's final answer is wrapped in `print_tool_box` — the same function used for every tool call. This means the user sees:
-
-```
-┌── 💬 claude-sonnet-4-20250514 (response) ────────┐
-│  Your task is complete...                        │
-└──────────────────────────────────────────────────┘
-```
-
-This is visually identical to a tool execution box and creates cognitive friction. The user must parse the header to understand this is the model's *answer*, not a tool result.
-
-**Fix:** Add a new `print_response_box` function that renders the LLM's response as a clean, chat-style output — a left accent bar or simple underline, not a full box. The response should feel like a *message*, not a *result*.
+Everything lives in one file. The color palette is limited to 10 ANSI codes. Box drawing uses basic `│─╭╰╮` characters.
 
 ---
 
-### 2. No Visual Separation Between Turns
+## Findings
 
-**Location:** `ai.c:3655-3670`
+### 1. Prompt Bar — Functional but Flat
+**Location:** `ai.c:4131-4155`
 
-In interactive mode, the loop goes: prompt → user input → tool calls → response → back to prompt. There is no visual break between turns. After many tool calls and a response, the next prompt appears immediately, making it hard to scan where one turn ends and the next begins.
+```
+magenta| model  session  ▸ auto
+dim    ╰──────────╯
+```
 
-**Fix:** Print a subtle separator line between turns (e.g., a dim dotted line or just extra whitespace with a session marker).
+**Issues:**
+- Only 3 data points shown (model, session ID, permission mode)
+- Session ID is opaque (`sess_1691234567`) — no way to identify it
+- No turn counter shown in prompt (it increments but isn't displayed)
+- No model context (which family, context window size)
+- Permission mode text is just color — no visual icon
+
+### 2. User Message Box — Adequate
+**Location:** `ai.c:114-160`
+
+Uses a `You ▸` header with word-wrapped content. Functional but:
+- "You" header is generic — could show timestamp or turn number
+- No visual separator between user input and tool output
+- Word-wrap logic is simplistic (breaks at space only, no soft-wrap)
+
+### 3. Response Box — Decent but Dated
+**Location:** `ai.c:162-215`
+
+Shows model name, turn count, tool count. Good info density. Issues:
+- No streaming animation/indicator
+- Turn/tool count in footer is fine but could be more prominent
+- No model context (parameters, context usage)
+
+### 4. Tool Box — Basic
+**Location:** `ai.c:217-280`
+
+Shows tool name, status (ok/error/info), truncated content (50 lines). Issues:
+- No distinction between tool types (shell, file, fetch, search, etc.)
+- Status is just a word — could use icons/colors better
+- Content truncation is blunt — no "click to expand" hint (even in text)
+- No timing information (how long did the tool take?)
+
+### 5. Color Palette — Very Limited
+**Location:** `ai.c:40-50`
+
+```c
+#define CL_RESET   "\033[0m"
+#define CL_BOLD    "\033[1m"
+#define CL_DIM     "\033[2m"
+#define CL_MAGENTA "\033[35m"
+#define CL_CYAN    "\033[36m"
+#define CL_GREEN   "\033[32m"
+#define CL_RED     "\033[31m"
+#define CL_YELLOW  "\033[33m"
+#define CL_BLUE    "\033[34m"
+#define CL_WHITE   "\033[37m"
+#define CL_BG_MAG  "\033[45m"
+```
+
+Only 10 codes. Missing:
+- Bright/intense variants (21, 22, 24)
+- Underline (4, 24)
+- No extended 256-color or RGB support
+- No system color awareness (light/dark terminal detection)
+
+### 6. Box Drawing — Basic ASCII
+Uses `╭─╮│╰╯` — these work but look dated compared to modern terminals.
+
+### 7. No Table Rendering
+Markdown tables in output are rendered as raw text. No special handling for tabular data.
+
+### 8. No Thinking/Reasoning Display
+When the model uses `think` tool, the output is mixed with tool calls. No dedicated "thinking" display that separates reasoning from action.
+
+### 9. Input UX — Good Foundation
+`read_line_interactive` has:
+- Full readline-style editing
+- Bracketed paste
+- Shift-Tab to cycle permission mode
+- History support
+
+Could be improved with:
+- Visual indicator for multi-line input
+- Better keybinding hints in prompt
+- Paste visualization (show how many lines were pasted)
 
 ---
 
-### 3. Prompt Header Lacks Context
+## Recommended Improvements
 
-**Location:** `ai.c:3671-3680`
+### Priority 1: Quick Wins (High Impact, Low Effort)
 
-```c
-printf("%s%s%s%s %s%s%s%s  %s%s%s%s%s%s%s%s\n",
-       CL_MAGENTA CL_BOLD, "ai", CL_MAGENTA, " ",
-       CL_DIM, "[", CL_DIM, model[0] ? model : "unknown", CL_DIM, "]",
-       CL_DIM, "  ",
-       g_auto_approve ? CL_GREEN "auto-approve" : CL_RED "confirm",
-       CL_DIM, " mode");
-const char *prompt_str = ...;
+#### 1.1 Enhanced Prompt Bar
+
+Replace the simple prompt with a richer header:
+
+```
+magenta  ai  dim│  cyan●  cyan gemma-4-flash  dim·  turn 3  dim·  session 2m ago  dim│  green auto
+dim      ─────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
-The prompt header shows model name and approval mode, but not:
-- Session ID (useful for `:session` commands)
-- Turn number (useful for tracking progress)
-- Active tool count (how many tools are registered)
-- Remaining context budget indicator
+Changes:
+- Add "ai" brand prefix with bold
+- Show model in cyan (distinct from session)
+- Show turn counter
+- Show relative session time (not just ID)
+- Show permission mode with icon: `●auto` / `◐plan` / `○manual`
+- Add subtle bottom border line
 
-**Fix:** Expand the header to include session ID, turn counter, and tool count. Use a more compact layout.
+#### 1.2 Extended Color Palette
 
----
-
-### 4. Startup Banner is Plain
-
-**Location:** `ai.c:3646-3648`
+Add these to the defines:
 
 ```c
-printf("\033[1;36mai\033[0m  \033[2m%s\033[0m\n", model);
-printf("\033[2m:help · ESC to interrupt · Shift-Tab to disable auto-approve · :btw <msg> to inject a note mid-task\033[0m\n\n");
+#define CL_BRIGHT   "\033[22m"   /* Normal intensity */
+#define CL_UNDERLINE "\033[4m"
+#define CL_DIM2     "\033[22m"   /* Semi-dim for secondary text */
+#define CL_ORANGE   "\033[38;5;208m"  /* Extended color for warnings */
+#define CL_TEAL     "\033[38;5;37m"   /* Extended color for info */
+#define CL_PURPLE   "\033[38;5;135m"  /* Extended color for special */
 ```
 
-Just two plain lines. No visual identity.
+#### 1.3 Tool Box Enhancements
 
-**Fix:** Add a small decorative element (e.g., a thin accent line or a styled header), show session ID if resuming, and keep the help line.
+Add tool-type icons:
 
----
+| Tool Type | Icon | Color |
+|-----------|------|-------|
+| shell | `⬡` | cyan |
+| file | `⌨` | yellow |
+| fetch | `◉` | blue |
+| web_search | `⌕` | green |
+| arXiv/pubmed | `⊹` | purple |
+| calendar | `⊡` | teal |
+| email | `✉` | orange |
+| code | `⟨⟩` | magenta |
+| thinking | `◈` | dim white |
 
-### 5. Tool Box Could Be More Information-Dense
+Show execution time: `ok · 1.2s`
 
-**Location:** `ai.c:103-145`
+#### 1.4 Response Box — Streaming Indicator
 
-The current `print_tool_box` has:
-- A full bordered box with corner characters
-- Status in the header (ok/error/info)
-- Content in dim text with vertical bar prefix
+Add a subtle animation while streaming:
 
-The box is visually heavy for simple "ok" results and the status text ("ok") is redundant when the color already conveys success.
-
-**Fix:** Keep the box for complex results but simplify the header. Use icons (●, ✕, ◌) instead of text for status. Remove redundant "ok" text.
-
----
-
-### 6. Error/Warning Boxes Could Be More Distinct
-
-**Location:** `ai.c:148-175`
-
-Currently use red color but same box format as tool results. The warning is visually buried among tool boxes.
-
-**Fix:** Use a slightly different border style or add a "!" icon to make errors immediately scannable.
-
----
-
-## Proposed Changes (in priority order)
-
-### Change 1: New `print_response_box` function
-
-```c
-/* Print the LLM's final response — distinct from tool call boxes.
- * Renders as a clean chat-style message with a left accent bar
- * and the model name as a subtle header. */
-static void print_response_box(const char *model_name, const char *content)
-{
-    printf("\n");
-
-    /* Model name header — subtle, not boxed */
-    printf("%s%s %s %s%s  %s%s%s\n",
-           CL_DIM, CL_MAGENTA, "◆", CL_DIM, model_name ? model_name : "model",
-           CL_DIM, "─────────────────────────────────────────────────────────────",
-           CL_RESET);
-
-    /* Content — rendered markdown, full width, no box */
-    if (content) {
-        const char *line = content;
-        int lines = 0;
-        const int max_lines = 100;
-        while (*line && lines < max_lines) {
-            const char *nl = strchr(line, '\n');
-            if (!nl) {
-                printf("  %s%s%s\n", CL_RESET, line, CL_DIM);
-                break;
-            }
-            int len = (int)(nl - line);
-            printf("  %.*s%s\n", len, line, CL_DIM);
-            line = nl + 1;
-            lines++;
-        }
-        if (*line && lines >= max_lines) {
-            printf("  ... (%zu more lines)\n", strlen(line));
-        }
-    }
-
-    printf("%s%s%s\n", CL_DIM, "─", CL_RESET);
-    printf("\n");
-}
+```
+magenta  ◉  cyan gemma-4-flash  dim│  thinking...
 ```
 
-Then replace the response rendering at `ai.c:4775-4782`:
+Replace "thinking..." with a subtle animation (spinning `◐◑◒◓` or `⠋⠙⠹⠸⠼⠴`).
 
-```c
-/* Old: */
-char box_name[256];
-snprintf(box_name, sizeof(box_name), "💬 %s",
-         model[0] ? model : "model");
-if (rendered_output && *rendered_output) {
-    print_tool_box(box_name, "response", rendered_output);
-    free(rendered_output);
-} else {
-    print_tool_box(box_name, "response", unescaped_content);
-}
+### Priority 2: Medium Effort
 
-/* New: */
-if (rendered_output && *rendered_output) {
-    print_response_box(model, rendered_output);
-    free(rendered_output);
-} else {
-    print_response_box(model, unescaped_content);
-}
+#### 2.1 Table Rendering
+
+Add a `render_table` function that detects markdown tables and renders them with proper alignment:
+
+```
+│ Col1      │ Col2      │ Col3      │
+│───────────┼───────────┼───────────│
+│ value1    │ value2    │ value3    │
+│───────────┼───────────┼───────────│
 ```
 
-### Change 2: Enhanced Prompt Header
+Use double-line separators between header and rows for clarity.
 
-Replace the current header at `ai.c:3671-3680` with:
+#### 2.2 Thinking Display
 
-```c
-/* ── Prompt header ── */
-printf("%s%s%s%s %s%s%s%s  %s%s%s%s%s%s%s%s%s%s%s%s\n",
-       CL_MAGENTA CL_BOLD, "ai", CL_MAGENTA, " ",
-       CL_DIM, "[", CL_DIM, model[0] ? model : "unknown", CL_DIM, "]",
-       CL_DIM, "  ",
-       g_auto_approve ? CL_GREEN "auto" : CL_YELLOW "confirm",
-       CL_DIM, " mode  ",
-       current_session_id[0] ? CL_DIM : "",
-       current_session_id[0] ? "sess:" : "",
-       current_session_id[0] ? CL_RESET : "",
-       CL_DIM, current_session_id[0] ? current_session_id : "-",
-       CL_DIM, "  ",
-       CL_RESET);
+When `think` tool is called, show a distinct "thinking" block:
+
+```
+dim  ◈  Thinking
+dim  ──────────────
+dim  [reasoning content in dim text]
+dim  ──────────────
 ```
 
-Track a turn counter:
+This visually separates reasoning from the final response, reducing cognitive load.
 
-```c
-/* In the while loop, at the top, before the prompt: */
-static int turn_count = 0;
-turn_count++;
+#### 2.3 Input UX Improvements
+
+- Show keybinding hint in dim text: `dim[Shift-Tab: cycle mode · Enter: send]`
+- Show paste indicator when multi-line input detected
+- Show line count for pasted content: `dim(3 lines)`
+
+#### 2.4 Session Identification
+
+Make session IDs more human-readable:
+- Show relative time: "2m ago", "1h ago"
+- Show first few words of first prompt as a label
+- Or: show a short hash + context
+
+### Priority 3: Higher Effort
+
+#### 3.1 Model Context Footer
+
+At the bottom of response boxes, show model metadata:
+- Context window usage (e.g., "12k/131k tokens")
+- Temperature / parameters (if available from API)
+- Latency (time to first token, total time)
+
+#### 3.2 Tool Call Timeline
+
+Instead of individual boxes, show a condensed timeline:
+```
+dim  [⬡ ls] → [⌨ cat file.txt] → [⊹ web_search] → [⟨⟩ code]
 ```
 
-And include it in the header.
+Click/expand to see details. This reduces visual clutter during long tool chains.
 
-### Change 3: Turn Separator
+#### 3.3 Multi-line Input Visualization
 
-After the response is printed and before the next prompt, add:
-
-```c
-printf("%s%s%s\n\n", CL_DIM, "─", CL_RESET);
+When user pastes multiple lines, show:
 ```
-
-This creates a subtle visual break between conversation turns.
-
-### Change 4: Improved Startup Banner
-
-```c
-printf("\n");
-printf("%s%s%s%s\n",
-       CL_MAGENTA, "╭──╮", CL_DIM, " ai — autonomous coding agent");
-printf("%s│ %s │%s  %s%s%s  %s%s%s\n\n",
-       CL_MAGENTA, "ai", CL_DIM,
-       CL_CYAN CL_BOLD, model[0] ? model : "unknown model", CL_DIM,
-       current_session_id[0] ? CL_GREEN "resuming" : CL_DIM "new session",
-       CL_RESET, CL_RESET);
-printf("%s:help · ESC to interrupt · Shift-Tab to toggle auto-approve · :btw <msg> to inject a note mid-task%s\n\n",
-       CL_DIM, CL_RESET);
-```
-
-### Change 5: Simplified Tool Box Header
-
-Update `print_tool_box` to use icons instead of text status:
-
-```c
-static void print_tool_box(const char *name, const char *status, const char *content)
-{
-    const char *hc = (status && strncmp(status, "error", 5) == 0) ? CL_RED
-                  : (status && strcmp(status, "ok") == 0)       ? CL_GREEN
-                  : (status && strcmp(status, "info") == 0)      ? CL_CYAN
-                  : CL_DIM;
-
-    const char *icon = (status && strncmp(status, "error", 5) == 0) ? "✕"
-                     : (status && strcmp(status, "ok") == 0)        ? "●"
-                     : (status && strcmp(status, "info") == 0)       ? "◌"
-                     : "·";
-
-    printf("\n");
-    printf("%s%s%s%s %s %s %s%s%s%s\n",
-           CL_DIM, BTLN, hc, BTHR, hc, icon, name,
-           status ? (status && strncmp(status, "error", 5) == 0) ? "" : "" : "",
-           CL_DIM, BTRN, CL_RESET);
-    /* ... content stays the same ... */
-```
-
-Actually, simpler — just replace the status text with an icon:
-
-```c
-    printf("%s%s%s%s %s %s %s %s%s%s%s\n",
-           CL_DIM, BTLN, hc, BTHR, hc, icon, name,
-           (status && strncmp(status, "error", 5) != 0 &&
-            status && strcmp(status, "ok") != 0 &&
-            status && strcmp(status, "info") != 0) ? status : "",
-           CL_DIM, BTRN, CL_RESET);
-```
-
-### Change 6: Distinct Error Box
-
-Add a `!` icon to error boxes:
-
-```c
-static void print_warning_box(const char *title, const char *body)
-{
-    printf("\n%s%s%s%s %s %s %s%s\n",
-           CL_RED CL_BOLD, BTLN, CL_RED, BTHR,
-           CL_RED CL_BOLD, "⊘", CL_RED, title, BTHR, CL_RESET);
-    /* ... rest stays the same ... */
+magenta ai ▸  [3 lines pasted]
+dim     ──────────────
+dim     line1
+dim     line2
+dim     line3
+dim     ──────────────
+dim     [Enter to send · Ctrl+D to discard]
 ```
 
 ---
 
-## Summary of Design Principles
+## Implementation Plan
 
-| Element | Current | Proposed |
-|---------|---------|----------|
-| LLM Response | Same box as tools | Distinct chat-style message |
-| Tool Result | Full box with text status | Box with icon status |
-| Error | Red box (same shape) | Red box with ⊘ icon |
-| Prompt | Model + mode | Model + mode + session + turn |
-| Turn Separator | None | Subtle divider line |
-| Startup | Plain text | Styled banner with session info |
-| Response Header | "💬 model_name" in box | Thin accent line, not boxed |
+### Phase 1: Colors & Prompt (1-2 hours)
+1. Add extended color palette (CL_ORANGE, CL_TEAL, etc.)
+2. Rewrite `prompt_str` construction with richer display
+3. Add turn counter, relative session time, permission icons
 
-The core philosophy: **the LLM's response should feel like a conversation, not a data dump.** Tool calls are system events; the model's answer is the human-facing output. They deserve different visual treatment.
+### Phase 2: Tool & Response Polish (2-3 hours)
+1. Add tool-type icons and execution time to `print_tool_box`
+2. Add streaming animation to response header
+3. Implement basic table rendering in `render_markdown`
+
+### Phase 3: Advanced UX (3-4 hours)
+1. Thinking display with distinct styling
+2. Input UX improvements (hints, paste visualization)
+3. Tool call timeline (condensed view)
+
+### Phase 4: Model Context (2 hours)
+1. Add latency/usage footer to response boxes
+2. Show context window usage if available from API response
+
+---
+
+## Code Locations Reference
+
+| Feature | Function | Line |
+|---------|----------|------|
+| Prompt bar | Main loop prompt construction | 4131-4155 |
+| User message | `print_user_message` | 114-160 |
+| Response box | `print_response_box` | 162-215 |
+| Tool box | `print_tool_box` | 217-280 |
+| Token streaming | `print_token_stream` | ~2800-3000 |
+| Markdown render | `render_markdown` | ~3400-3800 |
+| Input editing | `read_line_interactive` | 1614-1800 |
+| Color defines | Top of file | 40-50 |
+| Session ID | `current_session_id` | 335 |
+| Turn counter | `g_turn_count` | 408 |
+| Permission mode | `g_permission_mode` | 405 |
+
+---
+
+## Design Philosophy
+
+The current interface is **functional but flat**. The goal is to add **visual hierarchy** without clutter:
+
+1. **Information density** — Show more useful context (timing, counts, relative IDs)
+2. **Visual separation** — Use color, icons, and spacing to distinguish sections
+3. **Cognitive load** — Group related info, de-emphasize noise
+4. **Consistency** — Use the same icons/colors across all displays
+5. **Brevity** — Modern CLIs show less but mean more (think `gh`, `git`, `starship`)
+
+The aesthetic should be: **minimal, information-rich, with subtle animations**. Think `starship.rs` prompt meets `gh` CLI.

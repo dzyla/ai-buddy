@@ -40,6 +40,8 @@ static int g_remote_discovered = 0;
 #define CL_RESET   "\033[0m"
 #define CL_BOLD    "\033[1m"
 #define CL_DIM     "\033[2m"
+#define CL_DIM2    "\033[22m"  /* normal intensity (undo bold) */
+#define CL_UNDER   "\033[4m"
 #define CL_MAGENTA "\033[35m"
 #define CL_CYAN    "\033[36m"
 #define CL_GREEN   "\033[32m"
@@ -48,6 +50,11 @@ static int g_remote_discovered = 0;
 #define CL_BLUE    "\033[34m"
 #define CL_WHITE   "\033[37m"
 #define CL_BG_MAG  "\033[45m"
+#define CL_ORANGE  "\033[38;5;208m"
+#define CL_TEAL    "\033[38;5;37m"
+#define CL_PURPLE  "\033[38;5;135m"
+#define CL_BG_DARK "\033[48;5;236m"
+#define CL_BG_MED  "\033[48;5;241m"
 
 /* Box-drawing characters */
 #define BTLN "\xe2\x95\xad"   /* ╭ top-left corner  */
@@ -60,11 +67,68 @@ static int g_remote_discovered = 0;
 #define BTRL "├"   /* left T-junction    */
 #define BCTR "┼"   /* cross              */
 
-/* Forward declaration for run_shell_command (used by render_markdown) */
+/* ── Tool-type metadata: icon + color per tool family ─────────────────── */
+typedef struct {
+    const char *name;
+    const char *icon;
+    const char *color;
+} tool_meta_t;
+
+static const tool_meta_t g_tool_meta[] = {
+    {"execute_command",     "⬡",  CL_CYAN},
+    {"read_file",           "⌨",  CL_ORANGE},
+    {"write_file",          "⌨",  CL_ORANGE},
+    {"edit_file",           "⌨",  CL_ORANGE},
+    {"fetch_webpage",       "◉",  CL_BLUE},
+    {"fetch_webpage_js",    "◉",  CL_BLUE},
+    {"fetch_smart",         "◉",  CL_BLUE},
+    {"web_search",          "⌕",  CL_GREEN},
+    {"arxiv_search",        "⊹",  CL_PURPLE},
+    {"pubmed_search",       "⊹",  CL_PURPLE},
+    {"gcal_list_events",    "⊡",  CL_TEAL},
+    {"gcal_create_event",   "⊡",  CL_TEAL},
+    {"gcal_update_event",   "⊡",  CL_TEAL},
+    {"gcal_delete_event",   "⊡",  CL_TEAL},
+    {"delegate_task",       "⊞",  CL_MAGENTA},
+    {"parallel_fetch",      "⊞",  CL_MAGENTA},
+    {"schedule_task",       "⊞",  CL_MAGENTA},
+    {"unschedule_task",     "⊞",  CL_MAGENTA},
+    {"scientific__",        "⟨⟩", CL_PURPLE},
+    {"vault_",              "⊞",  CL_PURPLE},
+    {"load_skill",          "⊞",  CL_PURPLE},
+    {"check_time",          "◷",  CL_CYAN},
+    {"get_clipboard",       "⎘",  CL_DIM},
+    {"list_processes",      "⬡",  CL_CYAN},
+    {"list_scheduled_tasks","⊞",  CL_MAGENTA},
+    {"start_background_process","⊞", CL_MAGENTA},
+    {"stop_process",        "⊞",  CL_MAGENTA},
+    {"check_process_status","⊞",  CL_MAGENTA},
+    {NULL, NULL, NULL}
+};
+
+static const char *tool_get_icon(const char *name) {
+    for (int i = 0; g_tool_meta[i].name; i++) {
+        if (strcmp(g_tool_meta[i].name, name) == 0)
+            return g_tool_meta[i].icon;
+    }
+    return "·";
+}
+
+static const char *tool_get_color(const char *name) {
+    for (int i = 0; g_tool_meta[i].name; i++) {
+        if (strcmp(g_tool_meta[i].name, name) == 0)
+            return g_tool_meta[i].color;
+    }
+    return CL_DIM;
+}
+
+/* ── Forward declaration for run_shell_command (used by render_markdown) */
 static char* run_shell_command(const char *cmd, int *exit_status);
 
 /* Render markdown via the Python helper (used by task_complete and model output).
  * Returns a dynamically allocated string or NULL on failure. Caller must free. */
+static char* shell_escape(const char *src);
+
 static char *render_markdown(const char *text)
 {
     if (!text || !*text) return NULL;
@@ -77,32 +141,18 @@ static char *render_markdown(const char *text)
         snprintf(script, sizeof(script), "%s/.local/bin/ai_mcp.py",
                  home ? home : "~");
 
-    /* Shell-escape the text for safe command-line passing */
-    char *escaped = malloc(strlen(text) * 2 + 1);
-    char *ep = escaped;
-    for (const char *s = text; *s; s++, ep++) {
-        if (*s == '\'') { *ep++ = '\''; *ep++ = '\\'; *ep++ = '\''; *ep++ = '\''; *ep = '\''; continue; }
-        if (*s == '"' || *s == '$' || *s == '\\' || *s == '`' || isspace((unsigned char)*s)) {
-            *ep++ = '\\'; *ep = *s;
-        } else {
-            *ep = *s;
-        }
-    }
-    *ep = '\0';
+    char *safe_text = shell_escape(text);
+    if (!safe_text) return NULL;
 
-    char cmd[1024 + strlen(escaped)];
-    snprintf(cmd, sizeof(cmd), "python3 %s render-markdown '%s' 2>/dev/null", script, escaped);
+    size_t cmd_len = strlen(script) + strlen(safe_text) + 64;
+    char *cmd = malloc(cmd_len);
+    snprintf(cmd, cmd_len, "python3 %s render-markdown %s 2>/dev/null", script, safe_text);
     char *result = run_shell_command(cmd, NULL);
-    free(escaped);
+    free(safe_text);
+    free(cmd);
     return result;
 }
 
-/* Print a styled user message block — appears above the agent's response
- * to create a clear chat-style pattern with distinct user vs assistant areas. */
-/* Print the LLM's final response — distinct from tool call boxes.
- * Renders as a clean chat-style message with a left accent bar and
- * model name as a subtle header. No surrounding box. */
-/* Forward declaration */
 static int lineed_term_cols(void);
 
 /* ── Print a user message box: shows the user's input in a styled container ── */
@@ -122,23 +172,45 @@ static void print_user_message(const char *message) {
 
     /* Content — word-wrapped at terminal width */
     const char *line = message;
-    int remaining = cols;
-    while (*line && remaining > 0) {
+    while (*line) {
         const char *nl = strchr(line, '\n');
-        const char *end = nl ? nl : line + remaining;
-        int len = (int)(end - line);
-
-        /* If the line is longer than cols, break at cols */
-        if (!nl && len >= remaining) {
-            /* Find a space to break on, or just break at cols */
-            const char *space = NULL;
-            const char *search = line;
-            for (int i = 0; i < remaining - 1 && *search; i++, search++) {
-                if (*search == ' ') space = search;
+        const char *end;
+        int len;
+        if (nl) {
+            int line_len = (int)(nl - line);
+            if (line_len <= cols) {
+                len = line_len;
+                end = nl + 1;
+            } else {
+                const char *space = NULL;
+                for (int i = 0; i < cols && line[i]; i++) {
+                    if (line[i] == ' ') space = line + i;
+                }
+                if (space) {
+                    end = space + 1;
+                    len = (int)(space - line);
+                } else {
+                    end = line + cols;
+                    len = cols;
+                }
             }
-            if (space) {
-                end = space + 1;
-                len = (int)(end - line);
+        } else {
+            int line_len = (int)strlen(line);
+            if (line_len <= cols) {
+                len = line_len;
+                end = line + line_len;
+            } else {
+                const char *space = NULL;
+                for (int i = 0; i < cols && line[i]; i++) {
+                    if (line[i] == ' ') space = line + i;
+                }
+                if (space) {
+                    end = space + 1;
+                    len = (int)(space - line);
+                } else {
+                    end = line + cols;
+                    len = cols;
+                }
             }
         }
 
@@ -148,9 +220,6 @@ static void print_user_message(const char *message) {
                (cols - len > 1) ? cols - len - 1 : 0, " ",
                CL_DIM);
         line = end;
-        /* Skip leading space on wrapped lines */
-        while (*line == ' ') line++;
-        remaining = cols;
     }
 
     /* Footer bar */
@@ -158,8 +227,10 @@ static void print_user_message(const char *message) {
     printf("\n");
 }
 
+static void print_markdown_table(const char *content);
 static void print_response_box(const char *model_name, const char *content,
-                               int turn_count, int tool_count)
+                               int turn_count, int tool_count,
+                               double elapsed_sec, double tokens_per_sec)
 {
     printf("\n");
 
@@ -175,32 +246,75 @@ static void print_response_box(const char *model_name, const char *content,
     if (tool_count > 0) {
         printf("  %d tools%s", tool_count, CL_DIM);
     }
+    printf("  \033[2m%.1fs", elapsed_sec);
+    if (tokens_per_sec > 0) {
+        printf("  %d tok/s\033[0m", (int)tokens_per_sec);
+    }
     printf("%*s│%s\n", 0, "", CL_DIM);
 
     /* Content — rendered markdown, word-wrapped */
     if (content) {
+        /* Detect markdown tables: render with alignment, not plain wrapping */
+        const char *first_line = content;
+        int nl_pos = (int)strcspn(content, "\n");
+        int is_table = (nl_pos > 0 && strcspn(first_line, "|") < 30 &&
+                        content[nl_pos] == '|');
+
+        if (is_table) {
+            print_markdown_table(content);
+            return;
+        }
+
         const char *line = content;
         int cols = lineed_term_cols() - 6;
         if (cols < 40) cols = 40;
 
         while (*line) {
             const char *nl = strchr(line, '\n');
-            const char *end = nl ? nl : line + cols;
-            int len = (int)(end - line);
-            if (nl && len >= cols) {
-                /* Try to break at a space */
-                const char *search = line;
-                const char *space = NULL;
-                for (int i = 0; i < cols - 1 && *search; i++, search++) {
-                    if (*search == ' ') space = search;
+            const char *end;
+            int len;
+            if (nl) {
+                int line_len = (int)(nl - line);
+                if (line_len <= cols) {
+                    len = line_len;
+                    end = nl + 1;
+                } else {
+                    const char *space = NULL;
+                    for (int i = 0; i < cols && line[i]; i++) {
+                        if (line[i] == ' ') space = line + i;
+                    }
+                    if (space) {
+                        end = space + 1;
+                        len = (int)(space - line);
+                    } else {
+                        end = line + cols;
+                        len = cols;
+                    }
                 }
-                if (space) { end = space + 1; len = (int)(end - line); }
+            } else {
+                int line_len = (int)strlen(line);
+                if (line_len <= cols) {
+                    len = line_len;
+                    end = line + line_len;
+                } else {
+                    const char *space = NULL;
+                    for (int i = 0; i < cols && line[i]; i++) {
+                        if (line[i] == ' ') space = line + i;
+                    }
+                    if (space) {
+                        end = space + 1;
+                        len = (int)(space - line);
+                    } else {
+                        end = line + cols;
+                        len = cols;
+                    }
+                }
             }
-            printf("%s│ %.*s%*s│%s\n",
+
+            printf("%s│ %.*s%*s│%s\033[0m\n",
                    CL_DIM, len, line, (cols - len > 1) ? cols - len - 1 : 0, " ",
                    CL_DIM);
             line = end;
-            while (*line == ' ') line++;
         }
     }
 
@@ -209,25 +323,36 @@ static void print_response_box(const char *model_name, const char *content,
 }
 
 /* Print a styled tool-result box with header bar */
-static void print_tool_box(const char *name, const char *status, const char *content)
+static void print_tool_box(const char *name, const char *status,
+                           const char *content, double elapsed_sec)
 {
+    /* Tool-type icon + base color */
+    const char *ticon = tool_get_icon(name);
+    const char *tcolor = tool_get_color(name);
+
+    /* Status styling */
     const char *hc = (status && strncmp(status, "error", 5) == 0) ? CL_RED
                   : (status && strcmp(status, "ok") == 0)       ? CL_GREEN
                   : (status && strcmp(status, "info") == 0)      ? CL_CYAN
                   : CL_DIM;
 
-    const char *icon = (status && strncmp(status, "error", 5) == 0) ? "✕"
+    const char *st_icon = (status && strncmp(status, "error", 5) == 0) ? "✕"
                      : (status && strcmp(status, "ok") == 0)        ? "●"
                      : (status && strcmp(status, "info") == 0)       ? "◦"
                      : "·";
 
     printf("\n");
-    printf("%s╭─%s %s⚙%s %s%s%s%s╮\n",
-           CL_MAGENTA, CL_RESET, hc, CL_RESET,
+    printf("%s╭─%s %s%s%s %s%s%s%s╮\n",
+           CL_DIM, CL_RESET, tcolor, ticon, CL_RESET,
            CL_BOLD, name, CL_RESET, CL_DIM);
-    if (status) {
-        printf("%s│ %s%-10s%s%s│\n", CL_DIM, hc, status, CL_RESET, CL_DIM);
+
+    /* Status line: status icon + label + optional timing */
+    printf("%s│ %s%s%s  %s%s%s", CL_DIM, hc, st_icon, CL_RESET,
+           hc, status ? status : "done", CL_RESET);
+    if (elapsed_sec > 0) {
+        printf("  \033[2m%.1fs\033[0m", elapsed_sec);
     }
+    printf("%*s│%s\n", 0, "", CL_DIM);
     printf("%s╰─%s%s╯\n", CL_DIM, CL_DIM, CL_DIM);
 
     /* Content: print with subtle left indent */
@@ -238,19 +363,123 @@ static void print_tool_box(const char *name, const char *status, const char *con
         while (*line && lines < max_lines) {
             const char *nl = strchr(line, '\n');
             if (!nl) {
-                printf("%s  %s\n", CL_DIM, line);
+                printf("%s  %s\033[0m\n", CL_DIM, line);
                 break;
             }
             int len = (int)(nl - line);
-            printf("%s  %.*s\n", CL_DIM, len, line);
+            printf("%s  %.*s\033[0m\n", CL_DIM, len, line);
             line = nl + 1;
             lines++;
         }
         if (*line && lines >= max_lines) {
-            printf("%s  ... (%zu more lines)%s\n", CL_DIM, strlen(line), CL_RESET);
+            printf("%s  ... (%zu more lines)\033[0m\n",
+                   CL_DIM, strlen(line));
         }
     }
     printf("\n");
+}
+
+/* ── Thinking box: dedicated display for reasoning output ─────────────── */
+static void print_think_box(const char *reasoning)
+{
+    printf("\n");
+    printf("%s╭─%s %s◈%s %sThinking%s╮\n",
+           CL_DIM, CL_RESET, CL_DIM, CL_RESET,
+           CL_DIM, CL_RESET);
+    if (reasoning && *reasoning) {
+        printf("%s│  \033[2m%s\033[0m\n", CL_DIM, reasoning);
+    }
+    printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
+}
+
+/* ── Markdown table renderer: aligned columns with separators ─────────── */
+static void print_markdown_table(const char *content)
+{
+    if (!content) return;
+
+    int cols = lineed_term_cols() - 8;
+    if (cols < 40) cols = 40;
+
+    /* Parse rows into dynamic arrays */
+    int max_cols = 4;
+    int *col_widths = calloc(max_cols, sizeof(int));
+    char ***rows = NULL;
+    int nrows = 0, row_cap = 32;
+    rows = calloc(row_cap, sizeof(char*));
+
+    const char *line = content;
+    while (*line) {
+        const char *nl = strchr(line, '\n');
+        int len = nl ? (int)(nl - line) : (int)strlen(line);
+        if (len == 0) { line = nl ? nl + 1 : ""; continue; }
+
+        /* Skip separator rows (|---|---|) */
+        int is_sep = 1;
+        for (int i = 0; i < len; i++) {
+            if (line[i] != '-' && line[i] != ':' && line[i] != '|' && line[i] != ' ') {
+                is_sep = 0; break;
+            }
+        }
+        if (is_sep) { line = nl ? nl + 1 : ""; continue; }
+
+        /* Parse columns */
+        char *row_str = strndup(line, len);
+        char **cells = NULL;
+        int ncells = 0, cap = 8;
+        cells = calloc(cap, sizeof(char*));
+
+        const char *p = row_str;
+        while (*p) {
+            while (*p == '|' || *p == ' ') p++;
+            const char *cs = p;
+            while (*p && *p != '|') p++;
+            int clen = p - cs;
+            while (*p == '|') p++;
+            if (clen > 0) {
+                if (ncells >= cap) { cap *= 2; cells = realloc(cells, cap * sizeof(char*)); }
+                cells[ncells++] = strndup(cs, clen);
+            }
+        }
+        free(row_str);
+        if (ncells == 0) { free(cells); continue; }
+
+        if (nrows >= row_cap) { row_cap *= 2; rows = realloc(rows, row_cap * sizeof(char*)); }
+        rows[nrows] = cells;
+
+        for (int c = 0; c < ncells; c++) {
+            int lw = (int)strlen(cells[c]);
+            if (lw > col_widths[c]) col_widths[c] = lw;
+            if (c + 1 > max_cols) max_cols = c + 2;
+        }
+        nrows++;
+    }
+
+    /* Render table */
+    for (int r = 0; r < nrows; r++) {
+        char **cells = rows[r];
+        printf("%s│", CL_DIM);
+        for (int c = 0; c < max_cols; c++) {
+            char *cell = (c < max_cols) ? cells[c] : "";
+            int w = col_widths[c] + 2;
+            printf(" %-*.*s%s", w, w, cell, CL_DIM);
+            if (c < max_cols - 1) printf("│");
+        }
+        printf("│%s\n", CL_RESET);
+        if (r == 0) {
+            /* Separator after header */
+            for (int c = 0; c < max_cols; c++) {
+                printf("┼");
+                for (int i = 0; i < col_widths[c] + 2; i++) printf("─");
+            }
+            printf("%s\n", CL_RESET);
+        }
+        free(cells);
+    }
+
+    /* Cleanup */
+    for (int r = 0; r < nrows; r++) free(rows[r]);
+    free(rows);
+    free(col_widths);
 }
 
 /* Print a styled error/warning box with border */
@@ -283,7 +512,7 @@ static void print_warning_box(const char *title, const char *body)
                    CL_DIM, len, line, (cols - len > 3) ? cols - len - 3 : 0, " ",
                    CL_DIM);
             line = end;
-            while (*line == ' ') line++;
+            while (*line == ' ' || *line == '\n') line++;
         }
     }
     printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
@@ -318,7 +547,7 @@ static void print_info_box(const char *title, const char *body)
                    CL_DIM, len, line, (cols - len > 3) ? cols - len - 3 : 0, " ",
                    CL_DIM);
             line = end;
-            while (*line == ' ') line++;
+            while (*line == ' ' || *line == '\n') line++;
         }
     }
     printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
@@ -415,6 +644,7 @@ static char *g_session_file = NULL;    /* session state file */
 /* ── Copy / clipboard ── */
 static char *g_last_response = NULL;   /* last assistant response text */
 static int   g_last_response_len = 0;
+static int   g_copy_enabled = 1;
 
 /* ── Thinking spinner animation ── */
 static int g_spinner_idx = 0;
@@ -423,6 +653,7 @@ static int g_spinner_idx = 0;
 static long g_tokens_prompt = 0;
 static long g_tokens_completion = 0;
 static int  g_tokens_total = 0;
+static long g_session_tokens = 0;  /* cumulative across session */
 
 static int is_command_denied(const char *cmd) {
     if (!cmd) return 0;
@@ -458,6 +689,11 @@ static const char *SYSTEM_PROMPT =
     "- When a command fails, you MUST call `think` to analyze the error log before retrying.\n"
     "- Verify your results. After writing a script, run it. If it produces output, read the output carefully.\n"
     "- Once all requested operations succeed and are empirically verified, call task_complete.\n\n"
+    "SYSTEMS ENGINEERING & MEMORY RIGOR (CRITICAL FOR CODE GENERATION):\n"
+    "- Memory Safety: In C/C++, NEVER call free() on stack-allocated memory (e.g. `char buf[128]`). Every free() must match a heap allocation (malloc/calloc/strdup). Never access pointers after free().\n"
+    "- String & Pointer Bounds: Check string bounds (strlen) before pointer arithmetic. Never advance string pointers past '\\0'.\n"
+    "- Complete Verification: When building or editing code, ALWAYS compile (`make` or `g++`) and run unit tests to verify. Update build files (Makefile/CMakeLists.txt) and test suites whenever new source files are added.\n"
+    "- Shell Command Safety: Do NOT embed raw single-quoted strings into shell commands without proper escaping. Write complex text to files or stdin to avoid syntax errors.\n\n"
     "TOOL USE:\n"
     "- For facts you already know (e.g. definitions, formulas, capitals), call task_complete directly — no tools needed.\n"
     "- For scientific databases, public APIs, or structured data (PDB, UniProt, NCBI, NASA, arXiv, etc.): use execute_command with curl to query the REST API directly. DO NOT rely on web_search snippets for structured data — the API will give exact answers.\n"
@@ -779,33 +1015,23 @@ static void git_commit(const char *extra_msg) {
     FILE *fp = popen(verify_cmd, "r");
     if (fp) {
         char buf[16] = {0};
-        if (fgets(buf, sizeof(buf), fp)) {
+        char *r = fgets(buf, sizeof(buf), fp);
+        pclose(fp);
+        if (r) {
             int has_changes = atoi(buf);
-            pclose(fp);
             if (has_changes == 0) {
                 /* There are staged changes - commit them */
                 const char *commit_msg = g_git_commit_msg ? g_git_commit_msg : "auto-commit: tool changes";
                 if (extra_msg) {
-                    size_t msg_len = strlen(commit_msg) + strlen(extra_msg) + 32;
-                    char *full_msg = malloc(msg_len);
-                    snprintf(full_msg, msg_len, "%s: %s", commit_msg, extra_msg);
-                    snprintf(cmd, sizeof(cmd), "git -C . commit -m '%s' 2>/dev/null",
-                             extra_msg ? extra_msg : commit_msg);
-                    /* Use proper escaping */
-                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s'", extra_msg);
-                    system(cmd);
-                    free(full_msg);
+                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s: %s'", commit_msg, extra_msg);
+                    (void)system(cmd);
                 } else {
                     snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s' 2>/dev/null", commit_msg);
-                    system(cmd);
+                    (void)system(cmd);
                 }
-                if (!g_git_commit_msg) free(g_git_commit_msg);
+                if (g_git_commit_msg) free(g_git_commit_msg);
                 g_git_commit_msg = NULL;
-            } else {
-                pclose(fp);
             }
-        } else {
-            pclose(fp);
         }
     }
 }
@@ -817,21 +1043,20 @@ static void notify_completion(const char *summary) {
     /* Use notify-send on Linux */
     char cmd[2048];
     if (summary && *summary) {
-        /* Truncate summary for notification */
-        char truncated[256] = {0};
-        int len = strlen(summary);
-        if (len > 240) {
-            memcpy(truncated, summary, 240);
-            truncated[240] = '\0';
-            strcat(truncated, "...");
-        } else {
-            strncpy(truncated, summary, sizeof(truncated) - 1);
+        /* Sanitize summary to remove single quotes and unsafe shell chars */
+        char safe_summary[256] = {0};
+        int j = 0;
+        for (int i = 0; summary[i] && j < 240; i++) {
+            char c = summary[i];
+            if (c == '\'' || c == '"' || c == '`' || c == '\\' || c == '\n') safe_summary[j++] = ' ';
+            else safe_summary[j++] = c;
         }
+        safe_summary[j] = '\0';
         snprintf(cmd, sizeof(cmd), "notify-send -u normal 'ai task done' '%s' 2>/dev/null &",
-                 truncated);
-        system(cmd);
+                 safe_summary);
+        (void)system(cmd);
     } else {
-        system("notify-send -u normal 'ai task done' 'Task completed successfully' 2>/dev/null &");
+        (void)system("notify-send -u normal 'ai task done' 'Task completed successfully' 2>/dev/null &");
     }
 }
 
@@ -938,34 +1163,19 @@ static void save_session_state(const char *prompt, const char *messages, int ses
 
 /* ── Copy response to system clipboard ── */
 static void copy_to_clipboard(const char *text) {
-    if (!text || !*text) {
-        fprintf(stderr, "\033[2m[ai] Nothing to copy — no response yet.\033[0m\n");
-        return;
-    }
+    if (!text || !*text || !g_copy_enabled) return;
 
-    /* Try xclip first, then xsel, then pbcopy (macOS) */
-    char cmd[4096];
-    int ok = 0;
+    FILE *fp = popen("xclip -selection clipboard 2>/dev/null", "w");
+    if (!fp) fp = popen("xsel --clipboard 2>/dev/null", "w");
+    if (!fp) fp = popen("pbcopy 2>/dev/null", "w");
 
-    snprintf(cmd, sizeof(cmd), "printf '%s' '%s' | xclip -selection clipboard 2>/dev/null",
-             text, text);
-    if (system(cmd) == 0) { ok = 1; }
-
-    if (!ok) {
-        snprintf(cmd, sizeof(cmd), "printf '%s' '%s' | xsel --clipboard 2>/dev/null",
-                 text, text);
-        if (system(cmd) == 0) { ok = 1; }
-    }
-
-    if (!ok) {
-        snprintf(cmd, sizeof(cmd), "printf '%s' | pbcopy 2>/dev/null", text);
-        if (system(cmd) == 0) { ok = 1; }
-    }
-
-    if (ok) {
-        fprintf(stderr, "\033[2m[ai] Response copied to clipboard.\033[0m\n");
-    } else {
-        fprintf(stderr, "\033[2m[ai] Warning: no clipboard tool available (tried xclip, xsel, pbcopy).\033[0m\n");
+    if (fp) {
+        fputs(text, fp);
+        int status = pclose(fp);
+        if (status == 0) {
+            fprintf(stderr, "\033[2m[ai] Response copied to clipboard.\033[0m\n");
+            return;
+        }
     }
 }
 
@@ -3629,7 +3839,7 @@ int main(int argc, char **argv) {
             g_git_commit_msg = argv[i+1];
             i++;
         } else if (strcmp(argv[i], "--no-copy") == 0) {
-            /* Disable auto-copy on task_complete */
+            g_copy_enabled = 0;
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
             if (i + 1 < argc && argv[i+1][0] != '-' &&
                 (strncmp(argv[i+1], "sess_", 5) == 0 || strcmp(argv[i+1], "last") == 0 ||
@@ -4091,15 +4301,20 @@ int main(int argc, char **argv) {
 
     if (interactive_mode && !run_query_this_turn) {
         printf("\n");
-        printf("%s╭──╮%s  %sai%s — autonomous coding agent%s\n",
-               CL_MAGENTA, CL_DIM, CL_MAGENTA CL_BOLD, CL_DIM, CL_RESET);
-        printf("%s│%s %s%s%s  %s  %s\n\n",
-               CL_MAGENTA, CL_DIM,
-               CL_CYAN CL_BOLD, model[0] ? model : "unknown model", CL_RESET,
-               current_session_id[0] ? CL_GREEN "resuming" : CL_DIM "new session",
-               CL_RESET);
-        printf("%s:help · ESC to interrupt · Shift-Tab to toggle auto-approve · :commit/:undo/:copy · :notify · :btw <msg>%s\n\n",
-               CL_DIM, CL_RESET);
+        printf("%s╭─%s %s◈%s %s%s%s %s─%s autonomous coding agent%s╮\n",
+               CL_MAGENTA, CL_RESET, CL_MAGENTA, CL_RESET,
+               CL_MAGENTA CL_BOLD, "ai", CL_RESET, CL_DIM, CL_DIM, CL_RESET);
+        printf("%s│ %s│ %s%s%s · %s · %s%s%s╮\n",
+               CL_DIM, CL_DIM,
+               CL_CYAN CL_BOLD, model[0] ? model : "unknown", CL_RESET,
+               current_session_id,
+               g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
+               CL_RESET, CL_RESET);
+        printf("%s│ %s%s%s╰╯%s\n",
+               CL_DIM, CL_DIM, CL_DIM, CL_DIM, CL_RESET);
+        printf("%s│ %s:help %s· %sESC%s interrupt  %sShift-Tab%s auto-approve  %s:commit/:undo/:copy%s  %s:notify/:btw%s%s│\n",
+               CL_DIM, CL_DIM, CL_DIM, CL_DIM, CL_RESET, CL_DIM, CL_RESET, CL_DIM, CL_RESET, CL_DIM, CL_RESET, CL_DIM);
+        printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
         lineed_init();
     }
 
@@ -4116,37 +4331,70 @@ int main(int argc, char **argv) {
             printf("\n");
             fflush(stdout);
 
-            /* ── Turn separator (elegant divider) ── */
+            /* ── Turn separator (clean header) ── */
+            g_turn_count++;
             if (g_turn_count > 1) {
-                printf("%s╭─ %s %s  turn %d · %s · %s%s╮\n",
-                       CL_DIM, CL_MAGENTA, CL_DIM, g_turn_count,
-                       model[0] ? model : "unknown",
+                printf("%s╭─%s %s%03d%s  turn %d · %s%s%s · %s%s%s╮\n",
+                       CL_DIM, CL_RESET, CL_MAGENTA, g_turn_count, CL_RESET,
+                       g_turn_count,
+                       CL_MAGENTA CL_BOLD, model[0] ? model : "unknown", CL_RESET,
+                       g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
+                       CL_DIM, CL_RESET);
+
+                /* Context usage bar */
+                if (context_window > 0 && g_session_tokens > 0) {
+                    int pct = (int)(100.0 * g_session_tokens / context_window);
+                    int bar_w = lineed_term_cols() - 12;
+                    if (bar_w < 20) bar_w = 20;
+                    int filled = (pct * bar_w) / 100;
+                    printf("%s│ %s▐", CL_DIM, CL_DIM);
+                    for (int i = 0; i < bar_w; i++) {
+                        if (i < filled) {
+                            if (pct > 90) printf("%s", CL_RED);
+                            else if (pct > 70) printf("%s", CL_YELLOW);
+                            else printf("%s", CL_GREEN);
+                        } else {
+                            printf("%s", CL_DIM);
+                        }
+                    }
+                    printf("%s %d%%\033[0m%s│\n", CL_DIM, pct, CL_DIM);
+                } else {
+                    printf("%s╰─%s%s╯\n", CL_DIM, CL_DIM, CL_DIM);
+                }
+            } else {
+                printf("%s╭─%s turn 1 · %s%s%s · %s%s%s╮\n",
+                       CL_DIM, CL_RESET, CL_MAGENTA,
+                       CL_MAGENTA CL_BOLD, model[0] ? model : "unknown", CL_RESET,
                        g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
                        CL_DIM);
+                printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
             }
 
-            /* ── Turn counter ── */
-            g_turn_count++;
-
-            /* ── Prompt header: model info + session context + mode ── */
-            printf("%s│ %s%s%s  %s[%s]%s  %s▸ %s%s%s\n",
-                   CL_DIM,
-                   CL_MAGENTA CL_BOLD, model[0] ? model : "unknown", CL_RESET,
-                   CL_DIM, current_session_id, CL_RESET,
-                   g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm", CL_RESET,
-                   CL_DIM);
-            printf("%s╰─%s%s╯\n", CL_DIM, CL_DIM, CL_DIM);
-
-            /* Build dynamic prompt with model name */
+            /* Build dynamic prompt with model name + input hints */
             char model_display[128];
             snprintf(model_display, sizeof(model_display),
                      "%s  %s%s%s  %s▸ %s  ",
                      CL_MAGENTA, CL_MAGENTA CL_BOLD,
                      model[0] ? model : "unknown", CL_RESET,
                      CL_DIM, CL_RESET);
-            char prompt_str[256];
+
+            /* Context window indicator (if available) */
+            char ctx_hint[64] = "";
+            if (context_window > 0 && g_session_tokens > 0) {
+                int pct = (int)(100.0 * g_session_tokens / context_window);
+                if (pct > 90) snprintf(ctx_hint, sizeof(ctx_hint),
+                    "%s[%d%%]\033[0m", CL_RED, pct);
+                else if (pct > 70) snprintf(ctx_hint, sizeof(ctx_hint),
+                    "%s[%d%%]\033[0m", CL_YELLOW, pct);
+                else snprintf(ctx_hint, sizeof(ctx_hint),
+                    "\033[2m[%d%%]\033[0m", pct);
+            }
+
+            char prompt_str[512];
             snprintf(prompt_str, sizeof(prompt_str),
-                     "\033[1;35mai\033[0m\033[2m▸ \033[0m%s", model_display);
+                     "\033[1;35mai\033[0m\033[2m▸ \033[0m%s%s%s",
+                     model_display, ctx_hint,
+                     "\033[2m  (tab:history, ?/h:help, ⎵:approve)\033[0m");
             char *line = read_line_interactive(prompt_str);
             if (!line) {
                 printf("\n");
@@ -4623,6 +4871,8 @@ step_limit_check:
                         }
                         k = json_skip_token(tok, r, k + 2);
                     }
+                    /* Accumulate session-wide token count */
+                    g_session_tokens += total_tokens;
                 }
 
                 if (error_tok != -1) {
@@ -4814,10 +5064,10 @@ step_limit_check:
                                        char *rendered = render_markdown(summary);
                                        fflush(stderr);
                                        if (rendered && *rendered) {
-                                           print_tool_box("✅ task_complete", "ok", rendered);
+                                           print_tool_box("✅ task_complete", "ok", rendered, 0.0);
                                            free(rendered);
                                        } else {
-                                           print_tool_box("✅ task_complete", "ok", summary);
+                                           print_tool_box("✅ task_complete", "ok", summary, 0.0);
                                        }
                                        free(escaped_summary);
                                        free(summary);
@@ -4914,6 +5164,17 @@ step_limit_check:
                                            char *status = remote_get_status(g_remote_server);
                                            tool_output = status ? status : strdup("Error: failed to get status");
                                        }
+                                   } else if (strcmp(action, "mount") == 0) {
+                                       if (!g_remote_server) {
+                                           tool_output = strdup("Error: not connected to remote server");
+                                       } else if (!cmd_val) {
+                                           tool_output = strdup("Error: 'command' argument required (format: 'mount <server_path> <mount_point>')");
+                                       } else {
+                                           char mount_cmd[1024];
+                                           snprintf(mount_cmd, sizeof(mount_cmd), "mount %s", cmd_val);
+                                           char *output = remote_exec(g_remote_server, mount_cmd, 60);
+                                           tool_output = output ? output : strdup("Error: mount failed");
+                                       }
                                    } else if (strcmp(action, "exec") == 0) {
                                        if (!g_remote_server) {
                                            tool_output = strdup("Error: not connected to remote server");
@@ -4922,27 +5183,6 @@ step_limit_check:
                                        } else {
                                            char *output = remote_exec(g_remote_server, cmd_val, timeout_sec);
                                            tool_output = output ? output : strdup("Error: command execution failed");
-                                       }
-                                   } else if (strcmp(action, "mount") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server");
-                                       } else {
-                                           /* Parse mount arguments from command field */
-                                           /* Format: "mount <server_path> <mount_point>" */
-                                           char mount_cmd[1024];
-                                           if (cmd_val) {
-                                               snprintf(mount_cmd, sizeof(mount_cmd), "mount %s", cmd_val);
-                                           } else {
-                                               tool_output = strdup("Error: 'command' argument required (format: 'mount <server_path> <mount_point>')");
-                                           }
-                                           if (!cmd_val) {
-                                               /* already handled above */
-                                           } else {
-                                               char *output = remote_exec(g_remote_server, mount_cmd, 60);
-                                               tool_output = output ? output : strdup("Error: mount failed");
-                                               free(output);
-                                               free(mount_cmd);
-                                           }
                                        }
                                    } else if (strcmp(action, "jobs") == 0) {
                                        if (!g_remote_server) {
@@ -5329,7 +5569,10 @@ step_limit_check:
                                           strcat(full_content, err_hint);
                                       }
 
-                                      print_tool_box(unescaped_name, status_label, full_content);
+                                      double tool_elapsed = (tool_output && strncmp(tool_output, "Error", 5) != 0)
+                                                            ? elapsed_sec : 0.0;
+                                      print_tool_box(unescaped_name, status_label,
+                                                     full_content, tool_elapsed);
                                       free(full_content);
                                   }
 
@@ -5492,10 +5735,10 @@ step_limit_check:
                               char *rendered = render_markdown(leaked_summary);
                               fflush(stderr);
                               if (rendered && *rendered) {
-                                  print_tool_box("✅ task_complete (extracted)", "ok", rendered);
+                                  print_tool_box("✅ task_complete (extracted)", "ok", rendered, 0.0);
                                   free(rendered);
                               } else {
-                                  print_tool_box("✅ task_complete (extracted)", "ok", leaked_summary);
+                                  print_tool_box("✅ task_complete (extracted)", "ok", leaked_summary, 0.0);
                               }
                               free(leaked_summary);
                               free(unescaped_content);
@@ -5508,13 +5751,17 @@ step_limit_check:
 
                           fflush(stderr);
                           {
+                              double tps = (elapsed_sec > 0.05 && completion_tokens > 0)
+                                           ? completion_tokens / elapsed_sec : 0.0;
                               if (rendered_output && *rendered_output) {
                                   print_response_box(model[0] ? model : "model", rendered_output,
-                                                     g_turn_count, total_tool_count);
+                                                     g_turn_count, total_tool_count,
+                                                     elapsed_sec, tps);
                                   free(rendered_output);
                               } else {
                                   print_response_box(model[0] ? model : "model", unescaped_content,
-                                                     g_turn_count, total_tool_count);
+                                                     g_turn_count, total_tool_count,
+                                                     elapsed_sec, tps);
                               }
                           }
 
