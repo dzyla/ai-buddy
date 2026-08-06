@@ -62,7 +62,6 @@ static char* run_command(const char *cmd, int timeout_sec, int *exit_code) {
     }
     
     unlink(tmpfile);
-    free(tmpfile);
     return strdup(outbuf);
 }
 
@@ -374,7 +373,7 @@ char* remote_list_jobs(remote_server_t *server, const char *user, int max_jobs) 
     
     char *cmd = malloc(512);
     if (server->job_system.system_type == JOB_SLURM) {
-        snprintf(cmd, 512, "squeue -u %s -o '%.10i %.8i %.10i %5.5i %10.10i %10.10i %10.10i %20.20s' -h | head -n %d",
+        snprintf(cmd, 512, "squeue -u %s -o '%%.10i %%.8u %%.10T %%.5M %%.10l %%.10D %%.10R' -h | head -n %d",
                  user, max_jobs);
     } else {
         snprintf(cmd, 512, "showq -u %s | grep '^ *%s' | head -n %d", user, user, max_jobs);

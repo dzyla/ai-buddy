@@ -21,7 +21,7 @@ Here is the error log:
 
 Analyze why the harness failed. Your task is to dynamically rewrite the harness code (ai.c or ai_mcp.py) to fix the underlying execution issue causing this benchmark failure.
 1. Use edit_file or run_command to apply your rewrite.
-2. Recompile ai.c using 'gcc -O2 -o ~/.local/bin/ai ai.c cJSON.c -lcurl'.
+2. Recompile ai.c using 'gcc -O2 -o ~/.local/bin/ai ai.c remote_harness.c cJSON.c -lcurl -lssl -lcrypto -lpthread -lm'.
 3. Run the benchmark locally via 'python3 benchmark_assistant.py'.
 4. If it still fails, iterate.
 5. Exit gracefully when the benchmark passes.
