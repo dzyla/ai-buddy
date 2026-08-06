@@ -18,11 +18,6 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <errno.h>
-#include "remote_harness.h"
-
-/* ── Remote Server State ───────────────────────────────────────────────────── */
-static remote_server_t *g_remote_server = NULL;
-static int g_remote_discovered = 0;
 #include <signal.h>
 
 #define MAX_LINE 1024
@@ -97,118 +92,49 @@ static char *render_markdown(const char *text)
     return result;
 }
 
-/* Print a styled user message block — appears above the agent's response
- * to create a clear chat-style pattern with distinct user vs assistant areas. */
 /* Print the LLM's final response — distinct from tool call boxes.
  * Renders as a clean chat-style message with a left accent bar and
  * model name as a subtle header. No surrounding box. */
-/* Forward declaration */
-static int lineed_term_cols(void);
-
-/* ── Print a user message box: shows the user's input in a styled container ── */
-static void print_user_message(const char *message) {
-    if (!message || !*message) return;
-
-    int cols = lineed_term_cols() - 6;
-    if (cols < 40) cols = 40;
-
-    printf("\n");
-
-    /* Header bar: subtle magenta accent */
-    printf("%s╭─%s %s%s%s %sYou%s %s╮\n",
-           CL_MAGENTA, CL_DIM,
-           CL_MAGENTA CL_DIM, "▸", CL_RESET,
-           CL_MAGENTA CL_BOLD, CL_RESET, CL_DIM);
-
-    /* Content — word-wrapped at terminal width */
-    const char *line = message;
-    int remaining = cols;
-    while (*line && remaining > 0) {
-        const char *nl = strchr(line, '\n');
-        const char *end = nl ? nl : line + remaining;
-        int len = (int)(end - line);
-
-        /* If the line is longer than cols, break at cols */
-        if (!nl && len >= remaining) {
-            /* Find a space to break on, or just break at cols */
-            const char *space = NULL;
-            const char *search = line;
-            for (int i = 0; i < remaining - 1 && *search; i++, search++) {
-                if (*search == ' ') space = search;
-            }
-            if (space) {
-                end = space + 1;
-                len = (int)(end - line);
-            }
-        }
-
-        printf("%s│ %.*s%s%*s│%s\n",
-               CL_DIM, len, line,
-               CL_RESET,
-               (cols - len > 1) ? cols - len - 1 : 0, " ",
-               CL_DIM);
-        line = end;
-        /* Skip leading space on wrapped lines */
-        while (*line == ' ') line++;
-        remaining = cols;
-    }
-
-    /* Footer bar */
-    printf("%s╰─%s%s╯\n", CL_DIM, CL_DIM, CL_DIM);
-    printf("\n");
-}
-
-static void print_response_box(const char *model_name, const char *content,
-                               int turn_count, int tool_count)
+static void print_response_box(const char *model_name, const char *content)
 {
     printf("\n");
 
-    /* Header bar: model name + turn/tool count */
-    printf("%s╭─%s %s◉%s %s%s%s%s╮\n",
-           CL_MAGENTA, CL_RESET, CL_MAGENTA, CL_RESET,
-           CL_MAGENTA CL_BOLD, model_name ? model_name : "assistant",
-           CL_DIM, CL_DIM);
+    /* Model name header — thin magenta accent bar */
+    printf("%s ── %s%s%s  %s%s\n",
+           CL_DIM,
+           CL_MAGENTA, model_name ? model_name : "model",
+           CL_DIM,
+           "─" CL_RESET,
+           CL_RESET);
 
-    /* Meta line */
-    printf("%s│  turn %d  %s▸%s", CL_DIM, turn_count > 0 ? turn_count : 0,
-           CL_RESET, CL_DIM);
-    if (tool_count > 0) {
-        printf("  %d tools%s", tool_count, CL_DIM);
-    }
-    printf("%*s│%s\n", 0, "", CL_DIM);
-
-    /* Content — rendered markdown, word-wrapped */
+    /* Content — rendered markdown, full width */
     if (content) {
         const char *line = content;
-        int cols = lineed_term_cols() - 6;
-        if (cols < 40) cols = 40;
-
-        while (*line) {
+        int lines = 0;
+        const int max_lines = 100;
+        while (*line && lines < max_lines) {
             const char *nl = strchr(line, '\n');
-            const char *end = nl ? nl : line + cols;
-            int len = (int)(end - line);
-            if (nl && len >= cols) {
-                /* Try to break at a space */
-                const char *search = line;
-                const char *space = NULL;
-                for (int i = 0; i < cols - 1 && *search; i++, search++) {
-                    if (*search == ' ') space = search;
-                }
-                if (space) { end = space + 1; len = (int)(end - line); }
+            if (!nl) {
+                printf("%s%s\n", line, CL_RESET);
+                break;
             }
-            printf("%s│ %.*s%*s│%s\n",
-                   CL_DIM, len, line, (cols - len > 1) ? cols - len - 1 : 0, " ",
-                   CL_DIM);
-            line = end;
-            while (*line == ' ') line++;
+            int len = (int)(nl - line);
+            printf("%.*s\n", len, line);
+            line = nl + 1;
+            lines++;
+        }
+        if (*line && lines >= max_lines) {
+            printf("  ... (%zu more lines)%s\n", strlen(line), CL_RESET);
         }
     }
 
-    /* Footer bar */
-    printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
+    printf("%s\n", CL_DIM);
 }
 
-/* Print a styled tool-result box with header bar */
+/* Print a styled tool-result box:
+ *  Clean compact format with colored icon, name, and status.
+ *  Content printed with subtle left indent.
+ */
 static void print_tool_box(const char *name, const char *status, const char *content)
 {
     const char *hc = (status && strncmp(status, "error", 5) == 0) ? CL_RED
@@ -222,106 +148,76 @@ static void print_tool_box(const char *name, const char *status, const char *con
                      : "·";
 
     printf("\n");
-    printf("%s╭─%s %s⚙%s %s%s%s%s╮\n",
-           CL_MAGENTA, CL_RESET, hc, CL_RESET,
-           CL_BOLD, name, CL_RESET, CL_DIM);
-    if (status) {
-        printf("%s│ %s%-10s%s%s│\n", CL_DIM, hc, status, CL_RESET, CL_DIM);
-    }
-    printf("%s╰─%s%s╯\n", CL_DIM, CL_DIM, CL_DIM);
+    printf("%s  %s%s  %s%s  %s%s\n",
+           CL_DIM, hc, icon, CL_RESET, name, CL_DIM, status ? status : "");
+    printf("%s%s\n", CL_DIM, "─");
 
-    /* Content: print with subtle left indent */
+    /* Content: print up to max_lines lines */
     if (content) {
         const char *line = content;
-        const int max_lines = 50;
         int lines = 0;
+        const int max_lines = 50;
         while (*line && lines < max_lines) {
             const char *nl = strchr(line, '\n');
             if (!nl) {
-                printf("%s  %s\n", CL_DIM, line);
+                printf("%s\n", line);
                 break;
             }
             int len = (int)(nl - line);
-            printf("%s  %.*s\n", CL_DIM, len, line);
+            printf("%.*s\n", len, line);
             line = nl + 1;
             lines++;
         }
         if (*line && lines >= max_lines) {
-            printf("%s  ... (%zu more lines)%s\n", CL_DIM, strlen(line), CL_RESET);
+            printf("  ... (%zu more lines)%s\n",
+                   strlen(line), CL_RESET);
         }
     }
     printf("\n");
 }
 
-/* Print a styled error/warning box with border */
+/* Print a styled error/warning box */
 static void print_warning_box(const char *title, const char *body)
 {
-    int cols = lineed_term_cols() - 6;
-    if (cols < 40) cols = 40;
-
-    printf("\n");
-    printf("%s╭─%s %s⚠%s %s%s%s%s╮\n",
-           CL_RED, CL_RESET, CL_RED, CL_RESET,
-           CL_RED CL_BOLD, title, CL_RESET, CL_DIM);
-
+    printf("\n%s  %s  %s\n",
+           CL_RED CL_BOLD, title, CL_RESET);
     if (body) {
         const char *line = body;
         while (*line) {
             const char *nl = strchr(line, '\n');
-            const char *end = nl ? nl : line + cols - 4;
-            int len = (int)(end - line);
-            if (nl && len >= cols - 4) {
-                /* Try space break */
-                const char *search = line;
-                const char *space = NULL;
-                for (int i = 0; i < cols - 5 && *search; i++, search++) {
-                    if (*search == ' ') space = search;
-                }
-                if (space) { end = space + 1; len = (int)(end - line); }
+            if (!nl) {
+                printf("  %s%s\n", CL_RESET, line);
+                break;
             }
-            printf("%s│ %.*s%*s│%s\n",
-                   CL_DIM, len, line, (cols - len > 3) ? cols - len - 3 : 0, " ",
-                   CL_DIM);
-            line = end;
-            while (*line == ' ') line++;
+            int len = (int)(nl - line);
+            printf("  %.*s%s\n", len, line, CL_RESET);
+            line = nl + 1;
         }
     }
-    printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
+    printf("%s%s\n", CL_RED, "─");
+    printf("\n");
 }
 
 /* Print a styled info box (for context resets, compaction, etc.) */
 static void print_info_box(const char *title, const char *body)
 {
-    int cols = lineed_term_cols() - 6;
-    if (cols < 40) cols = 40;
-
-    printf("\n");
-    printf("%s╭─%s %sℹ%s %s%s%s%s╮\n",
-           CL_CYAN, CL_RESET, CL_CYAN, CL_RESET,
-           CL_CYAN CL_BOLD, title, CL_RESET, CL_DIM);
-
+    printf("\n%s  %s  %s\n",
+           CL_CYAN, title, CL_RESET);
     if (body) {
         const char *line = body;
         while (*line) {
             const char *nl = strchr(line, '\n');
-            const char *end = nl ? nl : line + cols - 4;
-            int len = (int)(end - line);
-            if (nl && len >= cols - 4) {
-                const char *search = line;
-                const char *space = NULL;
-                for (int i = 0; i < cols - 5 && *search; i++, search++) {
-                    if (*search == ' ') space = search;
-                }
-                if (space) { end = space + 1; len = (int)(end - line); }
+            if (!nl) {
+                printf("  %s%s\n", CL_RESET, line);
+                break;
             }
-            printf("%s│ %.*s%*s│%s\n",
-                   CL_DIM, len, line, (cols - len > 3) ? cols - len - 3 : 0, " ",
-                   CL_DIM);
-            line = end;
-            while (*line == ' ') line++;
+            int len = (int)(nl - line);
+            printf("  %.*s%s\n", len, line, CL_RESET);
+            line = nl + 1;
         }
     }
-    printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
+    printf("%s%s\n", CL_CYAN, "─");
+    printf("\n");
 }
 
 // Config globals
@@ -1309,7 +1205,6 @@ static char *g_system_message_json = NULL;
 static volatile int g_compact_in_progress = 0;
 static int g_compact_dot_timer = 0;
 static int g_turn_count = 0;
-static int total_tool_count = 0;
 static int g_continue_until_done = 0;
 static volatile int g_agent_loop_active = 0; /* 1 while the has_more agent loop runs */
 
@@ -4116,37 +4011,22 @@ int main(int argc, char **argv) {
             printf("\n");
             fflush(stdout);
 
-            /* ── Turn separator (elegant divider) ── */
+            /* ── Turn separator (dim line between turns) ── */
             if (g_turn_count > 1) {
-                printf("%s╭─ %s %s  turn %d · %s · %s%s╮\n",
-                       CL_DIM, CL_MAGENTA, CL_DIM, g_turn_count,
-                       model[0] ? model : "unknown",
-                       g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
-                       CL_DIM);
+                printf("%s    %s %s  turn %d%s\n",
+                       CL_DIM, CL_MAGENTA, CL_DIM, g_turn_count, CL_RESET);
             }
 
             /* ── Turn counter ── */
             g_turn_count++;
 
             /* ── Prompt header: model info + session context + mode ── */
-            printf("%s│ %s%s%s  %s[%s]%s  %s▸ %s%s%s\n",
-                   CL_DIM,
-                   CL_MAGENTA CL_BOLD, model[0] ? model : "unknown", CL_RESET,
-                   CL_DIM, current_session_id, CL_RESET,
-                   g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm", CL_RESET,
-                   CL_DIM);
-            printf("%s╰─%s%s╯\n", CL_DIM, CL_DIM, CL_DIM);
-
-            /* Build dynamic prompt with model name */
-            char model_display[128];
-            snprintf(model_display, sizeof(model_display),
-                     "%s  %s%s%s  %s▸ %s  ",
-                     CL_MAGENTA, CL_MAGENTA CL_BOLD,
-                     model[0] ? model : "unknown", CL_RESET,
-                     CL_DIM, CL_RESET);
-            char prompt_str[256];
-            snprintf(prompt_str, sizeof(prompt_str),
-                     "\033[1;35mai\033[0m\033[2m▸ \033[0m%s", model_display);
+            printf("%s%s  [%s]%s  %s  %d\n",
+                   CL_MAGENTA CL_BOLD, "ai ",
+                   current_session_id, CL_RESET,
+                   g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
+                   g_turn_count);
+            const char *prompt_str = "\033[1;35mai\033[0m\033[2m▸ \033[0m";
             char *line = read_line_interactive(prompt_str);
             if (!line) {
                 printf("\n");
@@ -4157,11 +4037,6 @@ int main(int argc, char **argv) {
             strncpy(user_input, line, sizeof(user_input) - 1);
             user_input[sizeof(user_input) - 1] = '\0';
             free(line);
-
-            /* Display user message in styled box */
-            if (user_input[0]) {
-                print_user_message(user_input);
-            }
 
             /* Shift-Tab — returned as sentinel by read_line_interactive */
             if (user_input[0] == '\033' && user_input[1] == '[' && user_input[2] == 'Z') {
@@ -4825,202 +4700,6 @@ step_limit_check:
                                    tool_output = strdup("{\"ok\":true}");
                                    has_more = 0;
                                    task_done = 1;
-                               } else if (strcmp(unescaped_name, "remote_exec") == 0) {
-                                   /* ── Remote Server Control Tool ────────────────────────── */
-                                   /* Connect, discover, execute commands, monitor resources, submit jobs */
-                                   
-                                   /* Parse arguments */
-                                   jsmn_parser arg_parser;
-                                   jsmntok_t arg_toks[512];
-                                   jsmn_init(&arg_parser);
-                                   int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 512);
-                                   
-                                   char *action_val = NULL;
-                                   char *host_val = NULL;
-                                   char *port_val = NULL;
-                                   char *user_val = NULL;
-                                   char *pass_val = NULL;
-                                   char *cmd_val = NULL;
-                                   char *timeout_val = NULL;
-                                   
-                                   for (int a = 1; a < arg_r; a++) {
-                                       if (arg_toks[a].type == JSMN_STRING) {
-                                           int klen = arg_toks[a].end - arg_toks[a].start;
-                                           
-                                           if (klen == 6 && strncmp(unescaped_args + arg_toks[a].start, "action", 6) == 0) {
-                                               action_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           } else if (klen == 4 && strncmp(unescaped_args + arg_toks[a].start, "host", 4) == 0) {
-                                               host_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           } else if (klen == 4 && strncmp(unescaped_args + arg_toks[a].start, "port", 4) == 0) {
-                                               port_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           } else if (klen == 5 && strncmp(unescaped_args + arg_toks[a].start, "user", 5) == 0) {
-                                               user_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           } else if ((klen == 5 && strncmp(unescaped_args + arg_toks[a].start, "passw", 5) == 0) ||
-                                                      (klen == 4 && strncmp(unescaped_args + arg_toks[a].start, "pass", 4) == 0)) {
-                                               pass_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           } else if (klen == 7 && strncmp(unescaped_args + arg_toks[a].start, "command", 7) == 0) {
-                                               cmd_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           } else if (klen == 7 && strncmp(unescaped_args + arg_toks[a].start, "timeout", 7) == 0) {
-                                               timeout_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                           }
-                                       }
-                                   }
-                                   
-                                   char *action = action_val ? action_val : "connect";
-                                   int timeout_sec = timeout_val ? atoi(timeout_val) : 120;
-                                   if (timeout_sec <= 0) timeout_sec = 120;
-                                   
-                                   /* Handle connection lifecycle */
-                                   if (strcmp(action, "connect") == 0) {
-                                       if (!host_val || !user_val) {
-                                           tool_output = strdup("Error: 'host' and 'user' arguments required for connect");
-                                       } else {
-                                           int port = REMOTE_DEFAULT_PORT;
-                                           if (port_val) port = atoi(port_val);
-                                           
-                                           if (g_remote_server) {
-                                               remote_disconnect(g_remote_server);
-                                           }
-                                           
-                                           g_remote_server = remote_connect(host_val, port, user_val, 
-                                                                               pass_val ? pass_val : "", 
-                                                                               "Remote Cluster");
-                                           if (g_remote_server) {
-                                               tool_output = strdup("Connected to remote server.");
-                                           } else {
-                                               tool_output = strdup("Error: failed to connect to remote server");
-                                           }
-                                       }
-                                   } else if (strcmp(action, "disconnect") == 0) {
-                                       if (g_remote_server) {
-                                           remote_disconnect(g_remote_server);
-                                           g_remote_server = NULL;
-                                       }
-                                       tool_output = strdup("Disconnected from remote server.");
-                                   } else if (strcmp(action, "discover") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server. Call connect first.");
-                                       } else if (!remote_discover(g_remote_server)) {
-                                           tool_output = strdup("Error: discovery failed");
-                                       } else {
-                                           char *status = remote_get_status(g_remote_server);
-                                           tool_output = status ? status : strdup("Discovery complete.");
-                                           g_remote_discovered = 1;
-                                       }
-                                   } else if (strcmp(action, "status") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server");
-                                       } else {
-                                           char *status = remote_get_status(g_remote_server);
-                                           tool_output = status ? status : strdup("Error: failed to get status");
-                                       }
-                                   } else if (strcmp(action, "exec") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server");
-                                       } else if (!cmd_val) {
-                                           tool_output = strdup("Error: 'command' argument required for exec");
-                                       } else {
-                                           char *output = remote_exec(g_remote_server, cmd_val, timeout_sec);
-                                           tool_output = output ? output : strdup("Error: command execution failed");
-                                       }
-                                   } else if (strcmp(action, "mount") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server");
-                                       } else {
-                                           /* Parse mount arguments from command field */
-                                           /* Format: "mount <server_path> <mount_point>" */
-                                           char mount_cmd[1024];
-                                           if (cmd_val) {
-                                               snprintf(mount_cmd, sizeof(mount_cmd), "mount %s", cmd_val);
-                                           } else {
-                                               tool_output = strdup("Error: 'command' argument required (format: 'mount <server_path> <mount_point>')");
-                                           }
-                                           if (!cmd_val) {
-                                               /* already handled above */
-                                           } else {
-                                               char *output = remote_exec(g_remote_server, mount_cmd, 60);
-                                               tool_output = output ? output : strdup("Error: mount failed");
-                                               free(output);
-                                               free(mount_cmd);
-                                           }
-                                       }
-                                   } else if (strcmp(action, "jobs") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server");
-                                       } else {
-                                           char *output = remote_list_jobs(g_remote_server, NULL, 20);
-                                           tool_output = output ? output : strdup("No jobs found");
-                                       }
-                                   } else if (strcmp(action, "submit") == 0) {
-                                       if (!g_remote_server) {
-                                           tool_output = strdup("Error: not connected to remote server");
-                                       } else {
-                                           /* Parse submit arguments */
-                                           char *queue_val = NULL;
-                                           char *walltime_val = NULL;
-                                           char *nodes_val = NULL;
-                                           char *cpus_val = NULL;
-                                           char *mem_val = NULL;
-                                           
-                                           for (int a = 1; a < arg_r; a++) {
-                                               if (arg_toks[a].type == JSMN_STRING) {
-                                                   int klen = arg_toks[a].end - arg_toks[a].start;
-                                                   if (klen == 6 && strncmp(unescaped_args + arg_toks[a].start, "queue", 6) == 0) {
-                                                       queue_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                                   } else if (klen == 8 && strncmp(unescaped_args + arg_toks[a].start, "walltime", 8) == 0) {
-                                                       walltime_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                                   } else if (klen == 5 && strncmp(unescaped_args + arg_toks[a].start, "nodes", 5) == 0) {
-                                                       nodes_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                                   } else if (klen == 5 && strncmp(unescaped_args + arg_toks[a].start, "cpus", 5) == 0) {
-                                                       cpus_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                                   } else if (klen == 4 && strncmp(unescaped_args + arg_toks[a].start, "mem ", 4) == 0) {
-                                                       mem_val = unescape_json_string(unescaped_args + arg_toks[a+1].start, arg_toks[a+1].end - arg_toks[a+1].start);
-                                                   }
-                                               }
-                                           }
-                                           
-                                           int walltime = walltime_val ? atoi(walltime_val) : 60;
-                                           int nodes = nodes_val ? atoi(nodes_val) : 1;
-                                           int cpus = cpus_val ? atoi(cpus_val) : 1;
-                                           int mem = mem_val ? atoi(mem_val) : 4;
-                                           
-                                           /* Write script to temp file on remote */
-                                           char *write_script = malloc(2048);
-                                           snprintf(write_script, 2048, "cat > /tmp/ai_buddy_job.sh << 'EOF'\n%s\nEOF", cmd_val);
-                                           char *write_out = remote_exec(g_remote_server, write_script, 30);
-                                           
-                                           /* Submit job */
-                                           char *submit_cmd = malloc(2048);
-                                           snprintf(submit_cmd, 2048, "sbatch --job-name='ai-buddy' --time=%d:00:00 --nodes=%d --ntasks=%d --mem=%dG /tmp/ai_buddy_job.sh", walltime, nodes, cpus, mem);
-                                           
-                                           char *submit_out = remote_exec(g_remote_server, submit_cmd, 30);
-                                           
-                                           char *result = malloc(2048);
-                                           snprintf(result, 2048, "%s\n%s", write_out, submit_out);
-                                           
-                                           tool_output = result;
-                                           free(write_script);
-                                           free(write_out);
-                                           free(submit_cmd);
-                                           free(submit_out);
-                                           free(queue_val);
-                                           free(walltime_val);
-                                           free(nodes_val);
-                                           free(cpus_val);
-                                           free(mem_val);
-                                       }
-                                   } else {
-                                       tool_output = strdup("Error: unknown action. Valid actions: connect, disconnect, discover, status, exec, mount, jobs, submit");
-                                   }
-                                   
-                                   /* Cleanup */
-                                   free(action_val);
-                                   free(host_val);
-                                   free(port_val);
-                                   free(user_val);
-                                   free(pass_val);
-                                   free(cmd_val);
-                                   free(timeout_val);
                                } else if (strcmp(unescaped_name, "execute_command") == 0) {
                                    jsmn_parser arg_parser;
                                    jsmntok_t arg_toks[512];
@@ -5509,12 +5188,10 @@ step_limit_check:
                           fflush(stderr);
                           {
                               if (rendered_output && *rendered_output) {
-                                  print_response_box(model[0] ? model : "model", rendered_output,
-                                                     g_turn_count, total_tool_count);
+                                  print_response_box(model[0] ? model : "model", rendered_output);
                                   free(rendered_output);
                               } else {
-                                  print_response_box(model[0] ? model : "model", unescaped_content,
-                                                     g_turn_count, total_tool_count);
+                                  print_response_box(model[0] ? model : "model", unescaped_content);
                               }
                           }
 
