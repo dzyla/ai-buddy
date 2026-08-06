@@ -234,23 +234,12 @@ static void print_response_box(const char *model_name, const char *content,
 {
     printf("\n");
 
-    /* Header bar: model name + turn/tool count */
-    printf("%s╭─%s %s◉%s %s%s%s%s╮\n",
-           CL_MAGENTA, CL_RESET, CL_MAGENTA, CL_RESET,
-           CL_MAGENTA CL_BOLD, model_name ? model_name : "assistant",
-           CL_DIM, CL_DIM);
-
-    /* Meta line */
-    printf("%s│  turn %d  %s▸%s", CL_DIM, turn_count > 0 ? turn_count : 0,
-           CL_RESET, CL_DIM);
-    if (tool_count > 0) {
-        printf("  %d tools%s", tool_count, CL_DIM);
-    }
-    printf("  \033[2m%.1fs", elapsed_sec);
-    if (tokens_per_sec > 0) {
-        printf("  %d tok/s\033[0m", (int)tokens_per_sec);
-    }
-    printf("%*s│%s\n", 0, "", CL_DIM);
+    /* Header: model name + stats */
+    printf("%s%s%s", CL_MAGENTA, model_name ? model_name : "?", CL_RESET);
+    if (tool_count > 0) printf("  %s%d tools%s", CL_DIM, tool_count, CL_RESET);
+    printf("  %s%.1fs%s", CL_DIM, elapsed_sec, CL_RESET);
+    if (tokens_per_sec > 0) printf("  %s%d tok/s%s", CL_DIM, (int)tokens_per_sec, CL_RESET);
+    printf("\n");
 
     /* Content — rendered markdown, word-wrapped */
     if (content) {
@@ -3646,7 +3635,7 @@ int main(int argc, char **argv) {
     int interactive_mode = 0;
     int quiet_mode = 0;
 
-    // Parse set-default, install-llama, and version options first (all exit early)
+    // Parse set-default and version options first (all exit early)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             printf("ai %s\n", AI_VERSION);
@@ -4299,20 +4288,11 @@ int main(int argc, char **argv) {
 
     if (interactive_mode && !run_query_this_turn) {
         printf("\n");
-        printf("%s╭─%s %s◈%s %s%s%s %s─%s autonomous coding agent%s╮\n",
-               CL_MAGENTA, CL_RESET, CL_MAGENTA, CL_RESET,
-               CL_MAGENTA CL_BOLD, "ai", CL_RESET, CL_DIM, CL_DIM, CL_RESET);
-        printf("%s│ %s│ %s%s%s · %s · %s%s%s╮\n",
-               CL_DIM, CL_DIM,
-               CL_CYAN CL_BOLD, model[0] ? model : "unknown", CL_RESET,
-               current_session_id,
-               g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
-               CL_RESET, CL_RESET);
-        printf("%s│ %s%s%s╰╯%s\n",
-               CL_DIM, CL_DIM, CL_DIM, CL_DIM, CL_RESET);
-        printf("%s│ %s:help %s· %sESC%s interrupt  %sShift-Tab%s auto-approve  %s:commit/:undo/:copy%s  %s:notify/:btw%s%s│\n",
-               CL_DIM, CL_DIM, CL_DIM, CL_DIM, CL_RESET, CL_DIM, CL_RESET, CL_DIM, CL_RESET, CL_DIM, CL_RESET, CL_DIM);
-        printf("%s╰─%s%s╯\n\n", CL_DIM, CL_DIM, CL_DIM);
+        printf("%s%s%s %s%s%s\n",
+               CL_MAGENTA, model[0] ? model : "unknown", CL_RESET,
+               CL_DIM, current_session_id, CL_RESET);
+        printf("%s:help  %sESC  %sShift-Tab%s auto  %s:commit/:undo/:copy%s\n",
+               CL_DIM, CL_DIM, CL_DIM, CL_RESET, CL_DIM, CL_RESET);
         lineed_init();
     }
 
