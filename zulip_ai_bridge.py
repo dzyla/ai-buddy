@@ -10,9 +10,15 @@ processed by the agent.
 
 import subprocess
 import threading
-import zulip
-import os
 import sys
+import os
+try:
+    import zulip
+except ImportError:
+    import types
+    zulip = types.ModuleType("zulip")
+    zulip.Client = None
+    sys.modules["zulip"] = zulip
 import re
 import requests
 from urllib.parse import unquote
@@ -29,6 +35,8 @@ def clean_response(text):
 
 class ZulipAiBridge:
     def __init__(self):
+        if zulip is None:
+            raise RuntimeError("The 'zulip' Python package is required. Install it via `pip install zulip`.")
         # Automatically loads credentials from ~/.zuliprc
         self.client = zulip.Client()
         self.bot_email = self.client.email

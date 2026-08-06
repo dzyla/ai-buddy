@@ -15,12 +15,16 @@ gcc -o ai ai.c cJSON.c -lcurl  # build only (dependencies: libcurl + jsmn.h + cJ
 ./install.sh snap              # also detect and configure a running AI snap (qwen3-6/gemma4)
 ```
 
-Backend is managed by `ai-backend` (installed to `~/.local/bin/`). Active config lives in `~/.local/share/ai/env`.
+Backend and model deployment are managed by `ai-backend` (single tool, installed to `~/.local/bin/ai-backend`, aliased as `ai-model` and `ai-use`). Active config lives in `~/.local/share/ai/env`.
 ```bash
-ai-backend status              # show active backend and available options
-ai-backend auto                # switch to whatever is currently running
-ai-backend qwen3-6             # switch to qwen3-6 snap
-ai-backend llama /path/to.gguf # switch to llama-server with specific model
+ai-backend status                     # show active backend, model, and server status
+ai-backend use <hf_uri|path|preset>   # download (if HF URI) and switch active model
+                                      # e.g.: ai-backend use hf://AtomicChat/Ling-3.0-flash-GGUF/AD-IQ3_M/Ling-3.0-flash-AD-IQ3_M-00001-of-00002.gguf
+ai-backend list                       # list downloaded GGUF models
+ai-backend auto                       # switch to whatever is currently running
+ai-backend ctx <size|auto>            # set or clear explicit context window
+ai-backend gpu-layers <n|auto>        # set GPU offload layers
+ai-backend serve                      # run llama-server with auto context sizing (used by systemd)
 ```
 
 Tests (pytest):
