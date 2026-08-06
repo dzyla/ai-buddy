@@ -327,3 +327,162 @@ Where to call the enhanced functions:
 | Think display | Detect "think" in tool name in the tool processing loop |
 | Table rendering | In `render_markdown`, detect `|...|` pattern and call `print_markdown_table` |
 | Input hints | After `read_line_interactive` prompt display |
+
+---
+
+# Code Quality & Architecture Improvements
+
+## Critical: Security
+
+### 1. SSH password exposed via `sshpass` process list
+
+**File:** `remote_harness.c` — `remote_connect()`
+
+The password is passed as a CLI argument to `sshpass -p '...'`, which means it is visible in `ps aux` to every user on the system. Replace with env-var-based auth:
+
+```c
+setenv("SSHPASS", password, 1);
+snprintf(cmd, sizeof(cmd), "sshpass -e ssh %s@%s -p %d ...", user, host, port);
+```
+
+Or better yet, require key-based auth and drop `sshpass` entirely. If password auth is needed, write the password to a temp file with mode 0600 and use `sshpass -f /tmp/sshpass.XXXXXX`.
+
+### 2. Command denylist is substring-based and easily bypassed
+
+**File:** `ai.c` — `is_command_denied()`
+
+`strstr(cmd, "rm -rf /")` is a trivial substring check. Workarounds: `rm -rf //`, `rm -rf $HOME`, `rm -rf /` with a wildcard like `rm -rf *`. Add glob/wildcard pattern detection, environment variable expansion detection, and file-descriptor tricks. Consider using a proper denylist library or regex with word boundaries.
+
+### 3. `strncpy` does not null-terminate — unbounded read risk
+
+**File:** `remote_harness.c` — `remote_connect()`
+
+```c
+strncpy(rh->host, host, sizeof(rh->host) - 1);
+```
+
+`strncpy` does not guarantee null termination when the source is >= dest size. If an attacker supplies a 256-byte hostname, the `host` field is not null-terminated, and subsequent `snprintf` reads past the buffer. Fix with `snprintf(rh->host, sizeof(rh->host), "%s", host)`.
+
+---
+
+## High Priority: Architecture
+
+### 4. Split `ai.c` (5600 lines) into modules
+
+The single C file contains: HTTP/SSE, JSON parsing, agent loop, tool dispatch (think/task_complete/execute_command/remote_exec/MCP), interactive mode (lineed), git integration, base64, markdown rendering, system prompt (~24KB literal), memory, session persistence, and argument parsing. Split into:
+
+- `ai_main.c` — entry point, agent loop, argument parsing
+- `ai_http.c` — curl setup, SSE streaming, retry logic
+- `ai_tools.c` — tool dispatch switch, per-tool handlers
+- `ai_interactive.c` — lineed TUI, prompt display, raw mode
+- `ai_utils.c` — JSON escape, base64, markdown rendering, shell escape
+
+### 5. Split `ai_mcp.py` (4400 lines) into modules
+
+Current file handles: HTTP, search engines (Brave/SearXNG/DDG), web fetching (curl_cffi/Playwright/urllib), MCP JSON-RPC, memory DB, skill loading. Split into:
+
+- `mcp_server.py` — JSON-RPC server, MCP protocol
+- `tools_file.py` — file read/write/edit/list tools
+- `tools_search.py` — `web_search`, `arxiv_search`, `pubmed_search`
+- `tools_schedule.py` — calendar, reminders, notifications
+- `tools_remote.py` — `remote_exec`, HPC job submission
+- `search.py` — `brave_search`, `searxng_search`, `ddg_lite_search`, `web_search` orchestrator
+- `fetch.py` — `fetch_smart` cascade, `fetch_webpage`, `fetch_webpage_js`, `_html_to_text_fallback`
+- `memory.py` — `save_memory`, `recall`, FTS5 DB
+
+### 6. Move system prompt out of C binary
+
+The `SYSTEM_PROMPT` variable (~24KB C string literal) is baked into the binary. Editing the prompt requires recompiling. Move to `system_prompt.txt` or `system_prompt.md` loaded at startup, with template variables (e.g. `{model}`, `{tools_json}`) replaced at runtime. This also lets users customize without touching C code.
+
+### 7. Replace static 4096 `jsmntok_t` array with dynamic allocation
+
+**File:** `ai.c` — agent loop
+
+```c
+jsmntok_t tok[4096];
+```
+
+If a model response JSON exceeds 4096 tokens (e.g. tool arguments with large base64 strings), parsing silently fails with `JSMN_ERROR_NOMEM`. Use dynamic allocation with `malloc` + `realloc`, or expose a configurable limit via `INFER_JSON_TOKENS` env var.
+
+### 8. Add remote_harness.c to the build
+
+`compile.sh` compiles only `ai.c`. `remote_harness.c` and `remote_harness.h` are listed in the directory but never compiled into the binary. If `remote_exec`/`remote_harness` is intended to be part of the build (it provides the `remote_exec` tool), add it to the compile command:
+
+```bash
+gcc -o ai ai.c remote_harness.c -lcurl -ljsmn ...
+```
+
+---
+
+## Medium Priority: Code Quality
+
+### 9. Duplicate search implementations
+
+**File:** `ai_mcp.py`
+
+`ddg_lite_search`, `brave_search`, `searxng_search`, and `web_search` are all defined, but the C `web_search` tool only calls `ddg_lite_search`. The Brave and SearXNG functions are never invoked from the C side. The C tool should call the `web_search` orchestrator, which routes through the full cascade.
+
+### 10. No proper build system
+
+Replace `compile.sh` with a `Makefile`:
+
+```makefile
+CC = gcc
+CFLAGS = -Wall -Wextra -Wconversion -O2 -D_GNU_SOURCE
+LDFLAGS = -lcurl -ljsmn -lpthread -lm
+TARGET = ai
+
+$(TARGET): ai.c remote_harness.c jsmn.h
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+install: $(TARGET)
+	install -m 755 $(TARGET) $(PREFIX)/bin/
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: install clean
+```
+
+Also add `make test` to run `pytest tests/`.
+
+### 11. Remove unused `cJSON` includes and source
+
+`ai.c` includes `cJSON.h` but never uses any cJSON functions — JSON parsing is done by `jsmn`. `cJSON.c` and `cJSON.h` are listed in the directory but never compiled. Remove them or add a comment noting they are unused. The `cJSON.h` header unnecessarily includes `<sys/types.h>` and `<sys/stat.h>`.
+
+### 12. Missing `-lm` and `_GNU_SOURCE` for `remote_harness.c`
+
+`remote_harness.c` uses `clock_gettime` (needs `_POSIX_C_SOURCE` or `-lrt` on older glibc) and `strptime` (needs `_GNU_SOURCE`). The compile script doesn't define these flags. Add `-D_GNU_SOURCE` to `CFLAGS` and ensure `-lm` is linked.
+
+---
+
+## Low Priority: Polish & DX
+
+### 13. Add structured configuration file
+
+All settings are environment variables (`INFER_BASE_URL`, `INFER_API_KEY`, `INFER_MODEL`, `INFER_CONTEXT_WINDOW`, etc.) with no persistent config. Add `~/.config/ai/config.yaml` or `config.json` read at startup so users don't need to set env vars in their shell profile.
+
+### 14. Document undocumented environment variables
+
+`INFER_FETCH_BASIC=1` (forces plain urllib fetch), `INFER_AUTO_APPROVE` (auto-approve commands), `INFER_MAX_TOOL_OUTPUT` — none of these appear in `--help` or documentation. Add them to the help output and to `compile.sh`'s usage text.
+
+### 15. Add CI/CD pipeline
+
+No GitHub Actions, linting, or format checking. Add a CI workflow that:
+- Runs `make` to verify the C build doesn't break
+- Runs `python -m pytest tests/` for Python tests
+- Runs `clang-tidy` or `cppcheck` on C code
+
+### 16. Replace `goto end_tool_iter` with structured control flow
+
+**File:** `ai.c` — agent loop
+
+```c
+if (strcmp(unescaped_name, "reset_context") == 0) {
+    // ... resets context ...
+    goto end_tool_iter;
+}
+```
+
+The `goto` bypasses normal cleanup. While the current code appears to free resources before the goto, the pattern is fragile. Convert to a helper function or use a `continue` after setting a flag.
+

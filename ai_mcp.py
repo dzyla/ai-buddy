@@ -1520,6 +1520,57 @@ def render_math_safely(line):
     return temp_line
 
 def render_markdown(text):
+    if not text:
+        return ""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown, Heading, BlockQuote
+        from rich.text import Text
+        from rich.segment import Segment
+        import shutil
+
+        def custom_heading_rich_console(self, console, options):
+            text = self.text
+            text.justify = "left"
+            if self.tag == "h1":
+                yield Text("")
+                yield Text("# ", style="bold cyan") + text
+                yield Text("")
+            elif self.tag == "h2":
+                yield Text("")
+                yield Text("## ", style="bold magenta") + text
+                yield Text("")
+            else:
+                yield Text("")
+                yield Text("#" * int(self.tag[1]) + " ", style="bold yellow") + text
+                yield Text("")
+
+        def custom_blockquote_rich_console(self, console, options):
+            render_options = options.update(width=options.max_width - 4)
+            lines = console.render_lines(self.elements, render_options, style=self.style)
+            style = self.style
+            new_line = Segment("\n")
+            padding = Segment("  ", style)
+            for line in lines:
+                yield padding
+                yield from line
+                yield new_line
+
+        Heading.__rich_console__ = custom_heading_rich_console
+        BlockQuote.__rich_console__ = custom_blockquote_rich_console
+
+        cols = shutil.get_terminal_size((80, 24)).columns
+        console = Console(width=min(cols, 110), force_terminal=True, legacy_windows=False)
+        with console.capture() as capture:
+            console.print(Markdown(text))
+        raw_res = capture.get()
+        lines = [line.rstrip() for line in raw_res.splitlines()]
+        res = "\n".join(lines).strip('\n')
+        if res:
+            return res
+    except Exception:
+        pass
+
     lines = text.splitlines()
     rendered = []
     in_code_block = False
@@ -2014,17 +2065,17 @@ _AGENT_OUTPUT_CAP = 10 * 1024       # 10 KB per sub-agent result
 _PARALLEL_FETCH_CAP = 10 * 1024     # 10 KB per fetched URL
 
 def _resolve_ai_bin():
-    """Return path to the ai binary, checking local install first."""
+    """Return path to the ai binary, checking environment override first."""
     candidates = [
-        os.path.expanduser("~/.local/bin/ai"),
         os.environ.get("INFER_BIN_PATH", ""),
+        os.path.expanduser("~/.local/bin/ai"),
         "/usr/local/bin/ai",
         "./ai",
     ]
     for c in candidates:
         if c and os.path.exists(c):
             return c
-    return candidates[-1]  # fall back to ./ai even if missing
+    return "./ai"
 
 def _pubmed_fetch_raw(query, top_k=10, start_date=None, end_date=None, high_quality_only=True):
     """Return parsed JSON results list from the search API, or a string error."""

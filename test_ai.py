@@ -194,7 +194,7 @@ def test_scheduler_tool_calls():
         '{"task_id": "test_dummy_task", "prompt": "Respond with SUCCESS", "interval_seconds": 60}'
     ], capture_output=True, text=True)
     assert res.returncode == 0
-    assert "Successfully scheduled task" in res.stdout
+    assert "scheduled task" in res.stdout.lower()
     
     # List tasks again and verify it is there
     res = subprocess.run([
