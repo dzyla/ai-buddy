@@ -3652,7 +3652,6 @@ int main(int argc, char **argv) {
             printf("ai %s\n", AI_VERSION);
             return 0;
         }
-        if (strcmp(argv[i], "--install-llama") == 0) {
             char *home = getenv("HOME");
             if (!home) { fprintf(stderr, "Error: HOME not set.\n"); return 1; }
             char script[1024];
@@ -3731,7 +3730,6 @@ int main(int argc, char **argv) {
             printf("  -m, --model MODEL    Override the default model for this call.\n");
             printf("  -s, --set-default M  Set the global default model in shell configs.\n");
             printf("  -v, --version        Print the build commit and exit.\n");
-            printf("  --install-llama [R]  Download, build llama.cpp and start a local server.\n");
             printf("                       R: optional HuggingFace repo (e.g. unsloth/gemma-4-12b-it-GGUF).\n");
             printf("  -h, --help           Display this help screen.\n\n");
             printf("Advanced options:\n");
