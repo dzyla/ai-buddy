@@ -313,3 +313,19 @@ def test_command_denylist(tmp_path):
         assert len(reqs) >= 2
         tool_msg = next(m["content"] for m in reqs[1]["messages"] if m.get("role") == "tool")
         assert "INFER_COMMAND_DENYLIST" in tool_msg
+
+
+def test_hide_details_flag(tmp_path):
+    """Setting INFER_HIDE_DETAILS=1 suppresses thinking and tool box headers in output."""
+    home = str(tmp_path / "home")
+    os.makedirs(home)
+    cap = str(tmp_path / "cap.jsonl")
+    tool_call = {
+        "id": "c1", "type": "function",
+        "function": {"name": "think", "arguments": json.dumps({"reasoning": "secret plan"})},
+    }
+    env = dict(os.environ, INFER_HIDE_DETAILS="1")
+    with MockServer(cap, MOCK_TOOL_CALL=json.dumps(tool_call)) as srv:
+        res = run_binary(home, srv.base_url, ["plan steps"], extra_env=env)
+        assert "secret plan" not in res.stderr
+

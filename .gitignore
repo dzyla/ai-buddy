@@ -1,5 +1,6 @@
 # Compiled binary (build with: ./install.sh)
 ai
+test_remote_harness
 
 # Ignore Python cache and compiled files
 __pycache__/
