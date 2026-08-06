@@ -47,11 +47,13 @@ def write_env(url, model, llama_model_path=None, extra_vars=None):
     if extra_vars:
         current.update(extra_vars)
 
-    ctx_size = current.get("LLAMA_CTX_SIZE", "")
-    gpu_layers = current.get("LLAMA_N_GPU_LAYERS", "")
+    cuda_dev = current.get("CUDA_VISIBLE_DEVICES", "1")
+    ctx_size = current.get("LLAMA_CTX_SIZE", "131072")
+    gpu_layers = current.get("LLAMA_N_GPU_LAYERS", "99")
     
     lines = [
         "# ai backend config — managed by ai-backend, do not edit manually",
+        f'export CUDA_VISIBLE_DEVICES="{cuda_dev}"',
         f'export INFER_BASE_URL="{url}"',
         'export INFER_API_KEY="not-needed"',
         f'export INFER_MODEL="{model}"',
@@ -59,13 +61,12 @@ def write_env(url, model, llama_model_path=None, extra_vars=None):
     ]
     if llama_model_path:
         lines.append(f'export LLAMA_MODEL_PATH="{llama_model_path}"')
-    if ctx_size:
-        lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
+    lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
     if gpu_layers:
         lines.append(f'export LLAMA_N_GPU_LAYERS="{gpu_layers}"')
     lines.append(f'export PUBMED_API_KEY="{PUBMED_KEY}"')
     
-    seen = {"INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "PUBMED_API_KEY"}
+    seen = {"CUDA_VISIBLE_DEVICES", "INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "PUBMED_API_KEY"}
     for k, v in current.items():
         if k not in seen:
             lines.append(f'export {k}="{v}"')

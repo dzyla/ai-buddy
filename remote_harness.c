@@ -14,7 +14,7 @@
 /* Build SSH command line */
 static char* build_ssh_cmd(const char *hostname, int port, const char *username,
                            const char *password, const char *remote_cmd) {
-    size_t len = 512;
+    size_t len = 2048;
     char *cmd = malloc(len);
     if (password && *password) {
         snprintf(cmd, len, "sshpass -p '%s' ssh -o StrictHostKeyChecking=no "
@@ -36,13 +36,24 @@ static char* run_command(const char *cmd, int timeout_sec, int *exit_code) {
     char tmpfile[] = "/tmp/ai_remote_cmd_XXXXXX";
     int fd = mkstemp(tmpfile);
     if (fd == -1) return NULL;
-    write(fd, cmd, strlen(cmd));
+    if (write(fd, cmd, strlen(cmd)) < 0) {
+        close(fd);
+        unlink(tmpfile);
+        return NULL;
+    }
     close(fd);
     chmod(tmpfile, 0755);
     
-    /* Run via sh, capture output */
+    /* Run via timeout + sh, capture output */
+    char runner_cmd[1024];
+    if (timeout_sec > 0) {
+        snprintf(runner_cmd, sizeof(runner_cmd), "timeout %d %s", timeout_sec, tmpfile);
+    } else {
+        snprintf(runner_cmd, sizeof(runner_cmd), "%s", tmpfile);
+    }
+
     char outbuf[REMOTE_MAX_OUTPUT];
-    FILE *fp = popen(tmpfile, "r");
+    FILE *fp = popen(runner_cmd, "r");
     if (!fp) {
         unlink(tmpfile);
         return NULL;
@@ -73,11 +84,11 @@ remote_server_t* remote_connect(const char *hostname, int port,
     if (!hostname || !username) return NULL;
     
     remote_server_t *srv = calloc(1, sizeof(remote_server_t));
-    strncpy(srv->hostname, hostname, sizeof(srv->hostname) - 1);
+    snprintf(srv->hostname, sizeof(srv->hostname), "%s", hostname);
     srv->port = port > 0 ? port : REMOTE_DEFAULT_PORT;
-    strncpy(srv->username, username, sizeof(srv->username) - 1);
-    if (password) strncpy(srv->password, password, sizeof(srv->password) - 1);
-    if (description) strncpy(srv->description, description, sizeof(srv->description) - 1);
+    snprintf(srv->username, sizeof(srv->username), "%s", username);
+    if (password) snprintf(srv->password, sizeof(srv->password), "%s", password);
+    if (description) snprintf(srv->description, sizeof(srv->description), "%s", description);
     srv->connected = 1;
     srv->last_connect = time(NULL);
     
@@ -203,8 +214,8 @@ int remote_discover(remote_server_t *server) {
                     server->gpus[i].memory_used_mb = mem_used;
                     server->gpus[i].utilization_percent = util;
                     server->gpus[i].temperature_c = temp;
-                    strncpy(server->gpus[i].driver_version, drv, sizeof(server->gpus[i].driver_version) - 1);
-                    snprintf(server->gpus[i].cuda_version, sizeof(server->gpus[i].cuda_version), "%s.%s", cc, cc+2);
+                    snprintf(server->gpus[i].driver_version, sizeof(server->gpus[i].driver_version), "%s", drv);
+                    snprintf(server->gpus[i].cuda_version, sizeof(server->gpus[i].cuda_version), "%.16s", cc);
                 }
                 free(lines[i]);
             }
