@@ -3134,24 +3134,6 @@ static int update_config_file(const char *file_path, const char *new_model, cons
 }
 
 static int detect_model_url(const char *model_name, char *url_out, size_t max_len) {
-    if (strcmp(model_name, "llama") == 0 || strcmp(model_name, "llama-server") == 0) {
-        char *env_base = getenv("INFER_BASE_URL");
-        if (env_base && *env_base) {
-            strncpy(url_out, env_base, max_len - 1);
-            url_out[max_len - 1] = '\0';
-            size_t len = strlen(url_out);
-            if (len > 0 && url_out[len - 1] != '/') {
-                if (len < max_len - 1) {
-                    url_out[len] = '/';
-                    url_out[len + 1] = '\0';
-                }
-            }
-            return 1;
-        }
-        strncpy(url_out, "http://localhost:8080/v1/", max_len - 1);
-        url_out[max_len - 1] = '\0';
-        return 1;
-    }
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "%s status 2>/dev/null", model_name);
     FILE *status_fp = popen(cmd, "r");
@@ -3640,19 +3622,6 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             printf("ai %s\n", AI_VERSION);
             return 0;
-        }
-            char *home = getenv("HOME");
-            if (!home) { fprintf(stderr, "Error: HOME not set.\n"); return 1; }
-            char script[1024];
-            snprintf(script, sizeof(script), "%s/.local/bin/llama-install.sh", home);
-            char *repo = (i + 1 < argc && argv[i+1][0] != '-') ? argv[i+1] : NULL;
-            if (repo)
-                execl("/bin/bash", "bash", script, repo, (char *)NULL);
-            else
-                execl("/bin/bash", "bash", script, (char *)NULL);
-            perror("execl: could not run llama-install.sh");
-            fprintf(stderr, "Run ./setup_llama.sh first to install the script.\n");
-            return 1;
         }
         if (strcmp(argv[i], "--set-default") == 0 || strcmp(argv[i], "-s") == 0) {
             if (i + 1 < argc) {
