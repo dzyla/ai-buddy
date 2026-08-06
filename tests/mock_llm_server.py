@@ -45,9 +45,43 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
 
         content = os.environ.get("MOCK_REPLY_CONTENT", "MOCK_OK")
-        # If MOCK_TASK_COMPLETE is set, return a task_complete tool call so the
-        # agent loop terminates in one turn, mirroring a real agent response.
         summary = os.environ.get("MOCK_TASK_COMPLETE")
+        tool_call_env = os.environ.get("MOCK_TOOL_CALL")
+
+        msgs = body.get("messages", [])
+        last_is_tool = msgs and msgs[-1].get("role") == "tool"
+
+        if tool_call_env and not last_is_tool:
+            tc = json.loads(tool_call_env)
+            fn = tc.get("function", {})
+            self.send_response(200)
+            if stream:
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self._sse({"role": "assistant", "content": None,
+                           "tool_calls": [{"index": 0, "id": tc.get("id", "call_mock_1"),
+                                           "type": "function",
+                                           "function": {"name": fn.get("name", ""), "arguments": ""}}]})
+                self._sse({"tool_calls": [{"index": 0,
+                           "function": {"arguments": fn.get("arguments", "")}}]})
+                self._sse({}, finish="tool_calls")
+                self.wfile.write(b"data: [DONE]\n\n")
+            else:
+                self.send_header("Content-Type", "application/json")
+                resp = {
+                    "id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": [tc]}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+                payload = json.dumps(resp).encode()
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            return
+
+        if summary is None and last_is_tool:
+            summary = "Done"
 
         if stream:
             self._respond_stream(summary, content)

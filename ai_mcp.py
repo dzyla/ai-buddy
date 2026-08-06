@@ -123,6 +123,63 @@ def init_server(proc):
     send_notification(proc, "notifications/initialized")
     return resp
 
+def log_metric(tool_name, duration_ms, success=True):
+    try:
+        import datetime
+        metrics_file = os.path.expanduser("~/.cache/ai/metrics.jsonl")
+        os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "tool": tool_name,
+            "duration_ms": round(duration_ms, 2),
+            "success": success
+        }
+        with open(metrics_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+def show_metrics():
+    metrics_file = os.path.expanduser("~/.cache/ai/metrics.jsonl")
+    if not os.path.isfile(metrics_file):
+        print("No metrics logged yet.")
+        return
+    
+    stats = {}
+    total_calls = 0
+    try:
+        with open(metrics_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    t = data.get("tool", "unknown")
+                    dur = data.get("duration_ms", 0)
+                    succ = data.get("success", True)
+                    total_calls += 1
+                    if t not in stats:
+                        stats[t] = {"count": 0, "success": 0, "total_ms": 0.0}
+                    stats[t]["count"] += 1
+                    if succ:
+                        stats[t]["success"] += 1
+                    stats[t]["total_ms"] += dur
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Error reading metrics: {e}")
+        return
+
+    print("=== AI Buddy Metrics & Tool Usage Statistics ===")
+    print(f"Total Tool Executions Logged: {total_calls}\n")
+    print(f"{'Tool Name':<28} | {'Calls':<7} | {'Success':<8} | {'Avg Time (ms)':<14}")
+    print("-" * 65)
+    for t, s in sorted(stats.items(), key=lambda x: x[1]["count"], reverse=True):
+        avg_ms = round(s["total_ms"] / s["count"], 1) if s["count"] > 0 else 0.0
+        succ_rate = f"{s['success']}/{s['count']}"
+        print(f"{t:<28} | {s['count']:<7} | {succ_rate:<8} | {avg_ms:<14}")
+
 def list_tools(server_name, cfg):
     proc = start_server(cfg)
     if not proc:
@@ -764,17 +821,37 @@ def remember(content, metadata=""):
 
 
 def recall(query):
-    """Search memories using FTS5 full-text search. Returns content and metadata."""
+    """Search memories using FTS5 full-text search with fallback to LIKE search."""
     try:
         os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
         conn = sqlite3.connect(MEMORY_DB)
         _ensure_memories_schema(conn)
-        # Escape single quotes in user query for safe FTS5 usage
-        safe_query = query.replace("'", "''")
-        rows = conn.execute(
-            "SELECT content, metadata FROM memories WHERE memories MATCH ?",
-            (safe_query,),
-        ).fetchall()
+        
+        # Extract alphanumeric words for safe FTS query
+        words = re.findall(r'\w+', query)
+        fts_query = " OR ".join(words) if words else query
+        
+        rows = []
+        if fts_query:
+            try:
+                rows = conn.execute(
+                    "SELECT content, metadata FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT 10",
+                    (fts_query,),
+                ).fetchall()
+            except sqlite3.Error:
+                rows = []
+
+        if not rows and words:
+            # Fallback to LIKE search for key words
+            like_clauses = " OR ".join(["content LIKE ? OR metadata LIKE ?" for _ in words[:5]])
+            like_params = []
+            for w in words[:5]:
+                like_params.extend([f"%{w}%", f"%{w}%"])
+            rows = conn.execute(
+                f"SELECT content, metadata FROM memories WHERE {like_clauses} LIMIT 10",
+                tuple(like_params),
+            ).fetchall()
+
         conn.close()
         if not rows:
             return "No memories found matching that query."
@@ -1758,6 +1835,118 @@ def list_processes():
     except Exception as e:
         return f"Error listing processes: {e}"
 
+def start_background_process(command, log_file=None):
+    """Start a command in the background, writing output to a log file for status monitoring."""
+    import subprocess, os, time
+    if not command:
+        return "Error: command string is required."
+    if not log_file:
+        log_dir = os.path.expanduser("~/.config/ai/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"proc_{int(time.time())}.log")
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+    
+    try:
+        with open(log_file, "a") as f:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        return (f"[Background Process Started]\n"
+                f"PID: {proc.pid}\n"
+                f"Command: `{command}`\n"
+                f"Log File: `{log_file}`\n"
+                f"Use `check_process_status` with pid={proc.pid} or log_file='{log_file}' to evaluate execution health and logs.")
+    except Exception as e:
+        return f"Error starting background process: {e}"
+
+def check_process_status(pid=None, log_file=None):
+    """Inspect process state, read log tail, evaluate execution health, and return a decision summary."""
+    import os
+    if not pid and not log_file:
+        return "Error: provide at least 'pid' or 'log_file' to check status."
+
+    pid_status = "UNKNOWN"
+    if pid is not None:
+        try:
+            pid_int = int(pid)
+            os.kill(pid_int, 0)
+            pid_status = "RUNNING"
+        except ProcessLookupError:
+            pid_status = "TERMINATED/EXITED"
+        except PermissionError:
+            pid_status = "RUNNING (active)"
+        except Exception as e:
+            pid_status = f"ERROR ({e})"
+
+    log_tail = ""
+    target_log = log_file
+    if target_log and os.path.isfile(target_log):
+        try:
+            with open(target_log, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+                log_tail = "".join(lines[-50:])
+        except Exception as ex:
+            log_tail = f"Error reading log file: {ex}"
+    elif pid is not None:
+        log_dir = os.path.expanduser("~/.config/ai/logs")
+        if os.path.isdir(log_dir):
+            for fname in sorted(os.listdir(log_dir), reverse=True):
+                if fname.endswith(".log"):
+                    fpath = os.path.join(log_dir, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read(4096)
+                            if f"PID: {pid}" in content or fname.startswith("proc_"):
+                                target_log = fpath
+                                log_tail = content[-2000:]
+                                break
+                    except Exception:
+                        pass
+
+    health = "HEALTHY"
+    if any(term in log_tail for term in ["Error", "Exception", "FAILED", "Traceback", "CRITICAL"]):
+        health = "NEEDS ATTENTION (Errors detected in log output)"
+    elif pid_status == "TERMINATED/EXITED":
+        health = "FINISHED"
+
+    out = [
+        f"[Process Health Evaluation Report | PID: {pid if pid is not None else 'N/A'}]",
+        f"State: {pid_status}",
+        f"Health Verdict: {health}",
+        f"Log File: `{target_log if target_log else 'None'}`"
+    ]
+    if log_tail:
+        out.append(f"--- Log Tail ---\n{log_tail.strip()}")
+    else:
+        out.append("No log output recorded yet.")
+
+    return "\n".join(out)
+
+def stop_process(pid):
+    """Terminate a running background process by PID."""
+    import os, signal, time
+    try:
+        pid_int = int(pid)
+        os.kill(pid_int, signal.SIGTERM)
+        time.sleep(0.2)
+        try:
+            os.kill(pid_int, 0)
+            os.kill(pid_int, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return f"Successfully stopped process PID {pid_int}."
+    except ProcessLookupError:
+        return f"Process PID {pid} is not running."
+    except Exception as e:
+        return f"Error stopping process PID {pid}: {e}"
+
+
 TOOL_REQUIRED_ARGS = {
     "execute_command": ["command"],
     "web_search":      ["query"],
@@ -1783,6 +1972,9 @@ TOOL_REQUIRED_ARGS = {
     "vault_backlinks":        ["title"],
     "pubmed_search":          ["query"],
     "pubmed_research_round":  ["query"],
+    "start_background_process": ["command"],
+    "check_process_status": [],
+    "stop_process": ["pid"],
     "schedule_task":   ["task_id", "prompt", "interval_seconds"],
     "unschedule_task": ["task_id"],
     "list_scheduled_tasks": [],
@@ -2776,6 +2968,71 @@ def main():
             }
         })
 
+        # 10d. start_background_process
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "start_background_process",
+                "description": "Start a command in the background, writing stdout/stderr output to a log file for status & health monitoring.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command line string to run asynchronously in background."
+                        },
+                        "log_file": {
+                            "type": "string",
+                            "description": "Optional log file path. Defaults to ~/.config/ai/logs/proc_<timestamp>.log if omitted."
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        })
+
+        # 10e. check_process_status
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "check_process_status",
+                "description": "Inspect a background process state, read recent log output, evaluate health status, and receive a decision summary.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pid": {
+                            "type": "integer",
+                            "description": "PID of the background process to inspect."
+                        },
+                        "log_file": {
+                            "type": "string",
+                            "description": "Path to the log file to inspect."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        })
+
+        # 10f. stop_process
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "stop_process",
+                "description": "Terminate a running background process by PID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pid": {
+                            "type": "integer",
+                            "description": "PID of the process to terminate."
+                        }
+                    },
+                    "required": ["pid"]
+                }
+            }
+        })
+
         # 11. delegate_task
         openai_tools.append({
             "type": "function",
@@ -3388,6 +3645,9 @@ def main():
 
         print(json.dumps(openai_tools))
 
+    elif action == "show-metrics" or action == "metrics":
+        show_metrics()
+
     elif action == "call-tool":
         if len(sys.argv) < 5:
             print("Usage: ai_mcp.py call-tool <server_name> <tool_name> <arguments_json>", file=sys.stderr)
@@ -3415,6 +3675,22 @@ def main():
         if missing:
             print(json.dumps({"error": f"Missing required argument(s): {', '.join(missing)}"}))
             sys.exit(0)
+
+        # Validate argument types for core tools
+        if tool_name in ("read_file", "write_file", "edit_file", "list_directory"):
+            p = arguments.get("path")
+            if p is not None and not isinstance(p, str):
+                print(json.dumps({"error": f"Invalid argument type for 'path': expected string, got {type(p).__name__}"}))
+                sys.exit(0)
+        elif tool_name in ("web_search", "fetch_webpage"):
+            q = arguments.get("query") if tool_name == "web_search" else arguments.get("url")
+            if q is not None and not isinstance(q, str):
+                print(json.dumps({"error": f"Invalid argument type: expected string, got {type(q).__name__}"}))
+                sys.exit(0)
+
+        _t0 = time.time()
+        import atexit
+        atexit.register(lambda: log_metric(tool_name, (time.time() - _t0) * 1000))
 
         # Route custom tools
         if tool_name == "think" or server_name == "think":
@@ -3508,6 +3784,24 @@ def main():
         elif tool_name == "list_processes" or server_name == "list_processes":
             result = list_processes()
             print(result)
+        elif tool_name == "start_background_process" or server_name == "start_background_process":
+            try:
+                res = start_background_process(arguments.get("command", ""), arguments.get("log_file"))
+                print(res)
+            except Exception as e:
+                print(f"Error in start_background_process: {e}")
+        elif tool_name == "check_process_status" or server_name == "check_process_status":
+            try:
+                res = check_process_status(arguments.get("pid"), arguments.get("log_file"))
+                print(res)
+            except Exception as e:
+                print(f"Error in check_process_status: {e}")
+        elif tool_name == "stop_process" or server_name == "stop_process":
+            try:
+                res = stop_process(arguments.get("pid"))
+                print(res)
+            except Exception as e:
+                print(f"Error in stop_process: {e}")
         elif tool_name == "read_file" or server_name == "read_file":
             path = arguments.get("path", "")
             start_line = arguments.get("start_line", None)
@@ -3677,22 +3971,34 @@ def main():
                             available.extend(os.listdir(base))
                     print(f"Skill '{skill_name}' not found. Call load_skill() with no argument to list available skills.")
         elif tool_name == "computer_control" or server_name == "computer_control":
-            result = computer_control(arguments)
-            print(result)
+            try:
+                result = computer_control(arguments)
+                print(result)
+            except Exception as e:
+                print(f"Error in computer_control: {e}")
         elif tool_name == "pubmed_research_round" or server_name == "pubmed_research_round":
-            result = pubmed_research_round(
-                query=arguments.get("query", ""),
-                known_dois=arguments.get("known_dois"),
-                start_date=arguments.get("start_date"),
-                end_date=arguments.get("end_date"),
-            )
-            print(result)
+            try:
+                result = pubmed_research_round(
+                    query=arguments.get("query", ""),
+                    known_dois=arguments.get("known_dois"),
+                    start_date=arguments.get("start_date"),
+                    end_date=arguments.get("end_date"),
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in pubmed_research_round: {e}")
         elif tool_name == "get_system_status" or server_name == "get_system_status":
-            result = get_system_status()
-            print(result)
+            try:
+                result = get_system_status()
+                print(result)
+            except Exception as e:
+                print(f"Error in get_system_status: {e}")
         elif tool_name == "get_clipboard" or server_name == "get_clipboard":
-            result = get_clipboard()
-            print(result)
+            try:
+                result = get_clipboard()
+                print(result)
+            except Exception as e:
+                print(f"Error in get_clipboard: {e}")
         elif tool_name == "learn_rule" or server_name == "learn_rule":
             try:
                 rule_text = arguments.get("rule_text", "")
@@ -3714,37 +4020,40 @@ def main():
                 print(res)
             except Exception as e:
                 import traceback
-                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\nAn internal error occurred in the middleware during tool execution:\n{str(e)}\n{traceback.format_exc()}\n\n[GRAPH ENFORCEMENT]\nYou must pause, recalculate your approach, and try a different strategy.")
         elif tool_name == "vault_read" or server_name == "vault_read":
             try:
                 res = vault_read(arguments.get("title", ""))
                 print(res)
             except Exception as e:
                 import traceback
-                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\nAn internal error occurred in the middleware during tool execution:\n{str(e)}\n{traceback.format_exc()}\n\n[GRAPH ENFORCEMENT]\nYou must pause, recalculate your approach, and try a different strategy.")
         elif tool_name == "vault_search" or server_name == "vault_search":
             try:
                 res = vault_search(arguments.get("query", ""))
                 print(res)
             except Exception as e:
                 import traceback
-                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\nAn internal error occurred in the middleware during tool execution:\n{str(e)}\n{traceback.format_exc()}\n\n[GRAPH ENFORCEMENT]\nYou must pause, recalculate your approach, and try a different strategy.")
         elif tool_name == "vault_backlinks" or server_name == "vault_backlinks":
             try:
                 res = vault_backlinks(arguments.get("title", ""))
                 print(res)
             except Exception as e:
                 import traceback
-                print(f"[SYSTEM EXCEPTION INTERCEPTED]\\nAn internal error occurred in the middleware during tool execution:\\n{str(e)}\\n{traceback.format_exc()}\\n\\n[GRAPH ENFORCEMENT]\\nYou must pause, recalculate your approach, and try a different strategy.")
+                print(f"[SYSTEM EXCEPTION INTERCEPTED]\nAn internal error occurred in the middleware during tool execution:\n{str(e)}\n{traceback.format_exc()}\n\n[GRAPH ENFORCEMENT]\nYou must pause, recalculate your approach, and try a different strategy.")
         elif tool_name == "pubmed_search" or server_name == "pubmed_search":
-            result = pubmed_search(
-                query=arguments.get("query", ""),
-                top_k=arguments.get("top_k", 10),
-                start_date=arguments.get("start_date"),
-                end_date=arguments.get("end_date"),
-                high_quality_only=arguments.get("high_quality_only", True),
-            )
-            print(result)
+            try:
+                result = pubmed_search(
+                    query=arguments.get("query", ""),
+                    top_k=arguments.get("top_k", 10),
+                    start_date=arguments.get("start_date"),
+                    end_date=arguments.get("end_date"),
+                    high_quality_only=arguments.get("high_quality_only", True),
+                )
+                print(result)
+            except Exception as e:
+                print(f"Error in pubmed_search: {e}")
         elif tool_name == "gcal_list_events" or server_name == "gcal_list_events":
             try:
                 import gcal

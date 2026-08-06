@@ -117,7 +117,8 @@ TOOL_EDIT_MESSAGE = {
 }
 
 def get_zulip_client():
-    if "zulip" not in sys.modules:
+    zmod = sys.modules.get("zulip")
+    if not zmod or not getattr(zmod, "Client", None):
         raise Exception("The 'zulip' Python package is not installed. Please run: pip install zulip")
 
     site = os.environ.get("ZULIP_SITE")
