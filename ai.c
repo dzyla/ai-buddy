@@ -18,6 +18,7 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <errno.h>
+#include <signal.h>
 
 #define MAX_LINE 1024
 #define MAX_VAL  2048
@@ -40,6 +41,87 @@ static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no time
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
 static int   trim_threshold   = 100000;/* set via INFER_TRIM_THRESHOLD; default 100000 */
 static int   stub_threshold   = 250000;/* set via INFER_STUB_THRESHOLD; default 250000 */
+static char  *g_goal_text     = NULL; /* -g/--goal flag */
+
+typedef struct ToolCacheNode {
+    char *key;
+    char *output;
+    struct ToolCacheNode *next;
+} ToolCacheNode;
+
+static ToolCacheNode *g_tool_cache = NULL;
+
+static const char* get_tool_cache(const char *name, const char *args) {
+    if (!name || !args) return NULL;
+    if (strcmp(name, "read_file") != 0 &&
+        strcmp(name, "web_search") != 0 &&
+        strcmp(name, "fetch_webpage") != 0 &&
+        strcmp(name, "list_directory") != 0) {
+        return NULL;
+    }
+    size_t klen = strlen(name) + strlen(args) + 2;
+    char *key = malloc(klen);
+    snprintf(key, klen, "%s:%s", name, args);
+    ToolCacheNode *curr = g_tool_cache;
+    while (curr) {
+        if (strcmp(curr->key, key) == 0) {
+            free(key);
+            return curr->output;
+        }
+        curr = curr->next;
+    }
+    free(key);
+    return NULL;
+}
+
+static void set_tool_cache(const char *name, const char *args, const char *output) {
+    if (!name || !args || !output) return;
+    if (strcmp(name, "read_file") != 0 &&
+        strcmp(name, "web_search") != 0 &&
+        strcmp(name, "fetch_webpage") != 0 &&
+        strcmp(name, "list_directory") != 0) {
+        return;
+    }
+    if (strncmp(output, "Error", 5) == 0 || strncmp(output, "[Command Failed", 15) == 0) return;
+
+    size_t klen = strlen(name) + strlen(args) + 2;
+    char *key = malloc(klen);
+    snprintf(key, klen, "%s:%s", name, args);
+
+    ToolCacheNode *node = malloc(sizeof(ToolCacheNode));
+    node->key = key;
+    node->output = strdup(output);
+    node->next = g_tool_cache;
+    g_tool_cache = node;
+}
+
+static int g_dry_run = 0; /* --dry-run flag */
+
+static int is_command_denied(const char *cmd) {
+    if (!cmd) return 0;
+    static const char *default_denied[] = {
+        "rm -rf /", "rm -rf ~", "rm -rf $HOME", "mkfs", "dd if=/dev/zero",
+        ":(){ :|:& };:", "chmod -R 777 /", "> /dev/sda", NULL
+    };
+    for (int i = 0; default_denied[i]; i++) {
+        if (strstr(cmd, default_denied[i])) return 1;
+    }
+    const char *denylist = getenv("INFER_COMMAND_DENYLIST");
+    if (denylist && *denylist) {
+        char *copy = strdup(denylist);
+        char *token = strtok(copy, ",");
+        while (token) {
+            while (isspace((unsigned char)*token)) token++;
+            if (*token && strstr(cmd, token)) {
+                free(copy);
+                return 1;
+            }
+            token = strtok(NULL, ",");
+        }
+        free(copy);
+    }
+    return 0;
+}
 
 static const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
@@ -666,6 +748,12 @@ static void disable_raw_mode(void) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_mode_active = 0;
     }
+}
+
+static void sig_handler(int sig) {
+    disable_raw_mode();
+    fprintf(stderr, "\n[ai] Signal %d received — restoring terminal and exiting.\n", sig);
+    exit(128 + sig);
 }
 
 /* Called by libcurl periodically during transfers; returning non-zero aborts. */
@@ -1619,7 +1707,7 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                         if (!ctx->quiet_mode) {
                             if (!ctx->printed_thinking_header) {
                                 fprintf(stderr, "\r\033[2K");
-                                fprintf(stderr, "\033[2m[thinking]\n");
+                                fprintf(stderr, "\033[1;35m┌─ 🧠 Thinking ──────────────────────────────────────────────┐\033[0m\n\033[2;35m");
                                 ctx->printed_thinking_header = 1;
                             }
                             fprintf(stderr, "%s", reasoning_chunk);
@@ -1634,7 +1722,7 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                     if (content_chunk) {
                         buf_append_str(&ctx->accumulated_content, &ctx->content_len, &ctx->content_cap, content_chunk, strlen(content_chunk));
                         if (ctx->printed_thinking_header && !ctx->printed_thinking_footer) {
-                            fprintf(stderr, "\033[0m\n");
+                            fprintf(stderr, "\033[0m\n\033[1;35m└────────────────────────────────────────────────────────────┘\033[0m\n");
                             fflush(stderr);
                             ctx->printed_thinking_footer = 1;
                         } else if (!ctx->printed_thinking_header) {
@@ -2391,9 +2479,9 @@ static void load_from_profiles(char **url, char **key, char **model) {
         fclose(fp);
     }
 
-    if ((!*url || !**url) && strlen(f_url) > 0) *url = f_url;
-    if ((!*key || !**key) && strlen(f_key) > 0) *key = f_key;
-    if ((!*model || !**model) && strlen(f_model) > 0) *model = f_model;
+    if (url && (!*url || !**url) && strlen(f_url) > 0) *url = f_url;
+    if (key && (!*key || !**key) && strlen(f_key) > 0) *key = f_key;
+    if (model && (!*model || !**model) && strlen(f_model) > 0) *model = f_model;
 }
 
 static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk) {
@@ -2754,6 +2842,8 @@ static void load_env_file() {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
     time_t current_time = time(NULL);
     snprintf(current_session_id, sizeof(current_session_id), "sess_%ld", (long)current_time);
     load_env_file();
@@ -2819,6 +2909,20 @@ int main(int argc, char **argv) {
         }
         char cmd[8192];
         snprintf(cmd, sizeof(cmd), "python3 %s \"%s\"", script, topic);
+        return system(cmd);
+    }
+
+    /* metrics sub-command */
+    if (argc >= 2 && strcmp(argv[1], "metrics") == 0) {
+        char script[1024];
+        if (access("./ai_mcp.py", R_OK) == 0) {
+            snprintf(script, sizeof(script), "./ai_mcp.py");
+        } else {
+            const char *home = getenv("HOME");
+            snprintf(script, sizeof(script), "%s/.local/bin/ai_mcp.py", home ? home : "~");
+        }
+        char cmd[8192];
+        snprintf(cmd, sizeof(cmd), "python3 %s show-metrics", script);
         return system(cmd);
     }
 
@@ -2910,7 +3014,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
             interactive_mode = 1;
-        } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
+        } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0 ||
+                   strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--auto-approve") == 0) {
             g_auto_approve = 1;
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) {
             g_continue_until_done = 1;
@@ -2918,13 +3023,20 @@ int main(int argc, char **argv) {
             quiet_mode = 1;
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) {
             no_tools_mode = 1;
+        } else if (strcmp(argv[i], "--dry-run") == 0) {
+            g_dry_run = 1;
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
-            if (i + 1 < argc && argv[i+1][0] != '-') {
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                (strncmp(argv[i+1], "sess_", 5) == 0 || strcmp(argv[i+1], "last") == 0 ||
+                 strstr(argv[i+1], ".json") != NULL)) {
                 resume_session_id = argv[i+1];
                 i++;
             } else {
                 resume_session_id = "";
             }
+        } else if ((strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
+            g_goal_text = strdup(argv[i+1]);
+            i++;
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
             temperature_val = (float)atof(argv[i+1]);
             i++;
@@ -3115,7 +3227,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
-             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
+             strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
         }
         if (!image_path && is_image_file(argv[i])) {
@@ -3135,7 +3248,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
-             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
+             strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
         }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
@@ -3155,7 +3269,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
-             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
+             strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
         }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
@@ -3243,11 +3358,15 @@ int main(int argc, char **argv) {
     size_t mlen = strlen(safe_system) + strlen(safe_ctx)
                   + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
                   + (safe_mem ? strlen(safe_mem) + 64 : 0)
-                  + (safe_rag ? strlen(safe_rag) + 64 : 0) + 256;
+                  + (safe_rag ? strlen(safe_rag) + 64 : 0)
+                  + (g_goal_text ? strlen(g_goal_text) + 256 : 0) + 256;
 
     /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
     char *content = malloc(mlen);
     int clen = snprintf(content, mlen, "%s\n\n%s", active_system_prompt, sys_ctx);
+    if (g_goal_text && strlen(g_goal_text) > 0)
+        clen += snprintf(content + clen, mlen - clen,
+                         "\n\nMISSION BOARD:\n- Top Goal: %s\n- Status: In Progress\n- Instruction: Decompose into subtasks, execute step-by-step, verify work before finishing.", g_goal_text);
     if (triggers && strlen(triggers) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nCRITICAL SKILL TRIGGERS (obey BEFORE any other tool):\n%s", triggers);
@@ -3288,33 +3407,28 @@ int main(int argc, char **argv) {
         messages_json = load_session_transcript(messages_json, mcp_script);
 
     // Add User Prompt
-    char *safe_prompt = json_escape(prompt);
-    char *user_content = NULL;
+    char *raw_user_content = NULL;
     if (pipe_in && strlen(pipe_in) > 0) {
-        char *safe_pipe = json_escape(pipe_in);
         if (pipe_writer) {
-            char *safe_writer = json_escape(pipe_writer);
-            size_t len = strlen(safe_prompt) + strlen(safe_pipe) + strlen(safe_writer) + 256;
-            user_content = malloc(len);
-            sprintf(user_content, "%s\\n\\nContext (output of command `%s`):\\n%s", safe_prompt, safe_writer, safe_pipe);
-            free(safe_writer);
+            size_t len = strlen(prompt) + strlen(pipe_in) + strlen(pipe_writer) + 256;
+            raw_user_content = malloc(len);
+            snprintf(raw_user_content, len, "%s\n\nContext (output of command `%s`):\n%s", prompt, pipe_writer, pipe_in);
         } else {
-            size_t len = strlen(safe_prompt) + strlen(safe_pipe) + 128;
-            user_content = malloc(len);
-            sprintf(user_content, "%s\\n\\nContext:\\n%s", safe_prompt, safe_pipe);
+            size_t len = strlen(prompt) + strlen(pipe_in) + 128;
+            raw_user_content = malloc(len);
+            snprintf(raw_user_content, len, "%s\n\nContext:\n%s", prompt, pipe_in);
         }
-        free(safe_pipe);
     } else if (pipe_writer) {
-        // Print warning to stderr so the user knows the tool is intercepting and handling the empty pipe
         fprintf(stderr, "[ai] Warning: Piped command '%s' returned no stdout. The agent will execute it to inspect stderr.\n", pipe_writer);
-        char *safe_writer = json_escape(pipe_writer);
-        size_t len = strlen(safe_prompt) + strlen(safe_writer) + 512;
-        user_content = malloc(len);
-        sprintf(user_content, "%s\\n\\nContext:\\nThe user ran the command `%s` in their terminal, but its stdout was empty. It might have failed and written to stderr. You should run this command using the execute_command tool to inspect its output/errors.", safe_prompt, safe_writer);
-        free(safe_writer);
+        size_t len = strlen(prompt) + strlen(pipe_writer) + 512;
+        raw_user_content = malloc(len);
+        snprintf(raw_user_content, len, "%s\n\nContext:\nThe user ran the command `%s` in their terminal, but its stdout was empty. It might have failed and written to stderr. You should run this command using the execute_command tool to inspect its output/errors.", prompt, pipe_writer);
     } else {
-        user_content = strdup(safe_prompt);
+        raw_user_content = strdup(prompt);
     }
+
+    char *user_content = json_escape(raw_user_content);
+    free(raw_user_content);
 
     char *user_msg = NULL;
     if (image_path) {
@@ -3339,7 +3453,6 @@ int main(int argc, char **argv) {
         messages_json = append_message(messages_json, user_msg);
         run_query_this_turn = 1;
     }
-    free(safe_prompt);
     free(user_content); free(user_msg);
 
     // 2. Setup Curl
@@ -4025,138 +4138,144 @@ step_limit_check:
 
 
                                   if (cmd_val) {
-                                      int approved = g_auto_approve;
-                                      if (!approved) {
-                                          FILE *tty = fopen("/dev/tty", "r+");
-                                          if (tty) {
-                                               fprintf(tty, "\n\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
-                                               fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
-                                               fflush(tty);
-                                               
-                                               int fd = fileno(tty);
-                                               struct termios orig_tty_termios;
-                                               int has_termios = (tcgetattr(fd, &orig_tty_termios) >= 0);
-                                               
-                                               if (has_termios) {
-                                                   struct termios raw = orig_tty_termios;
-                                                   raw.c_lflag &= ~(ECHO | ICANON);
-                                                   raw.c_cc[VMIN] = 1;
-                                                   raw.c_cc[VTIME] = 0;
-                                                   tcsetattr(fd, TCSANOW, &raw);
-                                               }
-                                               
-                                               char ch = 0;
-                                               while (1) {
-                                                   if (read(fd, &ch, 1) != 1) {
-                                                       break;
+                                      if (is_command_denied(cmd_val)) {
+                                          fprintf(stderr, "[ai] Security block: command matches INFER_COMMAND_DENYLIST filter.\n");
+                                          tool_output = strdup("Error: Command execution blocked by security denylist filter (INFER_COMMAND_DENYLIST).");
+                                      } else if (g_dry_run) {
+                                          fprintf(stderr, "[ai] [Dry-run] Would execute: %s\n", cmd_val);
+                                          size_t dlen = strlen(cmd_val) + 128;
+                                          tool_output = malloc(dlen);
+                                          snprintf(tool_output, dlen, "[Command Dry-Run Success]\nWould execute: %s", cmd_val);
+                                      } else {
+                                          int approved = g_auto_approve;
+                                          if (!approved) {
+                                              FILE *tty = fopen("/dev/tty", "r+");
+                                              if (tty) {
+                                                   fprintf(tty, "\n\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
+                                                   fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
+                                                   fflush(tty);
+                                                   
+                                                   int fd = fileno(tty);
+                                                   struct termios orig_tty_termios;
+                                                   int has_termios = (tcgetattr(fd, &orig_tty_termios) >= 0);
+                                                   
+                                                   if (has_termios) {
+                                                       struct termios raw = orig_tty_termios;
+                                                       raw.c_lflag &= ~(ECHO | ICANON);
+                                                       raw.c_cc[VMIN] = 1;
+                                                       raw.c_cc[VTIME] = 0;
+                                                       tcsetattr(fd, TCSANOW, &raw);
                                                    }
                                                    
-                                                   if (ch == 27) { // ESC
-                                                       if (has_termios) {
-                                                           struct termios timeout_raw = orig_tty_termios;
-                                                           timeout_raw.c_lflag &= ~(ECHO | ICANON);
-                                                           timeout_raw.c_cc[VMIN] = 0;
-                                                           timeout_raw.c_cc[VTIME] = 1; // 100ms
-                                                           tcsetattr(fd, TCSANOW, &timeout_raw);
+                                                   char ch = 0;
+                                                   while (1) {
+                                                       if (read(fd, &ch, 1) != 1) {
+                                                           break;
                                                        }
                                                        
-                                                       char seq[2] = {0, 0};
-                                                       int n1 = read(fd, &seq[0], 1);
-                                                       int n2 = 0;
-                                                       if (n1 == 1) {
-                                                           n2 = read(fd, &seq[1], 1);
-                                                       }
-                                                       
-                                                       if (has_termios) {
-                                                           struct termios raw = orig_tty_termios;
-                                                           raw.c_lflag &= ~(ECHO | ICANON);
-                                                           raw.c_cc[VMIN] = 1;
-                                                           raw.c_cc[VTIME] = 0;
-                                                           tcsetattr(fd, TCSANOW, &raw);
-                                                       }
-                                                       
-                                                       if (n1 == 1 && n2 == 1 && seq[0] == '[' && seq[1] == 'Z') {
-                                                           g_auto_approve ^= 1;
-                                                           if (g_auto_approve) {
-                                                               setenv("INFER_AUTO_APPROVE", "1", 1);
-                                                               fprintf(tty, "\n\033[2mauto-approve on\033[0m\n");
-                                                               fflush(tty);
-                                                               approved = 1;
-                                                               break;
-                                                           } else {
-                                                               unsetenv("INFER_AUTO_APPROVE");
-                                                               fprintf(tty, "\n\033[2mauto-approve off\033[0m\n");
+                                                       if (ch == 27) { // ESC
+                                                           if (has_termios) {
+                                                               struct termios timeout_raw = orig_tty_termios;
+                                                               timeout_raw.c_lflag &= ~(ECHO | ICANON);
+                                                               timeout_raw.c_cc[VMIN] = 0;
+                                                               timeout_raw.c_cc[VTIME] = 1; // 100ms
+                                                               tcsetattr(fd, TCSANOW, &timeout_raw);
+                                                           }
+                                                           
+                                                           char seq[2] = {0, 0};
+                                                           int n1 = read(fd, &seq[0], 1);
+                                                           int n2 = 0;
+                                                           if (n1 == 1) {
+                                                               if (seq[0] == '[') {
+                                                                   n2 = read(fd, &seq[1], 1);
+                                                               }
+                                                           }
+                                                           
+                                                           if (n1 == 1 && n2 == 1 && seq[0] == '[' && seq[1] == 'Z') {
+                                                               g_auto_approve ^= 1;
+                                                               if (g_auto_approve)
+                                                                   setenv("INFER_AUTO_APPROVE", "1", 1);
+                                                               else
+                                                                   unsetenv("INFER_AUTO_APPROVE");
+                                                               fprintf(tty, "\n\033[2mauto-approve %s\033[0m\n",
+                                                                       g_auto_approve ? "on" : "off");
+                                                               fprintf(tty, "\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
                                                                fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
                                                                fflush(tty);
+                                                               continue;
+                                                           } else {
+                                                               fprintf(tty, "^[\n");
+                                                               fflush(tty);
+                                                               approved = 0;
+                                                               g_esc_requested = 1;
+                                                               break;
                                                            }
-                                                           continue;
                                                        }
-                                                       continue;
+                                                       
+                                                       if (ch == '\n' || ch == '\r') {
+                                                           fprintf(tty, "\n");
+                                                           fflush(tty);
+                                                           approved = 1;
+                                                           break;
+                                                       }
+                                                       if (ch == 'y' || ch == 'Y') {
+                                                           fprintf(tty, "%c\n", ch);
+                                                           fflush(tty);
+                                                           approved = 1;
+                                                           break;
+                                                       }
+                                                       if (ch == 'n' || ch == 'N') {
+                                                           fprintf(tty, "%c\n", ch);
+                                                           fflush(tty);
+                                                           approved = 0;
+                                                           break;
+                                                       }
+                                                       if (ch == 3) { // Ctrl+C
+                                                           fprintf(tty, "^C\n");
+                                                           fflush(tty);
+                                                           approved = 0;
+                                                           g_esc_requested = 1;
+                                                           break;
+                                                       }
                                                    }
                                                    
-                                                   if (ch == '\n' || ch == '\r') {
-                                                       fprintf(tty, "\n");
-                                                       fflush(tty);
-                                                       approved = 1;
-                                                       break;
+                                                   if (has_termios) {
+                                                       tcsetattr(fd, TCSAFLUSH, &orig_tty_termios);
                                                    }
-                                                   if (ch == 'y' || ch == 'Y') {
-                                                       fprintf(tty, "%c\n", ch);
-                                                       fflush(tty);
-                                                       approved = 1;
-                                                       break;
-                                                   }
-                                                   if (ch == 'n' || ch == 'N') {
-                                                       fprintf(tty, "%c\n", ch);
-                                                       fflush(tty);
-                                                       approved = 0;
-                                                       break;
-                                                   }
-                                                   if (ch == 3) { // Ctrl+C
-                                                       fprintf(tty, "^C\n");
-                                                       fflush(tty);
-                                                       approved = 0;
-                                                       g_esc_requested = 1;
-                                                       break;
-                                                   }
-                                               }
-                                               
-                                               if (has_termios) {
-                                                   tcsetattr(fd, TCSAFLUSH, &orig_tty_termios);
-                                               }
-                                               fclose(tty);
-                                          } else {
-                                              fprintf(stderr, "[ai] Warning: cannot open /dev/tty for confirmation. Skipping command execution for safety.\n");
-                                          }
-                                      }
-
-                                      if (approved) {
-                                          fprintf(stderr, "[ai] executing command: %s\n", cmd_val);
-                                          size_t cmd_len = strlen(cmd_val);
-                                          char *cmd_with_stderr = malloc(cmd_len + 16);
-                                          sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
-                                          int exit_code = 0;
-                                          char *raw_output = run_shell_command_timeout(cmd_with_stderr, &exit_code, cmd_timeout);
-                                          free(cmd_with_stderr);
-
-                                          if (exit_code == 130) /* ESC / SIGINT during command */
-                                              g_esc_requested = 1;
-
-                                          if (raw_output) {
-                                              size_t out_len = strlen(raw_output);
-                                              tool_output = malloc(out_len + 512);
-                                              if (exit_code == 0) {
-                                                  sprintf(tool_output, "[Command Success]\n%s", raw_output);
+                                                   fclose(tty);
                                               } else {
-                                                  sprintf(tool_output, "[Command Failed with exit status %d]\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
+                                                  fprintf(stderr, "[ai] Warning: cannot open /dev/tty for confirmation. Skipping command execution for safety.\n");
                                               }
-                                              free(raw_output);
-                                          } else {
-                                              tool_output = strdup("Error: failed to run command");
                                           }
-                                      } else {
-                                          fprintf(stderr, "[ai] command execution cancelled.\n");
-                                          tool_output = strdup("Error: Command execution was cancelled/denied by the user.");
+
+                                          if (approved) {
+                                              fprintf(stderr, "[ai] executing command: %s\n", cmd_val);
+                                              size_t cmd_len = strlen(cmd_val);
+                                              char *cmd_with_stderr = malloc(cmd_len + 16);
+                                              sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
+                                              int exit_code = 0;
+                                              char *raw_output = run_shell_command_timeout(cmd_with_stderr, &exit_code, cmd_timeout);
+                                              free(cmd_with_stderr);
+
+                                              if (exit_code == 130) /* ESC / SIGINT during command */
+                                                  g_esc_requested = 1;
+
+                                              if (raw_output) {
+                                                  size_t out_len = strlen(raw_output);
+                                                  tool_output = malloc(out_len + 512);
+                                                  if (exit_code == 0) {
+                                                      sprintf(tool_output, "[Command Success]\n%s", raw_output);
+                                                  } else {
+                                                      sprintf(tool_output, "[Command Failed with exit status %d]\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
+                                                  }
+                                                  free(raw_output);
+                                              } else {
+                                                  tool_output = strdup("Error: failed to run command");
+                                              }
+                                          } else {
+                                              fprintf(stderr, "[ai] command execution cancelled.\n");
+                                              tool_output = strdup("Error: Command execution was cancelled/denied by the user.");
+                                          }
                                       }
                                       free(cmd_val);
                                   } else {
@@ -4231,13 +4350,22 @@ step_limit_check:
                                               server_name, mcp_tool_name);
                                   }
                                   
-                                  char *escaped_args_shell = shell_escape(unescaped_args);
-                                  char call_cmd[4096 + strlen(escaped_args_shell)];
-                                  snprintf(call_cmd, sizeof(call_cmd), "python3 %s call-tool %s %s %s", mcp_script, server_name, mcp_tool_name, escaped_args_shell);
-                                  tool_output = run_shell_command(call_cmd, NULL);
+                                  const char *cached_res = get_tool_cache(mcp_tool_name, unescaped_args);
+                                  if (cached_res) {
+                                      fprintf(stderr, "\033[2m[ai] %s: (cached)\033[0m\n", mcp_tool_name);
+                                      tool_output = strdup(cached_res);
+                                  } else {
+                                      char *escaped_args_shell = shell_escape(unescaped_args);
+                                      char call_cmd[4096 + strlen(escaped_args_shell)];
+                                      snprintf(call_cmd, sizeof(call_cmd), "python3 %s call-tool %s %s %s", mcp_script, server_name, mcp_tool_name, escaped_args_shell);
+                                      tool_output = run_shell_command(call_cmd, NULL);
+                                      if (tool_output && strncmp(tool_output, "Error", 5) != 0) {
+                                          set_tool_cache(mcp_tool_name, unescaped_args, tool_output);
+                                      }
+                                      free(escaped_args_shell);
+                                  }
 
                                   free(server_name);
-                                  free(escaped_args_shell);
                               }
 
                               if (!tool_output) {
@@ -4253,14 +4381,25 @@ step_limit_check:
                                                 strncmp(tool_output, "{\"error\"", 8) == 0);
                                                 
                                   const char *graph_enforcement = "";
-                                  if (is_err && strncmp(tool_output, "[Command Failed", 15) != 0) {
-                                      graph_enforcement = "\n\n[GRAPH ENFORCEMENT: Middleware intercepted an exception. You must pause, recalculate your approach, and try a different strategy.]";
+                                  const char *err_hint = "";
+                                  if (is_err) {
+                                      if (strstr(tool_output, "No such file") || strstr(tool_output, "FileNotFoundError")) {
+                                          err_hint = "\n\n[HINT: File or path not found. Use list_directory to check the directory contents.]";
+                                      } else if (strstr(tool_output, "Permission denied")) {
+                                          err_hint = "\n\n[HINT: Permission denied. Check file permissions or paths.]";
+                                      } else if (strstr(tool_output, "timed out") || strstr(tool_output, "Connection refused") || strstr(tool_output, "429") || strstr(tool_output, "503")) {
+                                          err_hint = "\n\n[HINT: Network timeout or rate limit. Retry after a brief pause or try an alternative endpoint.]";
+                                      } else if (strstr(tool_output, "Missing required argument") || strstr(tool_output, "Invalid argument type")) {
+                                          err_hint = "\n\n[HINT: Tool argument validation failed. Verify required parameters and types before retrying.]";
+                                      } else if (strncmp(tool_output, "[Command Failed", 15) != 0) {
+                                          graph_enforcement = "\n\n[GRAPH ENFORCEMENT: Middleware intercepted an exception. You must pause, recalculate your approach, and try a different strategy.]";
+                                      }
                                   }
                                   
-                                  size_t hlen = strlen(unescaped_name) + strlen(tool_output) + strlen(graph_enforcement) + 64;
+                                  size_t hlen = strlen(unescaped_name) + strlen(tool_output) + strlen(graph_enforcement) + strlen(err_hint) + 64;
                                   char *hout = malloc(hlen);
-                                  snprintf(hout, hlen, "[Tool: %s | Status: %s]\n%s%s",
-                                           unescaped_name, is_err ? "error" : "ok", tool_output, graph_enforcement);
+                                  snprintf(hout, hlen, "[Tool: %s | Status: %s]\n%s%s%s",
+                                           unescaped_name, is_err ? "error" : "ok", tool_output, graph_enforcement, err_hint);
                                   free(tool_output);
                                   tool_output = hout;
                               }
@@ -4324,11 +4463,14 @@ step_limit_check:
                               }
 
                               char *safe_output = json_escape(tool_output);
-                              size_t tool_resp_len = strlen(safe_output) + strlen(unescaped_id) + strlen(unescaped_name) + 256;
+                              char *safe_id = json_escape(unescaped_id);
+                              char *safe_name = json_escape(unescaped_name);
+                              size_t tool_resp_len = strlen(safe_output) + strlen(safe_id) + strlen(safe_name) + 256;
                               char *tool_resp = malloc(tool_resp_len);
-                              sprintf(tool_resp, "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"name\":\"%s\",\"content\":\"%s\"}", unescaped_id, unescaped_name, safe_output);
-                              
+                              snprintf(tool_resp, tool_resp_len, "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"name\":\"%s\",\"content\":\"%s\"}", safe_id, safe_name, safe_output);
                               messages_json = append_message(messages_json, tool_resp);
+                              free(safe_id);
+                              free(safe_name);
 
                               // Check if it's an image file returned by read_file/read_image_file
                               if (strncmp(tool_output, "[IMAGE_DATA_SUCCESS:", 20) == 0) {

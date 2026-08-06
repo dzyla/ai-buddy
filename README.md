@@ -52,18 +52,47 @@ ai "hello"
 
 ---
 
-## Backends
+## Backends & Model Deployment
 
-`ai-backend` manages which LLM server `ai` talks to. Config lives in `~/.local/share/ai/env` and is loaded directly by the `ai` binary.
+`ai-backend` is the single, unified tool that manages model loading, downloading, setting, and serving. Active config lives in `~/.local/share/ai/env` and is loaded directly by the `ai` binary.
 
 ```bash
-ai-backend status          # show active backend and what's available
-ai-backend auto            # switch to whatever is currently running
-ai-backend qwen3-6         # switch to qwen3-6 snap (reads its live port)
-ai-backend gemma4          # switch to gemma4 snap
-ai-backend llama           # switch to local llama-server
-ai-backend llama /path/to/model.gguf   # switch + set model file
-ai-backend llama --list    # list downloaded models
+ai-backend status                             # Show active backend, model, and server status
+ai-backend use <hf_uri|model_path|preset>     # Download (if needed) & switch active model
+                                              # Supports hf:// URIs, split GGUFs, local files
+ai-backend list                               # List all downloaded GGUF models
+ai-backend auto                               # Switch to best available running backend
+ai-backend ctx <size|auto>                    # Set or clear explicit context window
+ai-backend gpu-layers <n|auto>                # Set GPU offload layer count
+ai-backend serve                              # Run llama-server with auto-VRAM context sizing
+```
+
+### Loading & Downloading Models
+
+`ai-backend` natively supports direct downloading and auto-switching from Hugging Face via `hf://` URIs, URLs, or repository names, including automatic multi-part split GGUF detection:
+
+```bash
+# 1. Download and use a multi-part split GGUF model via hf:// URI
+ai-backend use hf://AtomicChat/Ling-3.0-flash-GGUF/AD-IQ3_M/Ling-3.0-flash-AD-IQ3_M-00001-of-00002.gguf
+
+# 2. Download from Hugging Face repo with interactive file selection
+ai-backend download unsloth/gemma-4-12b-it-GGUF
+
+# 3. Switch to an existing local model
+ai-backend use /path/to/model.gguf
+# Or select from downloaded models list by number
+ai-backend use
+
+# 4. For gated or private Hugging Face repositories
+export HF_TOKEN="hf_your_token_here"
+ai-backend use hf://meta-llama/Llama-3.2-3B-Instruct-GGUF
+```
+
+### Context & GPU Tuning
+
+```bash
+ai-backend ctx 8192         # Set explicit context window (or 'auto')
+ai-backend gpu-layers 24    # Set GPU layer offload count (or 'auto')
 ```
 
 ### Local llama.cpp server

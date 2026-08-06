@@ -1,207 +1,675 @@
-#!/bin/bash
-# ai-backend — show or switch the active LLM backend for the 'ai' CLI
-#
-# Backends are written to ~/.local/share/ai/env.
-# Each snap's port is detected live so it stays correct after snap updates.
+#!/usr/bin/env python3
+"""
+ai-backend — single, unified tool for AI model deployment, serving, downloading, and configuration.
+"""
 
-ENV_FILE="${HOME}/.local/share/ai/env"
-mkdir -p "$(dirname "$ENV_FILE")"
+import os
+import sys
+import re
+import json
+import time
+import signal
+import shutil
+import subprocess
+import urllib.request
+import urllib.parse
+from pathlib import Path
 
-SYSTEMD_SERVICE="${HOME}/.config/systemd/user/llama-server.service"
-MODEL_DIR="${HOME}/.local/share/ai/models"
+DATA_DIR = Path.home() / ".local" / "share" / "ai"
+MODEL_DIR = DATA_DIR / "models"
+ENV_FILE = DATA_DIR / "env"
+SYSTEMD_SERVICE = Path.home() / ".config" / "systemd" / "user" / "llama-server.service"
+SYSTEMD_SOCKET = Path.home() / ".config" / "systemd" / "user" / "llama-server.socket"
+BIN_DIR = Path.home() / ".local" / "bin"
+PORT = 8080
+PUBMED_KEY = "myapp_kZnDpemyN9z43CqNrOYEE-LhAH9_UsxhWTavLkWv22Y"
 
-usage() {
-    cat <<'EOF'
-Usage: ai-backend [COMMAND] [OPTIONS]
+def load_env():
+    env_vars = {}
+    if ENV_FILE.exists():
+        with open(ENV_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:]
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    v = v.strip('"\'')
+                    env_vars[k.strip()] = v
+    return env_vars
 
-Commands:
-  status              Show current backend and all available backends
-  auto                Switch to the best available backend automatically
-  qwen3-6             Switch to qwen3-6 snap (reads its live port)
-  gemma4              Switch to gemma4 snap (reads its live port)
-  llama [PATH]        Switch to local llama-server (port 8080)
-                        PATH  path to a .gguf model file; if omitted, uses
-                              the current model or lists available models
-  llama --list        List downloaded models in ~/.local/share/ai/models/
+def write_env(url, model, llama_model_path=None, extra_vars=None):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not url.endswith("/"):
+        url += "/"
+    
+    current = load_env()
+    if extra_vars:
+        current.update(extra_vars)
 
-If no command is given, 'status' is shown.
-EOF
-}
+    ctx_size = current.get("LLAMA_CTX_SIZE", "")
+    gpu_layers = current.get("LLAMA_N_GPU_LAYERS", "")
+    
+    lines = [
+        "# ai backend config — managed by ai-backend, do not edit manually",
+        f'export INFER_BASE_URL="{url}"',
+        'export INFER_API_KEY="not-needed"',
+        f'export INFER_MODEL="{model}"',
+        'export INFER_TOOL_CHOICE=auto',
+    ]
+    if llama_model_path:
+        lines.append(f'export LLAMA_MODEL_PATH="{llama_model_path}"')
+    if ctx_size:
+        lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
+    if gpu_layers:
+        lines.append(f'export LLAMA_N_GPU_LAYERS="{gpu_layers}"')
+    lines.append(f'export PUBMED_API_KEY="{PUBMED_KEY}"')
+    
+    seen = {"INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "PUBMED_API_KEY"}
+    for k, v in current.items():
+        if k not in seen:
+            lines.append(f'export {k}="{v}"')
 
-# Return the OpenAI endpoint for a snap, or fail if snap not installed
-get_snap_endpoint() {
-    local snap="$1"
-    command -v "$snap" &>/dev/null || return 1
-    local ep
-    ep=$("$snap" status 2>/dev/null | grep -i 'openai:' | awk '{print $2}')
-    [ -n "$ep" ] || return 1
-    # Ensure trailing slash
-    [[ "$ep" == */ ]] && echo "$ep" || echo "${ep}/"
-}
+    with open(ENV_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
-is_snap_active() {
-    local snap="$1"
-    command -v "$snap" &>/dev/null || return 1
-    "$snap" status 2>/dev/null | grep -q "server: active"
-}
+def list_local_models():
+    if not MODEL_DIR.exists():
+        return []
+    models = []
+    for p in sorted(MODEL_DIR.glob("*.gguf")):
+        name = p.name
+        if name.startswith("mmproj-") or "/MTP/" in str(p) or name.endswith("-MTP.gguf"):
+            continue
+        models.append(p)
+    return models
 
-write_env() {
-    local url="$1" model="$2" llama_model_path="${3:-}"
-    # Ensure trailing slash
-    [[ "$url" == */ ]] || url="${url}/"
-    # Preserve any non-INFER exports already in the file (e.g. PUBMED_API_KEY)
-    local extras=""
-    if [ -f "$ENV_FILE" ]; then
-        if [ -n "$llama_model_path" ]; then
-            extras=$(grep "^export" "$ENV_FILE" | grep -v "^export INFER_" | grep -v "^export LLAMA_MODEL_PATH=" || true)
-        else
-            extras=$(grep "^export" "$ENV_FILE" | grep -v "^export INFER_" || true)
-        fi
-    fi
-    cat > "$ENV_FILE" <<EOF
-# ai backend — managed by ai-backend (do not edit manually)
-# Switch with: ai-backend [qwen3-6|gemma4|llama|auto]
-export INFER_BASE_URL="${url}"
-export INFER_API_KEY="not-needed"
-export INFER_MODEL="${model}"
-export INFER_TOOL_CHOICE=auto
-EOF
-    if [ -n "$llama_model_path" ]; then
-        echo "export LLAMA_MODEL_PATH=\"${llama_model_path}\"" >> "$ENV_FILE"
-    fi
-    [ -n "$extras" ] && printf '%s\n' "$extras" >> "$ENV_FILE"
-}
+def get_snap_endpoint(snap_name):
+    if not shutil.which(snap_name):
+        return None
+    try:
+        res = subprocess.run([snap_name, "status"], capture_output=True, text=True, timeout=5)
+        for line in res.stdout.splitlines():
+            if "openai:" in line.lower():
+                parts = line.split()
+                if len(parts) >= 2:
+                    ep = parts[1]
+                    return ep if ep.endswith("/") else ep + "/"
+    except Exception:
+        pass
+    return None
 
-cmd="${1:-status}"
+def is_snap_active(snap_name):
+    if not shutil.which(snap_name):
+        return False
+    try:
+        res = subprocess.run([snap_name, "status"], capture_output=True, text=True, timeout=5)
+        return "server: active" in res.stdout
+    except Exception:
+        return False
 
-case "$cmd" in
-    status)
-        echo "=== Active backend ==="
-        if [ -f "$ENV_FILE" ]; then
-            grep "^export INFER" "$ENV_FILE"
-        else
-            echo "(none — run: ai-backend auto)"
-        fi
-        echo ""
-        echo "=== Available backends ==="
-        for snap in qwen3-6 gemma4; do
-            if command -v "$snap" &>/dev/null; then
-                ep=$(get_snap_endpoint "$snap" 2>/dev/null || echo "?")
-                if is_snap_active "$snap"; then
-                    printf "  %-10s [RUNNING]  %s\n" "$snap" "$ep"
-                else
-                    printf "  %-10s [stopped]  %s\n" "$snap" "$ep"
-                fi
-            fi
-        done
-        if curl -sf http://localhost:8080/health &>/dev/null; then
-            printf "  %-10s [RUNNING]  %s\n" "llama" "http://localhost:8080/v1/"
-        elif [ -f "${HOME}/.local/bin/llama-server" ]; then
-            printf "  %-10s [stopped]  %s\n" "llama" "http://localhost:8080/v1/"
-        fi
-        ;;
+def parse_hf_target(target):
+    t = target.strip()
+    if t.startswith("hf://"):
+        t = t[5:]
+    elif t.startswith("https://huggingface.co/"):
+        t = t[23:]
+    elif t.startswith("http://huggingface.co/"):
+        t = t[22:]
+    
+    t = t.lstrip("/")
+    t = re.sub(r'^(blob|resolve)/[^/]+/', '', t)
+    
+    parts = t.split('/')
+    if len(parts) >= 2:
+        repo = f"{parts[0]}/{parts[1]}"
+        rel_path = "/".join(parts[2:]) if len(parts) > 2 else ""
+        return repo, rel_path
+    return t, ""
 
-    auto)
-        # Priority: qwen3-6 > gemma4 > llama
-        if is_snap_active qwen3-6; then
-            ep=$(get_snap_endpoint qwen3-6)
-            write_env "$ep" "qwen3-6"
-            echo "Switched to qwen3-6 (${ep})"
-        elif is_snap_active gemma4; then
-            ep=$(get_snap_endpoint gemma4)
-            write_env "$ep" "gemma4"
-            echo "Switched to gemma4 (${ep})"
-        elif curl -sf http://localhost:8080/health &>/dev/null; then
-            write_env "http://localhost:8080/v1/" "llama"
-            echo "Switched to llama-server (http://localhost:8080/v1/)"
-        else
-            echo "No backend is currently running."
-            echo "Start one:  qwen3-6 status | systemctl --user start llama-server"
-            exit 1
-        fi
-        ;;
+def fetch_hf_repo_files(repo):
+    api_url = f"https://huggingface.co/api/models/{repo}/tree/main"
+    headers = {"User-Agent": "ai-backend/1.0"}
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    
+    req = urllib.request.Request(api_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            files = []
+            for item in data:
+                if isinstance(item, dict):
+                    path = item.get("path", "")
+                    if path.endswith(".gguf") and not os.path.basename(path).startswith("mmproj"):
+                        files.append(path)
+            return files
+    except Exception:
+        api_url = f"https://huggingface.co/api/models/{repo}"
+        req = urllib.request.Request(api_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                files = []
+                for s in data.get("siblings", []):
+                    rfn = s.get("rfilename", "")
+                    if rfn.endswith(".gguf") and not os.path.basename(rfn).startswith("mmproj"):
+                        files.append(rfn)
+                return files
+        except Exception as e2:
+            print(f"Error fetching repo file list: {e2}", file=sys.stderr)
+            return []
 
-    qwen3-6)
-        ep=$(get_snap_endpoint qwen3-6) || { echo "qwen3-6 snap not installed"; exit 1; }
-        write_env "$ep" "qwen3-6"
-        echo "Switched to qwen3-6 (${ep})"
-        ;;
+def download_file(repo, rel_path):
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    filename = os.path.basename(rel_path)
+    dest = MODEL_DIR / filename
+    
+    if dest.is_symlink() and not dest.exists():
+        print(f"Removing broken symlink: {dest}", file=sys.stderr)
+        dest.unlink()
+        
+    if dest.exists():
+        print(f"Model already present: {dest}", file=sys.stderr)
+        return dest
 
-    gemma4)
-        ep=$(get_snap_endpoint gemma4) || { echo "gemma4 snap not installed"; exit 1; }
-        write_env "$ep" "gemma4"
-        echo "Switched to gemma4 (${ep})"
-        ;;
+    url = f"https://huggingface.co/{repo}/resolve/main/{rel_path}"
+    print(f"Downloading {filename} from {repo}...", file=sys.stderr)
+    print(f"URL: {url}", file=sys.stderr)
+    
+    token = os.environ.get("HF_TOKEN")
+    cmd = ["curl", "-L", "--progress-bar", "--fail"]
+    if token:
+        cmd.extend(["-H", f"Authorization: Bearer {token}"])
+    tmp_dest = str(dest) + ".part"
+    cmd.extend([url, "-o", tmp_dest])
+    
+    res = subprocess.run(cmd)
+    if res.returncode != 0:
+        if os.path.exists(tmp_dest):
+            os.remove(tmp_dest)
+        raise RuntimeError(f"Download failed for {url}")
+        
+    os.rename(tmp_dest, dest)
+    print(f"Downloaded: {dest}", file=sys.stderr)
+    return dest
 
-    llama)
-        model_arg="${2:-}"
-
-        if [ "$model_arg" = "--list" ]; then
-            echo "=== Downloaded models in ${MODEL_DIR} ==="
-            find "$MODEL_DIR" -name "*.gguf" ! -name "mmproj-*.gguf" ! -path "*/MTP/*" \
-                2>/dev/null | sort | while read -r f; do
-                size=$(du -h "$f" 2>/dev/null | cut -f1)
-                printf "  %-8s  %s\n" "$size" "$f"
-            done
-            exit 0
-        fi
-
-        if [ -n "$model_arg" ]; then
-            # Resolve to absolute path
-            model_path="$(realpath "$model_arg" 2>/dev/null || echo "$model_arg")"
-            [ -f "$model_path" ] || { echo "Model file not found: $model_path"; exit 1; }
-        else
-            # Use model from existing service file, or auto-find first available
-            model_path=$(grep -oP '(?<=LLAMA_MODEL_PATH=)\S+' "$SYSTEMD_SERVICE" 2>/dev/null | head -1)
-            if [ -z "$model_path" ]; then
-                model_path=$(find "$MODEL_DIR" -name "*.gguf" ! -name "mmproj-*.gguf" \
-                    ! -path "*/MTP/*" 2>/dev/null | sort | head -1)
-            fi
-            if [ -z "$model_path" ]; then
-                echo "No model found. Specify one:"
-                echo "  ai-backend llama /path/to/model.gguf"
-                echo "  ai-backend llama --list"
-                exit 1
-            fi
-            echo "Using model: $model_path"
-        fi
-
-        # Update systemd service with new model path (if service file exists)
-        if [ -f "$SYSTEMD_SERVICE" ]; then
-            sed -i "s|^Environment=LLAMA_MODEL_PATH=.*|Environment=LLAMA_MODEL_PATH=${model_path}|" \
-                "$SYSTEMD_SERVICE"
-            systemctl --user daemon-reload 2>/dev/null || true
-            echo "Updated systemd service: LLAMA_MODEL_PATH=${model_path}"
+def download_hf_target(target):
+    repo, rel_path = parse_hf_target(target)
+    if not repo:
+        raise ValueError(f"Invalid HuggingFace target: {target}")
+        
+    if not rel_path:
+        files = fetch_hf_repo_files(repo)
+        if not files:
+            raise ValueError(f"No .gguf files found in {repo}")
+        print(f"Available GGUF files in {repo}:")
+        for i, f in enumerate(files, 1):
+            print(f"  {i}) {f}")
+        choice = input("Enter choice number or filename: ").strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(files):
+                rel_path = files[idx]
+            else:
+                raise ValueError("Invalid selection")
+        else:
+            rel_path = choice
             
-            # Automatically restart/reload active or failed llama-server service to apply new model
-            if systemctl --user is-active -q llama-server.service 2>/dev/null || systemctl --user is-failed -q llama-server.service 2>/dev/null; then
-                echo "Restarting llama-server.service to load new model..."
-                systemctl --user restart llama-server.service || true
-            fi
-        fi
+    split_match = re.search(r'^(.*?)-(\d{5})-of-(\d{5})\.gguf$', rel_path)
+    if split_match:
+        prefix = split_match.group(1)
+        total_parts = int(split_match.group(3))
+        print(f"Detected split GGUF model with {total_parts} parts.", file=sys.stderr)
+        first_dest = None
+        for p in range(1, total_parts + 1):
+            part_str = f"{p:05d}"
+            part_rel_path = f"{prefix}-{part_str}-of-{total_parts:05d}.gguf"
+            dest = download_file(repo, part_rel_path)
+            if p == 1:
+                first_dest = dest
+        return first_dest
+    else:
+        return download_file(repo, rel_path)
 
-        # Also update the on-demand launcher in ~/.local/bin/ai if present
-        LAUNCHER="${HOME}/.local/bin/ai"
-        if [ -f "$LAUNCHER" ] && grep -q 'MODEL_PATH=' "$LAUNCHER"; then
-            sed -i "s|^MODEL_PATH=.*|MODEL_PATH=\"${model_path}\"|" "$LAUNCHER"
-            echo "Updated on-demand launcher: ${LAUNCHER}"
-        fi
+def apply_model_path(model_path):
+    model_path = Path(model_path).resolve()
+    if not model_path.exists():
+        print(f"Model file not found: {model_path}", file=sys.stderr)
+        sys.exit(1)
 
-        write_env "http://localhost:8080/v1/" "llama" "$model_path"
-        echo "Switched to llama-server (http://localhost:8080/v1/)"
-        echo "Model:     $model_path"
-        echo ""
-        echo "Start srv:  systemctl --user restart llama-server"
-        echo "       or:  LLAMA_MODEL_PATH=\"$model_path\" ~/.local/bin/llama-server-wrapper.sh"
-        ;;
+    kill_llama_server()
+    
+    if SYSTEMD_SERVICE.exists():
+        try:
+            content = SYSTEMD_SERVICE.read_text()
+            new_content = re.sub(r'^Environment=LLAMA_MODEL_PATH=.*', f'Environment=LLAMA_MODEL_PATH={model_path}', content, flags=re.MULTILINE)
+            SYSTEMD_SERVICE.write_text(new_content)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            print(f"Updated systemd service: LLAMA_MODEL_PATH={model_path}")
+            if is_systemd_service_active():
+                print("Restarting llama-server.service to apply new model...")
+                subprocess.run(["systemctl", "--user", "restart", "llama-server.service"])
+        except Exception as e:
+            print(f"Warning updating systemd service: {e}", file=sys.stderr)
 
-    -h|--help|help)
-        usage
-        ;;
+    write_env(f"http://localhost:{PORT}/v1/", "llama", str(model_path))
+    print(f"Switched active backend to llama-server (http://localhost:{PORT}/v1/)")
+    print(f"Active Model: {model_path}")
 
-    *)
-        echo "Unknown backend: $1"
-        usage
-        exit 1
-        ;;
-esac
+def kill_llama_server():
+    if is_systemd_service_active():
+        print("Stopping llama-server.service...")
+        subprocess.run(["systemctl", "--user", "stop", "llama-server.service"], capture_output=True)
+    try:
+        res = subprocess.run(["pgrep", "-f", "llama-server.*--model"], capture_output=True, text=True)
+        pids = res.stdout.strip().split()
+        for pid in pids:
+            print(f"Stopping running llama-server (PID {pid})...")
+            subprocess.run(["kill", pid], capture_output=True)
+    except Exception:
+        pass
+
+def is_systemd_service_active():
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", "llama-server.service"], capture_output=True, text=True)
+        return res.stdout.strip() == "active"
+    except Exception:
+        return False
+
+def calculate_auto_ctx(model_path):
+    vram_free = 0
+    if shutil.which("nvidia-smi"):
+        try:
+            res = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5
+            )
+            vram_free = int(res.stdout.splitlines()[0].strip())
+        except Exception:
+            pass
+            
+    ram_free = 0
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    ram_free = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        pass
+        
+    try:
+        model_mb = os.path.getsize(model_path) // (1024 * 1024)
+    except Exception:
+        model_mb = 4096
+        
+    factor = float(os.environ.get("LLAMA_CTX_SIZE_FACTOR", "1.0"))
+    ctx_max = int(os.environ.get("LLAMA_CTX_SIZE_MAX", "131072"))
+    
+    fixed_mb = int(model_mb * 0.703)
+    kv_gpu = 0.01518
+    kv_ram = 0.00400
+    safety_gpu = 2048
+    safety_ram = 4096
+    
+    gpu_budget = max(0, vram_free - fixed_mb - safety_gpu)
+    ctx_gpu_only = int(gpu_budget / kv_gpu)
+    
+    ram_budget = max(0, ram_free - safety_ram)
+    ctx_ram_extend = int(ram_budget / kv_ram)
+    
+    ctx_base = min(ctx_max, ctx_gpu_only + ctx_ram_extend)
+    ctx = int(ctx_base * factor)
+    ctx = min(ctx_max, max(4096, (ctx // 512) * 512))
+    
+    source = "GPU" if ctx <= ctx_gpu_only else "GPU+RAM"
+    if source == "GPU+RAM":
+        print(f"[llama-wrapper] GPU-only fits {ctx_gpu_only} tokens — extending to {ctx} via CPU RAM KV offload", file=sys.stderr)
+    print(f"[llama-wrapper] Auto ctx: {ctx} [{source}] (GPU free: {vram_free} MiB, RAM free: {ram_free} MiB, factor: {factor})", file=sys.stderr)
+    return ctx
+
+def cmd_serve():
+    env_vars = load_env()
+    model_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
+    if not model_path or not os.path.exists(model_path):
+        print(f"Error: LLAMA_MODEL_PATH not found or invalid: {model_path}", file=sys.stderr)
+        sys.exit(1)
+        
+    idle_timeout = int(os.environ.get("LLAMA_IDLE_TIMEOUT", env_vars.get("LLAMA_IDLE_TIMEOUT", "120")))
+    ctx_override = os.environ.get("LLAMA_CTX_SIZE", env_vars.get("LLAMA_CTX_SIZE"))
+    
+    if ctx_override:
+        ctx_size = int(ctx_override)
+        print(f"[llama-wrapper] Using explicit ctx: {ctx_size}", file=sys.stderr)
+    else:
+        ctx_size = calculate_auto_ctx(model_path)
+        
+    extra_args = []
+    if "mtp" in os.path.basename(model_path).lower():
+        extra_args.extend(["--spec-type", "draft-mtp"])
+        print("[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding.", file=sys.stderr)
+        
+    n_gpu = os.environ.get("LLAMA_N_GPU_LAYERS", env_vars.get("LLAMA_N_GPU_LAYERS", "99"))
+    
+    batch_size = os.environ.get("LLAMA_BATCH_SIZE", env_vars.get("LLAMA_BATCH_SIZE", "4096"))
+    ubatch_size = os.environ.get("LLAMA_UBATCH_SIZE", env_vars.get("LLAMA_UBATCH_SIZE", "2048"))
+    threads_count = os.environ.get("LLAMA_THREADS", env_vars.get("LLAMA_THREADS", "16"))
+    
+    cmd = [
+        "llama-server",
+        "--model", model_path,
+        "--host", "127.0.0.1",
+        "--port", str(PORT),
+        "--ctx-size", str(ctx_size),
+        "--n-gpu-layers", str(n_gpu),
+        "--flash-attn", "on",
+        "--batch-size", str(batch_size),
+        "--ubatch-size", str(ubatch_size),
+        "--threads", str(threads_count),
+        "--metrics"
+    ] + extra_args
+    
+    print(f"[llama-wrapper] Starting llama-server — model: {os.path.basename(model_path)} ctx: {ctx_size}", file=sys.stderr)
+    
+    proc = subprocess.Popen(cmd)
+    
+    def cleanup(signum=None, frame=None):
+        print(f"[llama-wrapper] Shutting down llama-server (PID {proc.pid})...", file=sys.stderr)
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        sys.exit(0)
+        
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    
+    ready = False
+    for _ in range(60):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=2) as resp:
+                if resp.status == 200:
+                    ready = True
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+        
+    if not ready:
+        print("[llama-wrapper] Warning: Health check did not respond within 60s", file=sys.stderr)
+    else:
+        print(f"[llama-wrapper] Server ready. Monitoring idle (timeout: {idle_timeout}s)...", file=sys.stderr)
+        
+    last_seen = time.time()
+    last_tokens = 0
+    
+    while proc.poll() is None:
+        time.sleep(10)
+        activity = False
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}/metrics")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                content = resp.read().decode('utf-8', errors='ignore')
+                prompt_tok = 0
+                pred_tok = 0
+                busy_conns = 0
+                for line in content.splitlines():
+                    if line.startswith("llamacpp:prompt_tokens_total "):
+                        prompt_tok = int(float(line.split()[1]))
+                    elif line.startswith("llamacpp:tokens_predicted_total "):
+                        pred_tok = int(float(line.split()[1]))
+                    elif line.startswith("llamacpp:requests_processing "):
+                        busy_conns = int(float(line.split()[1]))
+                tot = prompt_tok + pred_tok
+                if last_tokens == 0 and tot > 0:
+                    last_tokens = tot
+                if tot > last_tokens or busy_conns > 0:
+                    activity = True
+                    last_tokens = tot
+        except Exception:
+            pass
+            
+        if activity:
+            last_seen = time.time()
+            
+        idle = time.time() - last_seen
+        if idle > idle_timeout:
+            print(f"[llama-wrapper] Idle {int(idle)}s — stopping server.", file=sys.stderr)
+            cleanup()
+            
+    sys.exit(proc.returncode or 0)
+
+def cmd_status():
+    env_vars = load_env()
+    print("=== Active Backend ===")
+    if env_vars:
+        for k in ("INFER_BASE_URL", "INFER_MODEL", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS"):
+            if k in env_vars:
+                print(f"  {k:<18} = {env_vars[k]}")
+    else:
+        print("  (none — run: ai-backend auto or ai-backend use <model>)")
+    print("\n=== Available Backends ===")
+    for snap in ("qwen3-6", "gemma4"):
+        if shutil.which(snap):
+            ep = get_snap_endpoint(snap) or "?"
+            status = "[RUNNING]" if is_snap_active(snap) else "[stopped]"
+            print(f"  {snap:<10} {status:<10} {ep}")
+            
+    llama_running = False
+    try:
+        with urllib.request.urlopen(f"http://localhost:{PORT}/health", timeout=2) as resp:
+            if resp.status == 200:
+                llama_running = True
+    except Exception:
+        pass
+        
+    llama_status = "[RUNNING]" if llama_running else "[stopped]"
+    print(f"  llama      {llama_status:<10} http://localhost:{PORT}/v1/")
+    
+    print("\n=== Downloaded Models ===")
+    models = list_local_models()
+    active_model = env_vars.get("LLAMA_MODEL_PATH")
+    if not models:
+        print("  (none found in ~/.local/share/ai/models/)")
+    else:
+        for m in models:
+            size_gb = os.path.getsize(m) / (1024**3)
+            size_str = f"{size_gb:.1f} GB"
+            is_active = str(m) == active_model
+            marker = " ← active" if is_active else ""
+            prefix = "*" if is_active else " "
+            print(f"  {prefix} {m.name}  [{size_str}]{marker}")
+
+def cmd_list():
+    env_vars = load_env()
+    active = env_vars.get("LLAMA_MODEL_PATH")
+    models = list_local_models()
+    print(f"Downloaded models in {MODEL_DIR}:")
+    if not models:
+        print("  (none)")
+        return
+    for i, m in enumerate(models, 1):
+        size_gb = os.path.getsize(m) / (1024**3)
+        size_str = f"{size_gb:.1f} GB"
+        is_active = str(m) == active
+        marker = " ← active" if is_active else ""
+        prefix = "*" if is_active else " "
+        print(f"  {prefix} {i}) {m.name} [{size_str}]{marker}")
+
+def cmd_use(target=None):
+    if not target:
+        cmd_list()
+        print("")
+        sel = input("Enter path, number from list, or HF repo/URI: ").strip()
+        if not sel:
+            print("No selection made.")
+            return
+        target = sel
+
+    if target in ("qwen3-6", "qwen3", "gemma4"):
+        if target in ("qwen3-6", "qwen3"):
+            ep = get_snap_endpoint("qwen3-6")
+            if ep:
+                write_env(ep, "qwen3-6")
+                print(f"Switched to qwen3-6 ({ep})")
+                return
+        elif target == "gemma4":
+            ep = get_snap_endpoint("gemma4")
+            if ep:
+                write_env(ep, "gemma4")
+                print(f"Switched to gemma4 ({ep})")
+                return
+
+    local_path = Path(target).expanduser().resolve() if os.path.exists(target) else MODEL_DIR / target
+    if local_path.exists() and local_path.is_file():
+        apply_model_path(local_path)
+        return
+
+    if target.isdigit():
+        models = list_local_models()
+        idx = int(target) - 1
+        if 0 <= idx < len(models):
+            apply_model_path(models[idx])
+            return
+
+    if target.startswith("hf://") or "/" in target or target.endswith(".gguf"):
+        print(f"Resolving HuggingFace model target: {target}...")
+        model_file = download_hf_target(target)
+        apply_model_path(model_file)
+        return
+
+    print(f"Error: Could not resolve target: {target}", file=sys.stderr)
+    sys.exit(1)
+
+def cmd_auto():
+    if is_snap_active("qwen3-6"):
+        ep = get_snap_endpoint("qwen3-6")
+        write_env(ep, "qwen3-6")
+        print(f"Switched to qwen3-6 ({ep})")
+    elif is_snap_active("gemma4"):
+        ep = get_snap_endpoint("gemma4")
+        write_env(ep, "gemma4")
+        print(f"Switched to gemma4 ({ep})")
+    else:
+        models = list_local_models()
+        if models:
+            apply_model_path(models[0])
+        else:
+            print("No active backend or model found.")
+            sys.exit(1)
+
+def cmd_ctx(size=None):
+    if not size:
+        print("Usage: ai-backend ctx <size|auto>")
+        return
+    if size == "auto":
+        patch_env_key("LLAMA_CTX_SIZE", None)
+        print("Context size reset to auto (calculated from available VRAM/RAM).")
+    else:
+        if not size.isdigit():
+            print(f"Invalid size '{size}'. Use a number or 'auto'.", file=sys.stderr)
+            sys.exit(1)
+        patch_env_key("LLAMA_CTX_SIZE", size)
+        print(f"Context size locked to {size} tokens.")
+
+def cmd_gpu_layers(n=None):
+    if not n:
+        print("Usage: ai-backend gpu-layers <n|auto>")
+        return
+    if n == "auto":
+        patch_env_key("LLAMA_N_GPU_LAYERS", None)
+        print("GPU layers reset to auto (default 99).")
+    else:
+        if not n.isdigit():
+            print(f"Invalid value '{n}'. Use a number or 'auto'.", file=sys.stderr)
+            sys.exit(1)
+        patch_env_key("LLAMA_N_GPU_LAYERS", n)
+        print(f"GPU layers set to {n}.")
+
+def patch_env_key(key, value):
+    env_vars = load_env()
+    if value is None:
+        env_vars.pop(key, None)
+    else:
+        env_vars[key] = value
+    url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
+    model = env_vars.get("INFER_MODEL", "llama")
+    llama_path = env_vars.get("LLAMA_MODEL_PATH")
+    write_env(url, model, llama_path, env_vars)
+
+def print_usage():
+    print("""ai-backend — single tool for LLM model deployment and configuration
+
+Usage:
+  ai-backend                            Show active backend & downloaded models
+  ai-backend status                     Show status of backends and models
+  ai-backend download <hf_uri|repo>     Download model from Hugging Face
+                                         (supports hf://... URIs and split GGUFs)
+  ai-backend use <model|path|hf_uri>    Switch active model (downloads if needed)
+  ai-backend list                       List all downloaded GGUF models
+  ai-backend auto                       Switch to best running backend
+  ai-backend ctx <size|auto>            Set or clear explicit context size
+  ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
+  ai-backend serve                      Run llama-server with auto context sizing
+
+Examples:
+  ai-backend use hf://AtomicChat/Ling-3.0-flash-GGUF/AD-IQ3_M/Ling-3.0-flash-AD-IQ3_M-00001-of-00002.gguf
+  ai-backend use my-model.gguf
+  ai-backend ctx 16384
+""")
+
+def main():
+    prog = os.path.basename(sys.argv[0])
+    
+    if prog in ("llama-server-wrapper.sh", "llama-wrapper"):
+        cmd_serve()
+        return
+
+    args = sys.argv[1:]
+    if not args:
+        cmd_status()
+        return
+
+    cmd = args[0]
+
+    if cmd in ("-h", "--help", "help"):
+        print_usage()
+        return
+    elif cmd in ("status", "info"):
+        cmd_status()
+    elif cmd in ("list", "ls", "models"):
+        cmd_list()
+    elif cmd in ("serve", "run", "wrapper"):
+        cmd_serve()
+    elif cmd in ("download", "get", "gguf"):
+        target = args[1] if len(args) > 1 else None
+        if not target:
+            print("Usage: ai-backend download <hf_url_or_repo_or_uri>")
+            sys.exit(1)
+        dest = download_hf_target(target)
+        print(f"Model downloaded: {dest}")
+        apply_model_path(dest)
+    elif cmd in ("use", "set", "switch", "local", "llama", "qwen3", "qwen3-6", "qwen3-30", "gemma4"):
+        target = args[1] if len(args) > 1 else (cmd if cmd in ("qwen3", "qwen3-6", "qwen3-30", "gemma4") else None)
+        cmd_use(target)
+    elif cmd == "auto":
+        cmd_auto()
+    elif cmd == "ctx":
+        cmd_ctx(args[1] if len(args) > 1 else None)
+    elif cmd in ("gpu-layers", "gpulayers"):
+        cmd_gpu_layers(args[1] if len(args) > 1 else None)
+    elif cmd.startswith("hf://") or "/" in cmd or cmd.endswith(".gguf") or os.path.exists(cmd):
+        cmd_use(cmd)
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        print_usage()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

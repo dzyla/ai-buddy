@@ -263,3 +263,53 @@ def test_no_resume_starts_fresh(tmp_path):
         req = srv.requests()[0]
     roles = [m["role"] for m in req["messages"]]
     assert roles == ["system", "user"]  # no prior context leaked in
+
+
+def test_goal_mission_board(tmp_path):
+    """--goal / -g flag must inject MISSION BOARD into system prompt."""
+    home = str(tmp_path / "home")
+    os.makedirs(home)
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TASK_COMPLETE="ok") as srv:
+        run_binary(home, srv.base_url, ["-g", "Refactor agent loop", "do work"])
+        req = srv.requests()[0]
+    sysmsg = next(m["content"] for m in req["messages"] if m["role"] == "system")
+    assert "MISSION BOARD:" in sysmsg
+    assert "Top Goal: Refactor agent loop" in sysmsg
+
+
+def test_metrics_subcommand():
+    """ai_mcp.py show-metrics must run cleanly without error."""
+    res = subprocess.run(
+        [sys.executable, "ai_mcp.py", "show-metrics"],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+
+
+def test_invalid_arg_type():
+    """Passing invalid argument type to read_file must return structured error."""
+    res = subprocess.run(
+        [sys.executable, "ai_mcp.py", "call-tool", "read_file", "read_file", '{"path": 12345}'],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+    assert "Invalid argument type for 'path'" in res.stdout
+
+
+def test_command_denylist(tmp_path):
+    """Dangerous commands matching denylist must be intercepted in C."""
+    home = str(tmp_path / "home")
+    os.makedirs(home)
+    cap = str(tmp_path / "cap.jsonl")
+    # Mock LLM calls execute_command with 'rm -rf /'
+    tool_call = {
+        "id": "c1", "type": "function",
+        "function": {"name": "execute_command", "arguments": json.dumps({"command": "rm -rf /"})}
+    }
+    with MockServer(cap, MOCK_TOOL_CALL=json.dumps(tool_call)) as srv:
+        run_binary(home, srv.base_url, ["-y", "do destructive thing"])
+        reqs = srv.requests()
+        assert len(reqs) >= 2
+        tool_msg = next(m["content"] for m in reqs[1]["messages"] if m.get("role") == "tool")
+        assert "INFER_COMMAND_DENYLIST" in tool_msg

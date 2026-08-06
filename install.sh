@@ -46,7 +46,7 @@ if [ "${1:-}" = "uninstall" ]; then
 
     # 3. Remove binaries and scripts
     echo "--> Removing binaries and wrapper scripts from ${BIN_DIR}..."
-    for f in ai ai_mcp.py gcal.py zulip_mcp_server.py ai-backend pubmed_mcp_server.py deep_research.py llama-server-wrapper.sh llama-server; do
+    for f in ai ai_mcp.py gcal.py zulip_mcp_server.py ai-backend ai-model ai-use ai-use.sh pubmed_mcp_server.py deep_research.py llama-server-wrapper.sh llama-server; do
         rm -f "${BIN_DIR}/$f"
     done
 
@@ -194,16 +194,20 @@ echo "==> Built: ${SCRIPT_DIR}/ai"
 
 # ── 2. Install to ~/.local/bin ────────────────────────────────────────────────
 echo "==> Installing to ${BIN_DIR}..."
-rm -f "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
+rm -f "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/ai-use" "${BIN_DIR}/ai-use.sh" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py" "${BIN_DIR}/llama-server-wrapper.sh"
 cp "${SCRIPT_DIR}/ai"             "${BIN_DIR}/ai"
 cp "${SCRIPT_DIR}/ai_mcp.py"      "${BIN_DIR}/ai_mcp.py"
 cp "${SCRIPT_DIR}/gcal.py"        "${BIN_DIR}/gcal.py"
 cp "${SCRIPT_DIR}/zulip_mcp_server.py" "${BIN_DIR}/zulip_mcp_server.py"
 cp "${SCRIPT_DIR}/ai-backend"     "${BIN_DIR}/ai-backend"
+cp "${SCRIPT_DIR}/ai-backend"     "${BIN_DIR}/ai-model"
+ln -sf "${BIN_DIR}/ai-backend"    "${BIN_DIR}/ai-use"
+ln -sf "${BIN_DIR}/ai-backend"    "${BIN_DIR}/ai-use.sh"
+ln -sf "${BIN_DIR}/ai-backend"    "${BIN_DIR}/llama-server-wrapper.sh"
 cp "${SCRIPT_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/pubmed_mcp_server.py"
 cp "${SCRIPT_DIR}/deep_research.py"   "${BIN_DIR}/deep_research.py"
-chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
-echo "==> Installed: ai  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend  pubmed_mcp_server.py  deep_research.py"
+chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
+echo "==> Installed: ai  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
@@ -326,9 +330,8 @@ if [ "${1:-}" = "llama" ]; then
         echo "==> llama-server already built — skipping. Remove ${BIN_DIR}/llama-server to force rebuild."
     fi
 
-    # Install wrapper
-    cp "${SCRIPT_DIR}/llama-server-wrapper.sh" "${BIN_DIR}/llama-server-wrapper.sh"
-    chmod +x "${BIN_DIR}/llama-server-wrapper.sh"
+    # Sync ai-backend as wrapper
+    ln -sf "${BIN_DIR}/ai-backend" "${BIN_DIR}/llama-server-wrapper.sh"
 
     # Find or download model
     EXISTING_MODEL=$(find "$MODEL_DIR" -name "*.gguf" \
@@ -440,7 +443,7 @@ ${SYSTEMD_ENV}
 Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
 ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
-ExecStart=${BIN_DIR}/llama-server-wrapper.sh
+ExecStart=${BIN_DIR}/ai-backend serve
 ExecStopPost=/bin/bash -c '/usr/bin/systemd-run --user /bin/bash -c "for i in {1..10}; do systemctl --user is-active -q llama-server.service || { systemctl --user start llama-server.socket; exit 0; }; sleep 0.5; done" || true'
 Restart=no
 StandardOutput=journal
