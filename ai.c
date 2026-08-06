@@ -27,6 +27,199 @@
 #define AI_VERSION "dev"
 #endif
 
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Visual style helpers — modern CLI output with ANSI colors & box drawing
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* ANSI palette */
+#define CL_RESET   "\033[0m"
+#define CL_BOLD    "\033[1m"
+#define CL_DIM     "\033[2m"
+#define CL_MAGENTA "\033[35m"
+#define CL_CYAN    "\033[36m"
+#define CL_GREEN   "\033[32m"
+#define CL_RED     "\033[31m"
+#define CL_YELLOW  "\033[33m"
+#define CL_BLUE    "\033[34m"
+#define CL_WHITE   "\033[37m"
+#define CL_BG_MAG  "\033[45m"
+
+/* Box-drawing characters */
+#define BTLN "\xe2\x95\xad"   /* ╭ top-left corner  */
+#define BTRN "\xe2\x95\xae"   /* ╮ top-right corner */
+#define BBLN "\xe2\x95\xb0"   /* ╰ bottom-left      */
+#define BBBN "\xe2\x95\xb1"   /* ╯ bottom-right     */
+#define BVRT "\xe2\x94\x82"   /* │ vertical         */
+#define BTHR "\xe2\x94\x80"   /* ─ horizontal       */
+#define BTRR "┤"   /* right T-junction   */
+#define BTRL "├"   /* left T-junction    */
+#define BCTR "┼"   /* cross              */
+
+/* Forward declaration for run_shell_command (used by render_markdown) */
+static char* run_shell_command(const char *cmd, int *exit_status);
+
+/* Render markdown via the Python helper (used by task_complete and model output).
+ * Returns a dynamically allocated string or NULL on failure. Caller must free. */
+static char *render_markdown(const char *text)
+{
+    if (!text || !*text) return NULL;
+
+    const char *home = getenv("HOME");
+    char script[1024];
+    if (access("./ai_mcp.py", R_OK) == 0)
+        snprintf(script, sizeof(script), "./ai_mcp.py");
+    else
+        snprintf(script, sizeof(script), "%s/.local/bin/ai_mcp.py",
+                 home ? home : "~");
+
+    /* Shell-escape the text for safe command-line passing */
+    char *escaped = malloc(strlen(text) * 2 + 1);
+    char *ep = escaped;
+    for (const char *s = text; *s; s++, ep++) {
+        if (*s == '\'') { *ep++ = '\''; *ep++ = '\\'; *ep++ = '\''; *ep++ = '\''; *ep = '\''; continue; }
+        if (*s == '"' || *s == '$' || *s == '\\' || *s == '`' || isspace((unsigned char)*s)) {
+            *ep++ = '\\'; *ep = *s;
+        } else {
+            *ep = *s;
+        }
+    }
+    *ep = '\0';
+
+    char cmd[1024 + strlen(escaped)];
+    snprintf(cmd, sizeof(cmd), "python3 %s render-markdown '%s' 2>/dev/null", script, escaped);
+    char *result = run_shell_command(cmd, NULL);
+    free(escaped);
+    return result;
+}
+
+/* Print the LLM's final response — distinct from tool call boxes.
+ * Renders as a clean chat-style message with a left accent bar and
+ * model name as a subtle header. No surrounding box. */
+static void print_response_box(const char *model_name, const char *content)
+{
+    printf("\n");
+
+    /* Model name header — thin magenta accent bar */
+    printf("%s ── %s%s%s  %s%s\n",
+           CL_DIM,
+           CL_MAGENTA, model_name ? model_name : "model",
+           CL_DIM,
+           "─" CL_RESET,
+           CL_RESET);
+
+    /* Content — rendered markdown, full width */
+    if (content) {
+        const char *line = content;
+        int lines = 0;
+        const int max_lines = 100;
+        while (*line && lines < max_lines) {
+            const char *nl = strchr(line, '\n');
+            if (!nl) {
+                printf("%s%s\n", line, CL_RESET);
+                break;
+            }
+            int len = (int)(nl - line);
+            printf("%.*s\n", len, line);
+            line = nl + 1;
+            lines++;
+        }
+        if (*line && lines >= max_lines) {
+            printf("  ... (%zu more lines)%s\n", strlen(line), CL_RESET);
+        }
+    }
+
+    printf("%s\n", CL_DIM);
+}
+
+/* Print a styled tool-result box:
+ *  Clean compact format with colored icon, name, and status.
+ *  Content printed with subtle left indent.
+ */
+static void print_tool_box(const char *name, const char *status, const char *content)
+{
+    const char *hc = (status && strncmp(status, "error", 5) == 0) ? CL_RED
+                  : (status && strcmp(status, "ok") == 0)       ? CL_GREEN
+                  : (status && strcmp(status, "info") == 0)      ? CL_CYAN
+                  : CL_DIM;
+
+    const char *icon = (status && strncmp(status, "error", 5) == 0) ? "✕"
+                     : (status && strcmp(status, "ok") == 0)        ? "●"
+                     : (status && strcmp(status, "info") == 0)       ? "◦"
+                     : "·";
+
+    printf("\n");
+    printf("%s  %s%s  %s%s  %s%s\n",
+           CL_DIM, hc, icon, CL_RESET, name, CL_DIM, status ? status : "");
+    printf("%s%s\n", CL_DIM, "─");
+
+    /* Content: print up to max_lines lines */
+    if (content) {
+        const char *line = content;
+        int lines = 0;
+        const int max_lines = 50;
+        while (*line && lines < max_lines) {
+            const char *nl = strchr(line, '\n');
+            if (!nl) {
+                printf("%s\n", line);
+                break;
+            }
+            int len = (int)(nl - line);
+            printf("%.*s\n", len, line);
+            line = nl + 1;
+            lines++;
+        }
+        if (*line && lines >= max_lines) {
+            printf("  ... (%zu more lines)%s\n",
+                   strlen(line), CL_RESET);
+        }
+    }
+    printf("\n");
+}
+
+/* Print a styled error/warning box */
+static void print_warning_box(const char *title, const char *body)
+{
+    printf("\n%s  %s  %s\n",
+           CL_RED CL_BOLD, title, CL_RESET);
+    if (body) {
+        const char *line = body;
+        while (*line) {
+            const char *nl = strchr(line, '\n');
+            if (!nl) {
+                printf("  %s%s\n", CL_RESET, line);
+                break;
+            }
+            int len = (int)(nl - line);
+            printf("  %.*s%s\n", len, line, CL_RESET);
+            line = nl + 1;
+        }
+    }
+    printf("%s%s\n", CL_RED, "─");
+    printf("\n");
+}
+
+/* Print a styled info box (for context resets, compaction, etc.) */
+static void print_info_box(const char *title, const char *body)
+{
+    printf("\n%s  %s  %s\n",
+           CL_CYAN, title, CL_RESET);
+    if (body) {
+        const char *line = body;
+        while (*line) {
+            const char *nl = strchr(line, '\n');
+            if (!nl) {
+                printf("  %s%s\n", CL_RESET, line);
+                break;
+            }
+            int len = (int)(nl - line);
+            printf("  %.*s%s\n", len, line, CL_RESET);
+            line = nl + 1;
+        }
+    }
+    printf("%s%s\n", CL_CYAN, "─");
+    printf("\n");
+}
+
 // Config globals
 static char  api_url[MAX_VAL];
 static char  api_key[MAX_VAL];
@@ -96,6 +289,36 @@ static void set_tool_cache(const char *name, const char *args, const char *outpu
 }
 
 static int g_dry_run = 0; /* --dry-run flag */
+
+/* ── Git integration (auto-commit after successful commands) ── */
+static int g_git_commit_enabled = 1;   /* 1 = auto-commit on success */
+static char *g_git_commit_msg = NULL;  /* custom commit message from user */
+
+/* ── OS notifications ── */
+static int g_notifications_enabled = 0;
+
+/* ── Permission modes: 0=auto, 1=plan, 2=manual ── */
+static int g_permission_mode = 0;
+
+/* ── AGENTS.md integration ── */
+static int g_agents_enabled = 1;       /* auto-load AGENTS.md */
+static char *g_agents_content = NULL;  /* cached AGENTS.md content */
+
+/* ── Background sessions ── */
+static int g_background = 0;           /* --bg flag */
+static char *g_session_file = NULL;    /* session state file */
+
+/* ── Copy / clipboard ── */
+static char *g_last_response = NULL;   /* last assistant response text */
+static int   g_last_response_len = 0;
+
+/* ── Thinking spinner animation ── */
+static int g_spinner_idx = 0;
+
+/* ── Token tracking ── */
+static long g_tokens_prompt = 0;
+static long g_tokens_completion = 0;
+static int  g_tokens_total = 0;
 
 static int is_command_denied(const char *cmd) {
     if (!cmd) return 0;
@@ -419,7 +642,255 @@ static char* json_escape(const char *src) {
     return dest;
 }
 
-// Finds the command line of the process writing to our stdin pipe, if any
+/* ── Git Integration ── */
+static void git_commit(const char *extra_msg) {
+    if (!g_git_commit_enabled) return;
+
+    /* Check if there's a git repo */
+    char git_check[64];
+    snprintf(git_check, sizeof(git_check), "git -C . rev-parse --git-dir 2>/dev/null");
+    int has_git = (system(git_check) == 0);
+    if (!has_git) return;
+
+    /* Check if there are staged changes */
+    char status[64];
+    snprintf(status, sizeof(status), "git -C . diff --cached --quiet 2>/dev/null; echo $?");
+    /* Simpler: just check if git status has changes */
+    char *git_status_out = NULL;
+    int exit_code = 0;
+
+    /* Use a simpler approach: just stage and commit */
+    char cmd[512];
+
+    /* Stage all changes */
+    snprintf(cmd, sizeof(cmd), "git -C . add -A 2>/dev/null");
+    exit_code = system(cmd);
+    if (exit_code != 0) return; /* No changes to stage */
+
+    /* Check if anything was staged */
+    char verify_cmd[128];
+    snprintf(verify_cmd, sizeof(verify_cmd),
+             "git -C . diff --cached --quiet 2>/dev/null; echo $?");
+    /* Run and check: if output is "0" there are staged changes */
+    FILE *fp = popen(verify_cmd, "r");
+    if (fp) {
+        char buf[16] = {0};
+        if (fgets(buf, sizeof(buf), fp)) {
+            int has_changes = atoi(buf);
+            pclose(fp);
+            if (has_changes == 0) {
+                /* There are staged changes - commit them */
+                const char *commit_msg = g_git_commit_msg ? g_git_commit_msg : "auto-commit: tool changes";
+                if (extra_msg) {
+                    size_t msg_len = strlen(commit_msg) + strlen(extra_msg) + 32;
+                    char *full_msg = malloc(msg_len);
+                    snprintf(full_msg, msg_len, "%s: %s", commit_msg, extra_msg);
+                    snprintf(cmd, sizeof(cmd), "git -C . commit -m '%s' 2>/dev/null",
+                             extra_msg ? extra_msg : commit_msg);
+                    /* Use proper escaping */
+                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s'", extra_msg);
+                    system(cmd);
+                    free(full_msg);
+                } else {
+                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s' 2>/dev/null", commit_msg);
+                    system(cmd);
+                }
+                if (!g_git_commit_msg) free(g_git_commit_msg);
+                g_git_commit_msg = NULL;
+            } else {
+                pclose(fp);
+            }
+        } else {
+            pclose(fp);
+        }
+    }
+}
+
+/* ── OS Notifications ── */
+static void notify_completion(const char *summary) {
+    if (!g_notifications_enabled) return;
+
+    /* Use notify-send on Linux */
+    char cmd[2048];
+    if (summary && *summary) {
+        /* Truncate summary for notification */
+        char truncated[256] = {0};
+        int len = strlen(summary);
+        if (len > 240) {
+            memcpy(truncated, summary, 240);
+            truncated[240] = '\0';
+            strcat(truncated, "...");
+        } else {
+            strncpy(truncated, summary, sizeof(truncated) - 1);
+        }
+        snprintf(cmd, sizeof(cmd), "notify-send -u normal 'ai task done' '%s' 2>/dev/null &",
+                 truncated);
+        system(cmd);
+    } else {
+        system("notify-send -u normal 'ai task done' 'Task completed successfully' 2>/dev/null &");
+    }
+}
+
+/* ── AGENTS.md loading ── */
+static char* load_agents_md(void) {
+    if (!g_agents_enabled) return NULL;
+    if (g_agents_content) return g_agents_content; /* cached */
+
+    /* Check common locations */
+    static const char *candidates[] = {
+        "./AGENTS.md",
+        "./docs/AGENTS.md",
+        "./.ai/AGENTS.md",
+        NULL
+    };
+
+    for (int i = 0; candidates[i]; i++) {
+        FILE *f = fopen(candidates[i], "r");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long fsize = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (fsize > 0 && fsize < 100000) {
+                g_agents_content = malloc(fsize + 1);
+                fread(g_agents_content, 1, fsize, f);
+                g_agents_content[fsize] = '\0';
+                fclose(f);
+                fprintf(stderr, "\033[2m[ai] loaded AGENTS.md from %s\033[0m\n", candidates[i]);
+                return g_agents_content;
+            }
+            fclose(f);
+        }
+    }
+    return NULL;
+}
+
+/* ── Generate AGENTS.md from project scan ── */
+static void generate_agents_md(void) {
+    fprintf(stderr, "\033[2m[ai] Scanning project for AGENTS.md generation...\033[0m\n");
+
+    /* Get list of files and directories */
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "find . -maxdepth 2 -type f \\( -name '*.py' -o -name '*.js' -o -name '*.ts' "
+        "-o -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.go' "
+        "-o -name '*.java' -o -name '*.rb' -o -name '*.sh' -o -name '*.md' -o -name '*.toml' "
+        "-o -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.txt' "
+        "-o -name 'Makefile' -o -name 'CMakeLists.txt' -o -name 'Cargo.toml' "
+        "-o -name 'go.mod' -o -name 'package.json' -o -name 'requirements.txt' "
+        "-o -name 'Dockerfile' -o -name 'docker-compose.yml' "
+        "-o -name '*.sql' -o -name '*.html' -o -name '*.css' \\) "
+        "! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/__pycache__/*' "
+        "! -path '*/venv/*' ! -path '*/.venv/*' ! -path '*/.tox/*' "
+        "-printf '%%y %%s %%p\\n' 2>/dev/null | sort");
+
+    char *output = run_shell_command(cmd, NULL);
+    if (!output) return;
+
+    /* Count file types and identify structure */
+    char summary[4096];
+    snprintf(summary, sizeof(summary),
+        "# AGENTS.md\n\n"
+        "## Project Structure\n\n"
+        "```\n%s\n```\n\n", output);
+
+    /* Add standard sections */
+    strcat(summary, "## Rules\n\n"
+        "- Always use the `think` tool before major actions.\n"
+        "- For scientific tasks, write in long, cohesive paragraphs — no markdown tables, emojis, or bullet points.\n"
+        "- Verify results: run scripts after writing them, check outputs carefully.\n\n"
+        "## Workflow\n\n"
+        "1. Analyze the request and plan your approach\n"
+        "2. Use tools systematically, verifying each step\n"
+        "3. Present results clearly with appropriate formatting\n"
+        "4. Use `task_complete` when the task is finished\n");
+
+    FILE *f = fopen("./AGENTS.md", "w");
+    if (f) {
+        fputs(summary, f);
+        fclose(f);
+        fprintf(stderr, "\033[2m[ai] Generated AGENTS.md\033[0m\n");
+    }
+    free(output);
+}
+
+/* ── Background session management ── */
+static void save_session_state(const char *prompt, const char *messages, int session_idx) {
+    if (!g_session_file) return;
+
+    char path[1024];
+    if (session_idx > 0)
+        snprintf(path, sizeof(path), "%s.%d", g_session_file, session_idx);
+    else
+        snprintf(path, sizeof(path), "%s", g_session_file);
+
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "PROMPT: %s\n", prompt ? prompt : "");
+        if (messages) fputs(messages, f);
+        fclose(f);
+        fprintf(stderr, "\033[2m[ai] Session saved to %s\033[0m\n", path);
+    }
+}
+
+/* ── Copy response to system clipboard ── */
+static void copy_to_clipboard(const char *text) {
+    if (!text || !*text) {
+        fprintf(stderr, "\033[2m[ai] Nothing to copy — no response yet.\033[0m\n");
+        return;
+    }
+
+    /* Try xclip first, then xsel, then pbcopy (macOS) */
+    char cmd[4096];
+    int ok = 0;
+
+    snprintf(cmd, sizeof(cmd), "printf '%s' '%s' | xclip -selection clipboard 2>/dev/null",
+             text, text);
+    if (system(cmd) == 0) { ok = 1; }
+
+    if (!ok) {
+        snprintf(cmd, sizeof(cmd), "printf '%s' '%s' | xsel --clipboard 2>/dev/null",
+                 text, text);
+        if (system(cmd) == 0) { ok = 1; }
+    }
+
+    if (!ok) {
+        snprintf(cmd, sizeof(cmd), "printf '%s' | pbcopy 2>/dev/null", text);
+        if (system(cmd) == 0) { ok = 1; }
+    }
+
+    if (ok) {
+        fprintf(stderr, "\033[2m[ai] Response copied to clipboard.\033[0m\n");
+    } else {
+        fprintf(stderr, "\033[2m[ai] Warning: no clipboard tool available (tried xclip, xsel, pbcopy).\033[0m\n");
+    }
+}
+
+/* ── Thinking spinner animation ── */
+static const char *spinner_chars = "|/-\\";
+
+static void print_thinking_spinner(void) {
+    fprintf(stderr, "\r\033[2m\033[36m  %c thinking\033[0m", spinner_chars[g_spinner_idx % 4]);
+    fflush(stderr);
+    g_spinner_idx++;
+}
+
+/* ── Token estimation (rough) ── */
+static long estimate_tokens(const char *text) {
+    if (!text) return 0;
+    /* Rough estimate: 1 token ≈ 4 chars for English text */
+    return (long)(strlen(text) / 4.0);
+}
+
+static void print_token_stats(const char *prompt, const char *response) {
+    if (!g_tokens_total && !g_tokens_prompt && !g_tokens_completion) return;
+
+    long prompt_toks = g_tokens_prompt > 0 ? g_tokens_prompt : estimate_tokens(prompt);
+    long comp_toks = g_tokens_completion > 0 ? g_tokens_completion : estimate_tokens(response);
+    long total = prompt_toks + comp_toks;
+
+    fprintf(stderr, "\033[2m  %ld tok · %ld in · %ld out\033[0m\n",
+            total, prompt_toks, comp_toks);
+}
 static char* find_pipe_writer() {
     if (isatty(STDIN_FILENO)) return NULL;
 
@@ -733,7 +1204,7 @@ static volatile int g_esc_requested = 0;
 static char *g_system_message_json = NULL;
 static volatile int g_compact_in_progress = 0;
 static int g_compact_dot_timer = 0;
-static int g_auto_approve = 0;
+static int g_turn_count = 0;
 static int g_continue_until_done = 0;
 static volatile int g_agent_loop_active = 0; /* 1 while the has_more agent loop runs */
 
@@ -775,20 +1246,20 @@ static int curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                 char seq[2] = {0, 0};
                 int n = read(STDIN_FILENO, seq, 2);
                 if (n == 2 && seq[0] == '[' && seq[1] == 'Z') {
-                    if (g_agent_loop_active && !g_auto_approve) {
+                    if (g_agent_loop_active && !g_permission_mode) {
                         /* Safety: can't enable auto-approve during an active task */
                         fprintf(stderr,
                             "\n\033[2m[Shift-Tab: auto-approve can only be enabled "
                             "before a task starts]\033[0m\n");
                         fflush(stderr);
                     } else {
-                        g_auto_approve ^= 1;
-                        if (g_auto_approve)
+                        g_permission_mode = (g_permission_mode + 1) % 3;
+                        if (g_permission_mode == 0)
                             setenv("INFER_AUTO_APPROVE", "1", 1);
                         else
                             unsetenv("INFER_AUTO_APPROVE");
-                        fprintf(stderr, "\n\033[2mauto-approve %s\033[0m\n",
-                                g_auto_approve ? "on" : "off");
+                        const char *mode_names[] = { "auto", "plan", "manual" };
+                        fprintf(stderr, "\033[2mpermission mode: %s\033[0m\n", mode_names[g_permission_mode]);
                         fflush(stderr);
                     }
                     g_agent_stdin_len = 0;
@@ -862,17 +1333,17 @@ static void poll_agent_stdin(void) {
             int n = read(STDIN_FILENO, seq, 2);
             if (n == 2 && seq[0] == '[' && seq[1] == 'Z') {
                 /* Shift-Tab */
-                if (g_agent_loop_active && !g_auto_approve) {
+                if (g_agent_loop_active && !g_permission_mode) {
                     fprintf(stderr,
                         "\n\033[2m[Shift-Tab: auto-approve can only be enabled "
                         "before a task starts]\033[0m\n");
                     fflush(stderr);
                 } else {
-                    g_auto_approve ^= 1;
-                    if (g_auto_approve) setenv("INFER_AUTO_APPROVE", "1", 1);
-                    else               unsetenv("INFER_AUTO_APPROVE");
-                    fprintf(stderr, "\n\033[2mauto-approve %s\033[0m\n",
-                            g_auto_approve ? "on" : "off");
+                    g_permission_mode = (g_permission_mode + 1) % 3;
+                    if (g_permission_mode == 0) setenv("INFER_AUTO_APPROVE", "1", 1);
+                    else                        unsetenv("INFER_AUTO_APPROVE");
+                    const char *mode_names[] = { "auto", "plan", "manual" };
+                    fprintf(stderr, "\n\033[2mpermission mode: %s\033[0m\n", mode_names[g_permission_mode]);
                     fflush(stderr);
                 }
                 g_agent_stdin_len = 0;
@@ -1707,7 +2178,9 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                         if (!ctx->quiet_mode) {
                             if (!ctx->printed_thinking_header) {
                                 fprintf(stderr, "\r\033[2K");
-                                fprintf(stderr, "\033[1;35m┌─ 🧠 Thinking ──────────────────────────────────────────────┐\033[0m\n\033[2;35m");
+                                fprintf(stderr,
+                                    "\n%s▸ %s%s\n\033[2;35m",
+                                    CL_DIM, "thinking", CL_RESET);
                                 ctx->printed_thinking_header = 1;
                             }
                             fprintf(stderr, "%s", reasoning_chunk);
@@ -1722,7 +2195,7 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                     if (content_chunk) {
                         buf_append_str(&ctx->accumulated_content, &ctx->content_len, &ctx->content_cap, content_chunk, strlen(content_chunk));
                         if (ctx->printed_thinking_header && !ctx->printed_thinking_footer) {
-                            fprintf(stderr, "\033[0m\n\033[1;35m└────────────────────────────────────────────────────────────┘\033[0m\n");
+                            fprintf(stderr, "\n%s\n", CL_RESET);
                             fflush(stderr);
                             ctx->printed_thinking_footer = 1;
                         } else if (!ctx->printed_thinking_header) {
@@ -1731,7 +2204,7 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                             ctx->printed_thinking_header = 1;
                         }
                         if (!ctx->quiet_mode) {
-                            fprintf(stderr, "\033[1;36m%s\033[0m", content_chunk);
+                            fprintf(stderr, "%s", content_chunk);
                             fflush(stderr);
                         }
                         free(content_chunk);
@@ -2946,6 +3419,15 @@ int main(int argc, char **argv) {
             printf("  --install-llama [R]  Download, build llama.cpp and start a local server.\n");
             printf("                       R: optional HuggingFace repo (e.g. unsloth/gemma-4-12b-it-GGUF).\n");
             printf("  -h, --help           Display this help screen.\n\n");
+            printf("Advanced options:\n");
+            printf("  --no-git             Disable auto-git commit after successful commands.\n");
+            printf("  --notify             Enable OS desktop notifications on task complete.\n");
+            printf("  --no-notifications   Disable OS notifications.\n");
+            printf("  --no-agents          Disable automatic AGENTS.md loading.\n");
+            printf("  --session FILE       Save session state to FILE.\n");
+            printf("  --bg, --background   Run in background mode.\n");
+            printf("  --commit-msg MSG     Custom git commit message for auto-commit.\n");
+            printf("  --no-copy            Disable auto-copy of last response on task_complete.\n\n");
             printf("Examples:\n");
             printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
             printf("  ai -n \"what is RNA?\"                 # direct answer, no tool loop\n");
@@ -3016,7 +3498,7 @@ int main(int argc, char **argv) {
             interactive_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0 ||
                    strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--auto-approve") == 0) {
-            g_auto_approve = 1;
+            g_permission_mode = 1;
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) {
             g_continue_until_done = 1;
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
@@ -3025,6 +3507,24 @@ int main(int argc, char **argv) {
             no_tools_mode = 1;
         } else if (strcmp(argv[i], "--dry-run") == 0) {
             g_dry_run = 1;
+        } else if (strcmp(argv[i], "--no-git") == 0) {
+            g_git_commit_enabled = 0;
+        } else if (strcmp(argv[i], "--notify") == 0) {
+            g_notifications_enabled = 1;
+        } else if (strcmp(argv[i], "--no-notifications") == 0) {
+            g_notifications_enabled = 0;
+        } else if (strcmp(argv[i], "--no-agents") == 0) {
+            g_agents_enabled = 0;
+        } else if (strcmp(argv[i], "--session") == 0 && i + 1 < argc) {
+            g_session_file = argv[i+1];
+            i++;
+        } else if (strcmp(argv[i], "--bg") == 0 || strcmp(argv[i], "--background") == 0) {
+            g_background = 1;
+        } else if (strcmp(argv[i], "--commit-msg") == 0 && i + 1 < argc) {
+            g_git_commit_msg = argv[i+1];
+            i++;
+        } else if (strcmp(argv[i], "--no-copy") == 0) {
+            /* Disable auto-copy on task_complete */
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
             if (i + 1 < argc && argv[i+1][0] != '-' &&
                 (strncmp(argv[i+1], "sess_", 5) == 0 || strcmp(argv[i+1], "last") == 0 ||
@@ -3048,7 +3548,7 @@ int main(int argc, char **argv) {
 
     char *env_approve = getenv("INFER_AUTO_APPROVE");
     if (env_approve && (strcmp(env_approve, "1") == 0 || strcasecmp(env_approve, "true") == 0)) {
-        g_auto_approve = 1;
+        g_permission_mode = 1;
     }
 
     char *env_quiet = getenv("INFER_QUIET");
@@ -3069,7 +3569,7 @@ int main(int argc, char **argv) {
     }
 
     // Export resolved settings back to environment variables so subagents inherit them
-    if (g_auto_approve) {
+    if (g_permission_mode) {
         setenv("INFER_AUTO_APPROVE", "1", 1);
     } else {
         unsetenv("INFER_AUTO_APPROVE");
@@ -3354,11 +3854,15 @@ int main(int argc, char **argv) {
     char *safe_rag = rag_memories ? json_escape(rag_memories) : NULL;
     char *sys_msg = NULL;
 
+    /* Load AGENTS.md if enabled */
+    char *agents_md = load_agents_md();
+
     /* Build the content string: SYSTEM_PROMPT + ctx + optional triggers + optional memory */
     size_t mlen = strlen(safe_system) + strlen(safe_ctx)
                   + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
                   + (safe_mem ? strlen(safe_mem) + 64 : 0)
                   + (safe_rag ? strlen(safe_rag) + 64 : 0)
+                  + (agents_md ? strlen(agents_md) + 64 : 0)
                   + (g_goal_text ? strlen(g_goal_text) + 256 : 0) + 256;
 
     /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
@@ -3376,6 +3880,9 @@ int main(int argc, char **argv) {
     if (rag_memories && strlen(rag_memories) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nRelevant Context (RAG Memories):\n%s", rag_memories);
+    if (agents_md)
+        clen += snprintf(content + clen, mlen - clen,
+                         "\n\n--- Project Context (AGENTS.md) ---\n%s", agents_md);
 
     /* json_escape can expand content significantly; allocate sys_msg after escaping */
     char *safe_content = json_escape(content);
@@ -3478,8 +3985,16 @@ int main(int argc, char **argv) {
     char *current_prompt = strdup(prompt ? prompt : "");
 
     if (interactive_mode && !run_query_this_turn) {
-        printf("\033[1;36mai\033[0m  \033[2m%s\033[0m\n", model);
-        printf("\033[2m:help · ESC to interrupt · Shift-Tab to disable auto-approve · :btw <msg> to inject a note mid-task\033[0m\n\n");
+        printf("\n");
+        printf("%s╭──╮%s  %sai%s — autonomous coding agent%s\n",
+               CL_MAGENTA, CL_DIM, CL_MAGENTA CL_BOLD, CL_DIM, CL_RESET);
+        printf("%s│%s %s%s%s  %s  %s\n\n",
+               CL_MAGENTA, CL_DIM,
+               CL_CYAN CL_BOLD, model[0] ? model : "unknown model", CL_RESET,
+               current_session_id[0] ? CL_GREEN "resuming" : CL_DIM "new session",
+               CL_RESET);
+        printf("%s:help · ESC to interrupt · Shift-Tab to toggle auto-approve · :commit/:undo/:copy · :notify · :btw <msg>%s\n\n",
+               CL_DIM, CL_RESET);
         lineed_init();
     }
 
@@ -3488,16 +4003,30 @@ int main(int argc, char **argv) {
             /* Auto-compact when context grows very large */
             if (strlen(messages_json) > (size_t)(trim_threshold * 3)) {
                 fprintf(stderr,
-                    "\n\033[1;33m[ai] Context is large (%zu KB). Auto-compacting...\033[0m\n",
-                    strlen(messages_json) / 1024);
+                    "\n%s%s[ai] Context is large (%zu KB). Auto-compacting...\033[0m\n",
+                    CL_DIM, CL_CYAN, strlen(messages_json) / 1024);
                 messages_json = compact_session(messages_json, mcp_script, c, model, NULL);
             }
 
             printf("\n");
             fflush(stdout);
-            const char *prompt_str = g_auto_approve
-                ? "\033[1;33mai\033[0m\033[2m>\033[0m "
-                : "\033[1;36mai\033[0m\033[2m>\033[0m ";
+
+            /* ── Turn separator (dim line between turns) ── */
+            if (g_turn_count > 1) {
+                printf("%s    %s %s  turn %d%s\n",
+                       CL_DIM, CL_MAGENTA, CL_DIM, g_turn_count, CL_RESET);
+            }
+
+            /* ── Turn counter ── */
+            g_turn_count++;
+
+            /* ── Prompt header: model info + session context + mode ── */
+            printf("%s%s  [%s]%s  %s  %d\n",
+                   CL_MAGENTA CL_BOLD, "ai ",
+                   current_session_id, CL_RESET,
+                   g_permission_mode ? CL_GREEN "auto" : CL_RED "confirm",
+                   g_turn_count);
+            const char *prompt_str = "\033[1;35mai\033[0m\033[2m▸ \033[0m";
             char *line = read_line_interactive(prompt_str);
             if (!line) {
                 printf("\n");
@@ -3511,13 +4040,13 @@ int main(int argc, char **argv) {
 
             /* Shift-Tab — returned as sentinel by read_line_interactive */
             if (user_input[0] == '\033' && user_input[1] == '[' && user_input[2] == 'Z') {
-                g_auto_approve ^= 1;
-                if (g_auto_approve)
+                g_permission_mode = (g_permission_mode + 1) % 3;
+                if (g_permission_mode == 0)
                     setenv("INFER_AUTO_APPROVE", "1", 1);
                 else
                     unsetenv("INFER_AUTO_APPROVE");
-                printf("\033[2mauto-approve %s\033[0m\n",
-                       g_auto_approve ? "on" : "off");
+                const char *mode_names[] = { "auto", "plan", "manual" };
+                printf("\033[2mpermission mode: %s\033[0m\n", mode_names[g_permission_mode]);
                 run_query_this_turn = 0;
                 continue;
             }
@@ -3541,7 +4070,7 @@ int main(int argc, char **argv) {
                     int compact_ok = 0;
                     messages_json = compact_session(messages_json, mcp_script, c, model, &compact_ok);
                     if (compact_ok)
-                        printf("\033[2m[context compacted — continue the conversation]\033[0m\n");
+                        print_info_box("Context Compacted", "Conversation summarized — continuing with reduced context.");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -3552,23 +4081,86 @@ int main(int argc, char **argv) {
                         fresh = append_message(fresh, g_system_message_json);
                     free(messages_json);
                     messages_json = fresh;
-                    printf("\033[2m[conversation cleared — starting fresh]\033[0m\n");
+                    print_info_box("Conversation Cleared", "Starting fresh with no prior context.");
                     run_query_this_turn = 0;
                     continue;
                 }
                 if (strcmp(user_input, ":help") == 0) {
-                    printf("\n\033[1;36mInteractive commands:\033[0m\n");
-                    printf("  :compact       Summarise + reset context (keeps semantic history)\n");
-                    printf("  :clear         Wipe conversation history entirely\n");
-                    printf("  :status        Show context size and model info\n");
-                    printf("  :memory        Show persistent memory\n");
-                    printf("  :auto          Toggle auto-approve for execute_command\n");
-                    printf("  :btw <msg>     Inject a note into the agent context mid-task\n");
-                    printf("  :help          Show this message\n");
-                    printf("  :quit/:exit    Leave interactive mode\n");
-                    printf("  exit/quit      Leave interactive mode\n");
-                    printf("\n\033[2mPress Ctrl+C or ESC to interrupt. "
+                    print_info_box("Interactive Commands",
+                        "  :compact       Summarise + reset context (keeps semantic history)\n"
+                        "  :clear         Wipe conversation history entirely\n"
+                        "  :status        Show context size and model info\n"
+                        "  :memory        Show persistent memory\n"
+                        "  :auto          Toggle auto-approve for execute_command\n"
+                        "  :btw <msg>     Inject a note into the agent context mid-task\n"
+                        "  :commit        Commit staged changes to git\n"
+                        "  :undo          Revert last git commit (keeps changes staged)\n"
+                        "  :git-diff      Show current diff summary\n"
+                        "  :git-status    Show git status\n"
+                        "  :copy          Copy last response to clipboard\n"
+                        "  :agents        Regenerate AGENTS.md from project scan\n"
+                        "  :notify        Toggle OS notifications on task complete\n"
+                        "  :help          Show this message\n"
+                        "  :quit/:exit    Leave interactive mode");
+                    printf("\033[2mPress Ctrl+C or ESC to interrupt. "
                            "Shift-Tab to disable auto-approve (enable only at prompt).\033[0m\n\n");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":commit") == 0) {
+                    git_commit("user-commit");
+                    print_info_box("Git Committed", "Changes staged and committed to git.");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":undo") == 0) {
+                    system("git -C . log -1 --format=%h 2>/dev/null | xargs -I{} git -C . reset --soft HEAD~1 2>/dev/null");
+                    print_info_box("Git Undo", "Last commit undone (changes kept staged).");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":git-diff") == 0) {
+                    char *diff = run_shell_command("git -C . diff --stat 2>/dev/null", NULL);
+                    if (diff && *diff) {
+                        printf("\n%s\033[1;36mGit Diff:\033[0m\n%s%s\n",
+                               CL_CYAN, diff, CL_RESET);
+                    } else {
+                        printf("%sNo staged changes.\033[0m\n", CL_DIM);
+                        free(diff);
+                    }
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":git-status") == 0) {
+                    char *st = run_shell_command("git -C . status -s 2>/dev/null", NULL);
+                    if (st && *st) {
+                        printf("\n%s\033[1;36mGit Status:\033[0m\n%s%s\n",
+                               CL_CYAN, st, CL_RESET);
+                    } else {
+                        printf("%sWorking tree clean.\033[0m\n", CL_DIM);
+                        free(st);
+                    }
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":copy") == 0) {
+                    if (g_last_response && g_last_response[0]) {
+                        copy_to_clipboard(g_last_response);
+                    } else {
+                        printf("%sNo response to copy yet.\033[0m\n", CL_DIM);
+                    }
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":notify") == 0) {
+                    g_notifications_enabled ^= 1;
+                    printf("%sOS notifications %s\033[0m\n",
+                           CL_CYAN, g_notifications_enabled ? "enabled" : "disabled");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":agents") == 0) {
+                    generate_agents_md();
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -3585,18 +4177,18 @@ int main(int argc, char **argv) {
                     printf("  :compact needed: %s\n",
                            ctx_bytes > (size_t)(trim_threshold * 2) ? "YES (recommended)" : "no");
                     printf("  Auto-approve   : %s\n\n",
-                           g_auto_approve ? "\033[1;33mON\033[0m (Shift-Tab to disable)" : "off");
+                           g_permission_mode ? "\033[1;33mON\033[0m (Shift-Tab to disable)" : "off");
                     run_query_this_turn = 0;
                     continue;
                 }
                 if (strcmp(user_input, ":auto") == 0) {
-                    g_auto_approve ^= 1;
-                    if (g_auto_approve)
+                    g_permission_mode = (g_permission_mode + 1) % 3;
+                    if (g_permission_mode == 0)
                         setenv("INFER_AUTO_APPROVE", "1", 1);
                     else
                         unsetenv("INFER_AUTO_APPROVE");
-                    printf("\033[2mauto-approve %s\033[0m\n",
-                           g_auto_approve ? "on" : "off");
+                    const char *mode_names[] = { "auto", "plan", "manual" };
+                    printf("\033[2mpermission mode: %s\033[0m\n", mode_names[g_permission_mode]);
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -3632,7 +4224,7 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
-            int step_limit = (g_continue_until_done || g_auto_approve || !isatty(STDIN_FILENO)) ? 999999 : 30;
+            int step_limit = (g_continue_until_done || g_permission_mode || !isatty(STDIN_FILENO)) ? 999999 : 30;
             int think_count = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
@@ -4093,17 +4685,14 @@ step_limit_check:
                                        log_job(current_prompt, pipe_writer, summary, interactive_mode);
                                        char *escaped_summary = shell_escape(summary);
                                        size_t rcmd1_len = strlen(mcp_script) + strlen(escaped_summary) + 32;
-                                       char *render_cmd = malloc(rcmd1_len);
-                                       snprintf(render_cmd, rcmd1_len, "python3 %s render-markdown %s", mcp_script, escaped_summary);
-                                       char *rendered = run_shell_command(render_cmd, NULL);
-                                       free(render_cmd);
+                                       /* Render markdown via Python helper */
+                                       char *rendered = render_markdown(summary);
                                        fflush(stderr);
-                                       printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
-                                       if (rendered) {
-                                           printf("%s\n", rendered);
+                                       if (rendered && *rendered) {
+                                           print_tool_box("✅ task_complete", "ok", rendered);
                                            free(rendered);
                                        } else {
-                                           printf("%s\n", summary);
+                                           print_tool_box("✅ task_complete", "ok", summary);
                                        }
                                        free(escaped_summary);
                                        free(summary);
@@ -4147,12 +4736,14 @@ step_limit_check:
                                           tool_output = malloc(dlen);
                                           snprintf(tool_output, dlen, "[Command Dry-Run Success]\nWould execute: %s", cmd_val);
                                       } else {
-                                          int approved = g_auto_approve;
+                                          int approved = g_permission_mode;
                                           if (!approved) {
                                               FILE *tty = fopen("/dev/tty", "r+");
                                               if (tty) {
-                                                   fprintf(tty, "\n\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
-                                                   fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
+                                                   fprintf(tty, "\n\033[1;33m  ▶ execute_command\033[0m\n");
+                                                   fprintf(tty, "  \033[2m%s\033[0m\n", cmd_val);
+                                                   fprintf(tty, "  \033[32my\033[0m/\033[31mn\033[0m  %s  Confirm?%s\n\n",
+                                                           CL_DIM, CL_RESET);
                                                    fflush(tty);
                                                    
                                                    int fd = fileno(tty);
@@ -4192,15 +4783,16 @@ step_limit_check:
                                                            }
                                                            
                                                            if (n1 == 1 && n2 == 1 && seq[0] == '[' && seq[1] == 'Z') {
-                                                               g_auto_approve ^= 1;
-                                                               if (g_auto_approve)
+                                                               g_permission_mode = (g_permission_mode + 1) % 3;
+                                                               if (g_permission_mode == 0)
                                                                    setenv("INFER_AUTO_APPROVE", "1", 1);
                                                                else
                                                                    unsetenv("INFER_AUTO_APPROVE");
-                                                               fprintf(tty, "\n\033[2mauto-approve %s\033[0m\n",
-                                                                       g_auto_approve ? "on" : "off");
+                                                               const char *mode_names[] = { "auto", "plan", "manual" };
+                                                               fprintf(tty, "\n\033[2mpermission mode: %s\033[0m\n",
+                                                                       mode_names[g_permission_mode]);
                                                                fprintf(tty, "\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
-                                                               fprintf(tty, "\033[1;36mConfirm execution? [Y/n] (Shift+Tab to toggle auto-approve):\033[0m ");
+                                                               fprintf(tty, "\033[32my\033[0m/\033[31mn\033[0m  confirm  \033[2m(Shift+Tab cycle mode)\033[0m ");
                                                                fflush(tty);
                                                                continue;
                                                            } else {
@@ -4249,7 +4841,7 @@ step_limit_check:
                                           }
 
                                           if (approved) {
-                                              fprintf(stderr, "[ai] executing command: %s\n", cmd_val);
+                                              fprintf(stderr, "\r\033[2K\033[2m  ▶ running%s\033[0m\n", cmd_val);
                                               size_t cmd_len = strlen(cmd_val);
                                               char *cmd_with_stderr = malloc(cmd_len + 16);
                                               sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
@@ -4264,13 +4856,18 @@ step_limit_check:
                                                   size_t out_len = strlen(raw_output);
                                                   tool_output = malloc(out_len + 512);
                                                   if (exit_code == 0) {
-                                                      sprintf(tool_output, "[Command Success]\n%s", raw_output);
+                                                      sprintf(tool_output, "success\n%s", raw_output);
                                                   } else {
-                                                      sprintf(tool_output, "[Command Failed with exit status %d]\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
+                                                      sprintf(tool_output, "failed (exit %d)\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
                                                   }
                                                   free(raw_output);
                                               } else {
                                                   tool_output = strdup("Error: failed to run command");
+                                              }
+
+                                              /* Auto-commit on successful command execution */
+                                              if (exit_code == 0 && g_git_commit_enabled) {
+                                                  git_commit("command");
                                               }
                                           } else {
                                               fprintf(stderr, "[ai] command execution cancelled.\n");
@@ -4396,10 +4993,28 @@ step_limit_check:
                                       }
                                   }
                                   
-                                  size_t hlen = strlen(unescaped_name) + strlen(tool_output) + strlen(graph_enforcement) + strlen(err_hint) + 64;
+                                  /* ── Display tool result with styled box ── */
+                                  {
+                                      const char *status_label = is_err ? "error" : "ok";
+                                      char *full_content = tool_output ? strdup(tool_output) : strdup("");
+                                      if (graph_enforcement && *graph_enforcement) {
+                                          size_t gc = strlen(full_content) + strlen(graph_enforcement) + 1;
+                                          full_content = realloc(full_content, gc);
+                                          strcat(full_content, graph_enforcement);
+                                      }
+                                      if (err_hint && *err_hint) {
+                                          size_t ec = strlen(full_content) + strlen(err_hint) + 1;
+                                          full_content = realloc(full_content, ec);
+                                          strcat(full_content, err_hint);
+                                      }
+
+                                      print_tool_box(unescaped_name, status_label, full_content);
+                                      free(full_content);
+                                  }
+
+                                  size_t hlen = strlen(unescaped_name) + (tool_output ? strlen(tool_output) : 0) + 64;
                                   char *hout = malloc(hlen);
-                                  snprintf(hout, hlen, "[Tool: %s | Status: %s]\n%s%s%s",
-                                           unescaped_name, is_err ? "error" : "ok", tool_output, graph_enforcement, err_hint);
+                                  snprintf(hout, hlen, "%s\n%s", unescaped_name, tool_output ? tool_output : "");
                                   free(tool_output);
                                   tool_output = hout;
                               }
@@ -4553,17 +5168,14 @@ step_limit_check:
                           char *leaked_summary = extract_leaked_task_complete(unescaped_content);
                           if (leaked_summary) {
                               log_job(current_prompt, pipe_writer, leaked_summary, interactive_mode);
-                              char *esc_sum = shell_escape(leaked_summary);
-                              size_t rcmd_len = strlen(mcp_script) + strlen(esc_sum) + 32;
-                              char *render_cmd = malloc(rcmd_len);
-                              snprintf(render_cmd, rcmd_len, "python3 %s render-markdown %s", mcp_script, esc_sum);
-                              char *rendered = run_shell_command(render_cmd, NULL);
-                              free(render_cmd);
+                              char *rendered = render_markdown(leaked_summary);
                               fflush(stderr);
-                              printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
-                              if (rendered) { printf("%s\n", rendered); free(rendered); }
-                              else { printf("%s\n", leaked_summary); }
-                              free(esc_sum);
+                              if (rendered && *rendered) {
+                                  print_tool_box("✅ task_complete (extracted)", "ok", rendered);
+                                  free(rendered);
+                              } else {
+                                  print_tool_box("✅ task_complete (extracted)", "ok", leaked_summary);
+                              }
                               free(leaked_summary);
                               free(unescaped_content);
                               has_more = 0;
@@ -4571,24 +5183,19 @@ step_limit_check:
                           }
 
                           log_job(current_prompt, pipe_writer, unescaped_content, interactive_mode);
-                          char *escaped_content = shell_escape(unescaped_content);
-                          size_t rcmd2_len = strlen(mcp_script) + strlen(escaped_content) + 32;
-                          char *render_cmd2 = malloc(rcmd2_len);
-                          snprintf(render_cmd2, rcmd2_len, "python3 %s render-markdown %s", mcp_script, escaped_content);
-                          char *rendered_output = run_shell_command(render_cmd2, NULL);
-                          free(render_cmd2);
+                          char *rendered_output = render_markdown(unescaped_content);
 
                           fflush(stderr);
-                          printf("\n\033[2m%s\033[0m\n\n", "────────────────────────────────────────────");
-                          if (rendered_output) {
-                              printf("%s", rendered_output);
-                              free(rendered_output);
-                          } else {
-                              printf("%s\n", unescaped_content);
+                          {
+                              if (rendered_output && *rendered_output) {
+                                  print_response_box(model[0] ? model : "model", rendered_output);
+                                  free(rendered_output);
+                              } else {
+                                  print_response_box(model[0] ? model : "model", unescaped_content);
+                              }
                           }
 
                           free(unescaped_content);
-                          free(escaped_content);
                       }
 
                       /* If the model stopped with no content and no tool calls, nudge it
@@ -4621,12 +5228,12 @@ step_limit_check:
                       if (context_window > 0) {
                           int pct = (int)(100.0 * total_tokens / context_window);
                           fprintf(stderr,
-                              "\n\033[2m[loop %d | ctx %d/%d (%d%%) | +%d tok | %.0f tok/s]\033[0m\n",
+                              "\n\033[2m  loop %d · ctx %d/%d (%d%%) · +%d tok · %.0f tok/s\033[0m\n",
                               loop_count, total_tokens, context_window, pct,
                               completion_tokens, tps);
                       } else {
                           fprintf(stderr,
-                              "\n\033[2m[loop %d | %d ctx tok | +%d new | %.0f tok/s]\033[0m\n",
+                              "\n\033[2m  loop %d · %d ctx · +%d new · %.0f tok/s\033[0m\n",
                               loop_count, prompt_tokens, completion_tokens, tps);
                       }
                   }
@@ -4657,7 +5264,7 @@ step_limit_check:
                 FILE *tty_f = fopen("/dev/tty", "r+");
                 if (tty_f) {
                     fprintf(tty_f,
-                        "\n\033[1;33m[ai] Agent has taken %d steps. Continue for 30 more? [Y/n]: \033[0m",
+                        "\n\033[1;33m  %d steps completed. Continue for 30 more?\033[0m\n\033[32my\033[0m/\033[31mn\033[0m: ",
                         loop_count);
                     fflush(tty_f);
                     char cont_resp[64] = {0};
@@ -4676,7 +5283,7 @@ step_limit_check:
                     }
                 }
                 fprintf(stderr,
-                    "\033[1;33m[ai] Task stopped by user after %d steps.\033[0m\n",
+                    "\033[1;33m  task stopped after %d steps\033[0m\n",
                     loop_count);
                 has_more = 0;
             }
@@ -4701,6 +5308,6 @@ step_limit_check:
     if (g_system_message_json) free(g_system_message_json);
     curl_slist_free_all(h);
     curl_easy_cleanup(c);
-    fprintf(stderr, "\033[2m[ai] Session ended. To resume: ai -r %s\033[0m\n", current_session_id);
+    fprintf(stderr, "\033[2m  session ended · resume: ai -r %s\033[0m\n", current_session_id);
     return 0;
 }
