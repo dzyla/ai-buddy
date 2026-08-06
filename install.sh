@@ -189,7 +189,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
     sudo apt-get install -y "${missing[@]}"
 fi
 
-gcc -O2 -o "${SCRIPT_DIR}/ai" "${SCRIPT_DIR}/ai.c" "${SCRIPT_DIR}/cJSON.c" -lcurl
+gcc -O2 -o "${SCRIPT_DIR}/ai" "${SCRIPT_DIR}/ai.c" "${SCRIPT_DIR}/remote_harness.c" "${SCRIPT_DIR}/cJSON.c" -lcurl -lssl -lcrypto -lpthread -lm
 echo "==> Built: ${SCRIPT_DIR}/ai"
 
 # ── 2. Install to ~/.local/bin ────────────────────────────────────────────────
