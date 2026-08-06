@@ -1647,7 +1647,7 @@ def render_markdown(text):
                     all_lines.append(" ".join(current_line))
             return all_lines
 
-        def render_wrapped_row(row_cells, is_header=False):
+        def render_wrapped_row(row_cells, is_header=False, row_idx=None):
             wrapped_cells = []
             for col_idx in range(num_cols):
                 wrapped_cells.append(wrap_text(row_cells[col_idx], col_widths[col_idx]))
@@ -1662,6 +1662,10 @@ def render_markdown(text):
                     cell_line = wrapped_cells[col_idx][line_idx]
                     formatted = format_cell(cell_line, is_header)
                     padded = pad_cell(formatted, col_widths[col_idx], alignments[col_idx])
+                    # Alternating row shading for body rows
+                    if row_idx is not None and row_idx % 2 == 1 and not is_header:
+                        # Subtle dim background for even-indexed body rows
+                        padded = f"\033[48;5;236m{padded}\033[0m"
                     line_parts.append(f" {padded} ")
                 row_lines.append('\033[90m│\033[0m' + '\033[90m│\033[0m'.join(line_parts) + '\033[90m│\033[0m')
             return row_lines
@@ -1675,8 +1679,8 @@ def render_markdown(text):
         sep_line = '\033[90m├' + '┼'.join(sep_parts) + '┤\033[0m'
         
         body_lines = []
-        for row in aligned_body:
-            body_lines.extend(render_wrapped_row(row, is_header=False))
+        for row_idx, row in enumerate(aligned_body):
+            body_lines.extend(render_wrapped_row(row, is_header=False, row_idx=row_idx))
             
         bottom_parts = ['─' * (w + 2) for w in col_widths]
         bottom_line = '\033[90m└' + '┴'.join(bottom_parts) + '┘\033[0m'
@@ -1692,15 +1696,22 @@ def render_markdown(text):
             if not in_code_block:
                 in_code_block = True
                 lang = line[3:].strip().lower()
+                lang_display = lang if lang else "text"
+                # Badge-style language label with dim background
+                badge = f"\033[38;5;245m {lang_display} \033[0m"
+                rendered.append(f"{badge}  \033[90m{'─' * 40}\033[0m")
+                code_line_num = 0
             else:
                 in_code_block = False
                 lang = ""
-            rendered.append("\033[90m" + "─" * 45 + "\033[0m")
+                rendered.append(f"\033[90m{'─' * 42}\033[0m")
             i += 1
             continue
             
         if in_code_block:
-            rendered.append(highlight_line(line, lang))
+            # Line numbers in dim gray, content with syntax highlighting
+            rendered.append(f"  \033[90m{code_line_num:4d}\033[0m {highlight_line(line, lang)[2:]}")
+            code_line_num += 1
             i += 1
             continue
             
@@ -1717,8 +1728,21 @@ def render_markdown(text):
         if h_match:
             level = len(h_match.group(1))
             content = h_match.group(2)
-            color = "35" if level == 1 else ("34" if level == 2 else "36")
-            rendered.append(f"\n\033[1;{color}m{content}\033[0m")
+            if level == 1:
+                rendered.append(f"\n\033[1;35m{content}\033[0m")
+                rendered.append(f"\033[35m{'─' * len(content)}\033[0m")
+            elif level == 2:
+                rendered.append(f"\n\033[1;34m▸ {content}\033[0m")
+            else:
+                color = "36" if level == 3 else "90"
+                rendered.append(f"\n\033[1;{color}m{content}\033[0m")
+            i += 1
+            continue
+
+        # Blockquotes: render with a left accent border
+        if line.startswith('> '):
+            bq_content = line[2:]
+            rendered.append(f"  \033[33m│\033[0m {bq_content}")
             i += 1
             continue
             
@@ -1726,13 +1750,14 @@ def render_markdown(text):
         if list_match:
             indent = list_match.group(1)[:-1]
             content = list_match.group(2)
-            line = f"{indent}• {content}"
+            # Use colored bullets
+            line = f"{indent}\033[36m•\033[0m {content}"
             
         num_match = re.match(r'^(\s*\d+\.)\s+(.*)', line)
         if num_match:
             prefix = num_match.group(1)
             content = num_match.group(2)
-            line = f"{prefix} {content}"
+            line = f"\033[36m{prefix}\033[0m {content}"
 
         line = re.sub(r'\*\*(.*?)\*\*', r'\033[1m\1\033[22m', line)
         line = re.sub(r'(?<!\w)__(.*?)__(?!\w)', r'\033[1m\1\033[22m', line)
@@ -1981,6 +2006,7 @@ TOOL_REQUIRED_ARGS = {
     "get_system_status": [],
     "get_clipboard": [],
     "list_processes":   [],
+    "remote_exec":      ["action"],
 }
 
 # Per-agent and per-URL output caps for parallel tools
@@ -2707,6 +2733,49 @@ def main():
                         }
                     },
                     "required": ["host", "command"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "remote_exec",
+                "description": "Remote Server Control Tool. Connect, discover, execute commands, monitor resources, submit jobs on a remote server cluster. Supports connection lifecycle management, auto-discovery of compute nodes, HPC job submission (Slurm/PBS/Torque), and resource monitoring.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "Action to perform: connect, disconnect, discover, status, exec, mount, jobs, submit",
+                            "enum": ["connect", "disconnect", "discover", "status", "exec", "mount", "jobs", "submit"]
+                        },
+                        "host": {
+                            "type": "string",
+                            "description": "Remote server hostname or IP (required for connect)"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "SSH port (default: 22)"
+                        },
+                        "user": {
+                            "type": "string",
+                            "description": "SSH username (required for connect)"
+                        },
+                        "pass": {
+                            "type": "string",
+                            "description": "SSH password (optional - prefer key-based auth)"
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Command to execute (required for exec, submit)"
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Command timeout in seconds (default: 120)"
+                        }
+                    },
+                    "required": ["action"]
                 }
             }
         })
@@ -3713,6 +3782,118 @@ def main():
                     print(out if out else "[Command Success, no output]")
                 except Exception as e:
                     print(json.dumps({"error": str(e)}))
+        elif tool_name == "remote_exec" or server_name == "remote_exec":
+            def ssh_cmd_base(user, host, port):
+                """Build SSH command with key or password auth."""
+                if password:
+                    return f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port}"
+                return f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port}"
+            
+            action = arguments.get("action", "connect")
+            host = arguments.get("host", "")
+            port = arguments.get("port", 22)
+            user = arguments.get("user", "")
+            password = arguments.get("pass", "")
+            cmd = arguments.get("command", "")
+            timeout = arguments.get("timeout", 120)
+            
+            if action == "connect":
+                if not host or not user:
+                    print(json.dumps({"error": "host and user required for connect"}))
+                else:
+                    try:
+                        ssh_base = ssh_cmd_base(user, host, port)
+                        res = subprocess.run(f"{ssh_base} {user}@{host} 'echo Connected'", shell=True, capture_output=True, text=True, timeout=timeout)
+                        if res.returncode == 0:
+                            print(json.dumps({"status": "connected", "host": host, "user": user}))
+                        else:
+                            print(json.dumps({"error": f"Failed to connect: {res.stderr}"}))
+                    except Exception as e:
+                        print(json.dumps({"error": str(e)}))
+            
+            elif action == "disconnect":
+                print(json.dumps({"status": "disconnected"}))
+            
+            elif action == "discover":
+                try:
+                    ssh_base = ssh_cmd_base(user, host, port)
+                    res = subprocess.run(f"{ssh_base} {user}@{host} 'cat /etc/hosts | grep -v localhost | grep -v ::1'", shell=True, capture_output=True, text=True, timeout=timeout)
+                    if res.returncode == 0:
+                        nodes = [line.split()[1] for line in res.stdout.strip().split('\n') if len(line.split()) >= 2]
+                        print(json.dumps({"discovered_nodes": nodes, "total": len(nodes)}))
+                    else:
+                        print(json.dumps({"error": "Discovery failed"}))
+                except Exception as e:
+                    print(json.dumps({"error": str(e)}))
+            
+            elif action == "status":
+                try:
+                    ssh_base = ssh_cmd_base(user, host, port)
+                    res = subprocess.run(f"{ssh_base} {user}@{host} 'uname -a; echo ---; nproc; echo ---; free -h | head -2; echo ---; df -h / | tail -1'", shell=True, capture_output=True, text=True, timeout=timeout)
+                    if res.returncode == 0:
+                        print(res.stdout if res.stdout else "[No output]")
+                    else:
+                        print(json.dumps({"error": "Status failed"}))
+                except Exception as e:
+                    print(json.dumps({"error": str(e)}))
+            
+            elif action == "exec":
+                if not cmd:
+                    print(json.dumps({"error": "command required for exec"}))
+                else:
+                    try:
+                        ssh_base = ssh_cmd_base(user, host, port)
+                        res = subprocess.run(f"{ssh_base} {user}@{host} '{cmd}'", shell=True, capture_output=True, text=True, timeout=timeout)
+                        out = res.stdout + res.stderr
+                        if res.returncode != 0:
+                            out = f"[Command Failed with exit status {res.returncode}]\n" + out
+                        print(out if out else "[Command Success, no output]")
+                    except Exception as e:
+                        print(json.dumps({"error": str(e)}))
+            
+            elif action == "mount":
+                if not cmd:
+                    print(json.dumps({"error": "command required for mount (format: '<remote_path> <local_mount>')"}))
+                else:
+                    try:
+                        key = "~/.ssh/id_ed25519" if os.path.exists("~/.ssh/id_ed25519") else "~/.ssh/id_rsa"
+                        mount_cmd = f"sshfs -o IdentityFile={key} -p {port} {user}@{host}:{cmd} /tmp/mnt_remote"
+                        res = subprocess.run(mount_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                        if res.returncode == 0:
+                            print(json.dumps({"status": "mounted", "mount_point": "/tmp/mnt_remote"}))
+                        else:
+                            print(json.dumps({"error": f"Mount failed: {res.stderr}"}))
+                    except Exception as e:
+                        print(json.dumps({"error": str(e)}))
+            
+            elif action == "jobs":
+                try:
+                    ssh_base = ssh_cmd_base(user, host, port)
+                    res = subprocess.run(f"{ssh_base} {user}@{host} 'squeue -u {user} -o \"%i %u %j %T %t %M %N %L %v %c %m %n\"'", shell=True, capture_output=True, text=True, timeout=timeout)
+                    if res.returncode == 0:
+                        print(res.stdout if res.stdout else "No jobs found")
+                    else:
+                        print(json.dumps({"error": "Job listing failed"}))
+                except Exception as e:
+                    print(json.dumps({"error": str(e)}))
+            
+            elif action == "submit":
+                if not cmd:
+                    print(json.dumps({"error": "command required for submit"}))
+                else:
+                    try:
+                        ssh_base = ssh_cmd_base(user, host, port)
+                        submit_cmd = f"{ssh_base} {user}@{host} 'bash -s' << 'SCRIPT'\n{cmd}\nSCRIPT"
+                        res = subprocess.run(submit_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                        if res.returncode == 0:
+                            print(res.stdout if res.stdout else "[Job submitted successfully]")
+                        else:
+                            print(json.dumps({"error": f"Submit failed: {res.stderr}"}))
+                    except Exception as e:
+                        print(json.dumps({"error": str(e)}))
+            
+            else:
+                print(json.dumps({"error": f"Unknown action: {action}"}))
         elif tool_name == "check_time" or server_name == "check_time":
             import datetime
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
