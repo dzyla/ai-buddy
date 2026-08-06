@@ -23,6 +23,12 @@ When executing tasks, follow these strict guidelines to maintain focus and preve
 - If you need to search a large file, use `execute_command` with `grep` rather than `read_file`.
 - Do not repeat information that is already in the context.
 
-## 4. Termination
+## 4. Systems Engineering & Memory Hygiene (C/C++/Rust)
+- **Memory Safety**: Never call `free()` on stack memory (e.g. `char buf[256]`). Match `malloc`/`calloc`/`strdup` with `free`. Never dereference pointers after `free()`.
+- **String & Pointer Bounds**: Always verify string bounds (`strlen()`) before pointer arithmetic. Never advance string pointers past `\0`.
+- **Build & Test Verification**: When adding or editing source files, ALWAYS update all build manifests (`Makefile`, `CMakeLists.txt`) and test suite fixtures. Run build and test commands (`make && make test`) BEFORE calling `task_complete`.
+- **Shell Command Safety**: Never construct shell commands via raw string interpolation with single quotes; write input to files or stdin to prevent quote escaping errors.
+
+## 5. Termination
 - Once the task is complete, call `task_complete` immediately.
 - Do not ask follow-up questions or perform unnecessary verification steps unless explicitly requested.
