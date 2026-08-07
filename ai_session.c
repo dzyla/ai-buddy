@@ -210,9 +210,16 @@ char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
     snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s", mcp_script, tmpfile);
     char *trimmed = run_shell_command(cmd, NULL);
     unlink(tmpfile);
-    if (trimmed && strlen(trimmed) > 20 && trimmed[0] == '[' && trimmed[strlen(trimmed)-1] == ']') {
-        free(messages_json);
-        return trimmed;
+    if (trimmed) {
+        size_t tlen = strlen(trimmed);
+        while (tlen > 0 && isspace((unsigned char)trimmed[tlen-1])) {
+            trimmed[tlen-1] = '\0';
+            tlen--;
+        }
+        if (tlen > 20 && trimmed[0] == '[' && trimmed[tlen-1] == ']') {
+            free(messages_json);
+            return trimmed;
+        }
     }
     if (trimmed) free(trimmed);
     return messages_json;
