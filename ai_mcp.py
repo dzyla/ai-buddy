@@ -3069,7 +3069,7 @@ def main():
             "type": "function",
             "function": {
                 "name": "execute_command",
-                "description": "Run a shell command on the host system and return its stdout and stderr. Use for any system task, file inspection, running scripts, installing packages, or verification. Prefer this over describing commands to the user.",
+                "description": "Run a shell command on the host system and return its stdout and stderr. Use for any system task, file inspection, or quick scripts. IMPORTANT: For long-running tasks (e.g. training, servers, heavy builds), DO NOT use this tool as it blocks the main thread and locks the GUI. Instead, use `start_background_process` to detach the job so you can monitor or stop it if needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3079,7 +3079,7 @@ def main():
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Optional timeout in seconds. Defaults to 120s. Set a higher value (e.g. 600 or 3600) for commands you expect to take a long time to prevent premature termination."
+                            "description": "Optional timeout in seconds. Defaults to 120s. For tasks requiring more than a few minutes, use `start_background_process` instead."
                         }
                     },
                     "required": ["command"]
