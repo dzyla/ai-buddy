@@ -1247,55 +1247,6 @@ static char* load_agents_md(void) {
     return NULL;
 }
 
-/* ── Generate AGENTS.md from project scan ── */
-static void generate_agents_md(void) {
-    fprintf(stderr, "\033[2m[ai] Scanning project for AGENTS.md generation...\033[0m\n");
-
-    /* Get list of files and directories */
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "find . -maxdepth 2 -type f \\( -name '*.py' -o -name '*.js' -o -name '*.ts' "
-        "-o -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.go' "
-        "-o -name '*.java' -o -name '*.rb' -o -name '*.sh' -o -name '*.md' -o -name '*.toml' "
-        "-o -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.txt' "
-        "-o -name 'Makefile' -o -name 'CMakeLists.txt' -o -name 'Cargo.toml' "
-        "-o -name 'go.mod' -o -name 'package.json' -o -name 'requirements.txt' "
-        "-o -name 'Dockerfile' -o -name 'docker-compose.yml' "
-        "-o -name '*.sql' -o -name '*.html' -o -name '*.css' \\) "
-        "! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/__pycache__/*' "
-        "! -path '*/venv/*' ! -path '*/.venv/*' ! -path '*/.tox/*' "
-        "-printf '%%y %%s %%p\\n' 2>/dev/null | sort");
-
-    char *output = run_shell_command(cmd, NULL);
-    if (!output) return;
-
-    /* Count file types and identify structure */
-    char summary[4096];
-    snprintf(summary, sizeof(summary),
-        "# AGENTS.md\n\n"
-        "## Project Structure\n\n"
-        "```\n%s\n```\n\n", output);
-
-    /* Add standard sections */
-    strcat(summary, "## Rules\n\n"
-        "- Always use the `think` tool before major actions.\n"
-        "- For scientific tasks, write in long, cohesive paragraphs — no markdown tables, emojis, or bullet points.\n"
-        "- Verify results: run scripts after writing them, check outputs carefully.\n\n"
-        "## Workflow\n\n"
-        "1. Analyze the request and plan your approach\n"
-        "2. Use tools systematically, verifying each step\n"
-        "3. Present results clearly with appropriate formatting\n"
-        "4. Use `task_complete` when the task is finished\n");
-
-    FILE *f = fopen("./AGENTS.md", "w");
-    if (f) {
-        fputs(summary, f);
-        fclose(f);
-        fprintf(stderr, "\033[2m[ai] Generated AGENTS.md\033[0m\n");
-    }
-    free(output);
-}
-
 /* ── Background session management ── */
 static void save_session_state(const char *prompt, const char *messages, int session_idx) {
     if (!g_session_file) return;
@@ -4386,8 +4337,52 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (strcmp(user_input, ":agents") == 0) {
-                    generate_agents_md();
-                    run_query_this_turn = 0;
+                    /* Scan the project and hand the results to the AI for intelligent AGENTS.md generation. */
+                    fprintf(stderr, "\033[2m[ai] Scanning project for agents.md generation...\033[0m\n");
+                    char cmd[4096];
+                    snprintf(cmd, sizeof(cmd),
+                        "find . -maxdepth 2 -type f \\( -name '*.py' -o -name '*.js' -o -name '*.ts' "
+                        "-o -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.go' "
+                        "-o -name '*.java' -o -name '*.rb' -o -name '*.sh' -o -name '*.md' -o -name '*.toml' "
+                        "-o -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.txt' "
+                        "-o -name 'Makefile' -o -name 'CMakeLists.txt' -o -name 'Cargo.toml' "
+                        "-o -name 'go.mod' -o -name 'package.json' -o -name 'requirements.txt' "
+                        "-o -name 'Dockerfile' -o -name 'docker-compose.yml' "
+                        "-o -name '*.sql' -o -name '*.html' -o -name '*.css' \\) "
+                        "! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/__pycache__/*' "
+                        "! -path '*/venv/*' ! -path '*/.venv/*' ! -path '*/.tox/*' "
+                        "-printf '%%y %%s %%p\\n' 2>/dev/null | sort");
+                    char *output = run_shell_command(cmd, NULL);
+                    if (!output) {
+                        fprintf(stderr, "\033[2m[ai] Failed to scan project for :agents\033[0m\n");
+                    } else {
+                        /* Build a prompt the AI can use to generate AGENTS.md.
+                         * We pass the file scan into a user message so the model can analyze the project
+                         * and produce a tailored AGENTS.md rather than writing a hardcoded template. */
+                        char *scan_escaped = json_escape(output);
+                        char agent_prompt[8192];
+                        snprintf(agent_prompt, sizeof(agent_prompt),
+                            "Run the command: write_file {\"path\":\"./AGENTS.md\", \"content\": ...} with the content "
+                            "you generate below.\n\n"
+                            "Here is the project file scan:\n```\n%s\n```\n\n"
+                            "Please generate an AGENTS.md that includes: a concise project structure overview "
+                            "(highlighting the main entry points and architecture), a clear description of how "
+                            "to build and run the project, key rules the agent should follow based on the "
+                            "codebase conventions, and a workflow section. Tailor the content to this specific project.",
+                            scan_escaped);
+                        free(scan_escaped);
+
+                        char *prompt_escaped = json_escape(agent_prompt);
+                        char *user_msg = malloc(strlen(prompt_escaped) + 128);
+                        sprintf(user_msg, "{\"role\":\"user\",\"content\":\"%s\"}", prompt_escaped);
+                        free(prompt_escaped);
+                        messages_json = append_message(messages_json, user_msg);
+                        free(user_msg);
+                        add_turn_item(ITEM_USER_INPUT, "User", NULL, "Generate AGENTS.md from project scan", 0, 0, g_turn_count, 0);
+                        fprintf(stderr, "\033[2m[ai] Sending project scan to AI for AGENTS.md generation...\033[0m\n");
+                    }
+                    free(output);
+                    run_query_this_turn = 1;
                     continue;
                 }
                 if (strcmp(user_input, ":status") == 0) {
