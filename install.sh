@@ -337,8 +337,46 @@ if [ "${1:-}" = "llama" ]; then
     # Sync ai-backend as wrapper
     ln -sf "${BIN_DIR}/ai-backend" "${BIN_DIR}/llama-server-wrapper.sh"
 
+    # ── Auto-fix: ensure models dir points to /mnt/scratch where weights live ─
+    SCRATCH_MODEL_DIR="/mnt/scratch/dzyla/.local/share/ai/models"
+    if [ ! -e "$MODEL_DIR" ]; then
+        # Models dir doesn't exist at all — create a symlink to scratch
+        if [ -d "$SCRATCH_MODEL_DIR" ]; then
+            mkdir -p "$(dirname "$MODEL_DIR")"
+            ln -s "$SCRATCH_MODEL_DIR" "$MODEL_DIR"
+            echo "==>.local/share/ai/models symlinked to $SCRATCH_MODEL_DIR"
+        else
+            mkdir -p "$MODEL_DIR"
+        fi
+    elif [ ! -L "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ]; then
+        # It's a real directory — check if scratch has weights we should use
+        if [ -d "$SCRATCH_MODEL_DIR" ] && ls "$SCRATCH_MODEL_DIR"/*.gguf &>/dev/null; then
+            echo "==>.local/share/ai/models is a real directory, but weights found on scratch."
+            echo "===> Recreating as symlink to $SCRATCH_MODEL_DIR"
+            rm -rf "$MODEL_DIR"
+            ln -s "$SCRATCH_MODEL_DIR" "$MODEL_DIR"
+        fi
+    elif [ -L "$MODEL_DIR" ]; then
+        # It's a symlink — make sure it points to the right place
+        REAL_TARGET=$(readlink "$MODEL_DIR")
+        if [ "$REAL_TARGET" != "$SCRATCH_MODEL_DIR" ]; then
+            echo "==>.local/share/ai/models points to $REAL_TARGET (expected $SCRATCH_MODEL_DIR)"
+            if [ -d "$SCRATCH_MODEL_DIR" ] && ls "$SCRATCH_MODEL_DIR"/*.gguf &>/dev/null; then
+                ln -sfn "$SCRATCH_MODEL_DIR" "$MODEL_DIR"
+                echo "===> Fixed: symlink now points to $SCRATCH_MODEL_DIR"
+            else
+                echo "===> Kept existing symlink (no weights found on scratch to use)"
+            fi
+        fi
+    fi
+
+    # Try to ensure /mnt/scratch is accessible (autofs trigger)
+    if [ ! -d "$SCRATCH_MODEL_DIR" ] && [ -d "$(dirname "$SCRATCH_MODEL_DIR")" ]; then
+        ls "$SCRATCH_MODEL_DIR" &>/dev/null || echo "==>.local/share/ai/models (on /mnt/scratch) not yet accessible — continuing anyway"
+    fi
+
     # Find or download model
-    EXISTING_MODEL=$(find "$MODEL_DIR" -name "*.gguf" \
+    EXISTING_MODEL=$(find -L "$MODEL_DIR" -name "*.gguf" \
         ! -name "mmproj-*.gguf" ! -path "*/MTP/*" 2>/dev/null | sort | head -1)
 
     if [ -n "$EXISTING_MODEL" ]; then
