@@ -375,9 +375,20 @@ if [ "${1:-}" = "llama" ]; then
         ls "$SCRATCH_MODEL_DIR" &>/dev/null || echo "==>.local/share/ai/models (on /mnt/scratch) not yet accessible — continuing anyway"
     fi
 
-    # Find or download model
-    EXISTING_MODEL=$(find -L "$MODEL_DIR" -name "*.gguf" \
-        ! -name "mmproj-*.gguf" ! -path "*/MTP/*" 2>/dev/null | sort | head -1)
+    # Check if a model is already configured in env
+    CONFIGURED_MODEL=""
+    if [ -f "${DATA_DIR}/env" ]; then
+        CONFIGURED_MODEL=$(grep -E '^export LLAMA_MODEL_PATH=' "${DATA_DIR}/env" | cut -d'"' -f2 | cut -d"'" -f2 | tail -n1)
+    fi
+
+    if [ -n "$CONFIGURED_MODEL" ] && [ -f "$CONFIGURED_MODEL" ]; then
+        EXISTING_MODEL="$CONFIGURED_MODEL"
+        echo "==> Preserving currently configured model from env: $EXISTING_MODEL"
+    else
+        # Find first available model
+        EXISTING_MODEL=$(find -L "$MODEL_DIR" -name "*.gguf" \
+            ! -name "mmproj-*.gguf" ! -path "*/MTP/*" 2>/dev/null | sort | head -1)
+    fi
 
     if [ -n "$EXISTING_MODEL" ]; then
         MODEL_PATH="$EXISTING_MODEL"

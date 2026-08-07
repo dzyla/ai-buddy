@@ -18,6 +18,7 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <errno.h>
+#include <poll.h>
 #include "remote_harness.h"
 
 /* ── Remote Server State ───────────────────────────────────────────────────── */
@@ -543,7 +544,7 @@ static void print_response_box(const char *model_name, const char *content,
         return;
     }
 
-    printf("\n\033[1;35m🤖 %s\033[0m\n", mname);
+    printf("\n\n\033[1;32m🤖 %s (Answer)\033[0m\n\n", mname);
     if (content && *content) {
         char *rendered = NULL;
         int is_pre_rendered = (strstr(content, "\033[") != NULL);
@@ -859,7 +860,7 @@ static int g_spinner_idx = 0;
 static long g_tokens_prompt = 0;
 static long g_tokens_completion = 0;
 static int  g_tokens_total = 0;
-static long g_session_tokens = 0;  /* cumulative across session */
+static long g_session_tokens = 0;  /* latest request total_tokens (context window size) */
 
 static int is_command_denied(const char *cmd) {
     if (!cmd) return 0;
@@ -909,6 +910,7 @@ const char *SYSTEM_PROMPT =
     "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n"
     "- To modify existing files, strictly use the `edit_file` tool instead of `sed`, `awk`, or interactive editors.\n"
     "- NEVER run interactive terminal programs like `vim`, `nano`, `top`, `less`, or `ssh` via execute_command as they will hang the agent. Use provided tools instead.\n"
+    "- For long-running jobs (e.g. servers, training, heavy builds), NEVER use execute_command as it blocks the main thread and locks the GUI. Use `start_background_process` instead, and monitor it using `check_process_status`.\n"
     "- NEVER run `find /` or search indiscriminately from the root directory; it will hang forever. Always constrain searches to specific, relevant directories (e.g., `./` or `~/Code`).\n"
     "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
     "CITATIONS:\n"
@@ -1635,10 +1637,12 @@ static int total_tool_count = 0;
 static int g_continue_until_done = 0;
 static volatile int g_agent_loop_active = 0; /* 1 while the has_more agent loop runs */
 
+#define LINEED_MAX_LINE    1048576
+
 /* Shared stdin accumulation buffer for :btw detection (used by progress_cb + poll) */
-static char g_agent_stdin_buf[4096] = "";
+static char g_agent_stdin_buf[LINEED_MAX_LINE] = "";
 static int  g_agent_stdin_len = 0;
-static char g_btw_message[4096] = "";
+static char g_btw_message[LINEED_MAX_LINE] = "";
 static volatile int g_btw_available = 0;
 
 static void disable_raw_mode(void) {
@@ -1702,21 +1706,27 @@ static int curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                 g_agent_stdin_buf[g_agent_stdin_len] = '\0';
                 const char *line = g_agent_stdin_buf;
                 while (*line == ' ') line++;
-                if (strncmp(line, ":btw", 4) == 0) {
-                    const char *msg = line + 4;
-                    while (*msg == ' ') msg++;
-                    if (*msg) {
-                        strncpy(g_btw_message, msg, sizeof(g_btw_message) - 1);
-                        g_btw_message[sizeof(g_btw_message) - 1] = '\0';
-                        g_btw_available = 1;
-                        fprintf(stderr, "\n\033[2m[btw] queued\033[0m\n");
-                        fflush(stderr);
-                    } else {
-                        fprintf(stderr, "\n\033[2m[btw] usage: :btw <message>\033[0m\n");
-                        fflush(stderr);
-                    }
+                if (strncmp(line, ":btw ", 5) == 0) {
+                    line += 5;
+                    while (*line == ' ') line++;
+                } else if (strncmp(line, ":btw", 4) == 0) {
+                    line += 4;
+                    while (*line == ' ') line++;
+                }
+                if (*line) {
+                    strncpy(g_btw_message, line, sizeof(g_btw_message) - 1);
+                    g_btw_message[sizeof(g_btw_message) - 1] = '\0';
+                    g_btw_available = 1;
+                    fprintf(stderr, "\n\033[2m[scheduled] %s\033[0m\n", g_btw_message);
+                    fflush(stderr);
                 }
                 g_agent_stdin_len = 0;
+            } else if (ch == 127 || ch == 8) {
+                if (g_agent_stdin_len > 0) {
+                    g_agent_stdin_len--;
+                    fprintf(stderr, "\b \b");
+                    fflush(stderr);
+                }
             } else if (ch >= 32 && ch <= 126) {
                 /* Echo printable char so user can see what they're typing */
                 if (g_agent_stdin_len < (int)sizeof(g_agent_stdin_buf) - 1) {
@@ -1789,24 +1799,33 @@ static void poll_agent_stdin(void) {
             g_agent_stdin_buf[g_agent_stdin_len] = '\0';
             const char *line = g_agent_stdin_buf;
             while (*line == ' ') line++;
-            if (strncmp(line, ":btw", 4) == 0) {
-                const char *msg = line + 4;
-                while (*msg == ' ') msg++;
-                if (*msg) {
-                    strncpy(g_btw_message, msg, sizeof(g_btw_message) - 1);
-                    g_btw_message[sizeof(g_btw_message) - 1] = '\0';
-                    g_btw_available = 1;
-                    fprintf(stderr, "\033[2m[btw] queued\033[0m\n");
-                    fflush(stderr);
-                } else {
-                    fprintf(stderr, "\033[2m[btw] usage: :btw <message>\033[0m\n");
-                    fflush(stderr);
-                }
+            if (strncmp(line, ":btw ", 5) == 0) {
+                line += 5;
+                while (*line == ' ') line++;
+            } else if (strncmp(line, ":btw", 4) == 0) {
+                line += 4;
+                while (*line == ' ') line++;
+            }
+            if (*line) {
+                strncpy(g_btw_message, line, sizeof(g_btw_message) - 1);
+                g_btw_message[sizeof(g_btw_message) - 1] = '\0';
+                g_btw_available = 1;
+                fprintf(stderr, "\n\033[2m[scheduled] %s\033[0m\n", g_btw_message);
+                fflush(stderr);
             }
             g_agent_stdin_len = 0;
+        } else if (ch == 127 || ch == 8) {
+            if (g_agent_stdin_len > 0) {
+                g_agent_stdin_len--;
+                fprintf(stderr, "\b \b");
+                fflush(stderr);
+            }
         } else if (ch >= 32 && ch <= 126) {
-            if (g_agent_stdin_len < (int)sizeof(g_agent_stdin_buf) - 1)
+            if (g_agent_stdin_len < (int)sizeof(g_agent_stdin_buf) - 1) {
                 g_agent_stdin_buf[g_agent_stdin_len++] = ch;
+                fputc(ch, stderr);
+                fflush(stderr);
+            }
         }
     }
 
@@ -1993,7 +2012,18 @@ static char *read_line_interactive(const char *prompt) {
     int  hidx   = lineed_history_len;
     static char saved_buf[LINEED_MAX_LINE];
     buf[0] = '\0';
+    if (g_btw_available) {
+        strncpy(buf, g_btw_message, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        len = strlen(buf);
+        cursor = len;
+        g_btw_available = 0;
+    }
     saved_buf[0] = '\0';
+
+    if (len > 0) {
+        write(STDOUT_FILENO, buf, len);
+    }
 
     for (;;) {
         unsigned char c;
@@ -2225,7 +2255,10 @@ static char *read_line_interactive(const char *prompt) {
             buf[cursor] = (char)c;
             cursor++;
             len++;
-            lineed_redraw(prompt, buf, len, cursor);
+            struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+            if (poll(&pfd, 1, 0) == 0) {
+                lineed_redraw(prompt, buf, len, cursor);
+            }
         }
     }
 
@@ -2233,6 +2266,13 @@ static char *read_line_interactive(const char *prompt) {
 #undef LINEED_RESTORE
 #undef LINEED_INS
     buf[len] = '\0';
+    
+    if (len > 30000) {
+        fprintf(stderr, "\n\033[1;33m[ai] Warning: large prompt inserted (%d bytes). "
+                        "If this exceeds your model's context budget, consider using the "
+                        "`delegate_task` tool to have a subagent process it in a fresh context.\033[0m\n", len);
+    }
+    
     return strdup(buf);
 }
 
@@ -3894,13 +3934,25 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
-        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
+        }
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
+             strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
+             strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
+            i++; continue;
+        }
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                (strncmp(argv[i+1], "sess_", 5) == 0 || strcmp(argv[i+1], "last") == 0 ||
+                 strstr(argv[i+1], ".json") != NULL)) {
+                i++;
+            }
+            continue;
         }
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         prompt_len += strlen(argv[i]) + 1;
@@ -3915,14 +3967,21 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
-        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
         }
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                (strncmp(argv[i+1], "sess_", 5) == 0 || strcmp(argv[i+1], "last") == 0 ||
+                 strstr(argv[i+1], ".json") != NULL)) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         if (added) strcat(prompt, " ");
         strcat(prompt, argv[i]);
@@ -4723,7 +4782,7 @@ step_limit_check:
                         k = json_skip_token(tok, r, k + 2);
                     }
                     /* Accumulate session-wide token count */
-                    g_session_tokens += total_tokens;
+                    g_session_tokens = total_tokens;
                 }
 
                 if (error_tok != -1) {
@@ -5299,6 +5358,13 @@ step_limit_check:
                                                                fprintf(tty, "\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
                                                                fprintf(tty, "\033[32my\033[0m/\033[31mn\033[0m  confirm  \033[2m(Shift+Tab cycle mode)\033[0m ");
                                                                fflush(tty);
+                                                               if (has_termios) {
+                                                                   struct termios raw = orig_tty_termios;
+                                                                   raw.c_lflag &= ~(ECHO | ICANON);
+                                                                   raw.c_cc[VMIN] = 1;
+                                                                   raw.c_cc[VTIME] = 0;
+                                                                   tcsetattr(fd, TCSANOW, &raw);
+                                                               }
                                                                continue;
                                                            } else {
                                                                fprintf(tty, "^[\n");
@@ -5346,33 +5412,38 @@ step_limit_check:
                                           }
 
                                           if (approved) {
-                                              fprintf(stderr, "\r\033[2K\033[2m  ▶ running%s\033[0m\n", cmd_val);
-                                              size_t cmd_len = strlen(cmd_val);
-                                              char *cmd_with_stderr = malloc(cmd_len + 16);
-                                              sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
-                                              int exit_code = 0;
-                                              char *raw_output = run_shell_command_timeout(cmd_with_stderr, &exit_code, cmd_timeout);
-                                              free(cmd_with_stderr);
-
-                                              if (exit_code == 130) /* ESC / SIGINT during command */
-                                                  g_esc_requested = 1;
-
-                                              if (raw_output) {
-                                                  size_t out_len = strlen(raw_output);
-                                                  tool_output = malloc(out_len + 512);
-                                                  if (exit_code == 0) {
-                                                      sprintf(tool_output, "success\n%s", raw_output);
-                                                  } else {
-                                                      sprintf(tool_output, "failed (exit %d)\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
-                                                  }
-                                                  free(raw_output);
+                                              fprintf(stderr, "\r\033[2K\033[2m  ▶ running %s\033[0m\n", cmd_val);
+                                              if (strncmp(cmd_val, "sleep ", 6) == 0 || strstr(cmd_val, " sleep ") || strstr(cmd_val, "&& sleep ") || strstr(cmd_val, "; sleep ")) {
+                                                  tool_output = strdup("Error: `sleep` is forbidden in execute_command. Use `schedule_task` to wait or check status asynchronously.");
+                                                  fprintf(stderr, "\r\033[2K\033[1;31m  ▶ sleep command rejected. Enforcing schedule_task.\033[0m\n");
                                               } else {
-                                                  tool_output = strdup("Error: failed to run command");
-                                              }
+                                                  size_t cmd_len = strlen(cmd_val);
+                                                  char *cmd_with_stderr = malloc(cmd_len + 16);
+                                                  sprintf(cmd_with_stderr, "%s 2>&1", cmd_val);
+                                                  int exit_code = 0;
+                                                  char *raw_output = run_shell_command_timeout(cmd_with_stderr, &exit_code, cmd_timeout);
+                                                  free(cmd_with_stderr);
 
-                                              /* Auto-commit on successful command execution */
-                                              if (exit_code == 0 && g_git_commit_enabled) {
-                                                  git_commit("command");
+                                                  if (exit_code == 130) /* ESC / SIGINT during command */
+                                                      g_esc_requested = 1;
+
+                                                  if (raw_output) {
+                                                      size_t out_len = strlen(raw_output);
+                                                      tool_output = malloc(out_len + 512);
+                                                      if (exit_code == 0) {
+                                                          sprintf(tool_output, "success\n%s", raw_output);
+                                                      } else {
+                                                          sprintf(tool_output, "failed (exit %d)\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
+                                                      }
+                                                      free(raw_output);
+                                                  } else {
+                                                      tool_output = strdup("Error: failed to run command");
+                                                  }
+
+                                                  /* Auto-commit on successful command execution */
+                                                  if (exit_code == 0 && g_git_commit_enabled) {
+                                                      git_commit("command");
+                                                  }
                                               }
                                           } else {
                                               fprintf(stderr, "[ai] command execution cancelled.\n");

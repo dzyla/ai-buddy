@@ -382,3 +382,16 @@ def test_execute_command_alias_in_c(tmp_path):
         assert "c_alias_ok" in tool_msg
 
 
+
+def test_background_process_system_prompt_guidance(tmp_path):
+    """Verify that the system prompt explicitly advises using start_background_process."""
+    cap = tmp_path / "cap.jsonl"
+    with MockServer(str(cap), MOCK_LLM_RESPONSE='{"choices":[{"delta":{"content":"done"}}]}') as s:
+        res = run_binary(str(tmp_path), s.base_url, ["hello"])
+    assert res.returncode == 0
+    reqs = s.requests()
+    assert reqs, "Expected at least one request"
+    sys_msg = reqs[0]["messages"][0]["content"]
+    assert "start_background_process" in sys_msg
+    assert "execute_command" in sys_msg
+    assert "blocks the main thread" in sys_msg
