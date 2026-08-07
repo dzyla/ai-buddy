@@ -2433,11 +2433,18 @@ char* run_shell_command(const char *cmd, int *exit_status) {
 
 /* Extract the string value of a key from a flat JSON object string. */
 static char* json_get_string(const char *json_str, const char *key) {
+    if (!json_str || !key) return NULL;
     jsmn_parser p;
     jsmntok_t tok[64];
     jsmn_init(&p);
     int r = jsmn_parse(&p, json_str, strlen(json_str), tok, 64);
-    if (r < 0) return NULL;
+    if (r <= 0) {
+        if (json_str && json_str[0] != '{' && json_str[0] != '[') return strdup(json_str);
+        return NULL;
+    }
+    if (tok[0].type == JSMN_STRING) {
+        return unescape_json_string(json_str + tok[0].start, tok[0].end - tok[0].start);
+    }
     int klen = (int)strlen(key);
     for (int i = 1; i < r - 1; i++) {
         if (tok[i].type == JSMN_STRING &&
@@ -2446,6 +2453,33 @@ static char* json_get_string(const char *json_str, const char *key) {
             tok[i+1].type == JSMN_STRING) {
             return unescape_json_string(json_str + tok[i+1].start,
                                         tok[i+1].end - tok[i+1].start);
+        }
+    }
+    const char *aliases[8] = {NULL};
+    int n_aliases = 0;
+    if (strcmp(key, "path") == 0) {
+        aliases[0] = "file"; aliases[1] = "filepath"; aliases[2] = "filename"; aliases[3] = "file_path"; aliases[4] = "p";
+        n_aliases = 5;
+    } else if (strcmp(key, "command") == 0) {
+        aliases[0] = "cmd"; aliases[1] = "command_line"; aliases[2] = "CommandLine"; aliases[3] = "args"; aliases[4] = "script"; aliases[5] = "code"; aliases[6] = "c";
+        n_aliases = 7;
+    } else if (strcmp(key, "query") == 0) {
+        aliases[0] = "q"; aliases[1] = "search"; aliases[2] = "prompt"; aliases[3] = "term";
+        n_aliases = 4;
+    } else if (strcmp(key, "url") == 0) {
+        aliases[0] = "uri"; aliases[1] = "link"; aliases[2] = "address"; aliases[3] = "u";
+        n_aliases = 4;
+    }
+    for (int a = 0; a < n_aliases; a++) {
+        int aklen = (int)strlen(aliases[a]);
+        for (int i = 1; i < r - 1; i++) {
+            if (tok[i].type == JSMN_STRING &&
+                tok[i].end - tok[i].start == aklen &&
+                strncmp(json_str + tok[i].start, aliases[a], aklen) == 0 &&
+                tok[i+1].type == JSMN_STRING) {
+                return unescape_json_string(json_str + tok[i+1].start,
+                                            tok[i+1].end - tok[i+1].start);
+            }
         }
     }
     return NULL;
@@ -4848,13 +4882,27 @@ step_limit_check:
                                        jsmn_init(&arg_parser);
                                        int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 256);
                                        char *reasoning = NULL;
-                                       for (int a = 1; a < arg_r; a++) {
-                                           if (arg_toks[a].type == JSMN_STRING &&
-                                               arg_toks[a].end - arg_toks[a].start == 9 &&
-                                               strncmp(unescaped_args + arg_toks[a].start, "reasoning", 9) == 0) {
-                                               reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
-                                                                                arg_toks[a+1].end - arg_toks[a+1].start);
-                                               break;
+                                       if (arg_r > 0 && arg_toks[0].type == JSMN_STRING) {
+                                           reasoning = unescape_json_string(unescaped_args + arg_toks[0].start, arg_toks[0].end - arg_toks[0].start);
+                                       } else if (arg_r > 0 && unescaped_args[0] != '{' && unescaped_args[0] != '[') {
+                                           reasoning = strdup(unescaped_args);
+                                       } else {
+                                           for (int a = 1; a < arg_r; a++) {
+                                               if (arg_toks[a].type == JSMN_STRING) {
+                                                   int klen = arg_toks[a].end - arg_toks[a].start;
+                                                   const char *kstr = unescaped_args + arg_toks[a].start;
+                                                   if ((klen == 9 && strncmp(kstr, "reasoning", 9) == 0) ||
+                                                       (klen == 7 && strncmp(kstr, "thought", 7) == 0) ||
+                                                       (klen == 8 && strncmp(kstr, "thoughts", 8) == 0) ||
+                                                       (klen == 4 && strncmp(kstr, "plan", 4) == 0) ||
+                                                       (klen == 6 && strncmp(kstr, "reason", 6) == 0)) {
+                                                       if (a + 1 < arg_r) {
+                                                           reasoning = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                                            arg_toks[a+1].end - arg_toks[a+1].start);
+                                                           break;
+                                                       }
+                                                   }
+                                               }
                                            }
                                        }
                                        if (reasoning) {
@@ -4873,13 +4921,29 @@ step_limit_check:
                                    jsmn_init(&arg_parser);
                                    int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 2048);
                                    char *summary = NULL;
-                                   for (int a = 1; a < arg_r; a++) {
-                                       if (arg_toks[a].type == JSMN_STRING &&
-                                           arg_toks[a].end - arg_toks[a].start == 7 &&
-                                           strncmp(unescaped_args + arg_toks[a].start, "summary", 7) == 0) {
-                                           summary = unescape_json_string(unescaped_args + arg_toks[a+1].start,
-                                                                          arg_toks[a+1].end - arg_toks[a+1].start);
-                                           break;
+                                   if (arg_r > 0 && arg_toks[0].type == JSMN_STRING) {
+                                       summary = unescape_json_string(unescaped_args + arg_toks[0].start, arg_toks[0].end - arg_toks[0].start);
+                                   } else if (arg_r > 0 && unescaped_args[0] != '{' && unescaped_args[0] != '[') {
+                                       summary = strdup(unescaped_args);
+                                   } else {
+                                       for (int a = 1; a < arg_r; a++) {
+                                           if (arg_toks[a].type == JSMN_STRING) {
+                                               int klen = arg_toks[a].end - arg_toks[a].start;
+                                               const char *kstr = unescaped_args + arg_toks[a].start;
+                                               if ((klen == 7 && strncmp(kstr, "summary", 7) == 0) ||
+                                                   (klen == 4 && strncmp(kstr, "text", 4) == 0) ||
+                                                   (klen == 8 && strncmp(kstr, "response", 8) == 0) ||
+                                                   (klen == 6 && strncmp(kstr, "result", 6) == 0) ||
+                                                   (klen == 7 && strncmp(kstr, "message", 7) == 0) ||
+                                                   (klen == 12 && strncmp(kstr, "final_answer", 12) == 0) ||
+                                                   (klen == 6 && strncmp(kstr, "answer", 6) == 0)) {
+                                                   if (a + 1 < arg_r) {
+                                                       summary = unescape_json_string(unescaped_args + arg_toks[a+1].start,
+                                                                                      arg_toks[a+1].end - arg_toks[a+1].start);
+                                                       break;
+                                                   }
+                                               }
+                                           }
                                        }
                                    }
                                    if (summary) {
@@ -5103,19 +5167,69 @@ step_limit_check:
                                    int arg_r = jsmn_parse(&arg_parser, unescaped_args, strlen(unescaped_args), arg_toks, 512);
                                    char *cmd_val = NULL;
                                    int cmd_timeout = 120; // Default timeout
-                                   for (int a = 1; a < arg_r; a++) {
-                                       if (arg_toks[a].type == JSMN_STRING && 
-                                           arg_toks[a].end - arg_toks[a].start == 7 &&
-                                           strncmp(unescaped_args + arg_toks[a].start, "command", 7) == 0) {
-                                           cmd_val = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
-                                       } else if (arg_toks[a].type == JSMN_STRING && 
-                                           arg_toks[a].end - arg_toks[a].start == 7 &&
-                                           strncmp(unescaped_args + arg_toks[a].start, "timeout", 7) == 0) {
-                                           if (arg_toks[a + 1].type == JSMN_PRIMITIVE) {
-                                               char *timeout_str = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
-                                               if (timeout_str) {
-                                                   cmd_timeout = atoi(timeout_str);
-                                                   free(timeout_str);
+                                   if (arg_r > 0 && arg_toks[0].type == JSMN_STRING) {
+                                       cmd_val = unescape_json_string(unescaped_args + arg_toks[0].start, arg_toks[0].end - arg_toks[0].start);
+                                   } else if (arg_r > 0 && unescaped_args[0] != '{' && unescaped_args[0] != '[') {
+                                       cmd_val = strdup(unescaped_args);
+                                   } else {
+                                       for (int a = 1; a < arg_r; a++) {
+                                           if (arg_toks[a].type == JSMN_STRING) {
+                                               int klen = arg_toks[a].end - arg_toks[a].start;
+                                               const char *kstr = unescaped_args + arg_toks[a].start;
+                                               if ((klen == 7 && strncmp(kstr, "command", 7) == 0) ||
+                                                   (klen == 3 && strncmp(kstr, "cmd", 3) == 0) ||
+                                                   (klen == 12 && strncmp(kstr, "command_line", 12) == 0) ||
+                                                   (klen == 11 && strncmp(kstr, "CommandLine", 11) == 0) ||
+                                                   (klen == 4 && strncmp(kstr, "args", 4) == 0) ||
+                                                   (klen == 6 && strncmp(kstr, "script", 6) == 0) ||
+                                                   (klen == 4 && strncmp(kstr, "code", 4) == 0) ||
+                                                   (klen == 1 && strncmp(kstr, "c", 1) == 0)) {
+                                                   if (a + 1 < arg_r) {
+                                                       if (arg_toks[a + 1].type == JSMN_STRING) {
+                                                           cmd_val = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
+                                                       } else if (arg_toks[a + 1].type == JSMN_ARRAY) {
+                                                           int elem_count = arg_toks[a + 1].size;
+                                                           int cur = a + 2;
+                                                           size_t buf_cap = 512;
+                                                           size_t buf_len = 0;
+                                                           char *arr_buf = malloc(buf_cap);
+                                                           if (arr_buf) {
+                                                               arr_buf[0] = ' ';
+                                                               for (int e = 0; e < elem_count && cur < arg_r; e++) {
+                                                                   if (arg_toks[cur].type == JSMN_STRING || arg_toks[cur].type == JSMN_PRIMITIVE) {
+                                                                       char *item = unescape_json_string(unescaped_args + arg_toks[cur].start, arg_toks[cur].end - arg_toks[cur].start);
+                                                                       if (item) {
+                                                                           size_t ilen = strlen(item);
+                                                                           if (buf_len + ilen + 2 > buf_cap) {
+                                                                               buf_cap = (buf_len + ilen + 2) * 2;
+                                                                               arr_buf = realloc(arr_buf, buf_cap);
+                                                                           }
+                                                                           if (buf_len > 0) {
+                                                                               strcat(arr_buf, " ");
+                                                                               buf_len++;
+                                                                           }
+                                                                           strcat(arr_buf, item);
+                                                                           buf_len += ilen;
+                                                                           free(item);
+                                                                       }
+                                                                   }
+                                                                   cur++;
+                                                               }
+                                                               cmd_val = arr_buf;
+                                                           }
+                                                       }
+                                                   }
+                                               } else if ((klen == 7 && strncmp(kstr, "timeout", 7) == 0) ||
+                                                          (klen == 1 && strncmp(kstr, "t", 1) == 0)) {
+                                                   if (a + 1 < arg_r) {
+                                                       if (arg_toks[a + 1].type == JSMN_PRIMITIVE || arg_toks[a + 1].type == JSMN_STRING) {
+                                                           char *timeout_str = unescape_json_string(unescaped_args + arg_toks[a + 1].start, arg_toks[a + 1].end - arg_toks[a + 1].start);
+                                                           if (timeout_str) {
+                                                               cmd_timeout = atoi(timeout_str);
+                                                               free(timeout_str);
+                                                           }
+                                                       }
+                                                   }
                                                }
                                            }
                                        }
