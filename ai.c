@@ -5465,8 +5465,14 @@ step_limit_check:
                                                                const char *mode_names[] = { "auto", "plan", "manual" };
                                                                fprintf(tty, "\n\033[2mpermission mode: %s\033[0m\n",
                                                                        mode_names[g_permission_mode]);
+                                                               if (g_permission_mode == 0) {
+                                                                   fprintf(tty, "\033[32mAuto-approved\033[0m\n");
+                                                                   fflush(tty);
+                                                                   approved = 1;
+                                                                   break;
+                                                               }
                                                                fprintf(tty, "\033[1;33m[ai] Execute command:\033[0m %s\n", cmd_val);
-                                                               fprintf(tty, "\033[32my\033[0m/\033[31mn\033[0m  confirm  \033[2m(Shift+Tab cycle mode)\033[0m ");
+                                                               fprintf(tty, "\033[32my\033[0m/\033[31mn\033[0m/\033[36mb\033[0m  confirm  \033[2m(Shift+Tab cycle mode)\033[0m ");
                                                                fflush(tty);
                                                                if (has_termios) {
                                                                    struct termios raw = orig_tty_termios;
