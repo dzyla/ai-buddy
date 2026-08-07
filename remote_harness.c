@@ -13,17 +13,28 @@
 
 /* Build SSH command line */
 static char* build_ssh_cmd(const char *hostname, int port, const char *username,
-                           const char *password, const char *remote_cmd) {
-    size_t len = 2048;
-    char *cmd = malloc(len);
-    if (password && *password) {
-        snprintf(cmd, len, "sshpass -p '%s' ssh -o StrictHostKeyChecking=no "
-                 "-o UserKnownHostsFile=/dev/null -p %d %s@%s '%s'",
-                 password, port, username, hostname, remote_cmd);
+                           const char *password, const char *ssh_key, const char *remote_cmd) {
+    size_t pwd_len = (password && *password) ? strlen(password) + 32 : 0;
+    size_t key_len = (ssh_key && *ssh_key) ? strlen(ssh_key) + 32 : 0;
+    size_t needed = strlen(hostname) + strlen(username) + strlen(remote_cmd) + pwd_len + key_len + 512;
+    char *cmd = malloc(needed);
+    if (!cmd) return NULL;
+
+    char key_opt[560] = {0};
+    if (ssh_key && *ssh_key) {
+        snprintf(key_opt, sizeof(key_opt), "-i '%s' ", ssh_key);
+    }
+
+    if (password && *password && (!ssh_key || !*ssh_key)) {
+        snprintf(cmd, needed, "sshpass -p '%s' ssh -o StrictHostKeyChecking=no "
+                 "-o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 "
+                 "-o ConnectTimeout=10 -o TCPKeepAlive=yes %s-p %d %s@%s '%s'",
+                 password, key_opt, port, username, hostname, remote_cmd);
     } else {
-        snprintf(cmd, len, "ssh -o StrictHostKeyChecking=no "
-                 "-o UserKnownHostsFile=/dev/null -p %d %s@%s '%s'",
-                 port, username, hostname, remote_cmd);
+        snprintf(cmd, needed, "ssh -o StrictHostKeyChecking=no "
+                 "-o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 "
+                 "-o ConnectTimeout=10 -o TCPKeepAlive=yes %s-p %d %s@%s '%s'",
+                 key_opt, port, username, hostname, remote_cmd);
     }
     return cmd;
 }
@@ -45,15 +56,21 @@ static char* run_command(const char *cmd, int timeout_sec, int *exit_code) {
     chmod(tmpfile, 0755);
     
     /* Run via timeout + sh, capture output */
-    char runner_cmd[1024];
+    size_t runner_len = strlen(tmpfile) + 64;
+    char *runner_cmd = malloc(runner_len);
+    if (!runner_cmd) {
+        unlink(tmpfile);
+        return NULL;
+    }
     if (timeout_sec > 0) {
-        snprintf(runner_cmd, sizeof(runner_cmd), "timeout %d %s", timeout_sec, tmpfile);
+        snprintf(runner_cmd, runner_len, "timeout %d %s", timeout_sec, tmpfile);
     } else {
-        snprintf(runner_cmd, sizeof(runner_cmd), "%s", tmpfile);
+        snprintf(runner_cmd, runner_len, "%s", tmpfile);
     }
 
     char outbuf[REMOTE_MAX_OUTPUT];
     FILE *fp = popen(runner_cmd, "r");
+    free(runner_cmd);
     if (!fp) {
         unlink(tmpfile);
         return NULL;
@@ -78,21 +95,29 @@ static char* run_command(const char *cmd, int timeout_sec, int *exit_code) {
 
 /* ── Public API ─────────────────────────────────────────────────────────────── */
 
-remote_server_t* remote_connect(const char *hostname, int port,
-                                 const char *username, const char *password,
-                                 const char *description) {
+remote_server_t* remote_connect_key(const char *hostname, int port,
+                                     const char *username, const char *password,
+                                     const char *ssh_key, const char *description) {
     if (!hostname || !username) return NULL;
     
     remote_server_t *srv = calloc(1, sizeof(remote_server_t));
+    if (!srv) return NULL;
     snprintf(srv->hostname, sizeof(srv->hostname), "%s", hostname);
     srv->port = port > 0 ? port : REMOTE_DEFAULT_PORT;
     snprintf(srv->username, sizeof(srv->username), "%s", username);
     if (password) snprintf(srv->password, sizeof(srv->password), "%s", password);
+    if (ssh_key) snprintf(srv->ssh_key, sizeof(srv->ssh_key), "%s", ssh_key);
     if (description) snprintf(srv->description, sizeof(srv->description), "%s", description);
     srv->connected = 1;
     srv->last_connect = time(NULL);
     
     return srv;
+}
+
+remote_server_t* remote_connect(const char *hostname, int port,
+                                 const char *username, const char *password,
+                                 const char *description) {
+    return remote_connect_key(hostname, port, username, password, NULL, description);
 }
 
 void remote_disconnect(remote_server_t *server) {
@@ -107,7 +132,7 @@ char* remote_exec(remote_server_t *server, const char *command, int timeout_sec)
     
     char *ssh_cmd = build_ssh_cmd(server->hostname, server->port,
                                    server->username, server->password,
-                                   command);
+                                   server->ssh_key, command);
     
     int exit_code = 0;
     char *output = run_command(ssh_cmd, timeout_sec, &exit_code);
@@ -148,10 +173,10 @@ int remote_discover(remote_server_t *server) {
             tok = strtok(NULL, "\n");
         }
         if (n >= 1) {
-            strncpy(server->os_name, lines[0], sizeof(server->os_name) - 1);
-            if (n >= 2) strncpy(server->os_version, lines[1], sizeof(server->os_version) - 1);
-            if (n >= 3) strncpy(server->kernel_version, lines[2], sizeof(server->kernel_version) - 1);
-            if (n >= 4) strncpy(server->arch, lines[3], sizeof(server->arch) - 1);
+            snprintf(server->os_name, sizeof(server->os_name), "%s", lines[0]);
+            if (n >= 2) snprintf(server->os_version, sizeof(server->os_version), "%s", lines[1]);
+            if (n >= 3) snprintf(server->kernel_version, sizeof(server->kernel_version), "%s", lines[2]);
+            if (n >= 4) snprintf(server->arch, sizeof(server->arch), "%s", lines[3]);
         }
         for (int i = 0; i < n; i++) free(lines[i]);
         free(os_out);
@@ -209,13 +234,13 @@ int remote_discover(remote_server_t *server) {
                 if (sscanf(lines[i], "%d,%[^,],%d,%d,%d,%d,%[^,],%s",
                            &idx, name, &mem_total, &mem_used, &util, &temp, drv, cc) >= 8) {
                     server->gpus[i].id = idx;
-                    strncpy(server->gpus[i].name, name, sizeof(server->gpus[i].name) - 1);
+                    snprintf(server->gpus[i].name, sizeof(server->gpus[i].name), "%s", name);
                     server->gpus[i].memory_total_mb = mem_total;
                     server->gpus[i].memory_used_mb = mem_used;
                     server->gpus[i].utilization_percent = util;
                     server->gpus[i].temperature_c = temp;
                     snprintf(server->gpus[i].driver_version, sizeof(server->gpus[i].driver_version), "%s", drv);
-                    snprintf(server->gpus[i].cuda_version, sizeof(server->gpus[i].cuda_version), "%.16s", cc);
+                    snprintf(server->gpus[i].cuda_version, sizeof(server->gpus[i].cuda_version), "%.31s", cc);
                 }
                 free(lines[i]);
             }
@@ -241,9 +266,9 @@ int remote_discover(remote_server_t *server) {
             int pct;
             if (sscanf(lines[i], "%[^ ] %[^ ] %[^ ] %[^ ] %[^ ] %[^ ] %d",
                        src, tgt, fstype, size_s, used_s, avail_s, &pct) == 7) {
-                strncpy(server->drives[i].device, src, sizeof(server->drives[i].device) - 1);
-                strncpy(server->drives[i].mount_point, tgt, sizeof(server->drives[i].mount_point) - 1);
-                strncpy(server->drives[i].filesystem_type, fstype, sizeof(server->drives[i].filesystem_type) - 1);
+                snprintf(server->drives[i].device, sizeof(server->drives[i].device), "%s", src);
+                snprintf(server->drives[i].mount_point, sizeof(server->drives[i].mount_point), "%s", tgt);
+                snprintf(server->drives[i].filesystem_type, sizeof(server->drives[i].filesystem_type), "%s", fstype);
                 server->drives[i].usage_percent = pct;
                 server->drives[i].total_gb = atoi(size_s);
                 server->drives[i].used_gb = atoi(used_s);
@@ -260,13 +285,13 @@ int remote_discover(remote_server_t *server) {
     if (js_out) {
         if (strstr(js_out, "sbatch")) {
             server->job_system.system_type = JOB_SLURM;
-            strncpy(server->job_system.queue_name, "all", sizeof(server->job_system.queue_name) - 1);
+            snprintf(server->job_system.queue_name, sizeof(server->job_system.queue_name), "all");
         } else if (strstr(js_out, "pbsnodes")) {
             server->job_system.system_type = JOB_PBS_PRO;
-            strncpy(server->job_system.queue_name, "default", sizeof(server->job_system.queue_name) - 1);
+            snprintf(server->job_system.queue_name, sizeof(server->job_system.queue_name), "default");
         } else if (strstr(js_out, "qsub")) {
             server->job_system.system_type = JOB_PBS_OPEN;
-            strncpy(server->job_system.queue_name, "default", sizeof(server->job_system.queue_name) - 1);
+            snprintf(server->job_system.queue_name, sizeof(server->job_system.queue_name), "default");
         }
         free(js_out);
     }
@@ -282,10 +307,10 @@ int remote_discover(remote_server_t *server) {
             lines[n++] = strdup(tok);
             tok = strtok(NULL, "\n");
         }
-        if (n >= 1) strncpy(server->home_dir, lines[0], sizeof(server->home_dir) - 1);
-        if (n >= 2) strncpy(server->working_dir, lines[1], sizeof(server->working_dir) - 1);
-        if (n >= 3) strncpy(server->shell, lines[2], sizeof(server->shell) - 1);
-        if (n >= 4) strncpy(server->hostname_remote, lines[3], sizeof(server->hostname_remote) - 1);
+        if (n >= 1) snprintf(server->home_dir, sizeof(server->home_dir), "%s", lines[0]);
+        if (n >= 2) snprintf(server->working_dir, sizeof(server->working_dir), "%s", lines[1]);
+        if (n >= 3) snprintf(server->shell, sizeof(server->shell), "%s", lines[2]);
+        if (n >= 4) snprintf(server->hostname_remote, sizeof(server->hostname_remote), "%s", lines[3]);
         for (int i = 0; i < n; i++) free(lines[i]);
         free(env_out);
     }
@@ -352,25 +377,27 @@ char* remote_submit_job(remote_server_t *server, const char *script,
         return strdup("Error: no job submission system detected");
     }
     
-    char *cmd = malloc(2048);
+    size_t cmd_len = strlen(script) + 1024;
+    char *cmd = malloc(cmd_len);
+    if (!cmd) return NULL;
     int hrs = walltime_min / 60;
     int mins = walltime_min % 60;
     
     if (server->job_system.system_type == JOB_SLURM) {
-        snprintf(cmd, 2048,
+        snprintf(cmd, cmd_len,
             "sbatch --partition=%s --time=%d:%02d:00 --nodes=%d --ntasks=%d "
-            "--mem=%dG --job-name='ai-buddy-job' /tmp/ai_job_%d.sh << 'SCRIPT'\n%s\nSCRIPT",
+            "--mem=%dG --job-name='ai-buddy-job' << 'SCRIPT'\n%s\nSCRIPT",
             queue ? queue : server->job_system.queue_name,
-            hrs, mins, num_nodes, num_cpus, memory_gb, rand() % 9999, script);
+            hrs, mins, num_nodes, num_cpus, memory_gb, script);
     } else if (server->job_system.system_type == JOB_PBS_OPEN ||
                server->job_system.system_type == JOB_PBS_PRO) {
-        snprintf(cmd, 2048,
+        snprintf(cmd, cmd_len,
             "qsub -q %s -l walltime=%d:%02d:00 -l select=%d:ncpus=%d:mem=%dg "
-            "-l job_name='ai-buddy-job' /tmp/ai_job_%d.sh << 'SCRIPT'\n%s\nSCRIPT",
+            "-N 'ai-buddy-job' << 'SCRIPT'\n%s\nSCRIPT",
             queue ? queue : server->job_system.queue_name,
-            hrs, mins, num_nodes, num_cpus, memory_gb, rand() % 9999, script);
+            hrs, mins, num_nodes, num_cpus, memory_gb, script);
     } else {
-        snprintf(cmd, 2048, "echo 'Unsupported job system: %d'", server->job_system.system_type);
+        snprintf(cmd, cmd_len, "echo 'Unsupported job system: %d'", server->job_system.system_type);
     }
     
     char *output = remote_exec(server, cmd, 30);

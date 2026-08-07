@@ -6,8 +6,7 @@ import pytest
 # Ensure the local binary is built before running tests
 @pytest.fixture(scope="session", autouse=True)
 def build_ai_binary():
-    print("\n[Test Setup] Compiling local ai binary...")
-    res = subprocess.run(["gcc", "-O2", "-o", "./ai", "ai.c", "remote_harness.c", "cJSON.c", "-lcurl", "-lssl", "-lcrypto", "-lpthread", "-lm"], capture_output=True, text=True)
+    res = subprocess.run(["make"], capture_output=True, text=True)
     assert res.returncode == 0, f"Compilation failed: {res.stderr}"
     print("[Test Setup] Syncing skills to local config...")
     # Sync skills to ~/.config/ai/skills as install.sh does

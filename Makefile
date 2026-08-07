@@ -1,21 +1,25 @@
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra
+CFLAGS = -O2 -Wall -Wextra -fPIC
 LDFLAGS = -lcurl -lssl -lcrypto -lpthread -lm
 
-SRCS = ai.c remote_harness.c cJSON.c
+SRCS = ai.c ai_git.c ai_terminal.c ai_session.c cJSON.c
 TARGET = ai
+SHARED_LIB = libremote_harness.so
 
 .PHONY: all test clean
 
-all: $(TARGET)
+all: $(SHARED_LIB) $(TARGET)
 
-$(TARGET): $(SRCS) remote_harness.h
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
+$(SHARED_LIB): remote_harness.c remote_harness.h cJSON.c
+	$(CC) $(CFLAGS) -shared -o $@ remote_harness.c cJSON.c $(LDFLAGS)
 
-test: $(TARGET)
-	$(CC) $(CFLAGS) -o test_remote_harness tests/test_remote_harness.c remote_harness.c $(LDFLAGS)
+$(TARGET): $(SRCS) $(SHARED_LIB)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) -L. -Wl,--no-as-needed -lremote_harness -Wl,-rpath,. -Wl,-rpath,$(HOME)/.local/lib $(LDFLAGS)
+
+test: $(SHARED_LIB)
+	$(CC) $(CFLAGS) -o test_remote_harness tests/test_remote_harness.c -L. -lremote_harness -Wl,-rpath,. $(LDFLAGS)
 	./test_remote_harness
 	pytest
 
 clean:
-	rm -f $(TARGET) test_remote_harness
+	rm -f $(TARGET) $(SHARED_LIB) test_remote_harness *.o
