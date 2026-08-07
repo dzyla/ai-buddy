@@ -27,10 +27,25 @@ void test_remote_connect_null(void) {
     printf("test_remote_connect_null PASSED\n");
 }
 
+void test_remote_connect_key(void) {
+    remote_server_t *srv = remote_connect_key("cluster.local", 2222, "hpcuser", NULL, "~/.ssh/id_rsa", "HPC Server");
+    assert(srv != NULL);
+    assert(strcmp(srv->hostname, "cluster.local") == 0);
+    assert(srv->port == 2222);
+    assert(strcmp(srv->username, "hpcuser") == 0);
+    assert(strcmp(srv->ssh_key, "~/.ssh/id_rsa") == 0);
+    assert(strcmp(srv->description, "HPC Server") == 0);
+    assert(srv->connected == 1);
+
+    remote_disconnect(srv);
+    printf("test_remote_connect_key PASSED\n");
+}
+
 int main(void) {
     printf("Running remote_harness C unit tests...\n");
     test_remote_connect_disconnect();
     test_remote_connect_null();
+    test_remote_connect_key();
     printf("All C unit tests PASSED.\n");
     return 0;
 }

@@ -219,6 +219,211 @@ def call_tool(server_name, cfg, tool_name, arguments):
         except:
             pass
 
+# --- Helper functions for improvements ---
+CONTEXT_POOL_FILE = os.path.expanduser("~/.config/ai/context_pool.json")
+
+def _load_context_pool():
+    if os.path.exists(CONTEXT_POOL_FILE):
+        try:
+            with open(CONTEXT_POOL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def _save_context_pool(pool):
+    os.makedirs(os.path.dirname(CONTEXT_POOL_FILE), exist_ok=True)
+    with open(CONTEXT_POOL_FILE, "w", encoding="utf-8") as f:
+        json.dump(pool, f, indent=2)
+
+def append_to_context_pool(entry):
+    pool = _load_context_pool()
+    pool.append({"id": len(pool), "timestamp": time.time(), "content": str(entry)})
+    _save_context_pool(pool)
+
+def get_context_snippet(index):
+    pool = _load_context_pool()
+    try:
+        idx = int(index)
+        if 0 <= idx < len(pool):
+            return json.dumps(pool[idx])
+        return f"Error: Context snippet index {idx} out of range (0-{len(pool)-1})."
+    except Exception as e:
+        return f"Error: {e}"
+
+def search_context(query):
+    pool = _load_context_pool()
+    if not query:
+        return "Error: query required"
+    results = []
+    q_lower = query.lower()
+    for item in pool:
+        content = item.get("content", "")
+        if q_lower in content.lower():
+            results.append(f"[{item['id']}]: {content[:400]}")
+    if not results:
+        return f"No context entries matching query '{query}'."
+    return "\n".join(results)
+
+def execute_command(command, timeout=120):
+    if not command or not command.strip():
+        return "Error: empty command"
+    try:
+        if isinstance(timeout, str):
+            timeout = int(timeout)
+    except ValueError:
+        timeout = 120
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        out = proc.stdout + proc.stderr
+        if proc.returncode == 0:
+            res = f"success\n{out}" if out else "success"
+        else:
+            res = f"failed (exit {proc.returncode})\n{out}\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]"
+        append_to_context_pool(res[:1000])
+        return res
+    except subprocess.TimeoutExpired:
+        return f"Error: Command timed out after {timeout} seconds."
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+def structured_query(target, filter_expr=None, transform=None, aggregate=None):
+    text = ""
+    if target.startswith("file:"):
+        fpath = target[5:]
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        else:
+            return f"Error: file '{fpath}' not found"
+    elif target.startswith("command:"):
+        cmd = target[8:]
+        text = execute_command(cmd)
+    else:
+        text = target
+
+    lines = text.splitlines()
+    if filter_expr:
+        import re
+        lines = [l for l in lines if re.search(filter_expr, l)]
+
+    if transform:
+        if transform.startswith("head:"):
+            n = int(transform[5:])
+            lines = lines[:n]
+        elif transform.startswith("tail:"):
+            n = int(transform[5:])
+            lines = lines[-n:]
+        elif transform == "sort":
+            lines = sorted(lines)
+        elif transform == "unique":
+            lines = list(dict.fromkeys(lines))
+
+    if aggregate:
+        if aggregate == "count":
+            return str(len(lines))
+        elif aggregate == "first":
+            return lines[0] if lines else ""
+        elif aggregate == "last":
+            return lines[-1] if lines else ""
+
+    return "\n".join(lines)
+
+AGENT_STORE_DIR = os.path.expanduser("~/.config/ai/agents")
+
+def spawn_agent(name, prompt, tools=None, persistent=True):
+    os.makedirs(AGENT_STORE_DIR, exist_ok=True)
+    agent_id = f"agent_{name}_{int(time.time())}"
+    data = {
+        "id": agent_id,
+        "name": name,
+        "prompt": prompt,
+        "tools": tools or ["execute_command", "read_file"],
+        "history": [],
+        "created_at": time.time(),
+        "status": "idle"
+    }
+    with open(os.path.join(AGENT_STORE_DIR, f"{agent_id}.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return f"Spawned agent {name} (ID: {agent_id})"
+
+def _resolve_ai_bin():
+    local_ai = os.path.join(os.getcwd(), "ai")
+    if os.path.isfile(local_ai) and os.access(local_ai, os.X_OK):
+        return local_ai
+    return shutil.which("ai") or "ai"
+
+def resume_agent(agent_id, user_message):
+    path = os.path.join(AGENT_STORE_DIR, f"{agent_id}.json")
+    if not os.path.exists(path):
+        return f"Error: Agent '{agent_id}' not found."
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["history"].append({"role": "user", "content": user_message})
+    ai_bin = _resolve_ai_bin()
+    res = subprocess.run([ai_bin, "-y", "-q", user_message], capture_output=True, text=True, timeout=180)
+    out = res.stdout or res.stderr
+    data["history"].append({"role": "assistant", "content": out})
+    data["last_activity"] = time.time()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return out
+
+def list_agents():
+    if not os.path.exists(AGENT_STORE_DIR):
+        return "No agents registered."
+    files = [f for f in os.listdir(AGENT_STORE_DIR) if f.endswith(".json")]
+    if not files:
+        return "No agents found."
+    agents_info = []
+    for fname in files:
+        with open(os.path.join(AGENT_STORE_DIR, fname), "r", encoding="utf-8") as f:
+            d = json.load(f)
+            agents_info.append(f"- {d.get('name')} ({d.get('id')}): {d.get('status', 'idle')} - {d.get('prompt')[:60]}")
+    return "\n".join(agents_info)
+
+SESSION_LOG_FILE = os.path.expanduser("~/.config/ai/session_outcomes.json")
+
+def session_report(success=True, failure_modes=None, notes=""):
+    os.makedirs(os.path.dirname(SESSION_LOG_FILE), exist_ok=True)
+    logs = []
+    if os.path.exists(SESSION_LOG_FILE):
+        try:
+            with open(SESSION_LOG_FILE, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+        except Exception:
+            logs = []
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "success": bool(success),
+        "failure_modes": failure_modes or [],
+        "notes": notes
+    }
+    logs.append(entry)
+    with open(SESSION_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(logs, f, indent=2)
+    return "Session outcome logged successfully."
+
+def count_tokens(model, text):
+    if not text:
+        return "0"
+    try:
+        if "gpt" in model.lower():
+            import tiktoken
+            enc = tiktoken.encoding_for_model(model)
+            return str(len(enc.encode(text)))
+        else:
+            return str(len(text) // 4)
+    except Exception:
+        return str(len(text) // 4)
+
+
 def arxiv_search(query, max_results=5):
     try:
         max_results = min(int(max_results), 10)
@@ -3830,6 +4035,11 @@ def main():
     elif action == "show-metrics" or action == "metrics":
         show_metrics()
 
+    elif action == "count-tokens":
+        model = sys.argv[2] if len(sys.argv) > 2 else "default"
+        text = sys.argv[3] if len(sys.argv) > 3 else ""
+        print(count_tokens(model, text))
+
     elif action == "call-tool":
         if len(sys.argv) < 5:
             print("Usage: ai_mcp.py call-tool <server_name> <tool_name> <arguments_json>", file=sys.stderr)
@@ -4074,6 +4284,47 @@ def main():
         elif tool_name == "recall" or server_name == "recall":
             query = arguments.get("query", "")
             result = recall(query)
+            print(result)
+        elif tool_name == "execute_command" or server_name == "execute_command":
+            cmd = arguments.get("command", "")
+            timeout = arguments.get("timeout", 120)
+            result = execute_command(cmd, timeout=timeout)
+            print(result)
+        elif tool_name == "get_context_snippet" or server_name == "get_context_snippet":
+            idx = arguments.get("index", 0)
+            result = get_context_snippet(idx)
+            print(result)
+        elif tool_name == "search_context" or server_name == "search_context":
+            query = arguments.get("query", "")
+            result = search_context(query)
+            print(result)
+        elif tool_name == "structured_query" or server_name == "structured_query":
+            target = arguments.get("target", "")
+            filter_expr = arguments.get("filter_expr")
+            transform = arguments.get("transform")
+            aggregate = arguments.get("aggregate")
+            result = structured_query(target, filter_expr=filter_expr, transform=transform, aggregate=aggregate)
+            print(result)
+        elif tool_name == "spawn_agent" or server_name == "spawn_agent":
+            name = arguments.get("name", "subagent")
+            prompt = arguments.get("prompt", "")
+            tools = arguments.get("tools")
+            persistent = arguments.get("persistent", True)
+            result = spawn_agent(name, prompt, tools=tools, persistent=persistent)
+            print(result)
+        elif tool_name == "resume_agent" or server_name == "resume_agent":
+            agent_id = arguments.get("agent_id", "")
+            msg = arguments.get("message", "")
+            result = resume_agent(agent_id, msg)
+            print(result)
+        elif tool_name == "list_agents" or server_name == "list_agents":
+            result = list_agents()
+            print(result)
+        elif tool_name == "session_report" or server_name == "session_report":
+            success = arguments.get("success", True)
+            failure_modes = arguments.get("failure_modes")
+            notes = arguments.get("notes", "")
+            result = session_report(success=success, failure_modes=failure_modes, notes=notes)
             print(result)
         elif tool_name == "list_processes" or server_name == "list_processes":
             result = list_processes()

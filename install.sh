@@ -178,7 +178,7 @@ fi
 # ── 1. Build ai binary ────────────────────────────────────────────────────────
 echo "==> Building ai..."
 missing=()
-for cmd in gcc python3; do
+for cmd in gcc python3 make; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
 done
 if ! pkg-config --exists libcurl 2>/dev/null && ! dpkg -l libcurl4-openssl-dev &>/dev/null 2>&1; then
@@ -189,13 +189,17 @@ if [ "${#missing[@]}" -gt 0 ]; then
     sudo apt-get install -y "${missing[@]}"
 fi
 
-gcc -O2 -o "${SCRIPT_DIR}/ai" "${SCRIPT_DIR}/ai.c" "${SCRIPT_DIR}/remote_harness.c" "${SCRIPT_DIR}/cJSON.c" -lcurl -lssl -lcrypto -lpthread -lm
-echo "==> Built: ${SCRIPT_DIR}/ai"
+(cd "${SCRIPT_DIR}" && make clean && make)
+echo "==> Built: ${SCRIPT_DIR}/ai and libremote_harness.so"
 
-# ── 2. Install to ~/.local/bin ────────────────────────────────────────────────
+# ── 2. Install to ~/.local/bin and ~/.local/lib ─────────────────────────────
 echo "==> Installing to ${BIN_DIR}..."
+mkdir -p "${BIN_DIR}"
+mkdir -p "${HOME}/.local/lib"
 rm -f "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/ai-use" "${BIN_DIR}/ai-use.sh" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py" "${BIN_DIR}/llama-server-wrapper.sh"
 cp "${SCRIPT_DIR}/ai"             "${BIN_DIR}/ai"
+cp "${SCRIPT_DIR}/libremote_harness.so" "${HOME}/.local/lib/libremote_harness.so"
+cp "${SCRIPT_DIR}/libremote_harness.so" "${BIN_DIR}/libremote_harness.so" 2>/dev/null || true
 cp "${SCRIPT_DIR}/ai_mcp.py"      "${BIN_DIR}/ai_mcp.py"
 cp "${SCRIPT_DIR}/gcal.py"        "${BIN_DIR}/gcal.py"
 cp "${SCRIPT_DIR}/zulip_mcp_server.py" "${BIN_DIR}/zulip_mcp_server.py"
@@ -207,7 +211,7 @@ ln -sf "${BIN_DIR}/ai-backend"    "${BIN_DIR}/llama-server-wrapper.sh"
 cp "${SCRIPT_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/pubmed_mcp_server.py"
 cp "${SCRIPT_DIR}/deep_research.py"   "${BIN_DIR}/deep_research.py"
 chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
-echo "==> Installed: ai  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py"
+echo "==> Installed: ai  libremote_harness.so  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
