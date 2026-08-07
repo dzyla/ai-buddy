@@ -3671,7 +3671,7 @@ int main(int argc, char **argv) {
             interactive_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0 ||
                    strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--auto-approve") == 0) {
-            g_permission_mode = 1;
+            g_permission_mode = 0;
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) {
             g_continue_until_done = 1;
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
@@ -3738,7 +3738,7 @@ int main(int argc, char **argv) {
 
     char *env_approve = getenv("INFER_AUTO_APPROVE");
     if (env_approve && (strcmp(env_approve, "1") == 0 || strcasecmp(env_approve, "true") == 0)) {
-        g_permission_mode = 1;
+        g_permission_mode = 0;
     }
 
     char *env_quiet = getenv("INFER_QUIET");
@@ -3759,7 +3759,7 @@ int main(int argc, char **argv) {
     }
 
     // Export resolved settings back to environment variables so subagents inherit them
-    if (g_permission_mode) {
+    if (g_permission_mode == 0) {
         setenv("INFER_AUTO_APPROVE", "1", 1);
     } else {
         unsetenv("INFER_AUTO_APPROVE");
@@ -4457,7 +4457,7 @@ int main(int argc, char **argv) {
                     printf("  :compact needed: %s\n",
                            ctx_bytes > (size_t)(trim_threshold * 2) ? "YES (recommended)" : "no");
                     printf("  Auto-approve   : %s\n\n",
-                           g_permission_mode ? "\033[1;33mON\033[0m (Shift-Tab to disable)" : "off");
+                           g_permission_mode == 0 ? "\033[1;33mON\033[0m (Shift-Tab to disable)" : "off");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -5300,7 +5300,7 @@ step_limit_check:
                                           tool_output = malloc(dlen);
                                           snprintf(tool_output, dlen, "[Command Dry-Run Success]\nWould execute: %s", cmd_val);
                                       } else {
-                                          int approved = g_permission_mode;
+                                          int approved = (g_permission_mode == 0);
                                           if (!approved) {
                                               FILE *tty = fopen("/dev/tty", "r+");
                                               if (tty) {
