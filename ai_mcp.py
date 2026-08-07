@@ -2228,6 +2228,60 @@ def stop_process(pid):
         return f"Error stopping process PID {pid}: {e}"
 
 
+def normalize_tool_arguments(tool_name, arguments):
+    if isinstance(arguments, str):
+        if tool_name in ("execute_command", "execute_remote_command"):
+            return {"command": arguments}
+        elif tool_name in ("read_file", "write_file", "edit_file", "list_directory"):
+            return {"path": arguments}
+        elif tool_name in ("web_search", "recall", "search_context", "arxiv_search"):
+            return {"query": arguments}
+        elif tool_name in ("fetch_webpage", "fetch_smart"):
+            return {"url": arguments}
+        elif tool_name == "think":
+            return {"reasoning": arguments}
+        elif tool_name == "task_complete":
+            return {"summary": arguments}
+        elif tool_name == "save_memory":
+            return {"content": arguments}
+        return arguments
+
+    if not isinstance(arguments, dict):
+        return arguments
+
+    alias_map = {
+        "execute_command": ("command", ["cmd", "command_line", "CommandLine", "args", "script", "code", "c"]),
+        "execute_remote_command": ("command", ["cmd", "command_line", "CommandLine", "args", "script", "code", "c"]),
+        "read_file": ("path", ["file", "filepath", "filename", "file_path", "p"]),
+        "write_file": ("path", ["file", "filepath", "filename", "file_path", "p"]),
+        "edit_file": ("path", ["file", "filepath", "filename", "file_path", "p"]),
+        "list_directory": ("path", ["dir", "directory", "folder", "path_name", "p"]),
+        "web_search": ("query", ["q", "search", "prompt", "term", "keywords"]),
+        "arxiv_search": ("query", ["q", "search", "prompt", "term", "keywords"]),
+        "fetch_webpage": ("url", ["uri", "link", "address", "u"]),
+        "fetch_smart": ("url", ["uri", "link", "address", "u"]),
+        "think": ("reasoning", ["thought", "thoughts", "plan", "reason"]),
+        "task_complete": ("summary", ["text", "response", "result", "message", "final_answer", "answer"]),
+        "save_memory": ("content", ["memory", "text", "entry"])
+    }
+
+    if tool_name in alias_map:
+        target, aliases = alias_map[tool_name]
+        if target not in arguments or not arguments[target]:
+            for alias in aliases:
+                if alias in arguments and arguments[alias]:
+                    val = arguments[alias]
+                    if isinstance(val, list):
+                        val = " ".join(str(x) for x in val)
+                    arguments[target] = val
+                    break
+
+    if tool_name in ("execute_command", "execute_remote_command") and isinstance(arguments.get("command"), list):
+        arguments["command"] = " ".join(str(x) for x in arguments["command"])
+
+    return arguments
+
+
 TOOL_REQUIRED_ARGS = {
     "execute_command": ["command"],
     "web_search":      ["query"],
@@ -4056,7 +4110,8 @@ def main():
                 arguments = json.loads(repair_json(args_json))
             except Exception as e:
                 print(json.dumps({"error": f"Failed to parse arguments JSON even after repair: {e}"}))
-                sys.exit(1)
+
+        arguments = normalize_tool_arguments(tool_name, arguments)
 
         # Validate required arguments before dispatch
         required = TOOL_REQUIRED_ARGS.get(tool_name, [])
