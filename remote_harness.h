@@ -117,6 +117,7 @@ typedef struct {
     int port;
     char username[128];
     char password[256];
+    char ssh_key[512];
     char description[256];
     int connected;
     pid_t ssh_pid;
@@ -165,6 +166,10 @@ typedef struct {
 remote_server_t* remote_connect(const char *hostname, int port, 
                                  const char *username, const char *password,
                                  const char *description);
+
+remote_server_t* remote_connect_key(const char *hostname, int port,
+                                     const char *username, const char *password,
+                                     const char *ssh_key, const char *description);
 
 /* Disconnect and free resources */
 void remote_disconnect(remote_server_t *server);

@@ -135,7 +135,7 @@ static const char *tool_get_color(const char *name) {
 }
 
 /* ── Forward declaration for run_shell_command (used by render_markdown) */
-static char* run_shell_command(const char *cmd, int *exit_status);
+char* run_shell_command(const char *cmd, int *exit_status);
 
 /* Render markdown via the Python helper (used by task_complete and model output).
  * Returns a dynamically allocated string or NULL on failure. Caller must free. */
@@ -173,7 +173,7 @@ static double get_time_sec_mono(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
-static char current_session_id[64] = "";
+char current_session_id[64] = "";
 static int  g_hide_details = 0;
 static int  g_permission_mode = 0;
 
@@ -768,7 +768,7 @@ static char  model[MAX_VAL];
 static float temperature_val  = -1.0f;
 static int   max_tokens_val   = 8192; // Prevent infinite reasoning loops
 static int   no_tools_mode    = 0;
-static char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
+char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
 static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
@@ -887,7 +887,7 @@ static int is_command_denied(const char *cmd) {
     return 0;
 }
 
-static const char *SYSTEM_PROMPT =
+const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
     "SCIENTIFIC ADVISOR RIGOR (highest priority):\n"
     "- You are an elite scientific advisor. You must use the `think` tool to reason step-by-step before EVERY major action. Do NOT guess.\n"
@@ -1188,59 +1188,7 @@ static char* json_escape(const char *src) {
     return dest;
 }
 
-/* ── Git Integration ── */
-static void git_commit(const char *extra_msg) {
-    if (!g_git_commit_enabled) return;
-
-    /* Check if there's a git repo */
-    char git_check[64];
-    snprintf(git_check, sizeof(git_check), "git -C . rev-parse --git-dir 2>/dev/null");
-    int has_git = (system(git_check) == 0);
-    if (!has_git) return;
-
-    /* Check if there are staged changes */
-    char status[64];
-    snprintf(status, sizeof(status), "git -C . diff --cached --quiet 2>/dev/null; echo $?");
-    /* Simpler: just check if git status has changes */
-    char *git_status_out = NULL;
-    int exit_code = 0;
-
-    /* Use a simpler approach: just stage and commit */
-    char cmd[512];
-
-    /* Stage all changes */
-    snprintf(cmd, sizeof(cmd), "git -C . add -A 2>/dev/null");
-    exit_code = system(cmd);
-    if (exit_code != 0) return; /* No changes to stage */
-
-    /* Check if anything was staged */
-    char verify_cmd[128];
-    snprintf(verify_cmd, sizeof(verify_cmd),
-             "git -C . diff --cached --quiet 2>/dev/null; echo $?");
-    /* Run and check: if output is "0" there are staged changes */
-    FILE *fp = popen(verify_cmd, "r");
-    if (fp) {
-        char buf[16] = {0};
-        char *r = fgets(buf, sizeof(buf), fp);
-        pclose(fp);
-        if (r) {
-            int has_changes = atoi(buf);
-            if (has_changes == 0) {
-                /* There are staged changes - commit them */
-                const char *commit_msg = g_git_commit_msg ? g_git_commit_msg : "auto-commit: tool changes";
-                if (extra_msg) {
-                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s: %s'", commit_msg, extra_msg);
-                    (void)system(cmd);
-                } else {
-                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s' 2>/dev/null", commit_msg);
-                    (void)system(cmd);
-                }
-                if (g_git_commit_msg) free(g_git_commit_msg);
-                g_git_commit_msg = NULL;
-            }
-        }
-    }
-}
+#include "ai_git.h"
 
 /* ── OS Notifications ── */
 static void notify_completion(const char *summary) {
@@ -2479,7 +2427,7 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
     return buf;
 }
 
-static char* run_shell_command(const char *cmd, int *exit_status) {
+char* run_shell_command(const char *cmd, int *exit_status) {
     return run_shell_command_timeout(cmd, exit_status, 120);
 }
 
@@ -3096,186 +3044,12 @@ static char* read_image_base64(const char *path, const char **mime_type) {
     return b64;
 }
 
-static char* read_memory_file() {
-    char *home = getenv("HOME");
-    if (!home) return NULL;
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/.config/ai/memory.txt", home);
-    
-    FILE *fp = fopen(path, "r");
-    if (!fp) return NULL;
-    
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    if (size <= 0) {
-        fclose(fp);
-        return NULL;
-    }
-    
-    if (size > 4096) size = 4096;
-    
-    char *buf = malloc(size + 1);
-    if (!buf) {
-        fclose(fp);
-        return NULL;
-    }
-    
-    size_t read_bytes = fread(buf, 1, size, fp);
-    buf[read_bytes] = '\0';
-    fclose(fp);
-    return buf;
-}
+#include "ai_session.h"
+#include "ai_terminal.h"
 
-/* Return the active system prompt as a malloc'd string the caller must free.
-   Reads an override file (INFER_SYSTEM_PROMPT_FILE, else ~/.config/ai/system_prompt.md)
-   when it exists and is non-empty; otherwise returns a copy of the compiled-in
-   SYSTEM_PROMPT. Lets users tune agent behavior without recompiling. */
-static char* load_system_prompt() {
-    char path[1024];
-    const char *override = getenv("INFER_SYSTEM_PROMPT_FILE");
-    if (override && override[0]) {
-        snprintf(path, sizeof(path), "%s", override);
-    } else {
-        char *home = getenv("HOME");
-        if (!home) return strdup(SYSTEM_PROMPT);
-        snprintf(path, sizeof(path), "%s/.config/ai/system_prompt.md", home);
-    }
 
-    FILE *fp = fopen(path, "r");
-    if (!fp) return strdup(SYSTEM_PROMPT);
 
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (size <= 0) { fclose(fp); return strdup(SYSTEM_PROMPT); }
-    if (size > 65536) size = 65536; /* cap to keep context sane */
 
-    char *buf = malloc(size + 1);
-    if (!buf) { fclose(fp); return strdup(SYSTEM_PROMPT); }
-    size_t read_bytes = fread(buf, 1, size, fp);
-    buf[read_bytes] = '\0';
-    fclose(fp);
-
-    /* Ignore a file that is only whitespace */
-    char *p = buf;
-    while (*p && isspace((unsigned char)*p)) p++;
-    if (!*p) { free(buf); return strdup(SYSTEM_PROMPT); }
-    return buf;
-}
-
-/* Return the path to the saved-session file (~/.cache/ai/sessions/last.json),
-   creating parent dirs. Writes into `out`; returns 0 on success. */
-static int session_file_path(char *out, size_t out_len, const char *session_id) {
-    char *home = getenv("HOME");
-    if (!home) return -1;
-    char dir[1024];
-    /* mkdir each level — mkdir(2) is not recursive and ~/.cache may not exist. */
-    snprintf(dir, sizeof(dir), "%s/.cache", home);
-    mkdir(dir, 0700);
-    snprintf(dir, sizeof(dir), "%s/.cache/ai", home);
-    mkdir(dir, 0700);
-    snprintf(dir, sizeof(dir), "%s/.cache/ai/sessions", home);
-    mkdir(dir, 0700);
-    if (session_id && *session_id) {
-        snprintf(out, out_len, "%s/%s.json", dir, session_id);
-    } else {
-        snprintf(out, out_len, "%s/last.json", dir);
-    }
-    return 0;
-}
-
-/* Persist the raw messages array so a later `ai -r` can resume this conversation. */
-static void save_session(const char *messages_json) {
-    char path[1200];
-    /* Save to specific session id */
-    if (session_file_path(path, sizeof(path), current_session_id) == 0) {
-        FILE *fp = fopen(path, "w");
-        if (fp) {
-            fputs(messages_json, fp);
-            fclose(fp);
-        }
-    }
-    /* Also save to last.json */
-    if (session_file_path(path, sizeof(path), NULL) == 0) {
-        FILE *fp = fopen(path, "w");
-        if (fp) {
-            fputs(messages_json, fp);
-            fclose(fp);
-        }
-    }
-}
-
-/* Load the previous session as a clean user/assistant transcript and append each
-   message to messages_json via append_message. mcp_script routes to the Python
-   session-transcript transformer. Returns the (possibly grown) messages_json. */
-static char* append_message(char *messages_json, const char *msg_to_append);
-static char* load_session_transcript(char *messages_json, const char *mcp_script) {
-    char path[1200];
-    if (session_file_path(path, sizeof(path), resume_session_id) != 0) return messages_json;
-    if (access(path, R_OK) != 0) {
-        if (resume_session_id && *resume_session_id) {
-            fprintf(stderr, "\033[2m[ai] --resume: session '%s' not found.\033[0m\n", resume_session_id);
-        } else {
-            fprintf(stderr, "\033[2m[ai] --resume: no previous session found.\033[0m\n");
-        }
-        return messages_json;
-    }
-    char cmd[1400];
-    snprintf(cmd, sizeof(cmd), "python3 %s session-transcript %s", mcp_script, path);
-    char *out = run_shell_command(cmd, NULL);
-    if (!out) return messages_json;
-    /* Each line is one compact JSON message object. Append each. */
-    int appended = 0;
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        /* skip empty/whitespace lines */
-        char *p = line;
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (*p == '{') {
-            messages_json = append_message(messages_json, line);
-            appended++;
-        }
-        if (!nl) break;
-        line = nl + 1;
-    }
-    free(out);
-    if (appended > 0)
-        fprintf(stderr, "\033[2m[ai] --resume: restored %d message(s) from last session.\033[0m\n", appended);
-    return messages_json;
-}
-
-/* Write messages_json to a temp file, ask Python to trim it, return trimmed version.
-   Keeps: messages[0] (system), messages[1] (first user), last 20 messages. */
-static char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
-    if ((int)strlen(messages_json) <= trim_threshold) return messages_json;
-    /* Use mkstemp for an unpredictable, private (0600) temp file — the
-       conversation may contain sensitive content and a fixed name is a
-       symlink-race / info-leak hazard on a shared /tmp. */
-    const char *tmpdir = getenv("TMPDIR");
-    if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
-    char tmpfile[256];
-    snprintf(tmpfile, sizeof(tmpfile), "%s/ai_msgs_XXXXXX", tmpdir);
-    int tfd = mkstemp(tmpfile);
-    if (tfd < 0) return messages_json;
-    FILE *fp = fdopen(tfd, "w");
-    if (!fp) { close(tfd); unlink(tmpfile); return messages_json; }
-    fputs(messages_json, fp);
-    fclose(fp);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s", mcp_script, tmpfile);
-    char *trimmed = run_shell_command(cmd, NULL);
-    unlink(tmpfile);
-    if (trimmed && strlen(trimmed) > 5 && trimmed[0] == '[') {
-        free(messages_json);
-        return trimmed;
-    }
-    if (trimmed) free(trimmed);
-    return messages_json;
-}
 
 static int update_config_file(const char *file_path, const char *new_model, const char *new_url) {
     FILE *fp = fopen(file_path, "r");
@@ -3609,143 +3383,7 @@ static int set_default_model(const char *new_model) {
     return 0;
 }
 
-/* compact_session: ask the LLM to summarise the conversation, then rebuild
-   messages_json as [system, compacted-user, compacted-assistant].
-   Returns a new messages_json (caller must use the returned pointer). */
-static char* compact_session(char *messages_json, const char *mcp_script,
-                              CURL *curl_handle, const char *model_name, int *out_success) {
-    (void)mcp_script;
-    if (out_success) *out_success = 0;
-    fprintf(stderr, "\033[1;35m[ai] Compacting session — requesting summary...\033[0m\n");
-    fflush(stderr);
 
-    size_t orig_size = strlen(messages_json);
-
-    const char *summary_req =
-        "{\"role\":\"user\",\"content\":\"Provide a comprehensive summary of this entire "
-        "conversation so far. Include: all topics discussed, decisions made, code written "
-        "or modified, commands run and their results, key findings, and any pending tasks. "
-        "Additionally, extract up to 5 standalone facts or key pieces of information from this conversation "
-        "that should be permanently remembered (the memory map). Format these memories as a JSON list of strings at the very end of your response, wrapped in <memories>...</memories> tags. "
-        "Be thorough — this summary will replace the full conversation history.\"}";
-
-    char *temp_msgs = strdup(messages_json);
-    temp_msgs = append_message(temp_msgs, summary_req);
-
-    char *esc_model = json_escape(model_name);
-    size_t plen = strlen(esc_model) + strlen(temp_msgs) + 128;
-    char *payload = malloc(plen);
-    snprintf(payload, plen,
-             "{\"model\":\"%s\",\"stream\":false,\"messages\":%s}",
-             esc_model, temp_msgs);
-    free(esc_model);
-    free(temp_msgs);
-
-    struct response chunk = {0};
-    int saved_esc = g_esc_requested;
-    g_esc_requested = 0;
-    if (raw_mode_active) disable_raw_mode();
-    g_compact_in_progress = 1;
-    g_compact_dot_timer = 0;
-    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payload);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-    perform_curl_with_retry(curl_handle, &chunk);
-    g_compact_in_progress = 0;
-    fprintf(stderr, "\n");
-    g_esc_requested = saved_esc;
-    free(payload);
-
-    char *summary = NULL;
-    if (chunk.data && chunk.size > 5) {
-        jsmn_parser cp;
-        jsmntok_t ctok[1024];
-        jsmn_init(&cp);
-        int cr = jsmn_parse(&cp, chunk.data, chunk.size, ctok, 1024);
-        int msg_tok = -1;
-        for (int i = 1; i < cr; i++) {
-            if (ctok[i].type == JSMN_STRING) {
-                int clen = ctok[i].end - ctok[i].start;
-                if (clen == 7 && strncmp(chunk.data + ctok[i].start, "message", 7) == 0) {
-                    msg_tok = i + 1;
-                }
-            }
-        }
-        if (msg_tok != -1 && ctok[msg_tok].type == JSMN_OBJECT) {
-            int msg_end = ctok[msg_tok].end;
-            int k = msg_tok + 1;
-            while (k < cr && ctok[k].start < msg_end) {
-                if (ctok[k].type == JSMN_STRING) {
-                    int flen = ctok[k].end - ctok[k].start;
-                    if (flen == 7 && strncmp(chunk.data + ctok[k].start, "content", 7) == 0
-                        && k + 1 < cr && ctok[k+1].type == JSMN_STRING) {
-                        summary = unescape_json_string(chunk.data + ctok[k+1].start,
-                                                       ctok[k+1].end - ctok[k+1].start);
-                        break;
-                    }
-                }
-                k = json_skip_token(ctok, cr, k + 2);
-            }
-        }
-    }
-    if (chunk.data) free(chunk.data);
-
-    if (!summary || strlen(summary) < 20) {
-        fprintf(stderr, "[ai] Compact failed: could not extract summary from model.\n");
-        if (summary) free(summary);
-        return messages_json;
-    }
-
-    char *new_msgs = malloc(4096);
-    strcpy(new_msgs, "[]");
-
-    /* Extract memories */
-    char *mem_start = strstr(summary, "<memories>");
-    char *mem_end = strstr(summary, "</memories>");
-    if (mem_start && mem_end && mem_end > mem_start) {
-        mem_start += 10;
-        size_t mem_len = mem_end - mem_start;
-        char *mem_json = malloc(mem_len + 1);
-        strncpy(mem_json, mem_start, mem_len);
-        mem_json[mem_len] = '\0';
-        
-        char *safe_mem_json = shell_escape(mem_json);
-        if (safe_mem_json) {
-            char cmd[8192];
-            snprintf(cmd, sizeof(cmd), "python3 %s save-memories %s", mcp_script, safe_mem_json);
-            char *out = run_shell_command(cmd, NULL);
-            if (out) free(out);
-            free(safe_mem_json);
-        }
-        free(mem_json);
-        
-        *(mem_start - 10) = '\0';
-    }
-
-    if (g_system_message_json)
-        new_msgs = append_message(new_msgs, g_system_message_json);
-
-    char *safe_sum = json_escape(summary);
-    size_t cu_len = strlen(safe_sum) + 128;
-    char *compact_user = malloc(cu_len);
-    snprintf(compact_user, cu_len,
-             "{\"role\":\"user\",\"content\":\"[Session compacted. Summary:\\n%s]\"}",
-             safe_sum);
-    new_msgs = append_message(new_msgs, compact_user);
-    free(compact_user);
-    free(safe_sum);
-    free(summary);
-
-    new_msgs = append_message(new_msgs,
-        "{\"role\":\"assistant\",\"content\":\"Understood. I have the context from our "
-        "previous conversation. Ready to continue.\"}");
-
-    free(messages_json);
-
-    fprintf(stderr, "\033[1;35m[ai] Session compacted (%.1f KB → %.1f KB).\033[0m\n",
-            orig_size / 1024.0, strlen(new_msgs) / 1024.0);
-    if (out_success) *out_success = 1;
-    return new_msgs;
-}
 
 
 /* Extract summary from a Gemma-style leaked task_complete call in text content.
@@ -3935,7 +3573,9 @@ int main(int argc, char **argv) {
             printf("  --session FILE       Save session state to FILE.\n");
             printf("  --bg, --background   Run in background mode.\n");
             printf("  --commit-msg MSG     Custom git commit message for auto-commit.\n");
-            printf("  --no-copy            Disable auto-copy of last response on task_complete.\n\n");
+            printf("  --no-copy            Disable auto-copy of last response on task_complete.\n");
+            printf("  --trim-threshold N   Set context auto-compact threshold in bytes (default 100000).\n");
+            printf("  --tokenizer MODEL    Pre-load tokenizer for precise token counting.\n\n");
             printf("Examples:\n");
             printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
             printf("  ai -n \"what is RNA?\"                 # direct answer, no tool loop\n");
@@ -4033,6 +3673,12 @@ int main(int argc, char **argv) {
             i++;
         } else if (strcmp(argv[i], "--no-copy") == 0) {
             g_copy_enabled = 0;
+        } else if (strcmp(argv[i], "--trim-threshold") == 0 && i + 1 < argc) {
+            trim_threshold = atoi(argv[i+1]);
+            i++;
+        } else if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) {
+            setenv("INFER_TOKENIZER", argv[i+1], 1);
+            i++;
         } else if (strcmp(argv[i], "--hide-details") == 0 || strcmp(argv[i], "--collapsed") == 0) {
             g_hide_details = 1;
         } else if (strcmp(argv[i], "--expanded") == 0 || strcmp(argv[i], "--details") == 0) {
@@ -4399,6 +4045,12 @@ int main(int argc, char **argv) {
     if (rag_memories && strlen(rag_memories) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nRelevant Context (RAG Memories):\n%s", rag_memories);
+    time_t sys_now = time(NULL);
+    char time_buf[64];
+    struct tm *tm_info = localtime(&sys_now);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", tm_info);
+    clen += snprintf(content + clen, mlen - clen,
+                     "\n\n[IMPORTANT: Current system time is %s. Always reference the current year, month, and day in your responses. Do not assume outdated dates.]", time_buf);
     if (agents_md)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\n--- Project Context (AGENTS.md) ---\n%s", agents_md);
@@ -6006,6 +5658,15 @@ step_limit_check:
                               "\n\033[2m  loop %d · %d ctx · +%d new · %.0f tok/s\033[0m\n",
                               loop_count, prompt_tokens, completion_tokens, tps);
                       }
+                  }
+
+                  /* Task 2: Interrupt Session Leak fix — append interrupted message on ESC */
+                  if (g_esc_requested) {
+                      fprintf(stderr, "\033[1;33m[ai] Task interrupted by user (ESC/Ctrl+C).\033[0m\n");
+                      messages_json = append_message(messages_json,
+                          "{\"role\":\"user\",\"content\":\"[INTERRUPTED: Task interrupted by user (ESC/Ctrl+C) during tool execution.]\"}");
+                      has_more = 0;
+                      break;
                   }
 
                   /* Task timeout check: if total elapsed > INFER_TASK_TIMEOUT, force one final iteration */
