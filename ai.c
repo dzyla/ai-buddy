@@ -2114,17 +2114,24 @@ static char *read_line_interactive(const char *prompt) {
             break;
         } else if (retval == 0) {
             int delay = get_next_scheduled_task_delay();
+            lineed_redraw(prompt, buf, len, cursor);
             if (delay >= 0) {
-                char dynamic_prompt[256];
+                int cols = lineed_term_cols();
+                char timer_str[64];
                 int m = delay / 60;
                 int s = delay % 60;
                 if (m > 0)
-                    snprintf(dynamic_prompt, sizeof(dynamic_prompt), "\033[2m[⏱ %dm%02ds]\033[0m %s", m, s, prompt);
+                    snprintf(timer_str, sizeof(timer_str), "⏱ %dm%02ds", m, s);
                 else
-                    snprintf(dynamic_prompt, sizeof(dynamic_prompt), "\033[2m[⏱ %ds]\033[0m %s", s, prompt);
-                lineed_redraw(dynamic_prompt, buf, len, cursor);
-            } else {
-                lineed_redraw(prompt, buf, len, cursor);
+                    snprintf(timer_str, sizeof(timer_str), "⏱ %ds", s);
+                
+                int padding = (m > 0) ? 12 : 9;
+                int pos = cols - padding;
+                if (pos < 20) pos = 20;
+                
+                char draw_cmd[256];
+                snprintf(draw_cmd, sizeof(draw_cmd), "\0337\033[%dG\033[2m[%s]\033[0m\0338", pos, timer_str);
+                write(STDOUT_FILENO, draw_cmd, strlen(draw_cmd));
             }
             continue;
         }
