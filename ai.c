@@ -2719,7 +2719,7 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                             fflush(stderr);
                             ctx->printed_thinking_header = 1;
                         }
-                        print_inline_markdown(content_chunk);
+                        printf("\033[2m%s\033[0m", content_chunk);
                         fflush(stdout);
                         free(content_chunk);
                     }
