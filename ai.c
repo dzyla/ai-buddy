@@ -1194,12 +1194,13 @@ static char* json_escape(const char *src) {
 
 /* ── OS Notifications ── */
 static void notify_completion(const char *summary) {
+    (void)summary;
+    /* User requested to disable notifications of job done as they are annoying.
+       Disabled completely.
     if (!g_notifications_enabled) return;
 
-    /* Use notify-send on Linux */
     char cmd[2048];
     if (summary && *summary) {
-        /* Sanitize summary to remove single quotes and unsafe shell chars */
         char safe_summary[256] = {0};
         int j = 0;
         for (int i = 0; summary[i] && j < 240; i++) {
@@ -1214,6 +1215,7 @@ static void notify_completion(const char *summary) {
     } else {
         (void)system("notify-send -u normal 'ai task done' 'Task completed successfully' 2>/dev/null &");
     }
+    */
 }
 
 /* ── AGENTS.md loading ── */
@@ -1955,6 +1957,78 @@ static void lineed_redraw(const char *prompt, const char *buf, int len, int curs
     }
 }
 
+static int get_next_scheduled_task_delay(void) {
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s/.config/ai/scheduled_tasks", getenv("HOME"));
+    DIR *d = opendir(dir_path);
+    if (!d) return -1;
+    
+    struct dirent *dir;
+    int min_delay = -1;
+    time_t now = time(NULL);
+    
+    while ((dir = readdir(d)) != NULL) {
+        if (strstr(dir->d_name, ".json") != NULL) {
+            char filepath[1024];
+            snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, dir->d_name);
+            FILE *f = fopen(filepath, "r");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long fsize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (fsize > 0 && fsize < 65536) {
+                    char *json = malloc(fsize + 1);
+                    if (fread(json, 1, fsize, f) == (size_t)fsize) {
+                        json[fsize] = '\0';
+                        char *interval_ptr = strstr(json, "\"interval_seconds\":");
+                        char *last_run_ptr = strstr(json, "\"last_run\":");
+                        char *created_ptr = strstr(json, "\"created_at\":");
+                        if (interval_ptr) {
+                            int interval = atoi(interval_ptr + 19);
+                            char *target_ptr = NULL;
+                            if (last_run_ptr) {
+                                char *q1 = strchr(last_run_ptr + 11, '"');
+                                if (q1 && strncmp(q1 + 1, "never", 5) != 0) {
+                                    target_ptr = q1 + 1;
+                                }
+                            }
+                            if (!target_ptr && created_ptr) {
+                                char *q1 = strchr(created_ptr + 13, '"');
+                                if (q1) target_ptr = q1 + 1;
+                            }
+                            if (target_ptr) {
+                                int Y, M, D, h, m, s;
+                                if (sscanf(target_ptr, "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
+                                    struct tm tm = {0};
+                                    tm.tm_year = Y - 1900;
+                                    tm.tm_mon = M - 1;
+                                    tm.tm_mday = D;
+                                    tm.tm_hour = h;
+                                    tm.tm_min = m;
+                                    tm.tm_sec = s;
+                                    tm.tm_isdst = -1;
+                                    time_t start_time = mktime(&tm);
+                                    if (start_time != (time_t)-1) {
+                                        int delay = (start_time + interval) - now;
+                                        if (delay < 0) delay = 0;
+                                        if (min_delay == -1 || delay < min_delay) {
+                                            min_delay = delay;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    free(json);
+                }
+                fclose(f);
+            }
+        }
+    }
+    closedir(d);
+    return min_delay;
+}
+
 /*
  * read_line_interactive: draw prompt, read a line with full editing + history.
  * Returns malloc'd string (caller frees), NULL on EOF/Ctrl+D with empty buffer,
@@ -2026,6 +2100,35 @@ static char *read_line_interactive(const char *prompt) {
     }
 
     for (;;) {
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        
+        int retval = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        if (retval == -1) {
+            if (errno == EINTR) continue;
+            break;
+        } else if (retval == 0) {
+            int delay = get_next_scheduled_task_delay();
+            if (delay >= 0) {
+                char dynamic_prompt[256];
+                int m = delay / 60;
+                int s = delay % 60;
+                if (m > 0)
+                    snprintf(dynamic_prompt, sizeof(dynamic_prompt), "\033[2m[⏱ %dm%02ds]\033[0m %s", m, s, prompt);
+                else
+                    snprintf(dynamic_prompt, sizeof(dynamic_prompt), "\033[2m[⏱ %ds]\033[0m %s", s, prompt);
+                lineed_redraw(dynamic_prompt, buf, len, cursor);
+            } else {
+                lineed_redraw(prompt, buf, len, cursor);
+            }
+            continue;
+        }
+
         unsigned char c;
         if (read(STDIN_FILENO, &c, 1) <= 0) {
             write(STDOUT_FILENO, "\r\n", 2);
@@ -5306,7 +5409,7 @@ step_limit_check:
                                               if (tty) {
                                                    fprintf(tty, "\n\033[1;33m  ▶ execute_command\033[0m\n");
                                                    fprintf(tty, "  \033[2m%s\033[0m\n", cmd_val);
-                                                   fprintf(tty, "  \033[32my\033[0m/\033[31mn\033[0m  %s  Confirm?%s\n\n",
+                                                   fprintf(tty, "  \033[32my\033[0m/\033[31mn\033[0m/\033[36mb\033[0m  %s  Confirm? (b=background)%s\n\n",
                                                            CL_DIM, CL_RESET);
                                                    fflush(tty);
                                                    
@@ -5393,6 +5496,12 @@ step_limit_check:
                                                            approved = 0;
                                                            break;
                                                        }
+                                                       if (ch == 'b' || ch == 'B') {
+                                                           fprintf(tty, "%c\n", ch);
+                                                           fflush(tty);
+                                                           approved = 2;
+                                                           break;
+                                                       }
                                                        if (ch == 3) { // Ctrl+C
                                                            fprintf(tty, "^C\n");
                                                            fflush(tty);
@@ -5411,7 +5520,7 @@ step_limit_check:
                                               }
                                           }
 
-                                          if (approved) {
+                                          if (approved == 1) {
                                               fprintf(stderr, "\r\033[2K\033[2m  ▶ running %s\033[0m\n", cmd_val);
                                               if (strncmp(cmd_val, "sleep ", 6) == 0 || strstr(cmd_val, " sleep ") || strstr(cmd_val, "&& sleep ") || strstr(cmd_val, "; sleep ")) {
                                                   tool_output = strdup("Error: `sleep` is forbidden in execute_command. Use `schedule_task` to wait or check status asynchronously.");
@@ -5445,6 +5554,25 @@ step_limit_check:
                                                       git_commit("command");
                                                   }
                                               }
+                                          } else if (approved == 2) {
+                                              fprintf(stderr, "\r\033[2K\033[2m  ▶ backgrounding %s\033[0m\n", cmd_val);
+                                              char log_file[512];
+                                              snprintf(log_file, sizeof(log_file), "%s/.config/ai/logs/bg_proc_%d.log", getenv("HOME"), (int)time(NULL));
+                                              char mkdir_cmd[512];
+                                              snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s/.config/ai/logs", getenv("HOME"));
+                                              system(mkdir_cmd);
+                                              char bg_cmd[4096];
+                                              snprintf(bg_cmd, sizeof(bg_cmd), "nohup sh -c '%s' > '%s' 2>&1 & echo $!", cmd_val, log_file);
+                                              FILE *fp = popen(bg_cmd, "r");
+                                              char pid_str[32] = {0};
+                                              if (fp) {
+                                                  fgets(pid_str, sizeof(pid_str), fp);
+                                                  pclose(fp);
+                                              }
+                                              char *nl = strchr(pid_str, '\n');
+                                              if (nl) *nl = '\0';
+                                              tool_output = malloc(1024);
+                                              sprintf(tool_output, "success\nCommand launched in background. PID: %s\nOutput is logging to %s\nYou can use `check_process_status(pid=%s, log_file=\"%s\")` to monitor it.", pid_str, log_file, pid_str, log_file);
                                           } else {
                                               fprintf(stderr, "[ai] command execution cancelled.\n");
                                               tool_output = strdup("Error: Command execution was cancelled/denied by the user.");
