@@ -325,6 +325,40 @@ For details on the architecture, adding tools, and cross-process contracts, see 
 
 ---
 
+## Project Structure
+
+```
+├── ai.c                  # Main agent loop (C)
+├── ai_mcp.py             # Tool backend (Python)
+├── ai-backend            # Backend manager (installed to ~/.local/bin)
+├── ai_session.c/h        # Session management
+├── ai_terminal.c/h       # Terminal handling
+├── ai_git.c/h            # Git integration
+├── cJSON.c/h             # JSON parsing library (vendored)
+├── jsmn.h                # Lightweight JSON parser (vendored)
+├── remote_harness.c/h    # Remote harness library
+├── Makefile              # Build system
+├── install.sh            # Install script
+├── mcp.json              # MCP server configuration
+├── gcal.py               # Google Calendar integration
+├── pubmed_mcp_server.py  # PubMed MCP server
+├── deep_research.py      # Deep research tool
+├── zulip_ai_bridge.py    # Zulip AI bridge
+├── zulip_mcp_server.py   # Zulip MCP server
+├── tests/                # Test suite
+├── docs/                 # Documentation
+├── .agents/              # Project skills
+├── build/                # Compiled binaries (not tracked)
+│   ├── ai                # Compiled CLI binary
+│   └── libremote_harness.so
+└── dev/                  # Development utilities
+    ├── benchmark*.py     # Benchmarking scripts
+    ├── test_*.py         # Standalone test scripts
+    └── *.py              # Debugging and reporting utilities
+```
+
+---
+
 ## Acknowledgements
 
 Fork of [infer](https://github.com/chethanreddy1/infer) by chethanreddy1. Extended with: agentic tool loop, shell execution, web search, file ops, persistent memory, sub-agent delegation, multimodal images, MCP integration, skill loading, rich terminal markdown rendering, context guards, and interactive REPL.
