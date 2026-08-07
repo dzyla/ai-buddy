@@ -329,3 +329,56 @@ def test_hide_details_flag(tmp_path):
         res = run_binary(home, srv.base_url, ["plan steps"], extra_env=env)
         assert "secret plan" not in res.stderr
 
+
+def test_execute_command_argument_aliases():
+    """execute_command must handle parameter aliases like cmd, CommandLine, args list, and raw string."""
+    # Test 'cmd' alias
+    res = subprocess.run(
+        [sys.executable, "ai_mcp.py", "call-tool", "execute_command", "execute_command", '{"cmd": "echo hello_cmd"}'],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+    assert "hello_cmd" in res.stdout
+
+    # Test 'CommandLine' alias
+    res = subprocess.run(
+        [sys.executable, "ai_mcp.py", "call-tool", "execute_command", "execute_command", '{"CommandLine": "echo hello_cmdline"}'],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+    assert "hello_cmdline" in res.stdout
+
+    # Test list of args
+    res = subprocess.run(
+        [sys.executable, "ai_mcp.py", "call-tool", "execute_command", "execute_command", '{"args": ["echo", "hello_args"]}'],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+    assert "hello_args" in res.stdout
+
+    # Test raw string argument
+    res = subprocess.run(
+        [sys.executable, "ai_mcp.py", "call-tool", "execute_command", "execute_command", '"echo hello_raw"'],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+    assert "hello_raw" in res.stdout
+
+
+def test_execute_command_alias_in_c(tmp_path):
+    """C agent binary must accept 'cmd' argument alias in execute_command."""
+    home = str(tmp_path / "home")
+    os.makedirs(home)
+    cap = str(tmp_path / "cap.jsonl")
+    tool_call = {
+        "id": "c1", "type": "function",
+        "function": {"name": "execute_command", "arguments": json.dumps({"cmd": "echo c_alias_ok"})}
+    }
+    with MockServer(cap, MOCK_TOOL_CALL=json.dumps(tool_call)) as srv:
+        run_binary(home, srv.base_url, ["-y", "run echo"])
+        reqs = srv.requests()
+        assert len(reqs) >= 2
+        tool_msg = next(m["content"] for m in reqs[1]["messages"] if m.get("role") == "tool")
+        assert "c_alias_ok" in tool_msg
+
+
