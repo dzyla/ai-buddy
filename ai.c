@@ -910,7 +910,7 @@ const char *SYSTEM_PROMPT =
     "- After writing a script with write_file, you MUST run it with execute_command to verify it works.\n"
     "- To modify existing files, strictly use the `edit_file` tool instead of `sed`, `awk`, or interactive editors.\n"
     "- NEVER run interactive terminal programs like `vim`, `nano`, `top`, `less`, or `ssh` via execute_command as they will hang the agent. Use provided tools instead.\n"
-    "- For long-running jobs (e.g. servers, training, heavy builds), NEVER use execute_command as it blocks the main thread and locks the GUI. Use `start_background_process` instead, and monitor it using `check_process_status`.\n"
+    "- For long-running jobs (e.g. scrapers, downloads, python scripts, servers, heavy builds), NEVER use execute_command as it blocks the main thread and locks the GUI! Use `start_background_process` instead, and monitor it autonomously using `check_process_status` (often via `schedule_task` polling).\n"
     "- NEVER run `find /` or search indiscriminately from the root directory; it will hang forever. Always constrain searches to specific, relevant directories (e.g., `./` or `~/Code`).\n"
     "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
     "CITATIONS:\n"
