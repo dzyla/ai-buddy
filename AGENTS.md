@@ -106,6 +106,8 @@ export INFER_MODEL="your-model-name"
 - Never embed raw single-quoted strings directly into shell commands — write to files or use stdin.
 - Never run `find /` — constrain searches to specific directories.
 - Never describe what the user can do themselves — use tools to do it.
+- **NEVER run long-running scripts synchronously (e.g. scrapers, downloads, servers, training loops) via `execute_command`. It locks up the user's terminal UI!** You MUST append `&` to run them in the background, or use `schedule_task` to check back on them.
+- If you launch a detached process, you MUST autonomously follow up using `check_process_status` (often via `schedule_task` polling) until it completes!
 - Prefer `schedule_task` or `set_reminder` over `sleep` for deferred work.
 - Use `parallel_fetch` or `delegate_task` when fetching multiple independent URLs.
 
