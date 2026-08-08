@@ -357,6 +357,11 @@ def cmd_serve():
     batch_size = os.environ.get("LLAMA_BATCH_SIZE", env_vars.get("LLAMA_BATCH_SIZE", "4096"))
     ubatch_size = os.environ.get("LLAMA_UBATCH_SIZE", env_vars.get("LLAMA_UBATCH_SIZE", "2048"))
     threads_count = os.environ.get("LLAMA_THREADS", env_vars.get("LLAMA_THREADS", "16"))
+    # Native llama-server idle-suspend: frees GPU VRAM after this many seconds of
+    # no activity without killing the process (it resumes on next request).
+    # Set to 90% of our Python-level idle_timeout so the server sleeps first,
+    # then we terminate if it stays idle even longer.
+    sleep_idle = max(30, idle_timeout - 30)
     
     cmd = [
         "llama-server",
@@ -369,7 +374,8 @@ def cmd_serve():
         "--batch-size", str(batch_size),
         "--ubatch-size", str(ubatch_size),
         "--threads", str(threads_count),
-        "--metrics"
+        "--metrics",
+        "--sleep-idle-seconds", str(sleep_idle),
     ] + extra_args
     
     print(f"[llama-wrapper] Starting llama-server — model: {os.path.basename(model_path)} ctx: {ctx_size}", file=sys.stderr)
@@ -408,7 +414,7 @@ def cmd_serve():
         print(f"[llama-wrapper] Server ready. Monitoring idle (timeout: {idle_timeout}s)...", file=sys.stderr)
         
     last_seen = time.time()
-    last_tokens = 0
+    last_tokens = -1  # -1 = not yet initialised; avoids false-idle on first poll
     
     while proc.poll() is None:
         time.sleep(10)
@@ -428,13 +434,30 @@ def cmd_serve():
                     elif line.startswith("llamacpp:requests_processing "):
                         busy_conns = int(float(line.split()[1]))
                 tot = prompt_tok + pred_tok
-                if last_tokens == 0 and tot > 0:
+                if last_tokens < 0:
+                    # First poll after ready: seed the baseline, don't count as activity
                     last_tokens = tot
-                if tot > last_tokens or busy_conns > 0:
+                elif tot > last_tokens:
+                    # New tokens were generated since last check → genuinely active
                     activity = True
                     last_tokens = tot
+                if not activity and busy_conns > 0:
+                    activity = True  # request in flight right now
         except Exception:
             pass
+
+        # Double-check via /slots for active generation (more reliable than metrics gauge)
+        if not activity:
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{PORT}/slots")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    import json as _json
+                    slots = _json.loads(resp.read())
+                    # state 1 = generating, state 2 = processing prompt
+                    if any(s.get("state", 0) in (1, 2) for s in slots):
+                        activity = True
+            except Exception:
+                pass
             
         if activity:
             last_seen = time.time()
