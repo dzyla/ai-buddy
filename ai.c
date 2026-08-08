@@ -771,7 +771,7 @@ static int   max_tokens_val   = 8192; // Prevent infinite reasoning loops
 static int   no_tools_mode    = 0;
 char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
-static int   task_timeout_sec = 300;  /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
+static int   task_timeout_sec = 1800; /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
 static int   trim_threshold   = 100000;/* set via INFER_TRIM_THRESHOLD; default 100000 */
 static int   stub_threshold   = 250000;/* set via INFER_STUB_THRESHOLD; default 250000 */
