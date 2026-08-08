@@ -597,6 +597,10 @@ static void print_tool_box(const char *name, const char *status,
                         : (status && strcmp(status, "ok") == 0)       ? "\033[32m✔\033[0m"
                         : "\033[36mℹ\033[0m";
 
+    /* Suppress tool-call boxes when stdout is piped (e.g. Zulip bridge).
+     * Only the final clean response from print_response_box should appear. */
+    if (!isatty(STDOUT_FILENO)) return;
+
     if (g_hide_details) {
         /* Inline compact rendering for Ctrl+O hidden mode */
         printf("  %s%s\033[0m \033[1m%s\033[0m %s",
@@ -643,6 +647,9 @@ static void print_tool_box(const char *name, const char *status,
 /* ── Thinking Display: Styled reasoning block ───────────────────────────── */
 static void print_think_box(const char *reasoning)
 {
+    /* Suppress thinking blocks when stdout is piped (e.g. Zulip bridge). */
+    if (!isatty(STDOUT_FILENO)) return;
+
     if (g_hide_details) {
         printf("\033[2;35m  ◈ thinking (collapsed)\033[0m\n");
         return;
@@ -2831,8 +2838,10 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                             fflush(stderr);
                             ctx->printed_thinking_header = 1;
                         }
-                        printf("\033[2m%s\033[0m", content_chunk);
-                        fflush(stdout);
+                        if (isatty(STDOUT_FILENO)) {
+                            printf("\033[2m%s\033[0m", content_chunk);
+                            fflush(stdout);
+                        }
                         free(content_chunk);
                     }
                 }
@@ -5548,7 +5557,7 @@ step_limit_check:
                                           }
 
                                           if (approved == 1) {
-                                              fprintf(stderr, "\r\033[2K\033[2m  ▶ running %s\033[0m\n", cmd_val);
+                                              fprintf(stderr, "\r\033[2K\033[36m  ⬡ $ %s\033[0m\n", cmd_val);
                                               if (strncmp(cmd_val, "sleep ", 6) == 0 || strstr(cmd_val, " sleep ") || strstr(cmd_val, "&& sleep ") || strstr(cmd_val, "; sleep ")) {
                                                   tool_output = strdup("Error: `sleep` is forbidden in execute_command. Use `schedule_task` to wait or check status asynchronously.");
                                                   fprintf(stderr, "\r\033[2K\033[1;31m  ▶ sleep command rejected. Enforcing schedule_task.\033[0m\n");
@@ -5565,11 +5574,12 @@ step_limit_check:
 
                                                   if (raw_output) {
                                                       size_t out_len = strlen(raw_output);
-                                                      tool_output = malloc(out_len + 512);
+                                                      size_t cmd_len = strlen(cmd_val);
+                                                      tool_output = malloc(out_len + cmd_len + 512);
                                                       if (exit_code == 0) {
-                                                          sprintf(tool_output, "success\n%s", raw_output);
+                                                          sprintf(tool_output, "$ %s\n%s", cmd_val, raw_output);
                                                       } else {
-                                                          sprintf(tool_output, "failed (exit %d)\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", exit_code, raw_output);
+                                                          sprintf(tool_output, "$ %s — failed (exit %d)\n%s\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]", cmd_val, exit_code, raw_output);
                                                       }
                                                       free(raw_output);
                                                   } else {
@@ -5582,7 +5592,7 @@ step_limit_check:
                                                   }
                                               }
                                           } else if (approved == 2) {
-                                              fprintf(stderr, "\r\033[2K\033[2m  ▶ backgrounding %s\033[0m\n", cmd_val);
+                                              fprintf(stderr, "\r\033[2K\033[36m  ⬡ $ %s (background)\033[0m\n", cmd_val);
                                               char log_file[512];
                                               snprintf(log_file, sizeof(log_file), "%s/.config/ai/logs/bg_proc_%d.log", getenv("HOME"), (int)time(NULL));
                                               char mkdir_cmd[512];
@@ -5598,8 +5608,8 @@ step_limit_check:
                                               }
                                               char *nl = strchr(pid_str, '\n');
                                               if (nl) *nl = '\0';
-                                              tool_output = malloc(1024);
-                                              sprintf(tool_output, "success\nCommand launched in background. PID: %s\nOutput is logging to %s\nYou can use `check_process_status(pid=%s, log_file=\"%s\")` to monitor it.", pid_str, log_file, pid_str, log_file);
+                                              tool_output = malloc(1024 + strlen(cmd_val));
+                                              sprintf(tool_output, "$ %s\n\nCommand launched in background. PID: %s\nOutput is logging to %s\nYou can use `check_process_status(pid=%s, log_file=\"%s\")` to monitor it.", cmd_val, pid_str, log_file, pid_str, log_file);
                                           } else {
                                               fprintf(stderr, "[ai] command execution cancelled.\n");
                                               tool_output = strdup("Error: Command execution was cancelled/denied by the user.");

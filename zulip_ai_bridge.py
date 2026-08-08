@@ -25,11 +25,13 @@ from urllib.parse import unquote
 
 
 def clean_response(text):
-    # Strip ANSI escape codes (e.g. \033[2m, \033[0m)
-    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+    # Strip all ANSI escape codes (colour, dim, bold, cursor movement, etc.)
+    ansi_escape = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\]\d*;[^\x07]*\x07|[@-Z\\-_])')
     clean = ansi_escape.sub('', text)
     # Replace long unicode horizontal lines with standard markdown horizontal rules
     clean = clean.replace("────────────────────────────────────────────", "---")
+    # Collapse runs of blank lines to at most two
+    clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
 
 
@@ -153,7 +155,10 @@ class ZulipAiBridge:
         # INFER_AUTO_APPROVE so execute_command never pauses for Y/n confirmation.
         run_env = os.environ.copy()
         run_env["INFER_AUTO_APPROVE"] = "1"
-        run_env["INFER_RAW_OUTPUT"] = "1"
+        # NOTE: Do NOT set INFER_RAW_OUTPUT here — when ai runs with a pipe
+        # (non-TTY stdout) it already outputs only the final clean response.
+        # INFER_RAW_OUTPUT caused streaming intermediate chunks to also be
+        # printed, polluting the output captured by this bridge.
         # Let set_reminder default the reminder recipient back to whoever asked,
         # so "remind me tomorrow to ..." works with no email needed.
         sender_email = msg.get("sender_email")
@@ -161,6 +166,10 @@ class ZulipAiBridge:
             run_env["AI_REMINDER_ZULIP_TO"] = sender_email
 
         # Run the local `ai` CLI in quiet + auto-approve mode.
+        # -q suppresses the think tool reasoning output.
+        # -y auto-approves command execution.
+        # Streaming intermediate content is suppressed automatically because
+        # stdout is a pipe (non-TTY), so only the final answer is captured.
         # With schedule_task properly used, the agent returns immediately for timed work.
         try:
             result = subprocess.run(

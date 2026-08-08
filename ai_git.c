@@ -42,7 +42,7 @@ void git_commit(const char *extra_msg) {
 
     /* Check if there's a git repo */
     char git_check[64];
-    snprintf(git_check, sizeof(git_check), "git -C . rev-parse --git-dir 2>/dev/null");
+    snprintf(git_check, sizeof(git_check), "git -C . rev-parse --git-dir >/dev/null 2>&1");
     int has_git = (system(git_check) == 0);
     if (!has_git) return;
 
