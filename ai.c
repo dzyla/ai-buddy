@@ -766,9 +766,11 @@ static void print_info_box(const char *title, const char *body)
 static char  api_url[MAX_VAL];
 static char  api_key[MAX_VAL];
 static char  model[MAX_VAL];
-static float temperature_val  = -1.0f;
-static int   max_tokens_val   = 8192; // Prevent infinite reasoning loops
-static int   no_tools_mode    = 0;
+static float temperature_val        = -1.0f;
+static int   max_tokens_val         = 8192;  /* Prevent infinite reasoning loops */
+static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops (0=off, INFER_FREQ_PENALTY) */
+static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
+static int   no_tools_mode          = 0;
 char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
 static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
 static int   task_timeout_sec = 1800; /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
@@ -3889,6 +3891,10 @@ int main(int argc, char **argv) {
     if (env_temp && *env_temp) temperature_val = (float)atof(env_temp);
     char *env_maxtok = getenv("INFER_MAX_TOKENS");
     if (env_maxtok && *env_maxtok) max_tokens_val = atoi(env_maxtok);
+    char *env_freq_pen = getenv("INFER_FREQ_PENALTY");
+    if (env_freq_pen && *env_freq_pen) frequency_penalty_val = (float)atof(env_freq_pen);
+    char *env_pres_pen = getenv("INFER_PRESENCE_PENALTY");
+    if (env_pres_pen && *env_pres_pen) presence_penalty_val = (float)atof(env_pres_pen);
     char *env_ctxwin = getenv("INFER_CONTEXT_WINDOW");
     if (env_ctxwin && *env_ctxwin) context_window = atoi(env_ctxwin);
     char *env_timeout = getenv("INFER_TASK_TIMEOUT");
@@ -4647,7 +4653,7 @@ step_limit_check:
                 }
 
                 /* Build optional parameter fields */
-                char opt_fields[128] = "";
+                char opt_fields[256] = "";
                 int opt_len = 0;
                 if (temperature_val >= 0.0f)
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
@@ -4655,6 +4661,14 @@ step_limit_check:
                 if (max_tokens_val > 0)
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"max_tokens\":%d", max_tokens_val);
+                /* frequency_penalty: penalises tokens that already appeared → breaks
+                   repetitive reasoning loops in thinking models (0.0 = disabled). */
+                if (frequency_penalty_val > 0.0f)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"frequency_penalty\":%.2f", frequency_penalty_val);
+                if (presence_penalty_val > 0.0f)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"presence_penalty\":%.2f", presence_penalty_val);
 
                 char *esc_model = json_escape(model);
                 char *payload = NULL;
