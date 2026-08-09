@@ -6,7 +6,7 @@
 
 **Two-process architecture:**
 - **`ai.c`** — Main agent loop. Owns conversation state, calls the LLM, handles `think` / `task_complete` / `execute_command` natively, and delegates all other tool calls to `ai_mcp.py`.
-- **`ai_mcp.py`** — Tool backend. Implements 12 native tools and acts as a generic MCP client for any server defined in `mcp.json`.
+- **`ai_mcp.py`** — Tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server defined in `mcp.json`.
 
 **Build outputs:**
 - `ai` — main CLI binary
@@ -62,7 +62,7 @@ export INFER_MODEL="your-model-name"
 
 ```
 ├── ai.c                  # Agent loop — conversation, LLM calls, native tools
-├── ai_mcp.py             # Tool backend — 12 native tools + MCP client
+├── ai_mcp.py             # Tool backend — many native tools + MCP client
 ├── ai_session.c/h        # Session persistence (save/resume conversations)
 ├── ai_terminal.c/h       # TUI, prompt handling, color output
 ├── ai_git.c/h            # Git integration (diff, status, log)
@@ -72,9 +72,34 @@ export INFER_MODEL="your-model-name"
 ├── Makefile              # Build system
 ├── install.sh            # Install/uninstall script
 ├── mcp.json              # Local MCP server registry
-├── gcal.py               # Google Calendar integration
+├── gcal.py               # Google Calendar CLI integration (list/create/update/delete/availability)
 ├── pubmed_mcp_server.py  # PubMed MCP server
 ├── deep_research.py      # Deep research tool
+├── zulip_ai_bridge.py    # Zulip bot bridge (file parsing, reconnection, ContextWindowManager)
+├── .agents/skills/       # Domain skills directory (loaded via load_skill)
+│   ├── autonomous_troubleshooting
+│   ├── bio_structure_analysis
+│   ├── bioinformatics_sequences
+│   ├── boltzgen-ops
+│   ├── brainstorming
+│   ├── cli_git_workflow
+│   ├── cli_shell_diagnostics
+│   ├── deep_research
+│   ├── email_assistant
+│   ├── google-calendar
+│   ├── karpathy_guidelines
+│   ├── mcp_explorer_guide
+│   ├── md_prep_openmm
+│   ├── planning
+│   ├── pubmed_search
+│   ├── robinhood_mcp
+│   ├── scientific_writing
+│   ├── small_model_reasoning
+│   ├── smart_web_fetch
+│   ├── structure_based_design
+│   ├── subagents
+│   ├── uniprot_fetcher
+│   └── search_history
 ├── tests/                # C and Python test suite
 ├── dev/                  # Benchmarks, utilities, test harnesses
 └── docs/                 # Architecture docs
@@ -85,12 +110,25 @@ export INFER_MODEL="your-model-name"
 - Python tool backend runs as a subprocess of the C agent loop.
 - Session state lives in `~/.cache/ai/sessions/` and `~/.cache/ai/history.jsonl`.
 - MCP server config is searched in order: `./mcp.json` → `./mcp_config.json` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`.
+- Domain skills live in `.agents/skills/<name>/` and are loaded via the `load_skill` tool.
 
 ### Zulip Bridge
 - `zulip_ai_bridge.py` — Zulip bot bridge that pipes messages to the `ai` CLI.
 - **File parsing:** automatically downloads uploaded files (PDFs, images, spreadsheets, code, etc.) and extracts their text content before passing to the agent. Supports text, PDF (pdfplumber/pypdfium2), image OCR (tesseract), CSV/Excel (openpyxl), and archives.
+- **ContextWindowManager:** manages conversation context to stay within the AI model's context window, truncating messages as needed.
+- **Automatic reconnection:** the bridge uses exponential backoff to reconnect on connection errors.
 - Cache directory: `~/.cache/zulip_ai_uploads/`
 - Privacy: only responds to the owner or explicitly configured `ZULIP_USER`.
+
+### Agent Spawning & Context Pool
+- `ai_mcp.py` provides `spawn_agent`, `resume_agent`, and `list_agents` for multi-agent workflows.
+- `append_to_context_pool`, `get_context_snippet`, and `search_context` provide a shared context pool that persists across agent sessions.
+- `session_report` aggregates results from spawned agents.
+
+### Scheduling & Background Tasks
+- `schedule_task`, `set_reminder`, `unschedule_task`, and `list_scheduled_tasks` manage deferred and recurring tasks.
+- `start_background_process`, `check_process_status`, and `stop_process` manage detached background processes.
+- `delegate_task` spawns N helper agents that run in parallel and return combined results.
 
 ---
 
@@ -151,3 +189,9 @@ export INFER_MODEL="your-model-name"
 2. Update README.md with usage examples.
 3. Add tests in `tests/` or `dev/`.
 4. If it affects the agent loop, update the system prompt in `ai.c` or `CLAUDE.md`.
+
+### Skills
+- Domain skills live in `.agents/skills/<name>/` and are loaded via `load_skill(name)`.
+- Each skill directory contains guidance documents that shape the agent's behavior for specific domains.
+- The `load_skill` tool reads the skill's markdown file and injects it into the system context.
+- CRITICAL triggers in the system prompt ensure domain-specific skills are loaded before relevant operations.

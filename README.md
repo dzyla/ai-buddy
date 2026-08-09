@@ -319,7 +319,17 @@ For complete configuration instructions, bot creation, and setting up the system
 Two cooperating processes talk via subprocess calls — no shared library or IPC:
 
 - **`ai.c`** — the agent loop. Owns the conversation, calls the LLM, handles `think` / `task_complete` / `execute_command` natively, delegates all other tool calls to `ai_mcp.py`.
-- **`ai_mcp.py`** — the tool backend. Implements 12 native tools and acts as a generic MCP client for any server in `mcp.json`.
+- **`ai_mcp.py`** — the tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server in `mcp.json`.
+
+Additional processes and services:
+
+- **`gcal.py`** — Google Calendar authentication and CLI helper.
+- **`pubmed_mcp_server.py`** — PubMed MCP server for literature search.
+- **`deep_research.py`** — Deep research tool (multi-hop, iterative retrieval).
+- **`zulip_ai_bridge.py`** — Zulip bot bridge that pipes messages to the `ai` CLI and downloads/extracts file attachments before passing them to the agent.
+- **`zulip_mcp_server.py`** — Zulip MCP server exposing `zulip_send_message`, `zulip_get_messages`, `zulip_add_reaction`, `zulip_edit_message`.
+- **`ContextWindowManager`** — monitors context-window budget across calls; on overflow it auto-splits the response and continues the conversation so work proceeds even when a single LLM call would exceed the token limit.
+- **Scheduling/background processes** — `schedule_task` and `set_reminder` run deferred work in detached background processes with explicit termination guards (`max_runs`, `ttl_hours`); `start_background_process` / `check_process_status` / `stop_process` manage long-running jobs.
 
 For details on the architecture, adding tools, and cross-process contracts, see [`CLAUDE.md`](CLAUDE.md).
 
