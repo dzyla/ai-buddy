@@ -6,8 +6,19 @@ import pytest
 # Ensure the local binary is built before running tests
 @pytest.fixture(scope="session", autouse=True)
 def build_ai_binary():
-    res = subprocess.run(["make"], capture_output=True, text=True)
-    assert res.returncode == 0, f"Compilation failed: {res.stderr}"
+    # Build only if stale, so we don't race with the autouse build fixtures in
+    # tests/test_modes_history.py and tests/test_offline.py (concurrent `make`
+    # on the same tree is unsafe and can rewrite `ai` mid-binary-vs-mock run).
+    src = os.path.join(os.path.dirname(__file__), "ai.c")
+    binp = os.path.join(os.path.dirname(__file__), "ai")
+    try:
+        stale = (not os.path.exists(binp)) or (
+            os.path.getmtime(src) > os.path.getmtime(binp))
+    except Exception:
+        stale = True
+    if stale:
+        res = subprocess.run(["make"], capture_output=True, text=True)
+        assert res.returncode == 0, f"Compilation failed: {res.stderr}"
     print("[Test Setup] Syncing skills to local config...")
     # Sync skills to ~/.config/ai/skills as install.sh does
     skills_src = "./.agents/skills"
