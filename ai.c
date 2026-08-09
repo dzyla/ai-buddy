@@ -5215,8 +5215,35 @@ step_limit_check:
                               }
 
                                if (same_tool_count >= 2) {
-                                   tool_output = strdup("Error: You are stuck in a loop calling the exact same tool with the exact same arguments. Stop and try a different approach, or call task_complete.");
-                               } else if (strcmp(unescaped_name, "think") == 0) {
+                                                                  /* The identical-(tool,args) repeat is a hard runaway signal: a healthy
+                                                                     model breaks out on the first "stuck in a loop" message. If it ignores
+                                                                     the warning and keeps repeating, we must TERMINATE, not just warn —
+                                                                     otherwise a degenerate model loops forever under -c (step_limit=999999)
+                                                                     where the step/nudge brakes below are ineffective. */
+                                                                  const char *tool_loop_cap_env = getenv("INFER_TOOL_LOOP_CAP");
+                                                                  int tool_loop_cap = (tool_loop_cap_env && atoi(tool_loop_cap_env) > 0)
+                                                                                       ? atoi(tool_loop_cap_env) : 6;
+                                                                  if (same_tool_count >= tool_loop_cap) {
+                                                                      fprintf(stderr,
+                                                                          "\033[1;31m[ai] Infinite tool loop: identical tool+args called %d "
+                                                                          "times in a row. Aborting agent loop and forcing task_complete.\033[0m\n",
+                                                                          same_tool_count);
+                                                                      /* Hard stop — do NOT hand the degenerate model another round-trip, or
+                                                                         it will keep looping under -c where step_limit is unlimited. */
+                                                                      char stall_msg[256];
+                                                                      snprintf(stall_msg, sizeof(stall_msg),
+                                                                          "{\"role\":\"user\",\"content\":\"[HARD STOP] You called the exact same tool "
+                                                                          "with the same arguments %d times in a row. You are in an infinite tool loop. "
+                                                                          "Aborting. Call task_complete NOW with your best summary. Do NOT call any "
+                                                                          "more tools.\\\"}", same_tool_count);
+                                                                      messages_json = append_message(messages_json, stall_msg);
+                                                                      tool_output = strdup("{\"ok\":true}");
+                                                                      has_more = 0;
+                                                                      task_done = 1;
+                                                                  } else {
+                                                                      tool_output = strdup("Error: You are stuck in a loop calling the exact same tool with the exact same arguments. Stop and try a different approach, or call task_complete.");
+                                                                  }
+                                                              } else if (strcmp(unescaped_name, "think") == 0) {
                                    think_count++;
                                    if (think_count > 12) {
                                        tool_output = strdup("Error: You have already called the 'think' tool once to plan. Do not call it again. You must call 'task_complete' to report your final answer/summary to the user, or call other action tools if there is more work to do. Calling 'think' repeatedly causes infinite loops.");
