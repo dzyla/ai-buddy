@@ -69,6 +69,16 @@ The plan/manual gating lives in `ai.c` (the `tool_is_mutating()` classification 
 selections are honoured so the Zulip bridge and schedulers can set a mode (`BRIDGE_AI_MODE`,
 `INFER_PERMISSION_MODE`).
 
+### Situational state header
+
+`ai.c` prepends a compact `[CURRENT STATE step N] <tool> -> ok|error | <rolling log>`
+header to every tool result, so small local models can always see where they are in a task
+(step number, this call's status, recent trajectory) without holding it in memory. The
+rolling log is bounded and per-task. Disable with `INFER_STATE_CONTEXT=0`. Tool-error
+`[HINT: ...]` / `[GRAPH ENFORCEMENT: ...]` guidance is injected into the model-visible
+tool message (not just the terminal), and failed `execute_command` output
+(`— failed (exit N)`) is correctly labelled `error`. See `docs/situational_awareness.md`.
+
 ### Continuous self-improvement (skills)
 
 `ai_mcp.py` provides `skill_create`, `skill_update`, and `skill_note` so the agent can
