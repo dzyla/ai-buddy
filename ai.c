@@ -851,6 +851,19 @@ static char *g_git_commit_msg = NULL;  /* custom commit message from user */
 /* ── OS notifications ── */
 static int g_notifications_enabled = 0;
 
+/* ── Automatic failure-learning (self-improvement ledger) ──
+   The harness records tool failures deterministically (no model discipline
+   needed). Per-session map of tools that failed; when the SAME tool later
+   succeeds, the working approach is auto-persisted as a FIX lesson so future
+   sessions don't repeat the mistake. */
+#define SI_MAX_TRACKED 32
+static struct {
+    int used;
+    char tool[140];
+    char args[400];
+    char error[600];
+} g_si_failed[SI_MAX_TRACKED];
+
 /* ── Permission modes: 0=auto, 1=plan, 2=manual (defined above) ── */
 
 /* ── AGENTS.md integration ── */
@@ -1021,7 +1034,17 @@ const char *SYSTEM_PROMPT =
     "- Do ONE planned step at a time, then check the tool result against the plan before starting the next step.\n"
     "- After any write/edit or command, validate: compile, run the relevant test, or read the output.\n"
     "- In PLAN mode an approval grants a BOUNDED number of state-changing actions (INFER_PLAN_STEP_BUDGET). When that budget is exhausted the harness blocks further changes and tells you to present_plan again - do exactly that (or task_complete), never keep going.\n"
-    "- If a step fails validation, stop, think, and adjust; do not barrel through unrelated changes.\n\n"
+    "- If a step fails validation, stop, think, and adjust; do not barrel through unrelated changes.\n"
+    "WORKFLOW (task -> plan -> execution -> tests -> solution):\n"
+    "- Follow this 5-phase discipline for every non-trivial task. This stops you from repeating mistakes on autopilot.\n"
+    "  1. TASK - restate the goal in your own words via `think`.\n"
+    "  2. PLAN - use `think` to lay out the exact steps, files, and commands. Identify what could go wrong BEFORE acting.\n"
+    "  3. EXECUTION - do ONE low-risk step at a time. If a tool errors, `think` about the error, then change your approach - never retry the identical failing call.\n"
+    "  4. TESTS - empirically verify each change: compile (`make`) and/or run the relevant test, or read the output. Never claim success without evidence.\n"
+    "  5. SOLUTION - call task_complete with a summary of what you did, how you verified it, and any lesson learned.\n"
+    "- SELF-IMPROVEMENT: The harness AUTOMATICALLY records your tool failures and the fixes that recovered them (persisted across sessions), and surfaces them when you hit the same error again. Treat [REMEMBERED FROM PAST SESSIONS] and [RECURRING FAILURE] messages as instructions. Still proactively persist reusable techniques with skill_create / skill_update / skill_note.\n"
+    "- When a tool result contains [RECURRING FAILURE], you have made this exact mistake before - stop and use the past FIX lesson or a genuinely new approach.\n"
+    "- The tests phase is mandatory: a change is only done once it is verified, not when you believe it works.\n\n"
     "CITATIONS:\n"
     "- fetch_webpage and read_file (PDF) results begin with a [Source: ...] line. Track every source whose content you use.\n"
     "- In your task_complete summary, always end with a '## Sources' section listing each [Source: ...] URL or file path you drew from.\n"
@@ -4785,6 +4808,7 @@ int main(int argc, char **argv) {
             else if (!isatty(STDIN_FILENO)) step_limit = (step_env_val > 0) ? step_env_val : 60; /* non-tty always finite; no infinite autonomy */
             else step_limit = (step_env_val > 0) ? step_env_val : 30;
             int think_count = 0;
+            for (int _si = 0; _si < SI_MAX_TRACKED; _si++) g_si_failed[_si].used = 0; /* reset failure-learning map per task */
             g_plan_approved = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
@@ -5996,7 +6020,103 @@ step_limit_check:
                                           graph_enforcement = "\n\n[GRAPH ENFORCEMENT: Middleware intercepted an exception. You must pause, recalculate your approach, and try a different strategy.]";
                                       }
                                   }
-                                  
+
+                                  /* ── Automatic self-improvement: harness learns from tool errors ──
+                                     Deterministic (does not depend on the model volunteering to persist):
+                                     every failure is logged to a persistent ledger; a recurring failure is
+                                     auto-promoted to a lesson; a later success of the same tool is recorded
+                                     as the fix; past lessons for this exact mistake are surfaced. */
+                                  if (tool_output) {
+                                      char si_name[128];
+                                      const char *_si_u = strstr(unescaped_name, "__");
+                                      if (_si_u) snprintf(si_name, sizeof(si_name), "%s", _si_u + 2);
+                                      else snprintf(si_name, sizeof(si_name), "%s", unescaped_name);
+
+                                      int si_failed = is_err ||
+                                          (tool_output && strstr(tool_output, "-- failed (exit") != NULL);
+
+                                      if (si_failed) {
+                                          /* persist the failure + detect recurrence */
+                                          char *ej_args = json_escape(unescaped_args ? unescaped_args : "");
+                                          char *ej_err  = json_escape(tool_output);
+                                          char si_pay[9000];
+                                          snprintf(si_pay, sizeof(si_pay),
+                                                   "{\"tool\":\"%s\",\"args\":\"%s\",\"error\":\"%s\",\"phase\":\"execution\"}",
+                                                   si_name, ej_args, ej_err);
+                                          free(ej_args); free(ej_err);
+                                          {
+                                              char si_cmd[10000];
+                                              snprintf(si_cmd, sizeof(si_cmd),
+                                                       "python3 %s record-failure %s 2>/dev/null",
+                                                       mcp_script, shell_escape(si_pay));
+                                              char *_o = run_shell_command(si_cmd, NULL);
+                                              if (_o) free(_o);
+                                          }
+                                          /* remember it so a later success = auto-learned fix */
+                                          int _slot = -1;
+                                          for (int _i = 0; _i < SI_MAX_TRACKED; _i++)
+                                              if (g_si_failed[_i].used && strcmp(g_si_failed[_i].tool, si_name) == 0) { _slot = _i; break; }
+                                          if (_slot < 0)
+                                              for (int _i = 0; _i < SI_MAX_TRACKED; _i++)
+                                                  if (!g_si_failed[_i].used) { _slot = _i; break; }
+                                          if (_slot >= 0) {
+                                              g_si_failed[_slot].used = 1;
+                                              snprintf(g_si_failed[_slot].tool, sizeof(g_si_failed[_slot].tool), "%s", si_name);
+                                              snprintf(g_si_failed[_slot].args,  sizeof(g_si_failed[_slot].args),  "%s", unescaped_args ? unescaped_args : "");
+                                              snprintf(g_si_failed[_slot].error, sizeof(g_si_failed[_slot].error), "%s", tool_output);
+                                          }
+                                          /* surface any past lesson for this exact mistake (cross-session memory) */
+                                          {
+                                              char *ej_err2 = json_escape(tool_output);
+                                              char si_lpay[9000];
+                                              snprintf(si_lpay, sizeof(si_lpay), "{\"tool\":\"%s\",\"error\":\"%s\"}", si_name, ej_err2);
+                                              free(ej_err2);
+                                              char si_lcmd[10000];
+                                              snprintf(si_lcmd, sizeof(si_lcmd),
+                                                       "python3 %s lessons-for %s 2>/dev/null",
+                                                       mcp_script, shell_escape(si_lpay));
+                                              char *_less = run_shell_command(si_lcmd, NULL);
+                                              if (_less && *_less) {
+                                                  size_t _nl = strlen(_less) + strlen(tool_output) + 96;
+                                                  char *_nb = malloc(_nl);
+                                                  snprintf(_nb, _nl,
+                                                           "[REMEMBERED FROM PAST SESSIONS (self-improvement)]\n%s\n---\n%s",
+                                                           _less, tool_output);
+                                                  free(tool_output);
+                                                  tool_output = _nb;
+                                                  fprintf(stderr, "\033[1;36m[ai] surfaced past lesson for '%s' to model\033[0m\n", si_name);
+                                              }
+                                              if (_less) free(_less);
+                                          }
+                                      } else {
+                                          /* success of a tool that failed earlier this task -> record the fix */
+                                          int _slot = -1;
+                                          for (int _i = 0; _i < SI_MAX_TRACKED; _i++)
+                                              if (g_si_failed[_i].used && strcmp(g_si_failed[_i].tool, si_name) == 0) { _slot = _i; break; }
+                                          if (_slot >= 0) {
+                                              char *ej_args = json_escape(unescaped_args ? unescaped_args : "");
+                                              char *ej_prev = json_escape(g_si_failed[_slot].error);
+                                              char si_rpay[9000];
+                                              snprintf(si_rpay, sizeof(si_rpay),
+                                                       "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\"}",
+                                                       si_name, ej_args, ej_prev);
+                                              free(ej_args); free(ej_prev);
+                                              {
+                                                  char si_rcmd[10000];
+                                                  snprintf(si_rcmd, sizeof(si_rcmd),
+                                                           "python3 %s record-recovery %s 2>/dev/null",
+                                                           mcp_script, shell_escape(si_rpay));
+                                                  char *_o = run_shell_command(si_rcmd, NULL);
+                                                  if (_o) {
+                                                      fprintf(stderr, "\033[1;36m[ai] learned fix for '%s': %s\033[0m\n", si_name, _o);
+                                                      free(_o);
+                                                  }
+                                              }
+                                              g_si_failed[_slot].used = 0;
+                                          }
+                                      }
+                                  }
+
                                   /* ── Display tool result with styled box ── */
                                   {
                                       const char *status_label = is_err ? "error" : "ok";

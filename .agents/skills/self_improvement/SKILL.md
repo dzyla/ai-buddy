@@ -9,6 +9,18 @@ You learn from the past. At the end of (or during) a task, persist insights into
 skill system so future sessions — including your own — start from today's discoveries.
 This is how the harness improves over time.
 
+## How the harness learns automatically (you don't have to opt in)
+Every tool failure is recorded to `~/.config/ai/self_improve/ledger.jsonl`. When the
+SAME failure signature is seen repeatedly, an auto-generated "recurring pitfall"
+lesson is persisted to `lessons.md`. When a tool that failed earlier in a task later
+SUCCEEDS, the working approach is auto-learned as a FIX lesson. On any future error,
+the harness injects matching past lessons into the tool result as
+"[REMEMBERED FROM PAST SESSIONS (self-improvement)]". So even a small model that never
+volunteers to persist still inherits what past sessions learned.
+
+You still add value on top by using skill_create / skill_update / skill_note for
+techniques the harness can't deduce (multi-step workflows, domain facts, tool quirks).
+
 ## When to persist
 Do this after any non-trivial task where you learned something reusable:
 - A technique, workflow, or non-obvious command that worked.
