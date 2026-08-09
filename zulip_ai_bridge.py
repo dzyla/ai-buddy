@@ -25,6 +25,7 @@ import requests
 from urllib.parse import unquote, quote
 import csv
 import io
+import time
 
 # Configure logging for truncation events
 logging.basicConfig(
@@ -88,6 +89,11 @@ class FileParser:
 
     def _download_file(self, url, dest_path):
         """Download a file with retry and size checking."""
+        # Validate URL is from a trusted domain (the configured Zulip server)
+        if not self._is_trusted_url(url):
+            logger.warning(f"Blocked download from untrusted domain: {url}")
+            return False, "Download from untrusted domain"
+
         try:
             resp = requests.get(url, stream=True, timeout=30)
             resp.raise_for_status()
@@ -105,6 +111,31 @@ class FileParser:
         except requests.exceptions.RequestException as e:
             logger.error(f"Download failed: {e}")
             return False, str(e)
+        except TimeoutError as e:
+            logger.error(f"Download timed out: {e}")
+            return False, str(e)
+        except OSError as e:
+            logger.error(f"Download file system error: {e}")
+            return False, str(e)
+
+    def _is_trusted_url(self, url):
+        """Check if a URL is from the configured Zulip server domain."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            # Relative paths (empty netloc) are same-origin and always trusted.
+            if not parsed.netloc:
+                return True
+            # Use the stored base_url (already normalized by the constructor).
+            allowed = self.base_url.replace('https://', '').replace('http://', '').rstrip('/')
+            downloaded = parsed.netloc.replace('https://', '').replace('http://', '').rstrip('/')
+            return (
+                downloaded == allowed
+                or downloaded.endswith("." + allowed)
+                or allowed.endswith("." + downloaded)
+            )
+        except Exception:
+            return False
 
     def _detect_file_type(self, path, content_type=None):
         """Detect file type from extension and/or MIME type."""
@@ -380,11 +411,11 @@ def clean_response(text):
 
 
 class ZulipAiBridge:
-    def __init__(self):
-        if zulip is None:
+    def __init__(self, client=None):
+        if zulip is None and client is None:
             raise RuntimeError("The 'zulip' Python package is required. Install it via `pip install zulip`.")
-        # Automatically loads credentials from ~/.zuliprc
-        self.client = zulip.Client()
+        # Allow dependency injection for testing / alternative backends
+        self.client = client if client is not None else zulip.Client()
         self.bot_email = self.client.email
         print(f"Loaded credentials for: {self.bot_email} on {self.client.base_url}")
         self.detected_owner = self._detect_owner()
@@ -415,20 +446,49 @@ class ZulipAiBridge:
         return None
 
     def _send_reply(self, msg, content):
-        """Send a reply to the same stream/topic or private thread."""
+        """Send a reply to the same stream/topic or private thread.
+
+        Retries on transient errors (rate limiting / connection drops) with
+        exponential backoff, since Zulip may temporarily refuse messages.
+        """
+        max_retries = 3
+        backoff = 2
+        message = {
+            "type": "private" if msg['type'] == 'private' else "stream",
+        }
         if msg['type'] == 'private':
-            self.client.send_message({
-                "type": "private",
-                "to": [msg['sender_email']],
-                "content": content
-            })
+            message["to"] = [msg['sender_email']]
         else:
-            self.client.send_message({
-                "type": "stream",
-                "to": msg['display_recipient'],
-                "topic": msg['subject'],
-                "content": content
-            })
+            message["to"] = msg['display_recipient']
+            message["topic"] = msg['subject']
+        message["content"] = content
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                self.client.send_message(message)
+                return
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    print(f"⚠️ send_message failed (attempt {attempt+1}/{max_retries}): {e}")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                else:
+                    print(f"❌ send_message failed after {max_retries} attempts: {last_error}")
+
+        # Append an error notice to the original message thread as a last resort.
+        error_notice = (
+            f"⚠️ Could not deliver reply after {max_retries} attempts: {last_error}"
+        )
+        if msg['type'] == 'private':
+            message["content"] = error_notice
+        else:
+            message["content"] = error_notice
+        try:
+            self.client.send_message(message)
+        except Exception:
+            pass
 
     def _get_context_messages(self, msg, limit=5):
         """Fetch up to `limit` previous messages in the same thread/conversation."""
@@ -506,6 +566,12 @@ class ZulipAiBridge:
         # Streaming intermediate content is suppressed automatically because
         # stdout is a pipe (non-TTY), so only the final answer is captured.
         # With schedule_task properly used, the agent returns immediately for timed work.
+        #
+        # Use INFER_TASK_TIMEOUT if set (defaults to 600s = 10 min), matching the
+        # scheduler's behaviour so users get consistent expectations across the
+        # bridge and scheduled tasks.
+        task_timeout = int(os.environ.get("INFER_TASK_TIMEOUT", 0)) or 600
+
         try:
             result = subprocess.run(
                 ["ai", "-y", "-q", prompt],
@@ -513,7 +579,7 @@ class ZulipAiBridge:
                 stderr=subprocess.PIPE,
                 env=run_env,
                 text=True,
-                timeout=600
+                timeout=task_timeout
             )
             response_text = result.stdout
             if result.returncode != 0 and result.stderr:
@@ -525,7 +591,7 @@ class ZulipAiBridge:
 
         except subprocess.TimeoutExpired:
             response_text = (
-                "⏱️ The agent timed out after 10 minutes. "
+                f"⏱️ The agent timed out after {task_timeout}s. "
                 "For long-running tasks, ask me to **schedule** them so they run in "
                 "the background and notify you when done."
             )
@@ -593,12 +659,25 @@ class ZulipAiBridge:
 
     def _manage_context_window(self, context_messages, current_content):
         """Apply context window management to prevent overflow."""
+        # Exclude the bot's own messages from context — the agent already
+        # has its own conversation history; including Zulip-sent bot messages
+        # would duplicate and confuse context.
+        filtered = [
+            m for m in context_messages
+            if m.get("sender_email", "") != self.bot_email
+        ]
+        if len(filtered) != len(context_messages):
+            logger.info(
+                f"Filtered out {len(context_messages) - len(filtered)} bot messages "
+                f"from context ({len(context_messages)} → {len(filtered)})"
+            )
+
         window_manager = ContextWindowManager()
         truncated_messages, truncated = window_manager.truncate_context(
-            context_messages, current_content
+            filtered, current_content
         )
         if truncated:
-            logger.info(f"Context truncated from {len(context_messages)} to {len(truncated_messages)} messages")
+            logger.info(f"Context truncated from {len(filtered)} to {len(truncated_messages)} messages")
         return truncated_messages
 
     def run(self):
@@ -614,13 +693,11 @@ class ZulipAiBridge:
             except (ConnectionError, requests.exceptions.RequestException) as e:
                 print(f"⚠️ Connection error: {e}")
                 print(f"⏳ Reconnecting in {current_backoff}s...")
-                import time
                 time.sleep(current_backoff)
                 current_backoff = min(current_backoff * 2, max_backoff)
             except Exception as e:
                 print(f"❌ Unexpected error: {e}")
                 print(f"⏳ Restarting in {current_backoff}s...")
-                import time
                 time.sleep(current_backoff)
                 current_backoff = min(current_backoff * 2, max_backoff)
 
@@ -643,42 +720,57 @@ class ContextWindowManager:
         """Rough token estimation: ~4 chars per token for English text."""
         return len(text) // 4
     
-    def truncate_context(self, context_messages, current_content, max_context_length=3000):
+    def truncate_context(self, context_messages, current_content):
         """
-        Truncate context messages to fit within token budget.
-        
+        Truncate context messages to fit within the token / message budget.
+
+        Strategy: keep the most recent messages and drop the oldest ones when
+        either the ``max_tokens`` budget or the ``max_messages`` cap is
+        exceeded.  This preserves the most relevant conversational context.
+
         Args:
             context_messages: List of message dictionaries
             current_content: The current message content
-            max_context_length: Maximum length for context in characters
-            
+
         Returns:
             Tuple of (truncated messages, whether truncation occurred)
         """
         if not context_messages:
             return context_messages, False
-        
-        # Estimate total prompt length
-        estimated_prompt_length = len(current_content)
-        
-        # Build context incrementally until we hit the limit
-        truncated = []
-        for msg in context_messages:
+
+        # Estimate how many characters the current query occupies.
+        estimated_length = len(current_content)
+        kept = []
+
+        # Walk backwards through the context so the most recent messages are kept.
+        for msg in reversed(context_messages):
             sender = msg.get("sender_full_name", msg.get("sender_email", "Unknown"))
             body = msg.get("content", "").strip()
             msg_length = len(f"- {sender}: {body}")
-            
-            if estimated_prompt_length + msg_length > max_context_length:
-                logger.warning(
-                    f"Context truncated: {len(context_messages)} messages would exceed "
-                    f"token budget. Keeping {len(truncated)} messages."
+
+            # Check token budget (rough estimate: 4 chars ≈ 1 token)
+            if estimated_length + msg_length > self.max_tokens * 4:
+                logger.info(
+                    f"Context truncated to fit token budget: keeping "
+                    f"{len(kept)} of {len(context_messages)} messages."
                 )
-                return truncated, True
-            
-            truncated.append(msg)
-            estimated_prompt_length += msg_length
-        
-        return truncated, False
+                break
+
+            # Check message count cap
+            if len(kept) >= self.max_messages:
+                logger.info(
+                    f"Context truncated to fit message cap: keeping "
+                    f"{len(kept)} of {len(context_messages)} messages."
+                )
+                break
+
+            kept.append(msg)
+            estimated_length += msg_length
+
+        # Restore to chronological order so the prompt reads naturally.
+        kept = list(reversed(kept))
+        truncated = len(kept) < len(context_messages)
+        return kept, truncated
     
     def format_context(self, context_messages, bot_email):
         """Format context messages into a readable string for the prompt."""
