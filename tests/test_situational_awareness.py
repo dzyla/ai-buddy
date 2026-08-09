@@ -280,3 +280,54 @@ def test_state_header_not_added_to_control_messages(tmp_path):
             if c.startswith("[CURRENT STATE step") and "read_file" not in c:
                 # This would be a header on think/other control; fail.
                 assert False, f"state header leaked onto a control tool message: {c}"
+
+
+# ── 7: ONE oversized `think` is capped and turns into an "act now" error ─────
+def test_oversized_think_capped_and_nudges_to_act(tmp_path):
+    """Hard case from a live run: the small model dumped its ENTIRE output budget
+    (~8k tokens) into a single giant `think` and then stalled, producing no file.
+    The harness must cap a single think's reasoning and surface a directive to
+    take a concrete action instead of thinking more."""
+    home = str(tmp_path)
+    huge = "L" * 4000  # well over the 2200-char cap
+    seq = _seq(_tool_call("think", {"reasoning": huge}),
+               _tool_call("task_complete", {"summary": "done"}))
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq),
+                    MOCK_REPLY_CONTENT="MOCK_OK",
+                    MOCK_TASK_COMPLETE="STOP") as srv:
+        res = run_binary(home, srv.base_url, ["--auto", "do a long careful task"],
+                         extra_env={"INFER_STEP_LIMIT": "50"})
+        assert res.returncode == 0, res.stdout + res.stderr
+    body = _tool_messages(MockServer(cap).requests() if os.path.exists(cap) else [])
+    # The model is told its think was far too long and to act instead.
+    assert "reasoning was very long" in body, body
+    assert "write_file" in body and "execute_command" in body, body
+    # The monolithic reasoning was NOT replayed in full (capped to save context).
+    assert ("L" * 4000) not in body, "oversized reasoning leaked into context"
+
+
+# ── 8: consecutive think-without-action triggers the productivity watchdog ───
+def test_consecutive_think_without_action_triggers_productivity_watchdog(tmp_path):
+    """Hard case: a small model chains `think` calls and never writes/builds
+    anything. The watchdog counts think-only loops and forces an 'act now'
+    directive, WITHOUT bricking a subsequent real action."""
+    home = str(tmp_path)
+    okf = tmp_path / "progress_target.txt"
+    okf.write_text("real work happened")
+    seq = ([_tool_call("think", {"reasoning": f"pass {i}"}) for i in range(4)] +
+           [_tool_call("read_file", {"path": str(okf)}),
+            _tool_call("task_complete", {"summary": "done"})])
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq),
+                    MOCK_REPLY_CONTENT="MOCK_OK",
+                    MOCK_TASK_COMPLETE="STOP") as srv:
+        res = run_binary(home, srv.base_url, ["--auto", "think before acting"],
+                         extra_env={"INFER_STEP_LIMIT": "50"})
+        assert res.returncode == 0, res.stdout + res.stderr
+    body = _tool_messages(MockServer(cap).requests() if os.path.exists(cap) else [])
+    # The watchdog fired: the model is told it is not making progress.
+    assert "without taking any concrete action" in body, body
+    assert "STOP thinking" in body, body
+    # ...but the real action still executed (watchdog nudges, does not brick).
+    assert "real work happened" in body, body
