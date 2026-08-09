@@ -6,7 +6,7 @@
 
 **Two-process architecture:**
 - **`ai.c`** — Main agent loop. Owns conversation state, calls the LLM, handles `think` / `task_complete` / `execute_command` natively, and delegates all other tool calls to `ai_mcp.py`.
-- **`ai_mcp.py`** — Tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server defined in `mcp.json`.
+- **`ai_mcp.py`** — Tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server defined in `mcp.json`. It has a `#!/usr/bin/env python3` shebang and is directly executable via `./ai_mcp.py`.
 
 **Build outputs:**
 - `ai` — main CLI binary
@@ -158,6 +158,7 @@ export INFER_MODEL="your-model-name"
 ### Testing
 - Run `make test` to verify C tests and pytest suite pass.
 - For new features, add a corresponding test in `tests/` or `dev/test_*.py`.
+- `tests/test_offline.py` validates the full tool backend, including `test_ai_mcp_directly_runnable` which checks that `ai_mcp.py` is executable via its shebang.
 - If a command fails, read the error, fix the root cause, and retry (at least 3 attempts before giving up).
 
 ---

@@ -287,6 +287,17 @@ def test_metrics_subcommand():
     assert res.returncode == 0
 
 
+def test_ai_mcp_directly_runnable():
+    """ai_mcp.py must be directly executable via its shebang (./ai_mcp.py)."""
+    mcp = os.path.join(REPO, "ai_mcp.py")
+    assert os.access(mcp, os.X_OK), "ai_mcp.py must have execute permission"
+    res = subprocess.run(
+        ["./ai_mcp.py", "show-metrics"],
+        cwd=REPO, capture_output=True, text=True
+    )
+    assert res.returncode == 0
+
+
 def test_invalid_arg_type():
     """Passing invalid argument type to read_file must return structured error."""
     res = subprocess.run(

@@ -319,7 +319,7 @@ For complete configuration instructions, bot creation, and setting up the system
 Two cooperating processes talk via subprocess calls — no shared library or IPC:
 
 - **`ai.c`** — the agent loop. Owns the conversation, calls the LLM, handles `think` / `task_complete` / `execute_command` natively, delegates all other tool calls to `ai_mcp.py`.
-- **`ai_mcp.py`** — the tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server in `mcp.json`.
+- **`ai_mcp.py`** — the tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server in `mcp.json`. It has a `#!/usr/bin/env python3` shebang and is directly executable via `./ai_mcp.py`.
 
 Additional processes and services:
 
