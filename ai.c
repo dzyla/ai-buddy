@@ -864,6 +864,15 @@ static struct {
     char error[600];
 } g_si_failed[SI_MAX_TRACKED];
 
+/* ── Situational awareness (state log) ──
+   Small models drop context and lose track of where they are mid-task. This is a
+   bounded, per-task rolling log of tool outcomes (step:tool=status) that gets
+   prepended as a [CURRENT STATE] header to every tool result, so the model always
+   sees its progress without having to hold it in memory. Disable with
+   INFER_STATE_CONTEXT=0. */
+static char g_state_log[512] = "";   /* rolling "stepN:tool=ok/ERR; " history for this task */
+static int  g_state_status = 0;      /* 1 if the LAST tool call erred (shared with the header) */
+
 /* ── Permission modes: 0=auto, 1=plan, 2=manual (defined above) ── */
 
 /* ── AGENTS.md integration ── */
@@ -4809,6 +4818,8 @@ int main(int argc, char **argv) {
             else step_limit = (step_env_val > 0) ? step_env_val : 30;
             int think_count = 0;
             for (int _si = 0; _si < SI_MAX_TRACKED; _si++) g_si_failed[_si].used = 0; /* reset failure-learning map per task */
+            g_state_log[0] = '\0';      /* reset situational state log per task */
+            g_state_status = 0;
             g_plan_approved = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
@@ -6003,7 +6014,28 @@ step_limit_check:
                                   strcmp(unescaped_name, "task_complete") != 0) {
                                   int is_err = (strncmp(tool_output, "Error:", 6) == 0 ||
                                                 strncmp(tool_output, "[Command Failed", 15) == 0 ||
-                                                strncmp(tool_output, "{\"error\"", 8) == 0);
+                                                strncmp(tool_output, "{\"error\"", 8) == 0 ||
+                                                strstr(tool_output, "failed (exit") != NULL ||
+                                                strstr(tool_output, "[SYSTEM WARNING:") != NULL);
+
+                                  /* Situational state: append this outcome to the rolling log
+                                     (bounded; oldest entries drop so a small model sees the recent
+                                     trajectory without context bloat). Skipped when INFER_STATE_CONTEXT=0. */
+                                  g_state_status = is_err ? 1 : 0;
+                                  {
+                                      const char *_sc = getenv("INFER_STATE_CONTEXT");
+                                      if (!_sc || atoi(_sc) != 0) {
+                                          char _entry[120];
+                                          snprintf(_entry, sizeof(_entry), "%d:%s=%s;", loop_count,
+                                                   unescaped_name ? unescaped_name : "?", is_err ? "ERR" : "ok");
+                                          while (strlen(g_state_log) + strlen(_entry) + 1 > sizeof(g_state_log)) {
+                                              char *_p2 = strchr(g_state_log, ';');
+                                              if (!_p2) { g_state_log[0] = '\0'; break; }
+                                              memmove(g_state_log, _p2 + 1, strlen(_p2 + 1) + 1);
+                                          }
+                                          strcat(g_state_log, _entry);
+                                      }
+                                  }
                                                 
                                   const char *graph_enforcement = "";
                                   const char *err_hint = "";
@@ -6140,9 +6172,14 @@ step_limit_check:
                                       free(full_content);
                                   }
 
-                                  size_t hlen = strlen(unescaped_name) + (tool_output ? strlen(tool_output) : 0) + 64;
+                                  size_t hlen = strlen(unescaped_name) + (tool_output ? strlen(tool_output) : 0) + 64
+                                              + (graph_enforcement ? strlen(graph_enforcement) : 0)
+                                              + (err_hint ? strlen(err_hint) : 0);
                                   char *hout = malloc(hlen);
-                                  snprintf(hout, hlen, "%s\n%s", unescaped_name, tool_output ? tool_output : "");
+                                  snprintf(hout, hlen, "%s\n%s%s%s", unescaped_name,
+                                           tool_output ? tool_output : "",
+                                           (graph_enforcement && *graph_enforcement) ? graph_enforcement : "",
+                                           (err_hint && *err_hint) ? err_hint : "");
                                   free(tool_output);
                                   tool_output = hout;
                               }
@@ -6214,6 +6251,24 @@ step_limit_check:
                                   tool_output = _bnt;
                                   free(g_plan_budget_note);
                                   g_plan_budget_note = NULL;
+                              }
+                              /* Prepend a compact situational header to the tool result so the model
+                                 always sees its step + status + recent trajectory (small models drop
+                                 this context if left implicit). Skipped when INFER_STATE_CONTEXT=0. */
+                              {
+                                  const char *_ln = unescaped_name ? unescaped_name : "";
+                                  if (g_state_log[0]
+                                      && strcmp(_ln, "think") != 0 && strcmp(_ln, "task_complete") != 0
+                                      && (!getenv("INFER_STATE_CONTEXT") || atoi(getenv("INFER_STATE_CONTEXT")) != 0)) {
+                                      const char *_src = tool_output ? tool_output : "";
+                                      size_t _cl = strlen(_src) + strlen(g_state_log) + 96;
+                                      char *_combined = malloc(_cl);
+                                      snprintf(_combined, _cl, "[CURRENT STATE step %d] %s -> %s  |  %s\n%s",
+                                               loop_count, _ln, g_state_status ? "error" : "ok",
+                                               g_state_log, _src);
+                                      if (tool_output) free(tool_output);
+                                      tool_output = _combined;
+                                  }
                               }
                               char *safe_output = json_escape(tool_output);
                               char *safe_id = json_escape(unescaped_id);
