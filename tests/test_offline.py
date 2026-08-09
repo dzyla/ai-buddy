@@ -125,6 +125,9 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     env["INFER_TOOL_CHOICE"] = "auto"
     if extra_env:
         env.update(extra_env)
+    import os as _os
+    _leak = {k: v for k, v in env.items() if k in ("INFER_BASE_URL","INFER_MODEL","INFER_CONTEXT_WINDOW")}
+    open("/tmp/run_binary_env.txt","a").write(f"port_leak_base={env.get("INFER_BASE_URL")} ctx={env.get("INFER_CONTEXT_WINDOW")} leak={_leak}\n")
     return subprocess.run([AI_BIN] + args, cwd=REPO, env=env,
                           stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, timeout=timeout)
