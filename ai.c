@@ -178,6 +178,9 @@ char current_session_id[64] = "";
 static int  g_hide_details = 0;
 static int  g_permission_mode = 0;
 static int  g_plan_approved = 0;   /* plan mode: user approved the presented plan */
+static int  g_plan_budget = 8;       /* INFER_PLAN_STEP_BUDGET: state-changing actions per plan approval (<=0 = unlimited) */
+static int  g_plan_remaining = 0;    /* credits left for the currently approved plan */
+static char *g_plan_budget_note = NULL; /* held until a mutating tool's output is finalized */
 
 /* ── Turn history storage for dynamic screen redrawing (Ctrl+O toggle) ── */
 typedef enum {
@@ -936,6 +939,7 @@ static int tool_is_mutating(const char *name) {
         "write_file","edit_file","save_memory","remember",
         "learn_rule","vault_write","schedule_task","set_reminder",
         "unschedule_task","start_background_process","stop_process","delegate_task",
+        "spawn_agent","resume_agent","append_context_pool",
         "skill_create","skill_update","skill_note",
         NULL
     };
@@ -944,8 +948,52 @@ static int tool_is_mutating(const char *name) {
     return 0;
 }
 
+static int tool_is_readonly(const char *name) {
+    /* Deny-by-default: only tools in this allowlist may run WITHOUT approval in
+       PLAN/MANUAL mode. Everything else (mutators AND unknown/new MCP tools) is
+       treated as state-changing and gated. This stops a small model from using an
+       unlisted tool to change state while a plan is supposed to be in control.
+       Keep read-only investigation tools here so plan-mode research stays free. */
+    if (!name) return 0;
+    static const char *ro[] = {
+        "think","web_search","arxiv_search","fetch_webpage","fetch_smart","read_file",
+        "list_directory","recall","list_processes","check_process_status","parallel_fetch",
+        "load_skill","fetch_webpage_js","get_system_status","get_clipboard",
+        "vault_read","vault_search","vault_backlinks","pubmed_search",
+        "gcal_list_events","gcal_check_availability","check_time","list_scheduled_tasks",
+        "search_history","list_sessions","get_session","present_plan","task_complete",
+        "scientific__pdb_parse","scientific__uniprot_search","scientific__align_sequences",
+        "scientific__data_analysis","scientific__security_audit",
+        NULL
+    };
+    for (int i = 0; ro[i]; i++)
+        if (strcmp(name, ro[i]) == 0) return 1;
+    return 0;
+}
+
+/* Plan-mode step budget: a single present_plan approval grants a BOUNDED number of
+   state-changing actions (execute_command + mutating MCP tools) before the agent is
+   forced to present an updated plan and be re-approved. This stops one approval from
+   unlocking an unbounded, multi-minute rampage - especially on small models. */
+static void plan_budget_consume(void) {
+    if (g_permission_mode != 1 || !g_plan_approved) return;
+    if (g_plan_budget <= 0) return;              /* INFER_PLAN_STEP_BUDGET=0 => unlimited */
+    if (g_plan_remaining > 0) g_plan_remaining--;
+    if (g_plan_remaining <= 0) {
+        g_plan_approved = 0;
+        g_plan_remaining = 0;
+        if (!g_plan_budget_note) {
+            g_plan_budget_note = strdup(
+                "[PLAN BUDGET EXHAUSTED] The approved plan's step budget is spent. "
+                "Do NOT start new state-changing work. Either call present_plan with the "
+                "next concrete set of changes to receive a new approval, or call task_complete "
+                "to report progress. Further changes are blocked until a new plan is approved.");
+        }
+    }
+}
+
 const char *SYSTEM_PROMPT =
-    "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
+    "By default you are a fully autonomous CLI agent in FULL AUTONOMY mode - Output in clean markdown and follow these rules exactly. MOST IMPORTANT: respect the CURRENT PERMISSION MODE injected below - in PLAN/MANUAL mode you must investigate first, then present_plan and wait for approval before ANY state change, and work in small approved steps, not one long unattended run:\n\n"
     "SCIENTIFIC ADVISOR RIGOR (highest priority):\n"
     "- You are an elite scientific advisor. You must use the `think` tool to reason step-by-step before EVERY major action. Do NOT guess.\n"
     "- For small models to succeed, rigorous chain-of-thought is required. Always analyze the current state, form a hypothesis, and plan your next tool call using `think`.\n"
@@ -968,17 +1016,22 @@ const char *SYSTEM_PROMPT =
     "- NEVER run interactive terminal programs like `vim`, `nano`, `top`, `less`, or `ssh` via execute_command as they will hang the agent. Use provided tools instead.\n"
     "- For long-running jobs (e.g. scrapers, downloads, python scripts, servers, heavy builds), NEVER use execute_command as it blocks the main thread and locks the GUI! Use `start_background_process` instead, and monitor it autonomously using `check_process_status` (often via `schedule_task` polling).\n"
     "- NEVER run `find /` or search indiscriminately from the root directory; it will hang forever. Always constrain searches to specific, relevant directories (e.g., `./` or `~/Code`).\n"
-    "- NEVER describe what the user can do themselves. If a tool can get the answer, use it.\n\n"
+    "- NEVER describe what the user can do themselves - if a tool can get an answer, call it. In PLAN/MANUAL mode call read-only tools freely, but present_plan before any state-changing one.\n\n"
+    "CHECKPOINT & VALIDATE (CRITICAL FOR SMALL MODELS):\n"
+    "- Do ONE planned step at a time, then check the tool result against the plan before starting the next step.\n"
+    "- After any write/edit or command, validate: compile, run the relevant test, or read the output.\n"
+    "- In PLAN mode an approval grants a BOUNDED number of state-changing actions (INFER_PLAN_STEP_BUDGET). When that budget is exhausted the harness blocks further changes and tells you to present_plan again - do exactly that (or task_complete), never keep going.\n"
+    "- If a step fails validation, stop, think, and adjust; do not barrel through unrelated changes.\n\n"
     "CITATIONS:\n"
     "- fetch_webpage and read_file (PDF) results begin with a [Source: ...] line. Track every source whose content you use.\n"
     "- In your task_complete summary, always end with a '## Sources' section listing each [Source: ...] URL or file path you drew from.\n"
     "- Do not list sources you fetched but did not use in the answer.\n\n"
     "FAILURE RECOVERY:\n"
     "- If execute_command fails, read the error, fix the root cause, and retry. At least 3 attempts before giving up.\n"
-    "- If a library is missing, install it non-interactively (e.g. `pip install --user` or `sudo apt-get install -y`). If a web source is blocked or noisy, find an alternative.\n"
+    "- If a library is missing: in AUTO mode install it non-interactively (e.g. `pip install --user` or `sudo apt-get install -y`). In PLAN/MANUAL mode, instead propose the install command in your present_plan and wait for approval. If a web source is blocked or noisy, find an alternative.\n"
     "- If fetch_webpage returns a WARNING about JavaScript or returns fewer than 80 words, the page is JS-only. Switch to execute_command with curl to a plain-text API instead.\n"
     "- For current weather: execute_command `curl -s 'wttr.in/Miami?format=3'` (replace city name). Never rely on weather.com/weather.gov — they require JavaScript.\n"
-    "- Never tell the user to 'visit a link' or 'run a command themselves' — do it yourself.\n\n"
+    "- Never tell the user to 'visit a link' or 'run a command themselves' — do the read-only investigation yourself with tools; in PLAN/MANUAL mode present a plan before state changes.\n\n"
     "PARALLEL EXECUTION (use these tools whenever work can be split):\n"
     "- parallel_fetch({\"urls\":[\"url1\",\"url2\",...]}) — fetch N pages at once. Use instead of N sequential fetch_webpage calls. Ideal for reading multiple search results, papers, or docs.\n"
     "- delegate_task({\"tasks\":[\"task1\",\"task2\",...]}) — spawn N agents concurrently. Use for independent sub-tasks that need their own tool loops (summarise a paper, write a script, run a benchmark). Always pass tasks as an ARRAY, never as a single string.\n"
@@ -1054,8 +1107,8 @@ static char* get_system_context() {
                  "- Investigate, read, search, and run READ-ONLY commands freely.\n"
                  "- DO NOT change anything (no write/edit/execute of state-changing commands / memory / schedule) until your plan is approved.\n"
                  "- To make changes: call present_plan(plan=\"...\") with your findings, the exact changes, and rationale; wait for approval.\n"
-                 "- Once a plan is approved you work AUTONOMOUSLY until you have another question or the task is done.\n"
-                 "- If your present_plan is rejected, revise and call present_plan again. Report discoveries and check your work before finishing.\n");
+                 "- Once a plan is approved you may make a BOUNDED number of state-changing actions (INFER_PLAN_STEP_BUDGET, default 8). When the budget runs out the harness blocks further changes; you MUST present_plan again before more changes.\n"
+                 "- Execute step by step: do ONE step, validate its result, then continue. For complex work, delegate individual steps to subagents and verify each result. If an approval is rejected, revise and call present_plan again.\n");
     } else if (g_permission_mode == 2) {
         size_t pl = strlen(buf);
         snprintf(buf + pl, 4096 - pl,
@@ -4726,10 +4779,11 @@ int main(int argc, char **argv) {
             int loop_count = 0;
             int has_more = 1;
             int step_limit;
+            const char *step_env = getenv("INFER_STEP_LIMIT");
+            int step_env_val = step_env ? atoi(step_env) : 0;
             if (g_continue_until_done) step_limit = 999999;
-            else if (g_permission_mode == 0 && !isatty(STDIN_FILENO)) step_limit = 999999; /* auto + non-tty = full autonomy */
-            else if (!isatty(STDIN_FILENO)) step_limit = 60; /* plan/manual non-tty: finite, won't run away */
-            else step_limit = 30;
+            else if (!isatty(STDIN_FILENO)) step_limit = (step_env_val > 0) ? step_env_val : 60; /* non-tty always finite; no infinite autonomy */
+            else step_limit = (step_env_val > 0) ? step_env_val : 30;
             int think_count = 0;
             g_plan_approved = 0;
             g_esc_requested = 0;
@@ -5269,7 +5323,11 @@ step_limit_check:
                                     if (!plan_txt) plan_txt = strdup(unescaped_args);
                                     int approved = 0;
                                     if (g_permission_mode == 1) {
-                                        approved = prompt_user_ok("APPROVE PLAN", plan_txt);
+                                        const char *pauto = getenv("INFER_PLAN_AUTOAPPROVE");
+                                        if (pauto && *pauto) {
+                                            approved = 1; /* opt-in auto-approve (trusted/harnessed/bridge runs only) */
+                                        } else {
+                                            approved = prompt_user_ok("APPROVE PLAN", plan_txt);
                                         if (approved == -1) {
                                             /* No interactive terminal (piped/bridge run). The user cannot
                                                approve here; present the plan and finish so the plan is the
@@ -5289,8 +5347,11 @@ step_limit_check:
                                             /* Hand control back so the loop produces a final answer. */
                                             goto present_plan_done;
                                         }
+                                        }
                                         /* plan mode: applicant approval unlocks autonomy for this task */
                                         g_plan_approved = approved ? 1 : 0;
+                                        g_plan_remaining = approved ? g_plan_budget : 0;
+                                        if (g_plan_budget_note) { free(g_plan_budget_note); g_plan_budget_note = NULL; }
                                     } else {
                                         /* auto/manual: present_plan is informational only.
                                            It must NOT set g_plan_approved in manual mode,
@@ -5736,6 +5797,7 @@ step_limit_check:
                                                   if (exit_code == 0 && g_git_commit_enabled && (g_permission_mode == 0 || g_plan_approved)) {
                                                       git_commit("command");
                                                   }
+                                                  if (g_permission_mode == 1) plan_budget_consume();
                                               }
                                           } else if (approved == 2) {
                                               fprintf(stderr, "\r\033[2K\033[36m  ⬡ $ %s (background)\033[0m\n", cmd_val);
@@ -5775,8 +5837,9 @@ step_limit_check:
                                       mcp_tool_name = unescaped_name;
                                   }
 
-                                  /* Mode-based approval gate for mutating MCP tools */
-                                  if (tool_is_mutating(mcp_tool_name)) {
+                                  /* Mode-based approval gate. In non-auto modes gate any MCP tool that mutates
+                                  OR is not on the read-only allowlist (deny-by-default). */
+                                  if (g_permission_mode != 0 && (tool_is_mutating(mcp_tool_name) || !tool_is_readonly(mcp_tool_name))) {
                                       if (g_permission_mode == 2) {
                                           int ok = prompt_user_ok(mcp_tool_name, unescaped_args);
                                           if (ok == 0 || ok == -1) {
@@ -5790,6 +5853,8 @@ step_limit_check:
                                           goto mcp_gated;
                                       }
                                   }
+                                  if (g_permission_mode == 1 && g_plan_approved && (tool_is_mutating(mcp_tool_name) || !tool_is_readonly(mcp_tool_name)))
+                                      plan_budget_consume();
 
                                   /* Show a human-readable line for what the model is doing */
                                   if (strcmp(mcp_tool_name, "read_file") == 0 ||
@@ -5991,6 +6056,16 @@ step_limit_check:
                                   goto end_tool_iter;
                               }
 
+                              if (g_plan_budget_note) {
+                                  size_t _bnl = strlen(g_plan_budget_note) + (tool_output ? strlen(tool_output) : 0) + 2;
+                                  char *_bnt = malloc(_bnl);
+                                  if (tool_output) snprintf(_bnt, _bnl, "%s%s", g_plan_budget_note, tool_output);
+                                  else snprintf(_bnt, _bnl, "%s", g_plan_budget_note);
+                                  if (tool_output) free(tool_output);
+                                  tool_output = _bnt;
+                                  free(g_plan_budget_note);
+                                  g_plan_budget_note = NULL;
+                              }
                               char *safe_output = json_escape(tool_output);
                               char *safe_id = json_escape(unescaped_id);
                               char *safe_name = json_escape(unescaped_name);

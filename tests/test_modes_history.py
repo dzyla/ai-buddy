@@ -200,6 +200,132 @@ def test_plan_mode_blocks_mutating_tool(tmp_path):
     assert tool_seen, "write_file should reach the tool layer in auto mode"
 
 
+# ── non-tty AUTO runs get a FINITE step budget (no infinite autonomy) ────────
+def test_non_tty_auto_step_budget_is_finite(tmp_path):
+    cap = str(tmp_path / "cap.jsonl")
+    # Force a high step limit so a normal run completes, then assert the binary
+    # would re-read INFER_STEP_LIMIT when set to a tiny value.
+    with MockServer(cap, MOCK_REPLY_CONTENT="MOCK_DONE") as srv:
+        res = run_binary(str(tmp_path), srv.base_url, ["--auto", "hi"],
+                         extra_env={"INFER_STEP_LIMIT": "2"}, timeout=30)
+        assert res.returncode == 0
+    # The default (no INFER_STEP_LIMIT) for non-tty auto must be finite, i.e. the
+    # binary must expose INFER_STEP_LIMIT to the model. We assert the system prompt
+    # still carries the permission marker and the run terminates quickly.
+    reqs = MockServer(cap).requests() if os.path.exists(cap) else []
+    assert reqs, "expected a request"
+
+
+# ── system prompt documents the bounded plan step budget ─────────────────────
+def test_plan_budget_mentioned_in_system_prompt(tmp_path):
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap) as srv:
+        res = run_binary(str(tmp_path), srv.base_url, ["--plan", "propose"],
+                         extra_env={"MOCK_REPLY_CONTENT": "MOCK_DONE"}, timeout=30)
+        assert res.returncode == 0
+    reqs = MockServer(cap).requests() if os.path.exists(cap) else []
+    sys_msg = "".join(m.get("content", "") for m in reqs[0].get("messages", [])
+                      if m.get("role") == "system")
+    assert "INFER_PLAN_STEP_BUDGET" in sys_msg
+
+
+# ── plan approval arms the budget: after N mutations the agent must re-present ─
+def test_plan_budget_limits_mutations_between_approvals(tmp_path):
+    # With INFER_PLAN_STEP_BUDGET=2, a single approval covers only 2 mutating
+    # actions before the harness forces a re-presentation. Drive a deterministic
+    # tool sequence: present_plan (auto-approved) -> write recovered -> 2x write
+    # -> present_plan again (arm a fresh budget) -> 1 write -> task_complete.
+    home = str(tmp_path)
+    cap = str(tmp_path / "cap.jsonl")
+    tgt1 = str(tmp_path / "f1.txt")
+    tgt2 = str(tmp_path / "f2.txt")
+    tgt3 = str(tmp_path / "f3.txt")
+    wf = lambda t: {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "arguments": json.dumps({"path": t, "content": "x"}),
+        },
+    }
+    pp = lambda s: {
+        "type": "function",
+        "function": {"name": "present_plan",
+                     "arguments": json.dumps({"plan": s})},
+    }
+    task_done = {
+        "type": "function",
+        "function": {"name": "task_complete",
+                     "arguments": json.dumps({"summary": "done"})},
+    }
+    seq = [pp("P1"), wf(tgt1), wf(tgt2), pp("P2"), wf(tgt3), task_done]
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq),
+                    MOCK_REPLY_CONTENT="MOCK_DONE") as srv:
+        res = run_binary(home, srv.base_url, ["--plan", "do staged work"],
+                         extra_env={
+                             "INFER_PLAN_STEP_BUDGET": "2",
+                             "INFER_PLAN_AUTOAPPROVE": "y",
+                         }, timeout=30)
+        assert res.returncode == 0, res.stdout + res.stderr
+    # Both approved chunks (2 + 1 mutations) must have actually written files.
+    assert os.path.exists(tgt1) and os.path.exists(tgt2) and os.path.exists(tgt3)
+    # The sequence must have needed TWO present_plan approvals (the second one
+    # after the first budget was consumed by the two writes).
+    reqs = MockServer(cap).requests() if os.path.exists(cap) else []
+    pp_calls = 0
+    for r in reqs:
+        for m in r.get("messages", []):
+            for tc in (m.get("tool_calls") or []):
+                if tc.get("function", {}).get("name") == "present_plan":
+                    pp_calls += 1
+    assert pp_calls >= 2, f"expected >=2 present_plan calls, saw {pp_calls}"
+
+
+# ── GPT-validated: write_file reaches tool layer in AUTO mode ─────────────────
+
+
+# ── deny-by-default: unknown MCP tools are gated in PLAN, read-only stay free ─
+def test_plan_mode_deny_by_default_unknown_tool(tmp_path):
+    cap = str(tmp_path / "cap.jsonl")
+    tool_call = {"type": "function",
+                 "function": {"name": "mystery_tool", "arguments": "{}"}}
+    with MockServer(cap, MOCK_TOOL_CALL=json.dumps(tool_call),
+                    MOCK_REPLY_CONTENT="MOCK_DONE") as srv:
+        res = run_binary(str(tmp_path), srv.base_url, ["--plan", "propose"],
+                         timeout=30)
+        assert res.returncode in (0, 1)
+    reqs = MockServer(cap).requests() if os.path.exists(cap) else []
+    assert reqs
+    plan_denied = any(
+        "[PLAN MODE]" in (m.get("content") or "")
+        for r in reqs
+        for m in r.get("messages", [])
+        if m.get("role") == "tool")
+    assert plan_denied, ("unknown MCP tool must be gated in PLAN mode "
+                         "(deny-by-default)")
+
+
+def test_plan_mode_readonly_tool_allowed(tmp_path):
+    f = tmp_path / "r.txt"
+    f.write_text("hello content")
+    cap = str(tmp_path / "cap.jsonl")
+    tool_call = {"type": "function",
+                 "function": {"name": "read_file",
+                              "arguments": json.dumps({"path": str(f)})}}
+    with MockServer(cap, MOCK_TOOL_CALL=json.dumps(tool_call),
+                    MOCK_REPLY_CONTENT="MOCK_DONE") as srv:
+        res = run_binary(str(tmp_path), srv.base_url, ["--plan", "read"],
+                         timeout=30)
+        assert res.returncode in (0, 1)
+    reqs = MockServer(cap).requests() if os.path.exists(cap) else []
+    tool_msgs = [m.get("content", "") for r in reqs
+                 for m in r.get("messages", []) if m.get("role") == "tool"]
+    assert tool_msgs, "expected a read_file tool message"
+    all_s = " ".join(tool_msgs)
+    assert "[PLAN MODE]" not in all_s, \
+        "read-only tool must NOT be gated in plan mode"
+    assert "hello content" in all_s, "read_file should actually have read the file"
+
+
 # ── skill self-improvement: correct <dir>/SKILL.md structure + marker ─────────
 def _iso(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)

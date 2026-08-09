@@ -1,6 +1,6 @@
 ---
 name: small-model-harness
-description: Best practices and agent loop guidelines specifically tuned for small (32-35B) models.
+description: Best practices and agent loop guidelines specifically tuned for small (32-35B) models: plan→approve→step→validate.
 ---
 
 # Small Model Harness Guidelines
@@ -11,7 +11,9 @@ state-changing action.
 
 ## 0. Permission mode reminders
 - **PLAN**: read/search are free; DO NOT change anything until `present_plan` is
-  approved. Present findings + exact changes, wait, then work autonomously after approval.
+  approved. Present findings + exact changes, wait, then work in **small bounded steps**
+  (the harness blocks changes once the approved step budget, `INFER_PLAN_STEP_BUDGET`,
+  is spent — then re-present for the next chunk).
 - **MANUAL**: every state-changing action needs explicit approval.
 - **FULL AUTONOMY**: investigate, execute, verify, finish.
 
@@ -21,15 +23,19 @@ state-changing action.
   is allowed.
 - Execute exactly **one step per turn**. Do not combine multiple unrelated tool calls
   in a single turn.
+- **Validate each step** before the next: compile, run the relevant test, or read the
+  output. Never chain edits you have not verified.
 - If you lose track, review your plan and check off completed steps before proceeding.
+- In PLAN mode, when the harness says the approved step budget is exhausted, call
+  `present_plan` again for the next small chunk — never bulldoze past it.
 
 ## 2. Reflexion and Error Recovery
 - If a command fails, **stop and reflect** (`think`).
-- Read the error output carefully and state what went wrong and how you'll fix it
-  before making another tool call. Do not blindly retry the exact same command.
-- **CRITICAL: Search for Documentation First**. If you hit an API error, missing
-  method, or library usage problem you don't immediately know how to fix, DO NOT guess
-  and iterate by brute force. Use `web_search` / `curl` to find official docs or examples.
+- Read the error output carefully and state what went wrong and how you'll fix it before
+  making another tool call. Do not blindly retry the exact same command.
+- **CRITICAL: Search for Documentation First**. If you hit an API error, missing method,
+  or library usage problem you don't immediately know how to fix, DO NOT guess and
+  iterate by brute force. Use `web_search` / `curl` to find official docs or examples.
 
 ## 3. Context Management
 - Avoid tools that produce massive output unless necessary. Use `grep` over `read_file`
@@ -43,11 +49,12 @@ state-changing action.
   test fixtures. Run build + test before `task_complete`.
 - Never build shell commands via raw single-quote interpolation; write to files/stdin.
 
-## 5. Termination
+## 5. Termination & Checkpoints
+- After each approved chunk, report progress by re-presenting the next chunk or by
+  calling `task_complete`. Do not run for many minutes without a checkpoint in PLAN/MANUAL
+  mode.
 - Once the task is complete, call `task_complete` immediately.
-- Do not perform unnecessary re-verification unless the permission mode or task
-  requires it. In plan/manual mode still ask before mutating; in autonomous mode finish
-  and report.
+- In AUTO mode, still verify before finishing and report.
 
 ## 6. Self-improvement
 - Solved something reusable this session? Persist it:
