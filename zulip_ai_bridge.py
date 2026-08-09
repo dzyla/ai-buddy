@@ -574,6 +574,29 @@ class ZulipAiBridge:
             logger.info(f"Context truncated from {len(context_messages)} to {len(truncated_messages)} messages")
         return truncated_messages
 
+    def run(self):
+        """Start the Zulip AI Bridge with automatic reconnection."""
+        print("🚀 Starting Zulip AI Bridge listener (threaded — concurrent messages supported)...")
+        
+        max_backoff = 60  # Maximum backoff in seconds
+        current_backoff = 1
+        
+        while True:
+            try:
+                self.client.call_on_each_message(self.handle_message)
+            except (ConnectionError, requests.exceptions.RequestException) as e:
+                print(f"⚠️ Connection error: {e}")
+                print(f"⏳ Reconnecting in {current_backoff}s...")
+                import time
+                time.sleep(current_backoff)
+                current_backoff = min(current_backoff * 2, max_backoff)
+            except Exception as e:
+                print(f"❌ Unexpected error: {e}")
+                print(f"⏳ Restarting in {current_backoff}s...")
+                import time
+                time.sleep(current_backoff)
+                current_backoff = min(current_backoff * 2, max_backoff)
+
 
 class ContextWindowManager:
     """Manages conversation context to stay within AI model's context window."""
@@ -650,31 +673,6 @@ class ContextWindowManager:
         context_lines.append("Latest query/message:")
         
         return "\n".join(context_lines)
-
-
-    def run(self):
-        """Start the Zulip AI Bridge with automatic reconnection."""
-        print("🚀 Starting Zulip AI Bridge listener (threaded — concurrent messages supported)...")
-        
-        max_backoff = 60  # Maximum backoff in seconds
-        current_backoff = 1
-        
-        while True:
-            try:
-                self.client.call_on_each_message(self.handle_message)
-            except (ConnectionError, requests.exceptions.RequestException) as e:
-                print(f"⚠️ Connection error: {e}")
-                print(f"⏳ Reconnecting in {current_backoff}s...")
-                import time
-                time.sleep(current_backoff)
-                current_backoff = min(current_backoff * 2, max_backoff)
-            except Exception as e:
-                print(f"❌ Unexpected error: {e}")
-                print(f"⏳ Restarting in {current_backoff}s...")
-                import time
-                time.sleep(current_backoff)
-                current_backoff = min(current_backoff * 2, max_backoff)
-
 
 if __name__ == "__main__":
     try:
