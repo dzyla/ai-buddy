@@ -873,6 +873,16 @@ static struct {
 static char g_state_log[512] = "";   /* rolling "stepN:tool=ok/ERR; " history for this task */
 static int  g_state_status = 0;      /* 1 if the LAST tool call erred (shared with the header) */
 
+/* ------- Small-model productivity watchdog -------
+   A small local model can burn its entire output budget on one giant `think`
+   block (or a long chain of `think` calls) and end the task having produced
+   NO artifact. We cap how much of a single think we keep and count consecutive
+   think-without-action loops; crossing the limit forces a concrete-action nudge.
+   'Productive' = any tool that is NOT read-only (see tool_is_readonly()). */
+static int g_think_since_action = 0; /* consecutive think/read-only loops since last productive action */
+static int g_think_max_chars = 2200; /* INFER_THINK_MAX_CHARS: cap a single think's reasoning length */
+
+
 /* ── Permission modes: 0=auto, 1=plan, 2=manual (defined above) ── */
 
 /* ── AGENTS.md integration ── */
@@ -5312,14 +5322,38 @@ step_limit_check:
                                            }
                                        }
                                        if (reasoning) {
-                                           add_turn_item(ITEM_THINKING, "thinking", NULL, reasoning, 0, 0, 0, 0);
-                                           if (!quiet_mode) {
-                                               print_think_box(reasoning);
-                                               fflush(stderr);
-                                           }
-                                           free(reasoning);
-                                       }
+                                   size_t rlen = strlen(reasoning);
+                                   g_think_since_action++;
+                                   if (rlen > (size_t)g_think_max_chars) reasoning[g_think_max_chars] = '\0';
+                                   add_turn_item(ITEM_THINKING, "thinking", NULL, reasoning, 0, 0, 0, 0);
+                                   if (!quiet_mode) {
+                                       print_think_box(reasoning);
+                                       fflush(stderr);
+                                   }
+                                   char think_out[900];
+                                   int act_limit = 3;
+                                   const char *tal = getenv("INFER_THINK_ACTION_LIMIT");
+                                   if (tal && atoi(tal) > 0) act_limit = atoi(tal);
+                                   if (rlen > (size_t)g_think_max_chars) {
+                                       snprintf(think_out, sizeof(think_out),
+                                           "Error: Your 'think' reasoning was very long (%zu chars) so it was cut to %d chars to save "
+                                           "budget. Long think blocks are the #1 reason small local models stall and never produce output. "
+                                           "Keep 'think' to a MAXIMUM of 3 short sentences. Do NOT re-type your plan, code, or analysis inside "
+                                           "thinking. Take your next concrete action with an ACTION tool (write_file to write your code, or "
+                                           "execute_command to build/run) instead of thinking more.", (unsigned long)rlen, g_think_max_chars);
+                                       tool_output = strdup(think_out);
+                                   } else if (g_think_since_action >= act_limit) {
+                                       snprintf(think_out, sizeof(think_out),
+                                           "Error: You have called 'think' %d times in a row without taking any concrete action "
+                                           "(writing a file or running a command). You are not making progress. "
+                                           "STOP thinking. Take ONE concrete action NOW with write_file (write your code) or execute_command "
+                                           "(build/run). You may call 'think' again only AFTER you have acted.", g_think_since_action);
+                                       tool_output = strdup(think_out);
+                                   } else {
                                        tool_output = strdup("{\"ok\":true}");
+                                   }
+                                   free(reasoning);
+}
                                    }
                                } else if (strcmp(unescaped_name, "task_complete") == 0) {
                                    jsmn_parser arg_parser;
@@ -6022,6 +6056,7 @@ step_limit_check:
                                      (bounded; oldest entries drop so a small model sees the recent
                                      trajectory without context bloat). Skipped when INFER_STATE_CONTEXT=0. */
                                   g_state_status = is_err ? 1 : 0;
+                                  if (!tool_is_readonly(unescaped_name)) g_think_since_action = 0;
                                   {
                                       const char *_sc = getenv("INFER_STATE_CONTEXT");
                                       if (!_sc || atoi(_sc) != 0) {
@@ -6346,7 +6381,7 @@ step_limit_check:
                                                 } else {
                                                     messages_json = append_message(messages_json,
                                                         "{\"role\":\"user\",\"content\":\"Your last response was cut off "
-                                                        "by the token limit. Call task_complete now with your current "
+                                                        "by the token limit. This is almost always because you wrote an over-long 'think' block or dumped too much into one response, which stalls small local models and stops them from ever reaching the deliverable. Do NOT write another long think. Next: keep 'think' to a MAXIMUM of 3 short sentences, then make ONE concrete ACTION tool call (write_file to create your code file, or execute_command to build/run). If you have already completed the deliverable, call task_complete with your summary instead."
                                                         "best answer.\\\"}");
                                                     has_more = 1;
                                                 }
