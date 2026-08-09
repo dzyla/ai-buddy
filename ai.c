@@ -4791,6 +4791,8 @@ int main(int argc, char **argv) {
             char *last_tool_name = NULL;
             char *last_tool_args = NULL;
             int same_tool_count = 0;
+            int length_nudge_count = 0;   /* consecutive token-limit nudges; force completion if model never progresses */
+            int force_complete_after = 5; /* INFER_NUDGE_CAP: bail out and force task_complete after this many stalled nudges */
             struct timespec task_start;
             clock_gettime(CLOCK_MONOTONIC, &task_start);
 
@@ -6120,14 +6122,33 @@ step_limit_check:
                       }
                   } else {
                       if (finish_reason_length) {
-                          fprintf(stderr, "\033[1;33m[ai] Warning: model hit token limit — "
-                                          "response truncated. Nudging to complete.\033[0m\n");
-                          messages_json = append_message(messages_json,
-                              "{\"role\":\"user\",\"content\":\"Your last response was cut off "
-                              "by the token limit. Call task_complete now with your current "
-                              "best answer.\"}");
-                          has_more = 1;
-                      } else {
+                                                const char *nudge_cap_env = getenv("INFER_NUDGE_CAP");
+                                                if (nudge_cap_env && atoi(nudge_cap_env) > 0)
+                                                    force_complete_after = atoi(nudge_cap_env);
+                                                length_nudge_count++;
+                                                fprintf(stderr, "\033[1;33m[ai] Warning: model hit token limit — "
+                                                                "response truncated. Nudging to complete.\033[0m\n");
+                                                if (length_nudge_count >= force_complete_after) {
+                                                    fprintf(stderr,
+                                                        "\033[1;31m[ai] Model stalled (hit token limit %d consecutive "
+                                                        "times with no completion). Forcing task_complete.\033[0m\n",
+                                                        length_nudge_count);
+                                                    messages_json = append_message(messages_json,
+                                                        "{\"role\":\"user\",\"content\":\"[STALL] Your responses keep hitting the "
+                                                        "token limit without any progress and without calling task_complete. "
+                                                        "STOP taking additional actions. Call task_complete NOW with your best "
+                                                        "summary of work done so far. Do not call any more tools.\\\"}");
+                                                    loop_count = 28; /* allow exactly one more iteration */
+                                                    length_nudge_count = 0;
+                                                    has_more = 1;
+                                                } else {
+                                                    messages_json = append_message(messages_json,
+                                                        "{\"role\":\"user\",\"content\":\"Your last response was cut off "
+                                                        "by the token limit. Call task_complete now with your current "
+                                                        "best answer.\\\"}");
+                                                    has_more = 1;
+                                                }
+                                            } else {
                       has_more = 0;
 
                       int content_tok = -1;
