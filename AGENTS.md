@@ -75,6 +75,7 @@ export INFER_MODEL="your-model-name"
 ├── gcal.py               # Google Calendar CLI integration (list/create/update/delete/availability)
 ├── pubmed_mcp_server.py  # PubMed MCP server
 ├── deep_research.py      # Deep research tool
+├── zulip_mcp_server.py   # Zulip MCP server
 ├── zulip_ai_bridge.py    # Zulip bot bridge (file parsing, reconnection, ContextWindowManager)
 ├── .agents/skills/       # Domain skills directory (loaded via load_skill)
 │   ├── autonomous_troubleshooting
@@ -95,6 +96,7 @@ export INFER_MODEL="your-model-name"
 │   ├── robinhood_mcp
 │   ├── scientific_writing
 │   ├── small_model_reasoning
+│   ├── small-model-harness
 │   ├── smart_web_fetch
 │   ├── structure_based_design
 │   ├── subagents
