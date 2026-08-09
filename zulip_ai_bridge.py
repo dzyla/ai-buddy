@@ -281,8 +281,27 @@ class ZulipAiBridge:
         t.start()
 
     def run(self):
+        """Start the Zulip AI Bridge with automatic reconnection."""
         print("🚀 Starting Zulip AI Bridge listener (threaded — concurrent messages supported)...")
-        self.client.call_on_each_message(self.handle_message)
+        
+        max_backoff = 60  # Maximum backoff in seconds
+        current_backoff = 1
+        
+        while True:
+            try:
+                self.client.call_on_each_message(self.handle_message)
+            except (ConnectionError, requests.exceptions.RequestException) as e:
+                print(f"⚠️ Connection error: {e}")
+                print(f"⏳ Reconnecting in {current_backoff}s...")
+                import time
+                time.sleep(current_backoff)
+                current_backoff = min(current_backoff * 2, max_backoff)
+            except Exception as e:
+                print(f"❌ Unexpected error: {e}")
+                print(f"⏳ Restarting in {current_backoff}s...")
+                import time
+                time.sleep(current_backoff)
+                current_backoff = min(current_backoff * 2, max_backoff)
 
 
 if __name__ == "__main__":
