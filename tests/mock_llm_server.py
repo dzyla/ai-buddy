@@ -19,6 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Handler(BaseHTTPRequestHandler):
+    _seq_idx = 0  # index into MOCK_TOOL_SEQ for the current server process
+
     def log_message(self, *args):
         pass  # silence
 
@@ -47,12 +49,25 @@ class Handler(BaseHTTPRequestHandler):
         content = os.environ.get("MOCK_REPLY_CONTENT", "MOCK_OK")
         summary = os.environ.get("MOCK_TASK_COMPLETE")
         tool_call_env = os.environ.get("MOCK_TOOL_CALL")
+        seq_env = os.environ.get("MOCK_TOOL_SEQ")
+        seq = json.loads(seq_env) if seq_env else None
 
         msgs = body.get("messages", [])
         last_is_tool = msgs and msgs[-1].get("role") == "tool"
 
-        if tool_call_env and not last_is_tool:
+        tc = None
+        if seq is not None:
+            # MOCK_TOOL_SEQ: drive a deterministic tool sequence. Consume one
+            # item per LLM request regardless of message history so the loop can
+            # span multiple tool calls; when the sequence is exhausted, fall
+            # through to the normal content/task_complete reply.
+            if Handler._seq_idx < len(seq):
+                tc = seq[Handler._seq_idx]
+                Handler._seq_idx += 1
+        elif tool_call_env and not last_is_tool:
             tc = json.loads(tool_call_env)
+
+        if tc is not None:
             fn = tc.get("function", {})
             self.send_response(200)
             if stream:

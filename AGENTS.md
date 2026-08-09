@@ -57,8 +57,10 @@ ai --manual "tidy the scripts dir"       # you approve every state-changing acti
   Read-only investigation tools run freely.
 - **`--plan`** (`INFER_PERMISSION_MODE=plan`): the agent investigates, reads, searches,
   and runs read-only commands, but makes NO changes until it calls `present_plan(...)`
-  and the user approves. Once approved it works autonomously until it has another
-  question, then calls `present_plan` again.
+  and the user approves. Each approval grants a **bounded** number of state-changing
+  actions (`INFER_PLAN_STEP_BUDGET`, default 8); when that budget is spent the harness
+  blocks further changes and the agent must `present_plan` again to be re-approved.
+  Steps are executed one at a time and validated before proceeding.
 - **`--auto`** / default (`INFER_PERMISSION_MODE=auto`, `-y`, `INFER_AUTO_APPROVE=1`):
   full autonomy — the agent changes state freely until the task is finished.
 

@@ -4691,7 +4691,7 @@ def main():
             "type": "function",
             "function": {
                 "name": "present_plan",
-                "description": "PLAN MODE: Present your findings and proposed changes to the user and wait for approval before making any changes. Call this with a clear plan (findings, exact changes/commands, rationale, suggestions) when you are about to modify state (write/edit files, run state-changing commands, save memory, schedule, etc.). The user approves or rejects; do NOT proceed with changes until you receive approval.",
+                "description": "PLAN MODE: Investigate first, then present your findings and the ordered list of exact changes you intend to make, and wait for approval before making ANY change. Call this before modifying state (write/edit files, run state-changing commands, save memory, schedule, delegate subagents, etc.). On approval you get a BOUNDED number of state-changing actions (INFER_PLAN_STEP_BUDGET, default 8): execute those steps ONE at a time, validate each result, and when the budget is exhausted call present_plan again with the next chunk. Never start a new change without an in-force approval. The user approves or rejects; do NOT proceed with changes until approved.",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -47,10 +47,7 @@ void git_commit(const char *extra_msg) {
     if (!has_git) return;
 
     /* Stage all changes */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "git -C . add -A 2>/dev/null");
-    int exit_code = system(cmd);
-    if (exit_code != 0) return; /* No changes to stage */
+    (void)system("git -C . add -A 2>/dev/null");
 
     /* Safety check for sensitive staged files */
     if (has_sensitive_staged_files()) {
@@ -58,30 +55,24 @@ void git_commit(const char *extra_msg) {
         return;
     }
 
-    /* Check if anything was staged */
-    char verify_cmd[128];
-    snprintf(verify_cmd, sizeof(verify_cmd),
-             "git -C . diff --cached --quiet 2>/dev/null; echo $?");
-    FILE *fp = popen(verify_cmd, "r");
-    if (fp) {
-        char buf[16] = {0};
-        char *r = fgets(buf, sizeof(buf), fp);
-        pclose(fp);
-        if (r) {
-            int has_changes = atoi(buf);
-            if (has_changes == 0) {
-                /* There are staged changes - commit them */
-                const char *commit_msg = g_git_commit_msg ? g_git_commit_msg : "auto-commit: tool changes";
-                if (extra_msg) {
-                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s: %s'", commit_msg, extra_msg);
-                    (void)system(cmd);
-                } else {
-                    snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s' 2>/dev/null", commit_msg);
-                    (void)system(cmd);
-                }
-                if (g_git_commit_msg) free(g_git_commit_msg);
-                g_git_commit_msg = NULL;
-            }
-        }
+    /* Nothing staged? Then there is nothing to commit — stay silent. Do NOT run
+       an empty `git commit` (its "nothing to commit" stderr otherwise leaks into
+       the model's view on every task). Only report when something actually
+       changed and a commit really happens. */
+    if (system("git -C . diff --cached --quiet 2>/dev/null") == 0) return;
+
+    char cmd[768];
+    const char *commit_msg = g_git_commit_msg ? g_git_commit_msg : "auto-commit: tool changes";
+    if (extra_msg && *extra_msg) {
+        snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s: %s' >/dev/null 2>&1", commit_msg, extra_msg);
+    } else {
+        snprintf(cmd, sizeof(cmd), "git -C . commit -q -m '%s' >/dev/null 2>&1", commit_msg);
     }
+    if (system(cmd) == 0) {
+        /* A real commit happened — surface it to the user exactly once. */
+        fprintf(stderr, "\033[2m[ai] committed: %s\033[0m\n",
+                (extra_msg && *extra_msg) ? extra_msg : commit_msg);
+    }
+    if (g_git_commit_msg) free(g_git_commit_msg);
+    g_git_commit_msg = NULL;
 }

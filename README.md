@@ -133,6 +133,9 @@ All config lives in `~/.local/share/ai/env` (managed by `ai-backend`) and is loa
 | `INFER_TRIM_THRESHOLD` | Trim conversation when context exceeds this | 100000 |
 | `INFER_STUB_THRESHOLD` | Stub tool results once context exceeds this | 250000 |
 | `INFER_TASK_TIMEOUT` | Force `task_complete` after N seconds | 300 |
+| `INFER_STEP_LIMIT` | Cap on agent-loop tool iterations for a task (piped/auto runs are finite now) | 60 (non-tty), 30 (tty) |
+| `INFER_PLAN_STEP_BUDGET` | State-changing actions allowed per approved `present_plan` (PLAN mode); `0` = unlimited | 8 |
+| `INFER_PLAN_AUTOAPPROVE=1` | Auto-approve `present_plan` in PLAN mode (opt-in, for trusted/harnessed/bridge runs only) | off |
 
 ### MCP servers
 
@@ -221,7 +224,7 @@ checking with you. Set a mode with a flag (above) or `INFER_PERMISSION_MODE=
 | Mode | Behaviour |
 |------|-----------|
 | **MANUAL** (`--manual`) | Asks you for explicit approval before EVERY state-changing action (commands, file writes/edits, memory, scheduling). Read-only investigation runs freely. Nothing changes without your say-so. |
-| **PLAN** (`--plan`) | Investigates, reads, searches, and runs read-only commands on its own, but makes **no changes** until it calls `present_plan(plan="...")` and you approve. Once its plan is approved it works autonomously until it has another question — then it calls `present_plan` again. |
+| **PLAN** (`--plan`) | Investigates, reads, searches, and runs read-only commands on its own, but makes **no changes** until it calls `present_plan(plan="...")` and you approve. Each approval grants a **bounded** number of state-changing actions (`INFER_PLAN_STEP_BUDGET`, default 8); once that budget is spent the harness blocks further changes and forces the agent to present an updated plan and be re-approved before continuing. It must validate each step before the next. |
 | **FULL AUTONOMY** (`--auto`, default) | Investigates and changes state freely until the task is finished, then reports. |
 
 In **plan** mode the agent is strongly guided (via injected system context) to
