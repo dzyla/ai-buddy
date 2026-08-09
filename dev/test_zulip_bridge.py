@@ -206,6 +206,51 @@ class TestMessageCleaning(unittest.TestCase):
         self.assertIn("---", result)
         self.assertNotIn("───", result)
 
+    def test_normalize_text_joins_wrapped_lines(self):
+        """Single newlines within a paragraph should be joined to spaces."""
+        from zulip_ai_bridge import normalize_text
+
+        test_input = "This is sentence one. This is sentence two.\nThis is the next line."
+        result = normalize_text(test_input)
+        self.assertEqual(result, "This is sentence one. This is sentence two. This is the next line.")
+
+    def test_normalize_text_preserves_paragraphs(self):
+        """Paragraph breaks (blank lines) should be preserved."""
+        from zulip_ai_bridge import normalize_text
+
+        test_input = "First paragraph.\nSecond sentence.\n\nSecond paragraph.\nAnother sentence."
+        result = normalize_text(test_input)
+        self.assertEqual(
+            result,
+            "First paragraph. Second sentence.\n\nSecond paragraph. Another sentence."
+        )
+
+    def test_normalize_text_collapse_extra_spaces(self):
+        """Multiple consecutive spaces should be collapsed to a single space."""
+        from zulip_ai_bridge import normalize_text
+
+        test_input = "Hello  world  again\nnew line"
+        result = normalize_text(test_input)
+        self.assertEqual(result, "Hello world again new line")
+
+    def test_clean_response_sentence_per_line(self):
+        """Full clean_response should normalise sentence-per-line LLM output."""
+        from zulip_ai_bridge import clean_response
+
+        test_input = (
+            "Here is a summary of the paper.\n"
+            "The antibody neutralizes the virus.\n\n"
+            "Key findings:\n"
+            "1. High affinity.\n"
+            "2. Broad neutralization."
+        )
+        result = clean_response(test_input)
+        self.assertEqual(
+            result,
+            "Here is a summary of the paper. The antibody neutralizes the virus.\n\n"
+            "Key findings: 1. High affinity. 2. Broad neutralization."
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

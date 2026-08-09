@@ -341,6 +341,31 @@ class FileParser:
         return content, processed_urls
 
 
+def normalize_text(text):
+    """Join wrapped lines within paragraphs while preserving paragraph breaks.
+
+    The LLM output from ``ai`` often places a newline after every sentence
+    (or at arbitrary word-wrapping points).  When posted to Zulip each of
+    those single newlines becomes a hard line break, making the message
+    look choppy and unnatural.  This normaliser collapses single newlines
+    to spaces *inside* paragraphs (blocks separated by blank lines) so the
+    text flows naturally and Zulip can wrap it to the full message width,
+    while still keeping paragraph breaks intact.
+    """
+    # Split into paragraphs by blank lines (two or more consecutive newlines)
+    paragraphs = re.split(r'\n{2,}', text)
+    normalized = []
+    for para in paragraphs:
+        para = para.strip()
+        # Replace any remaining single newlines with a space
+        para = para.replace('\n', ' ')
+        # Collapse runs of multiple spaces into a single space
+        para = re.sub(r' {2,}', ' ', para)
+        if para:
+            normalized.append(para)
+    return '\n\n'.join(normalized)
+
+
 def clean_response(text):
     # Strip all ANSI escape codes (colour, dim, bold, cursor movement, etc.)
     ansi_escape = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\]\d*;[^\x07]*\x07|[@-Z\\-_])')
@@ -349,6 +374,8 @@ def clean_response(text):
     clean = clean.replace("────────────────────────────────────────────", "---")
     # Collapse runs of blank lines to at most two
     clean = re.sub(r'\n{3,}', '\n\n', clean)
+    # Join wrapped lines within paragraphs for natural Zulip rendering
+    clean = normalize_text(clean)
     return clean.strip()
 
 
