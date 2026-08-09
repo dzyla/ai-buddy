@@ -22,7 +22,9 @@ except ImportError:
     sys.modules["zulip"] = zulip
 import re
 import requests
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
+import csv
+import io
 
 # Configure logging for truncation events
 logging.basicConfig(
@@ -30,6 +32,313 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("ZulipBridge")
+
+# Maximum file size to process (10 MB)
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+# MIME type to content handler mapping
+TEXT_EXTS = {'.txt', '.md', '.rst', '.py', '.js', '.ts', '.jsx', '.tsx',
+             '.c', '.h', '.cpp', '.hpp', '.java', '.go', '.rs', '.rb',
+             '.sh', '.bash', '.zsh', '.bat', '.cmd', '.ps1',
+             '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+             '.json', '.xml', '.html', '.htm', '.css', '.scss',
+             '.sql', '.r', '.m', '.mm', '.swift', '.kt', '.kts'}
+
+IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff'}
+
+PDF_EXTS = {'.pdf'}
+
+SPREADSHEET_EXTS = {'.xlsx', '.xls', '.csv'}
+
+ARCHIVE_EXTS = {'.zip', '.tar', '.gz', '.bz2', '.xz', '.7z'}
+
+
+class FileParser:
+    """
+    Downloads Zulip uploads and extracts text content for various file types.
+    """
+
+    def __init__(self, client, base_url):
+        self.client = client
+        self.base_url = base_url.rstrip('/')
+        # Try to import optional dependencies
+        self._pdfplumber = None
+        self._tesseract = None
+        self._pillow = None
+        try:
+            import pdfplumber
+            self._pdfplumber = pdfplumber
+        except ImportError:
+            pass
+        try:
+            import pypdfium2 as pdfium
+            self._pdfium = pdfium
+        except ImportError:
+            pass
+        try:
+            from PIL import Image
+            self._pillow = Image
+        except ImportError:
+            pass
+        try:
+            import pytesseract
+            self._tesseract = pytesseract
+        except ImportError:
+            pass
+
+    def _download_file(self, url, dest_path):
+        """Download a file with retry and size checking."""
+        try:
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+
+            # Check Content-Length header if available
+            content_length = int(resp.headers.get('Content-Length', 0))
+            if content_length > MAX_FILE_SIZE:
+                logger.warning(f"File too large: {content_length} bytes (max {MAX_FILE_SIZE})")
+                return False, "File exceeds size limit"
+
+            with open(dest_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            return True, None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Download failed: {e}")
+            return False, str(e)
+
+    def _detect_file_type(self, path, content_type=None):
+        """Detect file type from extension and/or MIME type."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in TEXT_EXTS:
+            return 'text'
+        elif ext in IMAGE_EXTS:
+            return 'image'
+        elif ext in PDF_EXTS:
+            return 'pdf'
+        elif ext in SPREADSHEET_EXTS:
+            return 'spreadsheet'
+        elif ext in ARCHIVE_EXTS:
+            return 'archive'
+        # Fallback: try to detect from content
+        try:
+            with open(path, 'rb') as f:
+                header = f.read(512)
+            if header.startswith(b'PK'):  # ZIP/DOCX/XLSX/PPTX
+                return 'archive' if ext == '' else 'binary'
+            elif header.startswith(b'%PDF'):
+                return 'pdf'
+            elif header.startswith(b'{') or header.startswith(b'['):
+                return 'text'
+            elif header.startswith(b'<?xml') or header.startswith(b'<'):
+                return 'text'
+        except Exception:
+            pass
+        if content_type:
+            if 'json' in content_type:
+                return 'text'
+            elif 'xml' in content_type:
+                return 'text'
+            elif 'html' in content_type:
+                return 'text'
+        return 'unknown'
+
+    def _parse_text(self, path):
+        """Read text files."""
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(MAX_FILE_SIZE)
+            return content
+        except Exception as e:
+            logger.error(f"Failed to read text file {path}: {e}")
+            return None
+
+    def _parse_pdf(self, path):
+        """Extract text from PDF files."""
+        if self._pdfplumber:
+            try:
+                text = []
+                with self._pdfplumber.open(path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        page_text = page.extract_text()
+                        if page_text:
+                            text.append(f"--- Page {i+1} ---\n{page_text}")
+                return '\n\n'.join(text) if text else None
+            except Exception as e:
+                logger.error(f"PDF extraction failed with pdfplumber: {e}")
+
+        if self._pdfium:
+            try:
+                doc = self._pdfium.Document(path)
+                text = []
+                for i, page in enumerate(doc):
+                    page_text = page.get_textpage().get_text_bounded()
+                    if page_text:
+                        text.append(f"--- Page {i+1} ---\n{page_text}")
+                return '\n\n'.join(text) if text else None
+            except Exception as e:
+                logger.error(f"PDF extraction failed with pypdfium2: {e}")
+                return None
+
+        # Fallback to pypdf
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            text = []
+            for i, page in enumerate(reader.pages):
+                page_text = page.extract_text()
+                if page_text:
+                    text.append(f"--- Page {i+1} ---\n{page_text}")
+            return '\n\n'.join(text) if text else None
+        except Exception as e:
+            logger.error(f"PDF extraction failed: {e}")
+            return None
+
+    def _parse_image(self, path):
+        """Extract text from images using OCR."""
+        if self._tesseract:
+            try:
+                return self._tesseract.image_to_string(self._pillow.open(path))
+            except Exception as e:
+                logger.error(f"OCR failed: {e}")
+        return None
+
+    def _parse_csv(self, path):
+        """Parse CSV files into readable format."""
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(MAX_FILE_SIZE)
+            # Parse and reformat to show structure clearly
+            reader = csv.DictReader(io.StringIO(content))
+            if not reader.fieldnames:
+                return content
+            lines = []
+            lines.append(','.join(reader.fieldnames))
+            for i, row in enumerate(reader):
+                line = ','.join(str(row.get(f, '')) for f in reader.fieldnames)
+                lines.append(line)
+                if i >= 100:  # Limit to 100 rows
+                    lines.append('... [truncated]')
+                    break
+            return '\n'.join(lines)
+        except Exception as e:
+            logger.error(f"CSV parsing failed: {e}")
+            return content if 'content' in dir() else None
+
+    def _parse_excel(self, path):
+        """Parse Excel files."""
+        if self._pillow is None:
+            return None
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True)
+            text_parts = []
+            for sheet_name in wb.sheetnames[:3]:  # Limit to 3 sheets
+                ws = wb[sheet_name]
+                text_parts.append(f"--- Sheet: {sheet_name} ---")
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i >= 100:
+                        text_parts.append('... [truncated]')
+                        break
+                    text_parts.append('\t'.join(str(c) if c is not None else '' for c in row))
+            return '\n'.join(text_parts)
+        except Exception as e:
+            logger.error(f"Excel parsing failed: {e}")
+            return None
+
+    def _parse_archive(self, path):
+        """Extract contents from archives (list files)."""
+        import zipfile
+        import tarfile
+        import gzip as gz
+        text_parts = []
+        try:
+            if path.endswith('.zip'):
+                with zipfile.ZipFile(path, 'r') as z:
+                    text_parts.extend(z.namelist())
+            elif path.endswith(('.tar', '.gz', '.bz2', '.xz')):
+                with tarfile.open(path, 'r:*') as t:
+                    text_parts.extend(t.getnames())
+            elif path.endswith('.gz'):
+                try:
+                    with gz.open(path, 'rt', encoding='utf-8', errors='replace') as f:
+                        text_parts.append(f.read(MAX_FILE_SIZE))
+                except Exception:
+                    pass
+            return '\n'.join(text_parts) if text_parts else None
+        except Exception as e:
+            logger.error(f"Archive extraction failed: {e}")
+            return None
+
+    def parse_file(self, path):
+        """Parse a file and return extracted text content."""
+        file_type = self._detect_file_type(path)
+        logger.info(f"Parsing {os.path.basename(path)} as {file_type}")
+
+        handlers = {
+            'text': self._parse_text,
+            'pdf': self._parse_pdf,
+            'image': self._parse_image,
+            'spreadsheet': self._parse_csv if path.endswith('.csv') else self._parse_excel,
+            'archive': self._parse_archive,
+        }
+
+        handler = handlers.get(file_type)
+        if handler:
+            content = handler(path)
+            if content:
+                return content
+            return f"*[Unable to extract content from {file_type} file]*"
+        elif file_type == 'binary':
+            return f"*[Binary file: {os.path.basename(path)} - cannot extract text]*"
+        else:
+            return f"*[Unsupported file type for: {os.path.basename(path)}]*"
+
+    def process_message_urls(self, content):
+        """
+        Process a message content string: find Zulip upload URLs,
+        download the files, extract content, and replace URLs with content.
+        """
+        # Find all Zulip upload URLs
+        url_pattern = re.compile(r'https?://[^\s]+/user_uploads/[^\s\)]+')
+        urls = url_pattern.findall(content)
+
+        if not urls:
+            return content, []
+
+        processed_urls = []
+        download_dir = os.path.join(os.path.expanduser('~'), '.cache', 'zulip_ai_uploads')
+        os.makedirs(download_dir, exist_ok=True)
+
+        for url in urls:
+            # Extract filename from URL
+            decoded_url = unquote(url)
+            filename = os.path.basename(decoded_url.split('?')[0])
+            if not filename:
+                filename = 'downloaded_file'
+
+            dest_path = os.path.join(download_dir, filename)
+
+            # Download the file
+            success, error = self._download_file(decoded_url, dest_path)
+            if not success:
+                content = content.replace(url, f"*⚠️ Failed to download: {error}*")
+                continue
+
+            # Parse the file content
+            extracted = self.parse_file(dest_path)
+
+            # Replace URL with extracted content or placeholder
+            if extracted and not extracted.startswith('*['):
+                # Format the content nicely
+                content = content.replace(url, f"```[File: {filename}]\n{extracted}\n```")
+            else:
+                # File couldn't be parsed
+                content = content.replace(url, f"*⚠️ Cannot extract text from {filename}*\n*Note: File saved at {dest_path}*")
+
+            processed_urls.append(filename)
+            logger.info(f"Processed: {filename}")
+
+        return content, processed_urls
 
 
 def clean_response(text):
@@ -52,6 +361,9 @@ class ZulipAiBridge:
         self.bot_email = self.client.email
         print(f"Loaded credentials for: {self.bot_email} on {self.client.base_url}")
         self.detected_owner = self._detect_owner()
+        # Initialize the file parser for processing uploaded documents
+        self._file_parser = FileParser(self.client, self.client.base_url)
+        print("File parser initialized — will extract content from uploaded documents.")
 
     def _detect_owner(self):
         """Try to detect the owner's Zulip email/username from past private messages."""
@@ -197,6 +509,7 @@ class ZulipAiBridge:
         print(f"[thread-{tid}] Done.")
 
     def handle_message(self, msg):
+        """Handle a Zulip message."""
         sender_email = msg['sender_email']
 
         # Don't respond to our own messages
@@ -206,7 +519,7 @@ class ZulipAiBridge:
         # Restrict to the owner/configured user to protect privacy
         import getpass
         allowed_user = os.environ.get("ZULIP_USER") or self.detected_owner or getpass.getuser()
-        
+
         # Normalize values for case-insensitive comparison
         allowed_user_clean = allowed_user.strip().lower()
         sender_email_clean = sender_email.strip().lower()
@@ -237,33 +550,8 @@ class ZulipAiBridge:
                 if mention_end_close != -1:
                     content = content[mention_end_close + 2:].strip()
 
-        # Check for Zulip uploaded files and download them locally using Basic Auth.
-        # Upload paths have a variable number of segments (modern servers use
-        # /user_uploads/{realm}/{2-char}/{token}/{filename}), so match any depth
-        # and take the last segment as the filename.
-        upload_pattern = re.compile(r'(/user_uploads/(?:[^/\s)]+/)+([^/\s)]+))')
-        site_url = self.client.base_url.replace('/api/', '').replace('/api', '')
-        tmp_dir = "/tmp/zulip_uploads"
-        os.makedirs(tmp_dir, exist_ok=True)
-
-        for match in upload_pattern.finditer(content):
-            rel_url = match.group(1)
-            filename = os.path.basename(unquote(match.group(2)))
-            local_path = os.path.join(tmp_dir, filename)
-            download_url = site_url + rel_url
-
-            print(f"Downloading upload: {download_url} to {local_path}")
-            try:
-                r = requests.get(download_url, auth=(self.bot_email, self.client.api_key), timeout=30)
-                if r.status_code == 200:
-                    with open(local_path, 'wb') as f:
-                        f.write(r.content)
-                    content = content.replace(rel_url, local_path)
-                    print(f"Successfully downloaded and mapped to local path: {local_path}")
-                else:
-                    print(f"Failed to download upload, HTTP status: {r.status_code}")
-            except Exception as e:
-                print(f"Error downloading upload: {e}")
+        # Replace Zulip upload URLs with extracted file content
+        content, processed = self._file_parser.process_message_urls(content)
 
         print(f"Received query from {sender_email}: {content}")
 

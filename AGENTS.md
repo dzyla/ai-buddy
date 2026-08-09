@@ -86,6 +86,12 @@ export INFER_MODEL="your-model-name"
 - Session state lives in `~/.cache/ai/sessions/` and `~/.cache/ai/history.jsonl`.
 - MCP server config is searched in order: `./mcp.json` → `./mcp_config.json` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`.
 
+### Zulip Bridge
+- `zulip_ai_bridge.py` — Zulip bot bridge that pipes messages to the `ai` CLI.
+- **File parsing:** automatically downloads uploaded files (PDFs, images, spreadsheets, code, etc.) and extracts their text content before passing to the agent. Supports text, PDF (pdfplumber/pypdfium2), image OCR (tesseract), CSV/Excel (openpyxl), and archives.
+- Cache directory: `~/.cache/zulip_ai_uploads/`
+- Privacy: only responds to the owner or explicitly configured `ZULIP_USER`.
+
 ---
 
 ## Rules
