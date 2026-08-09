@@ -3496,6 +3496,15 @@ def list_skills_dir():
     return "Available skills:\n" + ("\n".join(lines) if lines else "(none yet — use skill_create to save what you learn)")
 
 def main():
+    # A pipe-writing backend must not raise a BrokenPipeError traceback when the
+    # parent (ai.c) closes the pipe on interrupt/exit. Restore default SIGPIPE so
+    # the process dies silently instead of dumping "Exception ignored on flushing
+    # sys.stdout: BrokenPipeError" at interpreter shutdown.
+    try:
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except Exception:
+        pass
     if len(sys.argv) < 2:
         print("Usage: ai_mcp.py [list-tools | call-tool | render-markdown | trim-messages]", file=sys.stderr)
         sys.exit(1)
