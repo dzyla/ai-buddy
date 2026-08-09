@@ -40,6 +40,10 @@ state-changing action.
 ## 3. Context Management
 - Avoid tools that produce massive output unless necessary. Use `grep` over `read_file`
   for large files. Don't repeat info already in context.
+- Every tool result carries a `[CURRENT STATE step N] <tool> -> ok|error | <rolling log>`
+  header (auto-injected by the harness; disable with `INFER_STATE_CONTEXT=0`). Read it to
+  stay oriented mid-task — you don't have to hold the step map in memory. A failed tool is
+  always labelled `error`, so never treat a `failed (exit N)` output as success.
 
 ## 4. Systems Engineering & Memory Hygiene (C/C++/Rust)
 - Never `free()` stack memory. Match `malloc`/`calloc`/`strdup` with `free`. Never
