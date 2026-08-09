@@ -1,41 +1,53 @@
 ---
 name: autonomous-troubleshooting
-description: CRITICAL — when executing or troubleshooting terminal commands, running tests, or debugging code: Behavioral guidelines for autonomous execution, debugging iteratively, and verifying success.
+description: CRITICAL — when executing or troubleshooting terminal commands, running tests, or debugging code: investigate first, verify success, and respect the active permission mode before mutating state.
 ---
 
 # Autonomous Troubleshooting and Execution Skill
 
-You are an autonomous agent. You must solve tasks completely without asking the user to run commands, write code, or execute scripts for you. When given a coding task, data fetching task, plotting task, or configuration task, follow this strict loop:
+Investigate and diagnose independently, but respect the CURRENT PERMISSION MODE
+(injected into your system context). Read-only investigation is always allowed.
+State-changing actions (editing files, writing new files, running mutating commands)
+follow the mode's approval rule:
+
+- **PLAN mode**: DON'T change anything until you call `present_plan(plan="...")` and
+  the user approves. Present your diagnosis + the exact fix you intend, then proceed
+  only after approval. Work autonomously after that until you have another question.
+- **MANUAL mode**: obtain explicit approval for every state-changing action.
+- **FULL AUTONOMY**: investigate, fix, and verify continuously.
 
 ## 1. Write Code to a File
-- Do not just output code blocks in markdown.
-- You MUST use the `write_file` tool to save your code to a file (e.g. `plot_stock.py`).
+- Save your code with `write_file`.
 
 ## 2. Execute and Verify the Code
-- Immediately after writing the file, use the `execute_command` tool to run it (e.g., `python3 plot_stock.py`).
-- Inspect the output returned by the tool.
+- Immediately run it with `execute_command` and inspect the output.
 
 ## 3. Analyze Success / Failure
-- The system will prepend `[Command Success]` or `[Command Failed with exit status X]` to the command output.
-- **On Success**: Present the final verified result (e.g., printed tables, text descriptions, generated graph images) directly in your final response.
+- The system prepends `[Command Success]` or `[Command Failed with exit status X]`.
+- **On Success**: Present the final verified result directly in your final response.
 - **On Failure**:
-  1. Carefully read the traceback and error messages (stderr).
-  2. Explain what failed and why.
-  3. Use the `edit_file` or `write_file` tool to apply a correction.
-  4. Run the code again using `execute_command`.
-  5. Repeat this loop (up to 5-10 rounds) until the command returns `[Command Success]`.
+  1. Carefully read the traceback/errors.
+  2. `think` to explain what failed and why.
+  3. Apply a correction (respect permission mode before editing: in plan mode,
+     present_plan what you'll change first).
+  4. Re-run. Repeat (up to 5-10 rounds) until it succeeds.
 
 ## 4. Handling Missing Dependencies
-- If execution fails with `ModuleNotFoundError: No module named '...'` or similar library error:
-  - Run the package manager command (e.g., `pip install <module_name>` or `python3 -m pip install <module_name>`) via `execute_command`.
-  - Once installed, re-run your script.
+- If execution fails with `ModuleNotFoundError` or similar, run the package manager
+  (`pip install ...` / `python3 -m pip install ...`) via `execute_command` — but in
+  plan/manual mode get approval first (this installs software / changes state).
 
 ## 5. Pivoting Strategies
-- If a data source, library, or API fails or is deprecated/blocked (e.g., Yahoo Finance API limit or Pandas date format mismatch):
-  - Do not stop or ask the user for keys.
-  - Search the web (using `web_search`) for alternative libraries, free APIs, or public scraping methods.
-  - Rewrite your script to use the alternative strategy and test again.
+- If a data source/library/API fails or is deprecated, do not give up. `web_search`
+  for alternatives, rewrite your script, and test again — per the active permission
+  mode's approval rule before mutating.
 
 ## 6. Delegation
-- If the task is exceptionally complex or requires multiple parallel lines of investigation, use the `delegate_task` tool to spawn a helper agent.
-- Feed the helper agent's results back into your troubleshooting loop.
+- For very complex tasks, use `delegate_task` to spawn helper agents and feed results
+  back into your troubleshooting loop.
+
+## 7. Self-improvement
+- After you solve something non-obvious, persist it:
+  `skill_create` (new technique), `skill_update` (fix a skill you loaded that was
+  wrong/outdated), or `skill_note` (standalone lesson). The user is notified on
+  create/update.

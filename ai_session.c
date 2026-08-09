@@ -141,6 +141,26 @@ static int session_file_path(char *out, size_t out_len, const char *session_id) 
     return 0;
 }
 
+/* Backup path: the conversation is also mirrored into the persistent local
+   user-data directory (~/.local/share/ai/sessions), not just the cache, so it
+   survives cache clears and is the canonical searchable history store. */
+static int backup_session_file_path(char *out, size_t out_len, const char *session_id) {
+    char *home = getenv("HOME");
+    if (!home) return -1;
+    char dir[1024];
+    /* mkdir -p equivalent for ~/.local/share/ai/sessions */
+    snprintf(dir, sizeof(dir), "%s/.local", home);      mkdir(dir, 0700);
+    snprintf(dir, sizeof(dir), "%s/.local/share", home); mkdir(dir, 0700);
+    snprintf(dir, sizeof(dir), "%s/.local/share/ai", home); mkdir(dir, 0700);
+    snprintf(dir, sizeof(dir), "%s/.local/share/ai/sessions", home); mkdir(dir, 0700);
+    if (session_id && *session_id) {
+        snprintf(out, out_len, "%s/%s.json", dir, session_id);
+    } else {
+        snprintf(out, out_len, "%s/last.json", dir);
+    }
+    return 0;
+}
+
 void save_session(const char *messages_json) {
     char path[1200];
     if (session_file_path(path, sizeof(path), current_session_id) == 0) {
@@ -150,7 +170,21 @@ void save_session(const char *messages_json) {
             fclose(fp);
         }
     }
+    if (backup_session_file_path(path, sizeof(path), current_session_id) == 0) {
+        FILE *fp = fopen(path, "w");
+        if (fp) {
+            fputs(messages_json, fp);
+            fclose(fp);
+        }
+    }
     if (session_file_path(path, sizeof(path), NULL) == 0) {
+        FILE *fp = fopen(path, "w");
+        if (fp) {
+            fputs(messages_json, fp);
+            fclose(fp);
+        }
+    }
+    if (backup_session_file_path(path, sizeof(path), NULL) == 0) {
         FILE *fp = fopen(path, "w");
         if (fp) {
             fputs(messages_json, fp);

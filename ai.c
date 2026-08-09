@@ -177,6 +177,7 @@ static double get_time_sec_mono(void) {
 char current_session_id[64] = "";
 static int  g_hide_details = 0;
 static int  g_permission_mode = 0;
+static int  g_plan_approved = 0;   /* plan mode: user approved the presented plan */
 
 /* ── Turn history storage for dynamic screen redrawing (Ctrl+O toggle) ── */
 typedef enum {
@@ -897,6 +898,52 @@ static int is_command_denied(const char *cmd) {
     return 0;
 }
 
+
+/* Prompt the user on the controlling terminal for y/n approval.
+   Returns: 1 = approved, 0 = denied, -1 = no terminal available. */
+static int prompt_user_ok(const char *title, const char *detail) {
+    FILE *tty = fopen("/dev/tty", "r+");
+    if (!tty) return -1;
+    fprintf(tty, "\n\033[1;33m  CONFIRM: %s\033[0m\n", title ? title : "");
+    if (detail && *detail) {
+        char *d = strdup(detail);
+        char *nl = d ? strchr(d, '\n') : NULL;
+        if (nl) *nl = '\0';
+        fprintf(tty, "  \033[2m%s\033[0m\n", d ? d : "");
+        if (d) free(d);
+    }
+    fprintf(tty, "  \033[32my\033[0m/\033[31mn\033[0m  %s Proceed?%s\n\n", CL_DIM, CL_RESET);
+    fflush(tty);
+    int fd = fileno(tty);
+    struct termios orig, raw;
+    int has = (tcgetattr(fd, &orig) >= 0);
+    if (has) { raw = orig; raw.c_lflag &= ~(ECHO|ICANON); raw.c_cc[VMIN]=1; raw.c_cc[VTIME]=0; tcsetattr(fd,TCSANOW,&raw); }
+    char ch = 0;
+    int r = (read(fd, &ch, 1) == 1);
+    if (has) tcsetattr(fd, TCSAFLUSH, &orig);
+    if (r) fprintf(tty, "%c\n", ch);
+    fclose(tty);
+    if (!r) return -1;
+    return (ch=='y'||ch=='Y'||ch=='\n'||ch=='\r') ? 1 : 0;
+}
+
+/* True if a tool changes persistent state and therefore needs approval
+   in manual or unapproved-plan mode. Read-only investigation tools return 0. */
+static int tool_is_mutating(const char *name) {
+    if (!name) return 0;
+    static const char *mut[] = {
+        "execute_command","execute_remote_command","remote_exec",
+        "write_file","edit_file","save_memory","remember",
+        "learn_rule","vault_write","schedule_task","set_reminder",
+        "unschedule_task","start_background_process","stop_process","delegate_task",
+        "skill_create","skill_update","skill_note",
+        NULL
+    };
+    for (int i = 0; mut[i]; i++)
+        if (strcmp(name, mut[i]) == 0) return 1;
+    return 0;
+}
+
 const char *SYSTEM_PROMPT =
     "You are a fully autonomous CLI agent. Output in clean markdown. Follow these rules exactly:\n\n"
     "SCIENTIFIC ADVISOR RIGOR (highest priority):\n"
@@ -999,6 +1046,30 @@ static char* get_system_context() {
              "- Shell: %s\n"
              "- Local Time: %s\n",
              os_info, cwd, user, shell, time_str);
+
+    if (g_permission_mode == 1) {
+        size_t pl = strlen(buf);
+        snprintf(buf + pl, 4096 - pl,
+                 "\nCURRENT PERMISSION MODE: PLAN\n"
+                 "- Investigate, read, search, and run READ-ONLY commands freely.\n"
+                 "- DO NOT change anything (no write/edit/execute of state-changing commands / memory / schedule) until your plan is approved.\n"
+                 "- To make changes: call present_plan(plan=\"...\") with your findings, the exact changes, and rationale; wait for approval.\n"
+                 "- Once a plan is approved you work AUTONOMOUSLY until you have another question or the task is done.\n"
+                 "- If your present_plan is rejected, revise and call present_plan again. Report discoveries and check your work before finishing.\n");
+    } else if (g_permission_mode == 2) {
+        size_t pl = strlen(buf);
+        snprintf(buf + pl, 4096 - pl,
+                 "\nCURRENT PERMISSION MODE: MANUAL\n"
+                 "- You must obtain explicit user approval for EVERY state-changing action (commands, file writes/edits, memory, scheduling).\n"
+                 "- Read-only investigation tools run without prompting.\n"
+                 "- When the system returns a denial, adjust your approach; do not retry the same action until the user allows it.\n");
+    } else {
+        size_t pl = strlen(buf);
+        snprintf(buf + pl, 4096 - pl,
+                 "\nCURRENT PERMISSION MODE: FULL AUTONOMY (auto)\n"
+                 "- Investigate, execute, and change state freely until the task is finished, then call task_complete.\n"
+                 "- Still prefer to think before major actions and verify your results.\n");
+    }
     return buf;
 }
 
@@ -1029,8 +1100,9 @@ static void log_job(const char *prompt, const char *pipe_writer, const char *res
     char *esc_writer = json_escape(pipe_writer ? pipe_writer : "");
     char *esc_resp = json_escape(response ? response : "");
     
-    fprintf(fp, "{\"timestamp\":\"%s\",\"prompt\":\"%s\",\"pipe_writer\":\"%s\",\"interactive\":%s,\"response\":\"%s\"}\n",
-            time_str, esc_prompt, esc_writer, interactive ? "true" : "false", esc_resp);
+    fprintf(fp, "{\"timestamp\":\"%s\",\"session_id\":\"%s\",\"prompt\":\"%s\",\"pipe_writer\":\"%s\",\"interactive\":%s,\"response\":\"%s\"}\n",
+            time_str, current_session_id[0] ? current_session_id : "unknown",
+            esc_prompt, esc_writer, interactive ? "true" : "false", esc_resp);
     
     free(esc_prompt);
     free(esc_writer);
@@ -3699,7 +3771,11 @@ int main(int argc, char **argv) {
             printf("A minimal, agentic CLI tool for piping anything into an LLM and executing terminal work.\n\n");
             printf("Options:\n");
             printf("  -i, --interactive    Start an interactive multi-turn chat session.\n");
-            printf("  -y, --yes            Auto-approve all command execution requests without prompting.\n");
+            printf("  -y, --yes            Auto-approve all command execution requests (FULL AUTONOMY mode).\n");
+            printf("  --plan               PLAN mode: investigate & report, but make NO changes until you present a\n");
+            printf("                       plan via present_plan() and the user approves it; then work autonomously.\n");
+            printf("  --manual             MANUAL mode: ask for explicit approval before EVERY state-changing action.\n");
+            printf("                       Read-only investigation tools still run without prompting.\n");
             printf("  -c, --continue       Continue working without turn limits until the job is done.\n");
             printf("  -r, --resume         Resume the previous conversation (from the last `ai` run).\n");
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
@@ -3791,8 +3867,13 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
             interactive_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0 ||
-                   strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--auto-approve") == 0) {
+                   strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--auto-approve") == 0 ||
+                   strcmp(argv[i], "--auto") == 0) {
             g_permission_mode = 0;
+        } else if (strcmp(argv[i], "--plan") == 0) {
+            g_permission_mode = 1;
+        } else if (strcmp(argv[i], "--manual") == 0) {
+            g_permission_mode = 2;
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) {
             g_continue_until_done = 1;
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
@@ -3860,6 +3941,13 @@ int main(int argc, char **argv) {
     char *env_approve = getenv("INFER_AUTO_APPROVE");
     if (env_approve && (strcmp(env_approve, "1") == 0 || strcasecmp(env_approve, "true") == 0)) {
         g_permission_mode = 0;
+    }
+
+    char *env_perm = getenv("INFER_PERMISSION_MODE");
+    if (env_perm && *env_perm) {
+        if (strcasecmp(env_perm, "plan") == 0) g_permission_mode = 1;
+        else if (strcasecmp(env_perm, "manual") == 0) g_permission_mode = 2;
+        else if (strcasecmp(env_perm, "auto") == 0) g_permission_mode = 0;
     }
 
     char *env_quiet = getenv("INFER_QUIET");
@@ -4007,6 +4095,8 @@ int main(int argc, char **argv) {
                 if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
                 if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
                 if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
+                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+                    || strcmp(argv[i], "--auto") == 0) continue;
                 if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
                 if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
@@ -4036,6 +4126,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
+                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+                    || strcmp(argv[i], "--auto") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
@@ -4057,6 +4149,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
+                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+                    || strcmp(argv[i], "--auto") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
@@ -4090,6 +4184,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
+                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+                    || strcmp(argv[i], "--auto") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
@@ -4629,8 +4725,13 @@ int main(int argc, char **argv) {
         if (run_query_this_turn) {
             int loop_count = 0;
             int has_more = 1;
-            int step_limit = (g_continue_until_done || g_permission_mode || !isatty(STDIN_FILENO)) ? 999999 : 30;
+            int step_limit;
+            if (g_continue_until_done) step_limit = 999999;
+            else if (g_permission_mode == 0 && !isatty(STDIN_FILENO)) step_limit = 999999; /* auto + non-tty = full autonomy */
+            else if (!isatty(STDIN_FILENO)) step_limit = 60; /* plan/manual non-tty: finite, won't run away */
+            else step_limit = 30;
             int think_count = 0;
+            g_plan_approved = 0;
             g_esc_requested = 0;
             g_agent_loop_active = 1;
             char *last_tool_name = NULL;
@@ -5061,7 +5162,7 @@ step_limit_check:
                                    tool_output = strdup("Error: You are stuck in a loop calling the exact same tool with the exact same arguments. Stop and try a different approach, or call task_complete.");
                                } else if (strcmp(unescaped_name, "think") == 0) {
                                    think_count++;
-                                   if (think_count > 1) {
+                                   if (think_count > 12) {
                                        tool_output = strdup("Error: You have already called the 'think' tool once to plan. Do not call it again. You must call 'task_complete' to report your final answer/summary to the user, or call other action tools if there is more work to do. Calling 'think' repeatedly causes infinite loops.");
                                    } else {
                                        jsmn_parser arg_parser;
@@ -5161,7 +5262,50 @@ step_limit_check:
                                    tool_output = strdup("{\"ok\":true}");
                                    has_more = 0;
                                    task_done = 1;
-                               } else if (strcmp(unescaped_name, "remote_exec") == 0) {
+                               
+                                } else if (strcmp(unescaped_name, "present_plan") == 0) {
+                                    char *plan_txt = json_get_string(unescaped_args, "plan");
+                                    if (!plan_txt) plan_txt = json_get_string(unescaped_args, "summary");
+                                    if (!plan_txt) plan_txt = strdup(unescaped_args);
+                                    int approved = 0;
+                                    if (g_permission_mode == 1) {
+                                        approved = prompt_user_ok("APPROVE PLAN", plan_txt);
+                                        if (approved == -1) {
+                                            /* No interactive terminal (piped/bridge run). The user cannot
+                                               approve here; present the plan and finish so the plan is the
+                                               deliverable reported back to the caller. */
+                                            g_plan_approved = 0;
+                                            char *esc_plan = json_escape(plan_txt ? plan_txt : "");
+                                            char *hint = malloc(strlen(esc_plan) + 512);
+                                            snprintf(hint, strlen(esc_plan) + 512,
+                                                "[PLAN MODE] This is a non-interactive run, so your plan cannot be approved on this terminal. "
+                                                "STOP making tool calls now. Report your complete plan (investigation, proposed changes, commands, "
+                                                "and rationale) as your final answer via task_complete. Do not attempt any state-changing tool again.\n\n"
+                                                "YOUR PLAN TO REPORT TO THE USER:\n%s", esc_plan);
+                                            tool_output = hint;
+                                            free(esc_plan);
+                                            if (plan_txt) free(plan_txt);
+                                            plan_txt = NULL;
+                                            /* Hand control back so the loop produces a final answer. */
+                                            goto present_plan_done;
+                                        }
+                                        /* plan mode: applicant approval unlocks autonomy for this task */
+                                        g_plan_approved = approved ? 1 : 0;
+                                    } else {
+                                        /* auto/manual: present_plan is informational only.
+                                           It must NOT set g_plan_approved in manual mode,
+                                           otherwise manual gating is bypassed. */
+                                        g_plan_approved = 0;
+                                        approved = (g_permission_mode == 0); /* auto: treat as fine; manual: still require per-action approval */
+                                    }
+                                    if (approved) {
+                                        tool_output = strdup("PLAN APPROVED. You may now proceed to make the proposed changes. Work autonomously until you have another question, then present_plan again.");
+                                    } else {
+                                        tool_output = strdup("PLAN NOT APPROVED. Revise your plan based on the user's feedback and call present_plan again. Do not make any changes until the plan is approved.");
+                                    }
+                                    present_plan_done:
+                                    if (plan_txt) free(plan_txt);
+                                } else if (strcmp(unescaped_name, "remote_exec") == 0) {
                                    /* ── Remote Server Control Tool ────────────────────────── */
                                    /* Connect, discover, execute commands, monitor resources, submit jobs */
                                    
@@ -5432,8 +5576,10 @@ step_limit_check:
                                           size_t dlen = strlen(cmd_val) + 128;
                                           tool_output = malloc(dlen);
                                           snprintf(tool_output, dlen, "[Command Dry-Run Success]\nWould execute: %s", cmd_val);
+                                      } else if (g_permission_mode == 1 && !g_plan_approved) {
+                                          tool_output = strdup("Error: [PLAN MODE] You must call present_plan to present your plan and receive approval before executing commands or changing anything. Nothing was changed.");
                                       } else {
-                                          int approved = (g_permission_mode == 0);
+                                          int approved = (g_permission_mode == 0 || g_plan_approved); /* auto or approved-plan auto-run; manual prompts below */
                                           if (!approved) {
                                               FILE *tty = fopen("/dev/tty", "r+");
                                               if (tty) {
@@ -5587,7 +5733,7 @@ step_limit_check:
                                                   }
 
                                                   /* Auto-commit on successful command execution */
-                                                  if (exit_code == 0 && g_git_commit_enabled) {
+                                                  if (exit_code == 0 && g_git_commit_enabled && (g_permission_mode == 0 || g_plan_approved)) {
                                                       git_commit("command");
                                                   }
                                               }
@@ -5627,6 +5773,22 @@ step_limit_check:
                                       mcp_tool_name += 2;
                                   } else {
                                       mcp_tool_name = unescaped_name;
+                                  }
+
+                                  /* Mode-based approval gate for mutating MCP tools */
+                                  if (tool_is_mutating(mcp_tool_name)) {
+                                      if (g_permission_mode == 2) {
+                                          int ok = prompt_user_ok(mcp_tool_name, unescaped_args);
+                                          if (ok == 0 || ok == -1) {
+                                              if (server_name) { free(server_name); server_name = NULL; }
+                                              tool_output = strdup("Error: Action denied by user (manual mode). You must get explicit approval before changing anything.");
+                                              goto mcp_gated;
+                                          }
+                                      } else if (g_permission_mode == 1 && !g_plan_approved) {
+                                          if (server_name) { free(server_name); server_name = NULL; }
+                                          tool_output = strdup("Error: [PLAN MODE] This action changes state but no plan is approved yet. Call present_plan with your proposed changes and get approval before proceeding. Nothing was changed.");
+                                          goto mcp_gated;
+                                      }
                                   }
 
                                   /* Show a human-readable line for what the model is doing */
@@ -5705,12 +5867,19 @@ step_limit_check:
 
                                   free(server_name);
                               }
-
+                              mcp_gated:
                               if (!tool_output) {
                                   tool_output = strdup("Error: failed to execute tool");
                               }
 
-                              /* Prefix tool results with a structured header so small models
+                              /* User notification when the model improves its skills (self-improvement) */
+                                  if (tool_output
+                                      && (strstr(tool_output, "[SKILL_CREATED") || strstr(tool_output, "[SKILL_UPDATED")
+                                          || strstr(tool_output, "[SKILL: updated"))) {
+                                      fprintf(stderr, "\n\033[1;36m[ai] %s\033[0m\n", tool_output);
+                                  }
+
+                                  /* Prefix tool results with a structured header so small models
                                  can track which tool produced which data */
                               if (strcmp(unescaped_name, "think") != 0 &&
                                   strcmp(unescaped_name, "task_complete") != 0) {

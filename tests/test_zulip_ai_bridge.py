@@ -189,3 +189,84 @@ def test_manage_context_window_filters_bot_messages():
     result = bridge._manage_context_window(context_messages, "Help me with X")
     assert len(result) == 2
     assert all(m["sender_email"] != "bot@example.zulipchat.com" for m in result)
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ZulipAiBridge trust / redirect tests
+# ---------------------------------------------------------------------------
+
+def test_is_trusted_url_exact():
+    """Exact domain match should be trusted."""
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._is_trusted_url("https://example.zulipchat.com") is True
+
+
+def test_is_trusted_url_subdomain():
+    """Subdomain of the configured domain should be trusted."""
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._is_trusted_url("https://sub.example.zulipchat.com") is True
+
+
+def test_is_trusted_url_untrusted():
+    """Different domain should be rejected."""
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._is_trusted_url("https://evil.com") is False
+
+
+def test_is_trusted_redirect_trusted_target():
+    """Redirect to a trusted final URL should pass."""
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._is_trusted_redirect("https://example.zulipchat.com/file", "https://example.zulipchat.com/old") is True
+
+
+def test_is_trusted_redirect_untrusted_target():
+    """Redirect to an untrusted final URL should be rejected."""
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._is_trusted_redirect("https://evil.com/steal", "https://example.zulipchat.com/redirect") is False
+
+
+def test_download_file_blocks_untrusted_redirect():
+    """_download_file should refuse to download from an untrusted redirect target."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    class FakeResponse:
+        url = "https://evil.com/steal"
+        def raise_for_status(self):
+            pass
+        def iter_content(self, chunk_size=8192):
+            return iter([b"malicious content"])
+
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    with patch("zulip_ai_bridge.requests.get", return_value=FakeResponse()):
+        success, err = bridge._download_file("https://example.zulipchat.com/original", "/tmp/malicious.bin")
+    assert success is False
+    assert "untrusted" in err
+
+
+def test_download_file_allows_trusted_redirect():
+    """_download_file should follow a redirect to a trusted target."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    class FakeResponse:
+        url = "https://example.zulipchat.com/redirected"
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def iter_content(self, chunk_size=8192):
+            return iter([b"trusted content"])
+
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    with patch("zulip_ai_bridge.requests.get", return_value=FakeResponse()):
+        success, err = bridge._download_file("https://example.zulipchat.com/original", "/tmp/trusted.bin")
+    assert success is True
+    assert err is None

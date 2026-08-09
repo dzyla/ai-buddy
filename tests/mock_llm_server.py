@@ -15,7 +15,7 @@ Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 import json
 import os
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -152,7 +152,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8919
-    srv = HTTPServer(("127.0.0.1", port), Handler)
+    # Threading so the binary's streaming SSE + a follow-up request (next agent
+    # loop iteration) never deadlock on keep-alive under load.
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.serve_forever()
 
 

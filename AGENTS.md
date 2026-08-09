@@ -19,8 +19,8 @@
 ### Prerequisites
 
 ```bash
-sudo apt install gcc libcurl4-openssl-dev python3   # Debian/Ubuntu
-brew install curl python                             # macOS
+sudo apt install gcc libcurl4-openssl-dev libssl-dev python3   # Debian/Ubuntu
+brew install curl python                                        # macOS
 ```
 
 ### Build
@@ -44,7 +44,45 @@ make test               # run C test + pytest suite
 ai "what's the current Bitcoin price?"
 ai -i                   # interactive REPL
 ps aux | ai "what's eating memory?"
+ai --plan "refactor the auth module"     # investigate first, ask before changing state
+ai --manual "tidy the scripts dir"       # you approve every state-changing action
 ```
+
+### Permission modes (manual / plan / auto)
+
+`ai` has three permission modes, selected by flag or `INFER_PERMISSION_MODE`:
+
+- **`--manual`** (`INFER_PERMISSION_MODE=manual`): the agent asks for explicit approval
+  before EVERY state-changing action (commands, write/edit, memory, scheduling).
+  Read-only investigation tools run freely.
+- **`--plan`** (`INFER_PERMISSION_MODE=plan`): the agent investigates, reads, searches,
+  and runs read-only commands, but makes NO changes until it calls `present_plan(...)`
+  and the user approves. Once approved it works autonomously until it has another
+  question, then calls `present_plan` again.
+- **`--auto`** / default (`INFER_PERMISSION_MODE=auto`, `-y`, `INFER_AUTO_APPROVE=1`):
+  full autonomy — the agent changes state freely until the task is finished.
+
+The plan/manual gating lives in `ai.c` (the `tool_is_mutating()` classification and the
+`present_plan` handler in the agent loop); read-only tools are never gated. Env/CLI
+selections are honoured so the Zulip bridge and schedulers can set a mode (`BRIDGE_AI_MODE`,
+`INFER_PERMISSION_MODE`).
+
+### Continuous self-improvement (skills)
+
+`ai_mcp.py` provides `skill_create`, `skill_update`, and `skill_note` so the agent can
+persist what it learns into skills — written to `.agents/skills/` (checked into the repo)
+and synced to `~/.config/ai/skills/` (global). A learning log lives at
+`~/.config/ai/skills_learning_log.md`. `ai.c` surfaces a user notification when a skill is
+created/updated. The `self_improvement` skill instructs the agent when to persist learnings.
+
+### Searchable conversation history
+
+Every conversation is backed up to both `~/.cache/ai/sessions/` (fast) and the persistent
+`~/.local/share/ai/sessions/` (survives cache clears), and every turn appends to
+`~/.cache/ai/history.jsonl` with its `session_id`. A kept-fresh SQLite FTS5 index
+(`~/.local/share/ai/history_index.db`) powers three agent-facing tools: `search_history`,
+`list_sessions`, and `get_session`, which let the agent recall and learn from past
+conversations (documented in the `search_history` skill).
 
 ### Configure
 

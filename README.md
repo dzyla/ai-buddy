@@ -201,12 +201,72 @@ dmesg | tail -20 | ai "any hardware warnings?"
 | Flag | Long | Env var | Effect |
 |------|------|---------|--------|
 | `-i` | `--interactive` | | Start REPL |
-| `-y` | `--yes` | `INFER_AUTO_APPROVE=1` | Auto-approve shell commands |
+| `--auto` | `--auto-approve` | `INFER_PERMISSION_MODE=auto` | FULL AUTONOMY: change state freely until done |
+| `--plan` | | `INFER_PERMISSION_MODE=plan` | PLAN: investigate & report, but no changes until `present_plan` is approved, then work autonomously |
+| `--manual` | | `INFER_PERMISSION_MODE=manual` | MANUAL: ask for approval before every state-changing action |
+| `-y` | `--yes` | `INFER_AUTO_APPROVE=1` | Auto-approve shell commands (a.k.a. `--auto`) |
 | `-c` | `--continue` | `INFER_CONTINUE=1` | Run without turn limit until done |
 | `-r` | `--resume` | `INFER_RESUME=1` | Resume the previous conversation |
 | `-q` | `--quiet` | `INFER_QUIET=1` | Suppress thinking output |
 | `-n` | `--no-tools` | | Direct answer, skip the agent loop |
 | `-h` | `--help` | | Print help |
+
+### Permission modes (manual / plan / auto)
+
+The harness has three permission modes that control how much autonomy the agent has.
+They address the problem of the agent "running away and changing things" without
+checking with you. Set a mode with a flag (above) or `INFER_PERMISSION_MODE=
+{manual|plan|auto}`, or cycle it live with `Shift-Tab` while the agent runs.
+
+| Mode | Behaviour |
+|------|-----------|
+| **MANUAL** (`--manual`) | Asks you for explicit approval before EVERY state-changing action (commands, file writes/edits, memory, scheduling). Read-only investigation runs freely. Nothing changes without your say-so. |
+| **PLAN** (`--plan`) | Investigates, reads, searches, and runs read-only commands on its own, but makes **no changes** until it calls `present_plan(plan="...")` and you approve. Once its plan is approved it works autonomously until it has another question — then it calls `present_plan` again. |
+| **FULL AUTONOMY** (`--auto`, default) | Investigates and changes state freely until the task is finished, then reports. |
+
+In **plan** mode the agent is strongly guided (via injected system context) to
+investigate first, report its discoveries, present a concrete plan with exact changes
+and rationale, and wait for your approval before mutating anything. If you reject the
+plan, it revises and asks again. Read-only tools (`think`, `read_file`,
+`list_directory`, `web_search`, `fetch_*`, searches, `load_skill`) are never gated, so
+the agent can always investigate.
+
+### Continuous self-improvement (skills)
+
+The harness learns from the past. After completing a task the agent can persist what it
+learned into reusable skills, checked into the repo (`.agents/skills/`) and synced to
+your global skills directory (`~/.config/ai/skills/`), so future sessions start from
+today's discoveries:
+
+- **`skill_create(name, description, content)`** — save a new reusable technique/workflow.
+- **`skill_update(name, note)`** — append a "good to know" fix or correction to a skill
+  the agent loaded and found wrong/outdated.
+- **`skill_note(name?, note)`** — append a standalone insight to the learning log
+  (`~/.config/ai/skills_learning_log.md`).
+
+The agent is prompted (via the `self_improvement` skill and system context) to persist
+learnings after non-trivial tasks and to notify you whenever a skill is created or
+updated. Run `ai "load_skill(self_improvement)"` to read the guidance the agent follows.
+
+### Searchable conversation history (backup + learn)
+
+Every conversation is backed up and searchable so the agent can learn from the past:
+
+- Each session is saved to **two places** for durability: `~/.cache/ai/sessions/` (fast
+  cache) and `~/.local/share/ai/sessions/` (persistent local user data, survives cache
+  clears). Every turn also appends to the global log `~/.cache/ai/history.jsonl`.
+- A fast full-text (SQLite FTS5) index at `~/.local/share/ai/history_index.db` is kept
+  automatically up to date.
+- The agent can search and read past conversations through three tools the harness
+  exposes and the `search_history` skill documents:
+  - **`search_history(query)`** — full-text search over all past conversations; returns
+    matching snippets + session IDs, rebuilt automatically when history changes.
+  - **`list_sessions(limit)`** — list the most recent backed-up conversations.
+  - **`get_session(session_id)`** — read a full prior conversation as a transcript.
+
+Ask the agent "how did we do X last time?" or "recall the session where we fixed Y" and
+it will search its own history, then verify against the current state before reusing an
+old approach.
 
 ### Resume a conversation
 

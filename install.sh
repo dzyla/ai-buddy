@@ -184,6 +184,11 @@ done
 if ! pkg-config --exists libcurl 2>/dev/null && ! dpkg -l libcurl4-openssl-dev &>/dev/null 2>&1; then
     missing+=(libcurl4-openssl-dev)
 fi
+# libssl-dev provides -lssl and -lcrypto (required by the Makefile); without it
+# the build fails with "cannot find -lssl / -lcrypto".
+if ! pkg-config --exists openssl 2>/dev/null && ! dpkg -l libssl-dev &>/dev/null 2>&1; then
+    missing+=(libssl-dev)
+fi
 if [ "${#missing[@]}" -gt 0 ]; then
     echo "==> Installing missing packages: ${missing[*]}"
     sudo apt-get install -y "${missing[@]}"

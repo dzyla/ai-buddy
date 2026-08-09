@@ -5,30 +5,51 @@ description: Best practices and agent loop guidelines specifically tuned for sma
 
 # Small Model Harness Guidelines
 
-When executing tasks, follow these strict guidelines to maintain focus and prevent context bloat:
+When executing tasks, follow these strict guidelines to maintain focus and prevent
+context bloat. Respect the CURRENT PERMISSION MODE in your system context before any
+state-changing action.
+
+## 0. Permission mode reminders
+- **PLAN**: read/search are free; DO NOT change anything until `present_plan` is
+  approved. Present findings + exact changes, wait, then work autonomously after approval.
+- **MANUAL**: every state-changing action needs explicit approval.
+- **FULL AUTONOMY**: investigate, execute, verify, finish.
 
 ## 1. Plan and Execute
-- **For multi-step tasks**, always use the `think` tool first to generate a numbered, step-by-step plan.
-- Execute exactly **one step per turn**. Do not combine multiple unrelated tool calls in a single turn.
+- **For multi-step tasks**, use `think` first to generate a numbered, step-by-step plan.
+  You may call `think` again between phases to reflect or adjust — repeated reasoning
+  is allowed.
+- Execute exactly **one step per turn**. Do not combine multiple unrelated tool calls
+  in a single turn.
 - If you lose track, review your plan and check off completed steps before proceeding.
 
 ## 2. Reflexion and Error Recovery
-- If a command fails (e.g., `execute_command` returns non-zero), **stop and reflect**.
-- Read the error output carefully to understand the root cause.
-- State what went wrong and how you plan to fix it before making another tool call. Do not blindly retry the exact same command.
-- **CRITICAL: Search for Documentation First**. If you encounter an API error, missing method, or library usage problem that you don't immediately know how to fix, **DO NOT GUESS** and iterate by brute force (e.g., repeatedly calling `dir()` or `help()`). Instead, immediately use web search tools (`web_search`, `curl`, etc.) to find the official documentation or examples online.
+- If a command fails, **stop and reflect** (`think`).
+- Read the error output carefully and state what went wrong and how you'll fix it
+  before making another tool call. Do not blindly retry the exact same command.
+- **CRITICAL: Search for Documentation First**. If you hit an API error, missing
+  method, or library usage problem you don't immediately know how to fix, DO NOT guess
+  and iterate by brute force. Use `web_search` / `curl` to find official docs or examples.
 
 ## 3. Context Management
-- Avoid calling tools that produce massive output unless absolutely necessary.
-- If you need to search a large file, use `execute_command` with `grep` rather than `read_file`.
-- Do not repeat information that is already in the context.
+- Avoid tools that produce massive output unless necessary. Use `grep` over `read_file`
+  for large files. Don't repeat info already in context.
 
 ## 4. Systems Engineering & Memory Hygiene (C/C++/Rust)
-- **Memory Safety**: Never call `free()` on stack memory (e.g. `char buf[256]`). Match `malloc`/`calloc`/`strdup` with `free`. Never dereference pointers after `free()`.
-- **String & Pointer Bounds**: Always verify string bounds (`strlen()`) before pointer arithmetic. Never advance string pointers past `\0`.
-- **Build & Test Verification**: When adding or editing source files, ALWAYS update all build manifests (`Makefile`, `CMakeLists.txt`) and test suite fixtures. Run build and test commands (`make && make test`) BEFORE calling `task_complete`.
-- **Shell Command Safety**: Never construct shell commands via raw string interpolation with single quotes; write input to files or stdin to prevent quote escaping errors.
+- Never `free()` stack memory. Match `malloc`/`calloc`/`strdup` with `free`. Never
+  dereference after `free()`.
+- Verify string bounds before pointer arithmetic. Never advance past `\0`.
+- When adding/editing source, update all build manifests (Makefile, CMakeLists.txt) and
+  test fixtures. Run build + test before `task_complete`.
+- Never build shell commands via raw single-quote interpolation; write to files/stdin.
 
 ## 5. Termination
 - Once the task is complete, call `task_complete` immediately.
-- Do not ask follow-up questions or perform unnecessary verification steps unless explicitly requested.
+- Do not perform unnecessary re-verification unless the permission mode or task
+  requires it. In plan/manual mode still ask before mutating; in autonomous mode finish
+  and report.
+
+## 6. Self-improvement
+- Solved something reusable this session? Persist it:
+  `skill_create` / `skill_update` / `skill_note`. You'll be notified when a skill is
+  created/updated.

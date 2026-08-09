@@ -1071,6 +1071,311 @@ def recall(query):
         return f"Error searching memories: {e}"
 
 
+# ── Searchable conversation history (backup + FTS index) ────────────────────
+# Every conversation is backed up to BOTH the cache (fast, ~/.cache/ai/sessions)
+# and the persistent local user-data dir (~/.local/share/ai/sessions), and each
+# turn is appended to ~/.cache/ai/history.jsonl with a session_id. This module
+# builds a fast SQLite FTS5 index over all of it so the agent can search and
+# learn from past conversations quickly.
+
+CACHE_SESSIONS = os.path.expanduser("~/.cache/ai/sessions")
+DATA_SESSIONS = os.path.expanduser("~/.local/share/ai/sessions")
+HISTORY_LOG = os.path.expanduser("~/.cache/ai/history.jsonl")
+HISTORY_DB = os.path.expanduser("~/.local/share/ai/history_index.db")
+
+
+def _session_dirs():
+    return [d for d in (CACHE_SESSIONS, DATA_SESSIONS) if os.path.isdir(d)]
+
+
+def _ensure_history_schema(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS history(session_id TEXT, ts TEXT, prompt TEXT, response TEXT, body TEXT)")
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(session_id, ts, prompt, response, body)")
+    conn.execute("CREATE TABLE IF NOT EXISTS hmeta(k TEXT PRIMARY KEY, v TEXT)")
+    conn.commit()
+
+
+def _iter_history_log_lines():
+    """Yield parsed records from history.jsonl. Returns (line_skip, records)."""
+    records = []
+    if not os.path.isfile(HISTORY_LOG):
+        return records
+    try:
+        with open(HISTORY_LOG, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                records.append(rec)
+    except Exception:
+        pass
+    return records
+
+
+def _history_is_stale():
+    """Rebuild the index if the history log or session set changed since the last
+    build. Uses byte-size (history.jsonl is append-only) and session-file count so
+    it's reliable even when files share the same mtime second."""
+    if not os.path.isfile(HISTORY_DB):
+        return True
+    try:
+        conn = sqlite3.connect(HISTORY_DB)
+        row = conn.execute("SELECT v FROM hmeta WHERE k='log_size'").fetchone()
+        sess = conn.execute("SELECT v FROM hmeta WHERE k='sess_count'").fetchone()
+        conn.close()
+    except Exception:
+        return True
+    try:
+        log_size = os.path.getsize(HISTORY_LOG) if os.path.isfile(HISTORY_LOG) else 0
+    except Exception:
+        log_size = 0
+    sess_count = 0
+    for d in _session_dirs():
+        try:
+            sess_count += len([f for f in os.listdir(d) if f.endswith(".json")])
+        except Exception:
+            pass
+    prev_log = int(row[0]) if row else -1
+    prev_sess = int(sess[0]) if sess else -1
+    return log_size != prev_log or sess_count != prev_sess
+
+
+def rebuild_history_index():
+    """(Re)build the full-text conversation index from history.jsonl + session files.
+    Idempotent: wipes and reinserts (history.jsonl is bounded and typically small-to-moderate).
+    Returns a human-readable summary of how many turns/sessions were indexed."""
+    try:
+        os.makedirs(os.path.dirname(HISTORY_DB), exist_ok=True)
+        conn = sqlite3.connect(HISTORY_DB)
+        conn.execute("DROP TABLE IF EXISTS history")
+        conn.execute("DROP TABLE IF EXISTS history_fts")
+        _ensure_history_schema(conn)
+
+        session_ids = set()
+        n_turns = 0
+        n_sessions = 0
+
+        # 1) From history.jsonl (prompt -> response pairs)
+        for rec in _iter_history_log_lines():
+            prompt = rec.get("prompt", "")
+            response = rec.get("response", "")
+            sid = rec.get("session_id", "") or "unknown"
+            ts = rec.get("timestamp", "")
+            body = (prompt or "") + "\n" + (response or "")
+            if not prompt and not response:
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO history(session_id, ts, prompt, response, body) VALUES (?,?,?,?,?)",
+                    (sid, ts, prompt, response, body),
+                )
+            except Exception:
+                continue
+            n_turns += 1
+            if sid and sid != "unknown":
+                session_ids.add(sid)
+
+        # 2) From session files (full transcripts) — index session summaries
+        seen = set()
+        for d in _session_dirs():
+            if not os.path.isdir(d):
+                continue
+            try:
+                for fn in sorted(os.listdir(d)):
+                    if not fn.endswith(".json"):
+                        continue
+                    p = os.path.join(d, fn)
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    try:
+                        with open(p, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                        messages = json.loads(content)
+                        if not isinstance(messages, list):
+                            continue
+                        sid = fn[:-5]
+                        # Build a compact transcript text for FTS.
+                        parts = []
+                        last_user = ""
+                        for m in messages:
+                            if not isinstance(m, dict):
+                                continue
+                            role = m.get("role", "")
+                            txt = m.get("content", "")
+                            if isinstance(txt, list):
+                                txt = " ".join(
+                                    str(c.get("text", "")) for c in txt if isinstance(c, dict)
+                                )
+                            txt = str(txt).strip()
+                            if role == "user" and txt:
+                                last_user = txt
+                                parts.append("USER: " + txt)
+                            elif role == "assistant" and txt:
+                                parts.append("ASSISTANT: " + txt)
+                        body = "\n".join(parts)
+                        prompt = last_user or ""
+                        ts = ""
+                        conn.execute(
+                            "INSERT INTO history(session_id, ts, prompt, response, body) VALUES (?,?,?,?,?)",
+                            (sid, ts, prompt, body[:2000], body),
+                        )
+                        n_turns += 1
+                        n_sessions += 1
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Copy everything into the FTS virtual table (columns: session_id,ts,prompt,response,body)
+        try:
+            conn.execute("INSERT INTO history_fts(session_id, ts, prompt, response, body) SELECT session_id, ts, prompt, response, body FROM history")
+        except Exception:
+            pass
+        # Record source fingerprints for staleness detection.
+        try:
+            conn.execute("INSERT OR REPLACE INTO hmeta(k, v) VALUES ('log_size', ?)",
+                         (str(os.path.getsize(HISTORY_LOG)) if os.path.isfile(HISTORY_LOG) else "0",))
+            conn.execute("INSERT OR REPLACE INTO hmeta(k, v) VALUES ('sess_count', ?)",
+                         (str(n_sessions),))
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
+        return f"[history] Indexed {n_turns} turn(s) / {n_sessions} session file(s): {HISTORY_DB}"
+    except Exception as e:
+        return f"Error building history index: {e}"
+
+
+def search_history(query, limit=8):
+    """FTS search across all past conversations. Returns matched turns/sessions
+    with snippet + session_id, so the agent can learn from earlier sessions and
+    then load the full session if needed. Rebuilds the index if it's stale/missing."""
+    if not query:
+        return "Error: query required"
+    try:
+        if _history_is_stale():
+            rebuild_history_index()
+        conn = sqlite3.connect(HISTORY_DB)
+        words = re.findall(r"\w+", query)
+        limit = int(limit)
+        rows = []
+
+        def _try(q, cols):
+            # cols: "fts" -> SELECT rows w/ (session_id, ts, prompt, response) using rank;
+            # covered by the FTS virtual table columns.
+            try:
+                if cols == "fts":
+                    return conn.execute(
+                        "SELECT session_id, ts, prompt, response FROM history_fts "
+                        "WHERE history_fts MATCH ? ORDER BY rank LIMIT ?",
+                        (q, max(limit, 1)),
+                    ).fetchall()
+                return conn.execute(
+                    f"SELECT session_id, ts, {cols} FROM history WHERE {cols} LIKE ? LIMIT ?",
+                    (f"%{q}%", max(limit, 1)),
+                ).fetchall()
+            except Exception:
+                return []
+
+        # Prefer exact phrase, then all-terms (AND), then any-term (OR), then LIKE.
+        if words:
+            phrase = '"' + " ".join(words) + '"'
+            all_terms = " AND ".join(words)
+            any_terms = " OR ".join(words)
+            rows = _try(phrase, "fts") or _try(all_terms, "fts") or _try(any_terms, "fts")
+            if not rows:
+                like = " OR ".join(["body LIKE ? OR prompt LIKE ?" for _ in words[:5]])
+                params = [f"%{w}%" for w in words[:5] for _ in range(2)]
+                try:
+                    rows = conn.execute(
+                        f"SELECT session_id, ts, substr(body,1,240) FROM history WHERE {like} LIMIT ?",
+                        tuple(params) + (max(limit, 1),),
+                    ).fetchall()
+                except Exception:
+                    rows = []
+        conn.close()
+
+        seen = set()
+        deduped = []
+        for r in rows:
+            sid, ts, *_rest = r
+            key = (sid, str(_rest[0])[:40])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+
+        if not deduped:
+            return f"No past conversation matches '{query}'. Try a broader term, or use list_sessions to see recent history."
+        out = [f"[history] {len(deduped)} match(es) for '{query}':\n"]
+        for sid, ts, *rest in deduped:
+            text = " | ".join(str(x) for x in rest if x)
+            out.append(f"- session {sid or '?'} ({ts or '?'}): {text[:200]}")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error searching history: {e}"
+
+
+def list_sessions(limit=12):
+    """List the most recent backed-up conversations (session id, mtime, bytes)."""
+    try:
+        items = []
+        for d in _session_dirs():
+            for fn in os.listdir(d):
+                if fn.endswith(".json"):
+                    p = os.path.join(d, fn)
+                    try:
+                        st = os.stat(p)
+                        items.append((st.st_mtime, fn[:-5], st.st_size, p))
+                    except Exception:
+                        continue
+        items.sort(reverse=True)
+        items = items[: int(limit)]
+        if not items:
+            return "No backed-up sessions found."
+        lines = ["Recent backed-up sessions:"]
+        for _mt, sid, size, p in items:
+            lines.append(f"- {sid}  ({size} B)  -> {p}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing sessions: {e}"
+
+
+def get_session(session_id, max_chars=4000):
+    """Load a full backed-up conversation by session_id and return a readable transcript."""
+    if not session_id:
+        return "Error: session_id required (use list_sessions or search_history to find one)."
+    for d in _session_dirs():
+        p = os.path.join(d, f"{session_id}.json")
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                messages = json.loads(content)
+                parts = []
+                for m in messages:
+                    if not isinstance(m, dict):
+                        continue
+                    role = m.get("role", "")
+                    txt = m.get("content", "")
+                    if isinstance(txt, list):
+                        txt = " ".join(str(c.get("text", "")) for c in txt if isinstance(c, dict))
+                    if isinstance(txt, str) and txt.strip():
+                        parts.append(f"[{role}]\n{txt.strip()}")
+                body = "\n\n".join(parts)
+                if len(body) > int(max_chars):
+                    body = body[: int(max_chars)] + "\n... [truncated — read the file for the full transcript]"
+                return f"[session {session_id}] from {p}\n\n{body}"
+            except Exception as e:
+                return f"Error reading session {session_id}: {e}"
+    return f"Session '{session_id}' not found."
+
+
 def _clean_pdf_text(raw):
     # Repair soft-hyphenation at line breaks (word-\nrest -> wordrest)
     raw = re.sub(r'-\n(?=[a-z])', '', raw)
@@ -3072,6 +3377,124 @@ def run_scheduler_loop(task_id):
     cleanup_pid()
     log_message("Scheduler loop exited cleanly.")
 
+
+# ── Continuous self-improvement: skill create/update/note ─────────────────────
+# The agent persists what it learns into skills so future sessions inherit it.
+# Skills are written to the project .agents/skills (checked into the repo) AND
+# to ~/.config/ai/skills (global, persistent). Returns a machine-recognisable
+# marker "[SKILL_CREATED:name]" / "[SKILL_UPDATED:name]" / "[SKILL:note:name]"
+# that ai.c surfaces to the user as a notification.
+
+def _skill_targets(skill_name):
+    """Return [(path, base_dir)] write targets for a skill (each a <dir>/SKILL.md),
+    project first so it's checked into the repo."""
+    san = skill_name.replace("/", "_").replace("\\", "_").replace("..", "_").strip()
+    if not san:
+        san = "learned"
+    targets = []
+    proj = os.path.join(os.getcwd(), ".agents", "skills", san, "SKILL.md")
+    glob = os.path.join(os.path.expanduser("~"), ".config", "ai", "skills", san, "SKILL.md")
+    if proj != glob:
+        targets.append((proj, "project"))
+    targets.append((glob, "global"))
+    return targets, san
+
+
+def _learning_log_path():
+    return os.path.join(os.path.expanduser("~"), ".config", "ai", "skills_learning_log.md")
+
+
+def _append_learning_log(entry):
+    try:
+        path = _learning_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n## {ts}\n{entry}\n")
+    except Exception as e:
+        return f"(log write failed: {e})"
+    return ""
+
+
+def skill_create(name, description, content):
+    """Create (or overwrite) a skill. Returns a [SKILL_CREATED:name] marker."""
+    targets, san = _skill_targets(name)
+    if not description:
+        description = "Learned during an ai session; auto-generated skill."
+    body = (
+        "---\n"
+        f"name: {san}\n"
+        f"description: {description}\n"
+        "---\n\n"
+        f"# {san}\n\n"
+        f"{content}\n"
+    )
+    wrote = []
+    for path, _where in targets:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+            wrote.append(path)
+        except Exception as e:
+            return f"Error writing skill {name}: {e}"
+    _append_learning_log(f"Created skill **{san}** (wrote to {len(wrote)} location(s)).\n\n```\n{description}\n```\n\n{content[:1000]}")
+    joined = ", ".join(wrote)
+    return f"[SKILL_CREATED:{san}]\nSkill '{san}' created/updated.\nSaved to: {joined}\n\nDescription: {description}"
+
+
+def skill_update(name, note):
+    """Update an existing skill with a note (good-to-know / discrepancy fix).
+    Appends a 'Recent learning' section; returns a [SKILL_UPDATED:name] marker."""
+    targets, san = _skill_targets(name)
+    updated = 0
+    for path, _where in targets:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            if "## Recent learning" not in content:
+                content += "\n\n## Recent learning\n"
+            content += f"\n- [{ts}] {note}\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            updated += 1
+        except Exception as e:
+            return f"Error updating skill {name}: {e}"
+    if updated == 0:
+        # Skill doesn't exist yet anywhere; create it as a note.
+        return skill_create(name, f"Auto-generated from learning note: {note[:140]}", note)
+    _append_learning_log(f"Updated skill **{san}** ({updated} location(s)): {note}")
+    return f"[SKILL_UPDATED:{san}]\nSkill '{san}' updated in {updated} location(s).\nRecorded learning: {note}"
+
+
+def skill_note(name, note):
+    """Attach a standalone learning note to a skill's learning log without touching its body."""
+    _append_learning_log(f"Note for skill **{name or 'general'}**: {note}")
+    return f"[SKILL:note:{name or 'general'}]\nNoted: {note}\n(Stored in {_learning_log_path()})"
+
+
+def list_skills_dir():
+    """Return human-readable index of all skills in project + global skill dirs."""
+    bases = [
+        os.path.join(os.getcwd(), ".agents", "skills"),
+        os.path.join(os.path.expanduser("~"), ".config", "ai", "skills"),
+    ]
+    seen = set()
+    lines = []
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        for entry in sorted(os.listdir(base)):
+            if entry in seen:
+                continue
+            if os.path.isfile(os.path.join(base, entry, "SKILL.md")):
+                lines.append(entry)
+                seen.add(entry)
+    return "Available skills:\n" + ("\n".join(lines) if lines else "(none yet — use skill_create to save what you learn)")
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: ai_mcp.py [list-tools | call-tool | render-markdown | trim-messages]", file=sys.stderr)
@@ -4263,7 +4686,130 @@ def main():
             }
         })
 
-        # 12. task_complete — last so model only sees it as exit
+        # 12. present_plan — investigate → plan → ask before changing
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "present_plan",
+                "description": "PLAN MODE: Present your findings and proposed changes to the user and wait for approval before making any changes. Call this with a clear plan (findings, exact changes/commands, rationale, suggestions) when you are about to modify state (write/edit files, run state-changing commands, save memory, schedule, etc.). The user approves or rejects; do NOT proceed with changes until you receive approval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan": {
+                            "type": "string",
+                            "description": "Your findings so far, the exact changes or commands you intend to run, and your reasoning / suggestions. Be concrete."
+                        }
+                    },
+                    "required": ["plan"]
+                }
+            }
+        })
+
+        # 13. Searchable conversation history — learn from past sessions
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "search_history",
+                "description": "Search all past conversations (backed up locally) with full-text search. Use this to learn from earlier sessions — recall how a previous problem was solved, which commands worked, what the user asked before, etc. Returns matched snippets + session IDs; then call get_session to read a full conversation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Keywords to find in past conversations."},
+                        "limit": {"type": "integer", "description": "Max results (default 8)."}
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_sessions",
+                "description": "List the most recent backed-up conversations (session id, size, path). Use it to see what you've worked on recently or to find a session_id for get_session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Number of recent sessions to list (default 12)."}
+                    }
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_session",
+                "description": "Load a full backed-up conversation by session_id as a readable transcript. Use after search_history / list_sessions to read the entire prior conversation in context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "Session id, e.g. sess_1786247517 or 'last'."},
+                        "max_chars": {"type": "integer", "description": "Cap on transcript length (default 4000)."}
+                    },
+                    "required": ["session_id"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "rebuild_history_index",
+                "description": "Rebuild the full-text search index over all backed-up conversations. Normally automatic; call if history search seems stale or returned nothing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        })
+
+        # 14. Continuous self-improvement: skill_create / skill_update / skill_note
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "skill_create",
+                "description": "SELF-IMPROVEMENT: Persist what you learned during this session into a reusable skill so future sessions inherit it. Call this after completing a non-trivial task, discovering a useful technique/workaround, or when a skill states something you found to be wrong. Saved to the repo .agents/skills AND ~/.config/ai/skills. The user is notified when a skill is created.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Skill name (directory, e.g. 'pandas_merge_fix')."},
+                        "description": {"type": "string", "description": "One-line description: when to use this skill."},
+                        "content": {"type": "string", "description": "Full skill body: numbered steps, exact commands, pitfalls, verification, sources."}
+                    },
+                    "required": ["name", "description", "content"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "skill_update",
+                "description": "SELF-IMPROVEMENT: Add a 'good to know' note or discrepancy fix to an existing skill after you loaded it and learned something new or found it wrong/outdated. The user is notified when a skill is updated.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Name of the existing skill to update."},
+                        "note": {"type": "string", "description": "Concise note: what to fix / what you learned, with any exact command or correction."}
+                    },
+                    "required": ["name", "note"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "skill_note",
+                "description": "SELF-IMPROVEMENT: Append a standalone learning note to the persisted skills learning log without editing any skill body. Lower-commitment than skill_create/update.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Optional skill name to associate the note with."},
+                        "note": {"type": "string", "description": "The lesson / insight to remember across sessions."}
+                    },
+                    "required": ["note"]
+                }
+            }
+        })
+
+        # 14. task_complete — last so model only sees it as exit
         openai_tools.append({
             "type": "function",
             "function": {
@@ -4950,6 +5496,56 @@ def main():
                 print(result)
             except Exception as e:
                 print(f"Error in gcal_delete_event: {e}")
+        elif tool_name == "present_plan" or server_name == "present_plan":
+            # Native approval flow is handled in ai.c; this is a safety fallback for
+            # direct ai_mcp.py invocations.
+            plan = arguments.get("plan", "")
+            print('{"ok": true, "note": "present_plan acknowledged (handled natively by the agent loop in ai.c). If you are in plan mode, the user will be asked to approve or reject this plan."}')
+        elif tool_name == "search_history" or server_name == "search_history":
+            try:
+                print(search_history(query=arguments.get("query", ""), limit=arguments.get("limit", 8)))
+            except Exception as e:
+                print(f"Error in search_history: {e}")
+        elif tool_name == "list_sessions" or server_name == "list_sessions":
+            try:
+                print(list_sessions(limit=arguments.get("limit", 12)))
+            except Exception as e:
+                print(f"Error in list_sessions: {e}")
+        elif tool_name == "get_session" or server_name == "get_session":
+            try:
+                print(get_session(session_id=arguments.get("session_id", ""), max_chars=arguments.get("max_chars", 4000)))
+            except Exception as e:
+                print(f"Error in get_session: {e}")
+        elif tool_name == "rebuild_history_index" or server_name == "rebuild_history_index":
+            try:
+                print(rebuild_history_index())
+            except Exception as e:
+                print(f"Error in rebuild_history_index: {e}")
+        elif tool_name == "skill_create" or server_name == "skill_create":
+            try:
+                print(skill_create(
+                    name=arguments.get("name", ""),
+                    description=arguments.get("description", ""),
+                    content=arguments.get("content", ""),
+                ))
+            except Exception as e:
+                print(f"Error in skill_create: {e}")
+        elif tool_name == "skill_update" or server_name == "skill_update":
+            try:
+                print(skill_update(
+                    name=arguments.get("name", ""),
+                    note=arguments.get("note", ""),
+                ))
+            except Exception as e:
+                print(f"Error in skill_update: {e}")
+        elif tool_name == "skill_note" or server_name == "skill_note":
+            try:
+                print(skill_note(
+                    name=arguments.get("name", ""),
+                    note=arguments.get("note", ""),
+                ))
+            except Exception as e:
+                print(f"Error in skill_note: {e}")
         else:
             # Route to MCP server
             cfg = mcp_servers.get(server_name)

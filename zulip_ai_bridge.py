@@ -96,6 +96,10 @@ class FileParser:
 
         try:
             resp = requests.get(url, stream=True, timeout=30)
+            # The final URL after following redirects must also be trusted.
+            if not self._is_trusted_redirect(resp.url, url):
+                logger.warning(f"Redirect to untrusted domain: {resp.url}")
+                return False, "Download redirects to untrusted domain"
             resp.raise_for_status()
 
             # Check Content-Length header if available
@@ -119,7 +123,11 @@ class FileParser:
             return False, str(e)
 
     def _is_trusted_url(self, url):
-        """Check if a URL is from the configured Zulip server domain."""
+        """Check if a URL is from the configured Zulip server domain.
+
+        Accepts exact domain matches, subdomains of the allowed domain,
+        and relative paths (which are always same-origin).
+        """
         try:
             from urllib.parse import urlparse
             parsed = urlparse(url)
@@ -134,6 +142,22 @@ class FileParser:
                 or downloaded.endswith("." + allowed)
                 or allowed.endswith("." + downloaded)
             )
+        except Exception:
+            return False
+
+    def _is_trusted_redirect(self, final_url, original_url):
+        """Check if a redirect target is trusted.
+
+        After following redirects, the final URL must also be from a
+        trusted domain to prevent redirects to malicious sites.
+        """
+        try:
+            from urllib.parse import urlparse
+            final_parsed = urlparse(final_url)
+            # If no netloc, treat as same-origin relative redirect.
+            if not final_parsed.netloc:
+                return True
+            return self._is_trusted_url(final_url)
         except Exception:
             return False
 
@@ -423,6 +447,18 @@ class ZulipAiBridge:
         self._file_parser = FileParser(self.client, self.client.base_url)
         print("File parser initialized — will extract content from uploaded documents.")
 
+    def _is_trusted_url(self, url):
+        """Check if a URL is from the trusted Zulip domain."""
+        return self._file_parser._is_trusted_url(url)
+
+    def _is_trusted_redirect(self, final_url, original_url):
+        """Check if a redirect final URL is trusted."""
+        return self._file_parser._is_trusted_redirect(final_url, original_url)
+
+    def _download_file(self, url, dest_path):
+        """Download a file, delegating to the file parser."""
+        return self._file_parser._download_file(url, dest_path)
+
     def _detect_owner(self):
         """Try to detect the owner's Zulip email/username from past private messages."""
         try:
@@ -546,10 +582,15 @@ class ZulipAiBridge:
 
         # Build a clean environment for the subprocess.
         # Inherit everything from the bridge's own env (which has the full PATH
-        # and conda setup from the service file / interactive launch), then force
-        # INFER_AUTO_APPROVE so execute_command never pauses for Y/n confirmation.
+        # and conda setup from the service file / interactive launch). Auto-approve
+        # is only forced in "auto" mode; plan/manual modes must NOT auto-approve so
+        # the agent's state-changing actions are blocked until approved via present_plan.
+        ai_mode = os.environ.get("BRIDGE_AI_MODE", "plan").strip().lower()
         run_env = os.environ.copy()
-        run_env["INFER_AUTO_APPROVE"] = "1"
+        if ai_mode == "auto":
+            run_env["INFER_AUTO_APPROVE"] = "1"
+        else:
+            run_env.pop("INFER_AUTO_APPROVE", None)
         # NOTE: Do NOT set INFER_RAW_OUTPUT here — when ai runs with a pipe
         # (non-TTY stdout) it already outputs only the final clean response.
         # INFER_RAW_OUTPUT caused streaming intermediate chunks to also be
@@ -560,21 +601,31 @@ class ZulipAiBridge:
         if sender_email:
             run_env["AI_REMINDER_ZULIP_TO"] = sender_email
 
-        # Run the local `ai` CLI in quiet + auto-approve mode.
+        # Run the local `ai` CLI in plan-mode by default so the agent investigates,
+        # reports findings, and asks before making changes, rather than acting
+        # unilaterally. Override with the BRIDGE_AI_MODE env var:
+        #   "auto"   = full autonomy (current/legacy behaviour)
+        #   "plan"   = investigate, present a plan, ask for approval before changing state
+        #   "manual" = require approval for every state-changing action
         # -q suppresses the think tool reasoning output.
-        # -y auto-approves command execution.
         # Streaming intermediate content is suppressed automatically because
         # stdout is a pipe (non-TTY), so only the final answer is captured.
         # With schedule_task properly used, the agent returns immediately for timed work.
-        #
-        # Use INFER_TASK_TIMEOUT if set (defaults to 600s = 10 min), matching the
-        # scheduler's behaviour so users get consistent expectations across the
-        # bridge and scheduled tasks.
+        ai_mode = os.environ.get("BRIDGE_AI_MODE", "plan").strip().lower()
+        mode_flags = []
+        if ai_mode == "auto":
+            mode_flags = ["--auto"]
+        elif ai_mode == "manual":
+            mode_flags = ["--manual"]
+        else:
+            mode_flags = ["--plan"]  # default
+
+        ai_cmd = ["ai", "-q"] + mode_flags + [prompt]
         task_timeout = int(os.environ.get("INFER_TASK_TIMEOUT", 0)) or 600
 
         try:
             result = subprocess.run(
-                ["ai", "-y", "-q", prompt],
+                ai_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=run_env,
