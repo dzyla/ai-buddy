@@ -3495,6 +3495,225 @@ def list_skills_dir():
                 seen.add(entry)
     return "Available skills:\n" + ("\n".join(lines) if lines else "(none yet — use skill_create to save what you learn)")
 
+
+# ── Automatic failure-learning ledger ────────────────────────────────────────
+# The C harness records tool failures deterministically, without relying on the
+# model choosing to persist anything. This solves "the agent makes the same
+# mistake twice and doesn't remember making it." Every failure goes to a JSONL
+# ledger; recurring signatures auto-promote to a lessons.md entry; when a tool
+# that previously failed later succeeds, the working approach is auto-learned
+# as a FIX lesson. On a future error, `lessons_for` returns the stored lessons
+# so the harness can surface the memory right where the model needs it.
+import re as _re
+
+def _si_dir():
+    d = os.path.join(os.path.expanduser("~"), ".config", "ai", "self_improve")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _ledger_path():
+    return os.path.join(_si_dir(), "ledger.jsonl")
+
+def _lessons_path():
+    return os.path.join(_si_dir(), "lessons.md")
+
+def _si_recurrence_threshold():
+    raw = os.environ.get("INFER_SELF_IMPROVE_RECURRENCE", "2")
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 2
+
+def _err_signature(tool, error):
+    """Normalise an error into a stable dedupe key: tool + stripped/normalised
+    error tokens (numbers collapsed) so the SAME mistake is recognised across
+    sessions even when paths/ids differ."""
+    s = ("%s %s" % ((tool or ""), (error or ""))).lower()
+    s = _re.sub(r"\d+", "#", s)
+    s = _re.sub(r"[^a-z0-9#%]+", " ", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _ledger_signature_count(signature):
+    n = 0
+    if os.path.isfile(_ledger_path()):
+        try:
+            with open(_ledger_path(), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("signature") == signature:
+                        n += 1
+        except Exception:
+            pass
+    return n
+
+def _block_tool(block):
+    for line in block.splitlines():
+        if line.lower().startswith("tool:"):
+            return line.split(":", 1)[1].strip().lower()
+    return ""
+
+def _has_lesson(kind, tool, signature):
+    if not os.path.isfile(_lessons_path()):
+        return False
+    try:
+        with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return False
+    needle_prefix = "\n## %s " % (kind or "")
+    if needle_prefix not in "\n" + content:
+        return False
+    return (signature and signature in content) or (
+        tool and ("\ntool: %s\n" % tool.lower() in "\n" + content.lower()))
+
+def _append_lesson(kind, tool, signature, body):
+    path = _lessons_path()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n## %s %s\ntool: %s\nsignature: %s\n> %s\n"
+                % (kind, ts, (tool or ""), (signature or ""), body))
+
+def record_failure(tool="", args="", error="", phase="execution"):
+    """Record a failed tool call in the ledger.
+
+    Returns (recurring_bool, lesson_text). If the SAME failure signature has
+    now been seen >= INFER_SELF_IMPROVE_RECURRENCE times and isn't already
+    captured, an auto-generated recurring-pitfall lesson is persisted and
+    returned so the harness can surface it immediately."""
+    tool = (tool or "").strip()
+    error = (error or "").strip()
+    sig = _err_signature(tool, error)
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "kind": "failure", "tool": tool,
+           "args": (args or "")[:200], "error": error[:300],
+           "signature": sig, "phase": phase}
+    try:
+        with open(_ledger_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        return False, "Error writing failure ledger: %s" % e
+    n = _ledger_signature_count(sig)
+    thresh = _si_recurrence_threshold()
+    if n >= thresh and not _has_lesson("PITFALL", tool, sig):
+        body = ("Recurring pitfall (%dx and counting): `%s` failed with:\n"
+                "> %s\n"
+                "Before retrying the identical call, look up the '## FIX' "
+                "lessons for this tool and change your approach."
+                % (n, tool or "?", (error or "?")[:160]))
+        _append_lesson("PITFALL", tool, sig, body)
+        return True, "[RECURRING FAILURE] " + body
+    return False, ""
+
+def record_recovery(tool="", args="", prior_error="", phase="execution"):
+    """Record that the model recovered from a prior failure of the SAME tool.
+
+    This is harness-driven (no model discipline required): the C loop notices a
+    failed call to a tool, then later a succeeding call to the same tool, and
+    persists the working approach as a FIX lesson. Returns the lesson text."""
+    tool = (tool or "").strip()
+    prior_error = (prior_error or "").strip()
+    args = (args or "").strip()
+    sig = _err_signature(tool, prior_error)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(_ledger_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": ts, "kind": "recovery", "tool": tool,
+                                "approach": args[:200],
+                                "prior_error": prior_error[:300],
+                                "signature": sig}) + "\n")
+    except Exception as e:
+        return "Error writing recovery ledger: %s" % e
+    lesson_text = ("`%s` failed (%s) then succeeded with approach: `%s`."
+                   % (tool or "?", (prior_error or "?")[:160], args[:200]))
+    if not _has_lesson("FIX", tool, sig):
+        _append_lesson("FIX", tool, sig, lesson_text)
+    return lesson_text
+
+def lessons_for(tool="", error=""):
+    """Return persisted lessons relevant to a tool name / error signature.
+
+    Matches lessons whose declared tool equals the given tool, or whose error
+    signature overlaps the current error. Returns '' when nothing matches, else
+    a compact markdown block (capped ~1600 chars) for injection."""
+    if not os.path.isfile(_lessons_path()):
+        return ""
+    try:
+        with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    target_tool = (tool or "").strip().lower()
+    sig = _err_signature(tool, error)
+    blocks, cur = [], []
+    for line in content.splitlines():
+        if line.startswith("## "):
+            if cur:
+                blocks.append("\n".join(cur))
+                cur = []
+        cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    hits, seen = [], set()
+    for b in blocks:
+        if not b.strip():
+            continue
+        key = b.splitlines()[0]
+        if key in seen:
+            continue
+        tool_match = target_tool and _block_tool(b) == target_tool
+        sig_match = sig and sig in b.lower()
+        if tool_match or sig_match:
+            seen.add(key)
+            hits.append(b)
+    if not hits:
+        return ""
+    joined = "\n".join(hits)
+    if len(joined) > 1600:
+        joined = joined[:1600] + "\n... (truncated)"
+    return joined
+
+def self_improve_status():
+    """Human-readable summary of the self-improvement ledger/lessons (debugging)."""
+    nfail = nrec = 0
+    if os.path.isfile(_ledger_path()):
+        try:
+            with open(_ledger_path(), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("kind") == "failure":
+                        nfail += 1
+                    elif rec.get("kind") == "recovery":
+                        nrec += 1
+        except Exception:
+            pass
+    lessons = ""
+    if os.path.isfile(_lessons_path()):
+        try:
+            with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
+                lessons = f.read()
+        except Exception:
+            lessons = ""
+    lines = ["Self-improvement state (%s):" % _si_dir(),
+             "- failures recorded : %d" % nfail,
+             "- recoveries recorded: %d" % nrec,
+             "- lessons.md         : %s" % _lessons_path(),
+             "- recurrence threshold: %d (INFER_SELF_IMPROVE_RECURRENCE)" % _si_recurrence_threshold()]
+    if lessons.strip():
+        lines.append("--- lessons.md ---")
+        lines.append(lessons.strip())
+    return "\n".join(lines)
 def main():
     # A pipe-writing backend must not raise a BrokenPipeError traceback when the
     # parent (ai.c) closes the pipe on interrupt/exit. Restore default SIGPIPE so
@@ -3554,6 +3773,32 @@ def main():
         except:
             # Fallback if not proper JSON
             remember(content, "Auto-compacted memory map")
+        sys.exit(0)
+
+    # ── Automatic failure-learning ledger (harness-internal; not exposed as model tools) ──
+    if action == "record-failure":
+        rec = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+        _, lesson = record_failure(rec.get("tool", ""), rec.get("args", ""),
+                                   rec.get("error", ""), rec.get("phase", "execution"))
+        if lesson:
+            print(lesson)
+        sys.exit(0)
+
+    if action == "record-recovery":
+        rec = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+        lesson = record_recovery(rec.get("tool", ""), rec.get("args", ""),
+                                 rec.get("prior_error", ""), rec.get("phase", "execution"))
+        if lesson:
+            print(lesson)
+        sys.exit(0)
+
+    if action == "lessons-for":
+        rec = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+        print(lessons_for(rec.get("tool", ""), rec.get("error", "")), end="")
+        sys.exit(0)
+
+    if action == "self-improve-status":
+        print(self_improve_status())
         sys.exit(0)
 
     if action == "trim-messages":
