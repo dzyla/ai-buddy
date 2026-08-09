@@ -125,12 +125,6 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     env["INFER_TOOL_CHOICE"] = "auto"
     if extra_env:
         env.update(extra_env)
-    import json as _j, inspect as _i
-    _caller = _i.stack()[1].function if len(_i.stack())>1 else "?"
-    _j.dump({"caller":_caller,"base_url":base_url,"extra_env":extra_env,"BASE":env.get("INFER_BASE_URL"),
-             "MODEL":env.get("INFER_MODEL"),"CTX":env.get("INFER_CONTEXT_WINDOW")},
-            open("/tmp/rb_env.jsonl","a"))
-    open("/tmp/rb_env.jsonl","a").write("\n")
     return subprocess.run([AI_BIN] + args, cwd=REPO, env=env,
                           stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, timeout=timeout)
