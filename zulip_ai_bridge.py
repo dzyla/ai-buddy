@@ -12,6 +12,7 @@ import subprocess
 import threading
 import sys
 import os
+import logging
 try:
     import zulip
 except ImportError:
@@ -22,6 +23,13 @@ except ImportError:
 import re
 import requests
 from urllib.parse import unquote
+
+# Configure logging for truncation events
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("ZulipBridge")
 
 
 def clean_response(text):
@@ -121,32 +129,20 @@ class ZulipAiBridge:
         if not context_messages:
             return content
 
-        context_lines = []
-        context_lines.append("---")
-        context_lines.append("Recent conversation context (for reference):")
-        for m in context_messages:
-            sender = m.get("sender_full_name", m.get("sender_email"))
-            if m.get("sender_email") == self.bot_email:
-                sender = "AI (You)"
-            else:
-                sender = f"User ({sender})"
-            body = m.get("content", "").strip()
-            if "\n" in body:
-                body = "\n".join("  " + line for line in body.splitlines())
-            context_lines.append(f"- {sender}: {body}")
-        context_lines.append("---")
-        context_lines.append("Latest query/message:")
-        context_lines.append(content)
+        context_window = ContextWindowManager()
+        context_text = context_window.format_context(context_messages, self.bot_email)
+        prompt = f"{context_text}\n\n{content}"
 
-        return "\n".join(context_lines)
+        return prompt
 
     def _process_message(self, msg, content):
         """Run the ai agent and send the result back. Runs in a background thread."""
         tid = threading.get_ident()
         print(f"[thread-{tid}] Processing: {content[:80]}")
 
-        # Fetch context messages and construct the prompt
+        # Fetch context messages and manage context window
         context_messages = self._get_context_messages(msg)
+        context_messages = self._manage_context_window(context_messages, content)
         prompt = self._construct_prompt_with_context(msg, content, context_messages)
 
         # Build a clean environment for the subprocess.
@@ -279,6 +275,94 @@ class ZulipAiBridge:
             daemon=True
         )
         t.start()
+
+    def _manage_context_window(self, context_messages, current_content):
+        """Apply context window management to prevent overflow."""
+        window_manager = ContextWindowManager()
+        truncated_messages, truncated = window_manager.truncate_context(
+            context_messages, current_content
+        )
+        if truncated:
+            logger.info(f"Context truncated from {len(context_messages)} to {len(truncated_messages)} messages")
+        return truncated_messages
+
+
+class ContextWindowManager:
+    """Manages conversation context to stay within AI model's context window."""
+    
+    def __init__(self, max_tokens=4096, max_messages=10):
+        """
+        Initialize the context window manager.
+        
+        Args:
+            max_tokens: Maximum estimated tokens for the prompt (conservative estimate)
+            max_messages: Maximum number of context messages to include
+        """
+        self.max_tokens = max_tokens
+        self.max_messages = max_messages
+    
+    def estimate_tokens(self, text):
+        """Rough token estimation: ~4 chars per token for English text."""
+        return len(text) // 4
+    
+    def truncate_context(self, context_messages, current_content, max_context_length=3000):
+        """
+        Truncate context messages to fit within token budget.
+        
+        Args:
+            context_messages: List of message dictionaries
+            current_content: The current message content
+            max_context_length: Maximum length for context in characters
+            
+        Returns:
+            Tuple of (truncated messages, whether truncation occurred)
+        """
+        if not context_messages:
+            return context_messages, False
+        
+        # Estimate total prompt length
+        estimated_prompt_length = len(current_content)
+        
+        # Build context incrementally until we hit the limit
+        truncated = []
+        for msg in context_messages:
+            sender = msg.get("sender_full_name", msg.get("sender_email", "Unknown"))
+            body = msg.get("content", "").strip()
+            msg_length = len(f"- {sender}: {body}")
+            
+            if estimated_prompt_length + msg_length > max_context_length:
+                logger.warning(
+                    f"Context truncated: {len(context_messages)} messages would exceed "
+                    f"token budget. Keeping {len(truncated)} messages."
+                )
+                return truncated, True
+            
+            truncated.append(msg)
+            estimated_prompt_length += msg_length
+        
+        return truncated, False
+    
+    def format_context(self, context_messages, bot_email):
+        """Format context messages into a readable string for the prompt."""
+        if not context_messages:
+            return ""
+        
+        context_lines = ["---", "Recent conversation context (for reference):"]
+        for m in context_messages:
+            sender = m.get("sender_full_name", m.get("sender_email"))
+            if m.get("sender_email") == bot_email:
+                sender = "AI (You)"
+            else:
+                sender = f"User ({sender})"
+            body = m.get("content", "").strip()
+            if "\n" in body:
+                body = "\n".join("  " + line for line in body.splitlines())
+            context_lines.append(f"- {sender}: {body}")
+        context_lines.append("---")
+        context_lines.append("Latest query/message:")
+        
+        return "\n".join(context_lines)
+
 
     def run(self):
         """Start the Zulip AI Bridge with automatic reconnection."""
