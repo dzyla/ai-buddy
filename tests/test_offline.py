@@ -369,9 +369,12 @@ def test_hide_details_flag(tmp_path):
         "id": "c1", "type": "function",
         "function": {"name": "think", "arguments": json.dumps({"reasoning": "secret plan"})},
     }
-    env = dict(os.environ, INFER_HIDE_DETAILS="1")
     with MockServer(cap, MOCK_TOOL_CALL=json.dumps(tool_call)) as srv:
-        res = run_binary(home, srv.base_url, ["plan steps"], extra_env=env)
+        # NOTE: pass ONLY the flag as extra_env. run_binary() scrubs INFER_*
+        # and injects the mock URL; passing the whole os.environ here would
+        # re-inject the developer's real INFER_BASE_URL/MODEL over the mock and
+        # silently hit the live server (hangs only when it's slow).
+        res = run_binary(home, srv.base_url, ["plan steps"], extra_env={"INFER_HIDE_DETAILS": "1"})
         assert "secret plan" not in res.stderr
 
 
