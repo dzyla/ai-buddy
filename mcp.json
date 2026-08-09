@@ -2,7 +2,7 @@
   "mcpServers": {
     "scientific": {
       "command": "python3",
-      "args": ["/home/dzyla/Code/ai-buddy/advanced_mcp_server.py"],
+      "args": ["/home/dzyla/Code/ai-buddy/dev/advanced_mcp_server.py"],
       "env": {}
     }
   }

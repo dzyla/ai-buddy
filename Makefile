@@ -16,7 +16,7 @@ $(SHARED_LIB): remote_harness.c remote_harness.h cJSON.c
 $(TARGET): $(SRCS) $(SHARED_LIB)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) -L. -Wl,--no-as-needed -lremote_harness -Wl,-rpath,. -Wl,-rpath,$(HOME)/.local/lib $(LDFLAGS)
 
-test: $(SHARED_LIB)
+test: $(SHARED_LIB) $(TARGET)
 	$(CC) $(CFLAGS) -o test_remote_harness tests/test_remote_harness.c -L. -lremote_harness -Wl,-rpath,. $(LDFLAGS)
 	./test_remote_harness
 	pytest

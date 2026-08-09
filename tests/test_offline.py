@@ -29,11 +29,29 @@ ai_mcp = importlib.import_module("ai_mcp")
 # ── build fixture ─────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session", autouse=True)
 def build_binary():
-    res = subprocess.run(
-        ["make"],
-        cwd=REPO, capture_output=True, text=True,
-    )
-    assert res.returncode == 0, f"Build failed:\n{res.stderr}"
+    # Build only if the binary is missing or older than its sources, so that when
+    # multiple test modules share this session we don't issue concurrent `make`
+    # calls (racing on the output binary) just because they each auto-build.
+    def _stale():
+        binp = os.path.join(REPO, "ai")
+        if not os.path.exists(binp):
+            return True
+        bin_mtime = os.path.getmtime(binp)
+        for src in ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "Makefile"):
+            p = os.path.join(REPO, src)
+            try:
+                if os.path.getmtime(p) > bin_mtime:
+                    return True
+            except OSError:
+                pass
+        return False
+
+    if _stale():
+        res = subprocess.run(
+            ["make"],
+            cwd=REPO, capture_output=True, text=True,
+        )
+        assert res.returncode == 0, f"Build failed:\n{res.stderr}"
     yield
 
 
@@ -61,8 +79,10 @@ class MockServer:
             [sys.executable, MOCK, str(self.port)], env=e,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        # wait until the port answers
-        for _ in range(50):
+        # Wait generously (up to ~20s) so the port is definitely listening before
+        # the binary runs; under heavy load a slow interpreter spawn used to make
+        # the binary's first connection retry and occasionally blow the timeout.
+        for _ in range(200):
             try:
                 with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
                     break
@@ -86,8 +106,16 @@ class MockServer:
             return [json.loads(line) for line in f if line.strip()]
 
 
-def run_binary(home, base_url, args, extra_env=None, timeout=25):
+def run_binary(home, base_url, args, extra_env=None, timeout=90):
     env = os.environ.copy()
+    # Scrub any INFER_*/CUDA vars the developer may have sourced from
+    # ~/.local/share/ai/env, so they can't override the mock URL below and hang
+    # offline tests. Then apply the variables we explicitly control.
+    for k in list(env):
+        if k.startswith("INFER_") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
+                                           "LD_LIBRARY_PATH", "LLAMA_CTX_SIZE",
+                                           "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
+            env.pop(k, None)
     # Isolate: a fresh HOME means load_env_file() finds no config to override
     # our INFER_* vars, so the mock URL actually takes effect.
     env["HOME"] = home
