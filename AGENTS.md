@@ -106,6 +106,33 @@ export INFER_API_KEY="your-key"
 export INFER_MODEL="your-model-name"
 ```
 
+### Server-level sampling penalties (llama.cpp)
+
+`ai-backend serve` forwards sampling penalties directly to `llama-server`. These apply
+globally to every request while the process is running:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LLAMA_REPEAT_PENALTY` | llama.cpp repeat penalty multiplier (1.0 = neutral) | `1.0` |
+| `LLAMA_PRESENCE_PENALTY` | presence penalty (additive; 0.0 = neutral) | `0.0` |
+| `LLAMA_FREQUENCY_PENALTY` | frequency penalty (additive; 0.0 = neutral) | `0.0` |
+| `LLAMA_REPEAT_LAST_N` | recent tokens considered for repeat penalty | `64` |
+
+**How they compare to the AI-level penalties (`ai`):**
+
+- `ai` sends `frequency_penalty` (default `INFER_FREQ_PENALTY=0.10`) and
+  `presence_penalty` (default `INFER_PRESENCE_PENALTY=0.05`) in each OpenAI-style
+  request. These are per-request and can differ across sessions.
+- The server-level settings apply to *all* requests equally and are fixed at server
+  start. With neutral defaults (`repeat_penalty=1.0`, `presence=0.0`, `frequency=0.0`)
+  the active loop-breaking mechanism is the per-request AI-level penalties.
+- A good loop-breaking combo (reported by XDA Developers) is
+  `LLAMA_REPEAT_PENALTY=1.05` + `INFER_PRESENCE_PENALTY=0.6`, but these values are
+  model/task-specific — always start neutral and increase gradually.
+- **Repeat penalty** is a multiplier that grows with each reuse of a token;
+  **presence/frequency penalty** is a flat per-token penalty. They are different
+  mechanisms and can be combined.
+
 ---
 
 ## Architecture
