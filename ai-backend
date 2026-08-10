@@ -322,7 +322,7 @@ def calculate_auto_ctx(model_path):
         model_mb = 4096
         
     factor = float(os.environ.get("LLAMA_CTX_SIZE_FACTOR", "1.0"))
-    ctx_max = int(os.environ.get("LLAMA_CTX_SIZE_MAX", "131072"))
+    ctx_max = int(os.environ.get("LLAMA_CTX_SIZE_MAX", "262144"))
     
     fixed_mb = int(model_mb * 0.703)
     kv_gpu = 0.01518
@@ -631,6 +631,7 @@ def cmd_ctx(size=None):
             print(f"Invalid size '{size}'. Use a number or 'auto'.", file=sys.stderr)
             sys.exit(1)
         patch_env_key("LLAMA_CTX_SIZE", size)
+        sync_ctx_to_systemd(size)
         print(f"Context size locked to {size} tokens.")
 
 def cmd_gpu_layers(n=None):
@@ -657,6 +658,28 @@ def patch_env_key(key, value):
     model = env_vars.get("INFER_MODEL", "llama")
     llama_path = env_vars.get("LLAMA_MODEL_PATH")
     write_env(url, model, llama_path, env_vars)
+
+
+def sync_ctx_to_systemd(ctx_size):
+    """Keep the systemd service's LLAMA_CTX_SIZE in sync with the env file."""
+    if not SYSTEMD_SERVICE.exists():
+        return
+    try:
+        content = SYSTEMD_SERVICE.read_text()
+        new_content = re.sub(
+            r'^Environment=LLAMA_CTX_SIZE=.*',
+            f'Environment=LLAMA_CTX_SIZE={ctx_size}',
+            content,
+            flags=re.MULTILINE,
+        )
+        if new_content != content:
+            SYSTEMD_SERVICE.write_text(new_content)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            print(f"[llama-wrapper] Synced systemd LLAMA_CTX_SIZE={ctx_size}")
+        else:
+            print(f"[llama-wrapper] systemd LLAMA_CTX_SIZE already {ctx_size}")
+    except Exception as e:
+        print(f"Warning syncing systemd service: {e}", file=sys.stderr)
 
 def print_usage():
     print("""ai-backend — single tool for LLM model deployment and configuration
