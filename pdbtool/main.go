@@ -345,6 +345,7 @@ func main() {
 	}
 
 	atoms, err := ParsePDB(path)
+	fmt.Fprintf(os.Stderr, "[DEBUG] atoms=%d err=%v\n", len(atoms), err)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
