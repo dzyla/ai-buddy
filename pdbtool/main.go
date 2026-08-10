@@ -168,7 +168,7 @@ func ParsePDB(path string) ([]Atom, error) {
 		if !isAtomRecord(line) {
 			continue
 		}
-	(atom, ok) := parseLine(line)
+	atom, ok := parseLine(line)
 		if !ok {
 			continue
 		}
