@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import signal
 import json
 import subprocess
 import urllib.request
@@ -273,23 +274,46 @@ def execute_command(command, timeout=120):
             timeout = int(timeout)
     except ValueError:
         timeout = 120
+    # Allow the harness to raise/lower the command timeout globally.
+    env_timeout = os.environ.get("INFER_COMMAND_TIMEOUT")
+    if env_timeout:
+        try:
+            timeout = int(env_timeout) or timeout
+        except ValueError:
+            pass
     try:
-        proc = subprocess.run(
+        # start_new_session puts the command (and everything it spawns) in its
+        # own process group, so a timeout can kill the WHOLE tree — not just the
+        # direct /bin/sh -c wrapper (whose grandchildren would otherwise leak as
+        # orphaned subprocesses and keep burning CPU).
+        proc = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout
+            start_new_session=True,
         )
-        out = proc.stdout + proc.stderr
-        if proc.returncode == 0:
-            res = f"success\n{out}" if out else "success"
-        else:
-            res = f"failed (exit {proc.returncode})\n{out}\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]"
+        try:
+            out_b, err_b = proc.communicate(timeout=timeout)
+            out = (out_b or "") + (err_b or "")
+            if proc.returncode == 0:
+                res = f"success\n{out}" if out else "success"
+            else:
+                res = f"failed (exit {proc.returncode})\n{out}\n[SYSTEM WARNING: Command failed. You MUST use the `think` tool to analyze the failure, explain why it failed, and formulate a new plan before executing another command.]"
+        except subprocess.TimeoutExpired:
+            # Kill the ENTIRE process group so grandchildren don't survive.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return f"Error: Command timed out after {timeout} seconds."
         append_to_context_pool(res[:1000])
         return res
-    except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout} seconds."
     except Exception as e:
         return f"Error executing command: {e}"
 
