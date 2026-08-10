@@ -276,7 +276,11 @@ func printReport(pairs []*ContactPair, cutoff float64) {
 		sort.Slice(sorted, func(i, j int) bool {
 			return sorted[i].count > sorted[j].count
 		})
-		for _, r := range sorted[:25] {
+		n := 25
+		if len(sorted) < n {
+			n = len(sorted)
+		}
+		for _, r := range sorted[:n] {
 			fmt.Printf("  %s res %d  -  %s res %d : %d\n",
 				cp.ChainA, r.resA, cp.ChainB, r.resB, r.count)
 		}
