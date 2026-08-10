@@ -77,15 +77,15 @@ func parseLine(line string) (Atom, bool) {
 	}
 	atom.ResSeq = resSeq
 	// Coordinates: x cols 31-38, y cols 39-46, z cols 47-54 (0-based).
-	x, err := strconv.ParseFloat(line[30:38], 64)
+	x, err := strconv.ParseFloat(strings.TrimSpace(line[30:38]), 64)
 	if err != nil {
 		return Atom{}, false
 	}
-	y, err := strconv.ParseFloat(line[38:46], 64)
+	y, err := strconv.ParseFloat(strings.TrimSpace(line[38:46]), 64)
 	if err != nil {
 		return Atom{}, false
 	}
-	z, err := strconv.ParseFloat(line[46:54], 64)
+	z, err := strconv.ParseFloat(strings.TrimSpace(line[46:54]), 64)
 	if err != nil {
 		return Atom{}, false
 	}
