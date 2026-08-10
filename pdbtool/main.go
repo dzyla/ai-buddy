@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -59,9 +58,10 @@ func radiusFor(element string) float64 {
 		return r
 	}
 	// Fallback: try single-letter element.
-	if len(elem) >= 1 {
-		if r, ok := vdW[elem[:1]]; ok && elem[:1] != elem {
-			// ambiguous multi-char that starts with a known single-letter
+	for i := 0; i < len(elem); i++ {
+		cand := elem[i : i+1]
+		if r, ok := vdW[cand]; ok {
+			return r
 		}
 	}
 	return 1.70 // default for unknown elements
