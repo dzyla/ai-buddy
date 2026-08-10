@@ -60,6 +60,10 @@ func parseLine(line string) (Atom, bool) {
 	if !isAtomRecord(line) {
 		return Atom{}, false
 	}
+	if len(line) < 54 {
+		return Atom{}, false
+	}
+	fmt.Fprintf(os.Stderr, "DEBUG parseLine: len=%d\n", len(line))
 	atom := Atom{}
 	// Atom name: columns 13-16 (0-based 12:16), right-justified.
 	atom.Name = strings.TrimSpace(line[12:16])
