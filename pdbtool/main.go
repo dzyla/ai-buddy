@@ -132,18 +132,24 @@ func ParsePDB(path string) ([]Atom, error) {
 
 	var atoms []Atom
 	scanner := bufio.NewScanner(file)
+	lineNum := 0
 	for scanner.Scan() {
 		line := scanner.Text()
+		lineNum++
 		if len(line) < 54 {
+			fmt.Fprintf(os.Stderr, "DEBUG line %d: too short (len=%d): %q\n", lineNum, len(line), line)
 			continue
 		}
 		if !isAtomRecord(line) {
 			continue
 		}
+		fmt.Fprintf(os.Stderr, "DEBUG line %d: ATOM record, line[0:6]=%q\n", lineNum, line[0:6])
 		atom, ok := parseLine(line)
 		if !ok {
+			fmt.Fprintf(os.Stderr, "DEBUG line %d: parseLine failed\n", lineNum)
 			continue
 		}
+		fmt.Fprintf(os.Stderr, "DEBUG line %d: parsed atom=%+v\n", lineNum, atom)
 		atoms = append(atoms, atom)
 	}
 	return atoms, scanner.Err()
@@ -331,6 +337,7 @@ func main() {
 	}
 
 	// DEBUG: print parsed atoms
+	fmt.Fprintf(os.Stderr, "DEBUG: total atoms parsed=%d\n", len(atoms))
 	for _, a := range atoms {
 		fmt.Fprintf(os.Stderr, "DEBUG: name=%q res=%q chain=%q resSeq=%d xyz=(%.2f,%.2f,%.2f) elem=%q\n",
 			a.Name, a.ResName, a.Chain, a.ResSeq, a.X, a.Y, a.Z, a.Element)

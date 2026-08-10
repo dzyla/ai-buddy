@@ -51,6 +51,17 @@ def write_env(url, model, llama_model_path=None, extra_vars=None):
     ctx_size = current.get("LLAMA_CTX_SIZE", "131072")
     gpu_layers = current.get("LLAMA_N_GPU_LAYERS", "99")
     
+    # Server-level sampling penalties (llama.cpp style).
+    # repeat-penalty is a multiplier (1.0 = neutral, >1 = more penalty).
+    # presence/frequency penalties are additive (0.0 = neutral).
+    # Defaults are neutral so current per-request AI-level penalties (INFER_FREQ_PENALTY /
+    # INFER_PRESENCE_PENALTY) remain the active mechanism for breaking thinking loops.
+    # Recommended from XDA article: repeat-penalty ~1.05-1.1, presence-penalty ~0.6.
+    repeat_penalty = current.get("LLAMA_REPEAT_PENALTY", "1.0")
+    presence_penalty = current.get("LLAMA_PRESENCE_PENALTY", "0.0")
+    frequency_penalty = current.get("LLAMA_FREQUENCY_PENALTY", "0.0")
+    repeat_last_n = current.get("LLAMA_REPEAT_LAST_N", "64")
+    
     lines = [
         "# ai backend config — managed by ai-backend, do not edit manually",
         f'export CUDA_VISIBLE_DEVICES="{cuda_dev}"',
@@ -64,9 +75,13 @@ def write_env(url, model, llama_model_path=None, extra_vars=None):
     lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
     if gpu_layers:
         lines.append(f'export LLAMA_N_GPU_LAYERS="{gpu_layers}"')
+    lines.append(f'export LLAMA_REPEAT_PENALTY="{repeat_penalty}"')
+    lines.append(f'export LLAMA_PRESENCE_PENALTY="{presence_penalty}"')
+    lines.append(f'export LLAMA_FREQUENCY_PENALTY="{frequency_penalty}"')
+    lines.append(f'export LLAMA_REPEAT_LAST_N="{repeat_last_n}"')
     lines.append(f'export PUBMED_API_KEY="{PUBMED_KEY}"')
     
-    seen = {"CUDA_VISIBLE_DEVICES", "INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "PUBMED_API_KEY"}
+    seen = {"CUDA_VISIBLE_DEVICES", "INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "LLAMA_FREQUENCY_PENALTY", "LLAMA_REPEAT_LAST_N", "PUBMED_API_KEY"}
     for k, v in current.items():
         if k not in seen:
             lines.append(f'export {k}="{v}"')
