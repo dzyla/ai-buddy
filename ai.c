@@ -2564,6 +2564,37 @@ static char *read_line_interactive(const char *prompt) {
     return strdup(buf);
 }
 
+/* Recursively kill a process and all of its descendants (via /proc children).
+   Fixes the orphaned-subprocess leak where `pkill -P $PPID` only killed the
+   direct /bin/sh -c wrapper and left the real command running as a grandchild. */
+static void kill_process_tree(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/children", pid, pid);
+    FILE *cf = fopen(path, "r");
+    if (cf) {
+        pid_t child;
+        while (fscanf(cf, "%d", &child) == 1) {
+            kill_process_tree(child);
+        }
+        fclose(cf);
+    }
+    kill(pid, SIGKILL);
+}
+
+/* Kill every process launched by this run_shell_command_timeout call. */
+static void kill_command_subprocess(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/children", getpid(), getpid());
+    FILE *cf = fopen(path, "r");
+    if (cf) {
+        pid_t child;
+        while (fscanf(cf, "%d", &child) == 1) {
+            kill_process_tree(child);
+        }
+        fclose(cf);
+    }
+}
+
 static char* run_shell_command_timeout(const char *cmd, int *exit_status, int timeout_sec) {
     int started_raw = 0;
     if (!raw_mode_active && isatty(STDIN_FILENO)) {
@@ -2598,9 +2629,7 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
     while (1) {
         if (timeout_sec > 0 && time(NULL) - start_time > timeout_sec) {
             interrupted = 2;
-            char kill_cmd[128];
-            snprintf(kill_cmd, sizeof(kill_cmd), "pkill -P %d 2>/dev/null", getpid());
-            system(kill_cmd);
+            kill_command_subprocess();
             
             char timeout_msg[256];
             snprintf(timeout_msg, sizeof(timeout_msg), "\n[SYSTEM WARNING: Command timed out after %d seconds. Process killed. Partial output above. Evaluate if script is stuck in an infinite loop, waiting for user input, or just intrinsically slow.]\n", timeout_sec);
@@ -2646,9 +2675,7 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
             if (read(STDIN_FILENO, &c, 1) == 1) {
                 if (c == 27) { // ESC key
                     interrupted = 1;
-                    char kill_cmd[128];
-                    snprintf(kill_cmd, sizeof(kill_cmd), "pkill -P %d 2>/dev/null", getpid());
-                    system(kill_cmd);
+                    kill_command_subprocess();
                     fprintf(stderr, "\n\033[1;31m[ai] Tool execution interrupted by ESC key.\033[0m\n");
                     break;
                 }
@@ -2707,7 +2734,13 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
 }
 
 char* run_shell_command(const char *cmd, int *exit_status) {
-    return run_shell_command_timeout(cmd, exit_status, 120);
+    int timeout_sec = 120;
+    const char *env_timeout = getenv("INFER_COMMAND_TIMEOUT");
+    if (env_timeout && *env_timeout) {
+        int v = atoi(env_timeout);
+        if (v > 0) timeout_sec = v;
+    }
+    return run_shell_command_timeout(cmd, exit_status, timeout_sec);
 }
 
 /* Extract the string value of a key from a flat JSON object string. */
