@@ -114,6 +114,40 @@ ai-backend llama ~/.local/share/ai/models/my-model.gguf
 systemctl --user restart llama-server
 ```
 
+### Server-level sampling penalties
+
+`ai-backend serve` passes sampling penalties directly to `llama-server` via
+`--repeat-penalty`, `--presence-penalty`, `--frequency-penalty`, and `--repeat-last-n`.
+These are global for every request served by the process. You configure them with
+environment variables in `~/.local/share/ai/env`:
+
+```bash
+export LLAMA_REPEAT_PENALTY="1.05"        # 1.0 = neutral; >1 scales penalty with reuse
+export LLAMA_PRESENCE_PENALTY="0.6"       # >0 pushes away from tokens already used
+export LLAMA_FREQUENCY_PENALTY="0.0"      # additive frequency penalty (0.0 = neutral)
+export LLAMA_REPEAT_LAST_N="64"           # tokens considered for repeat penalty
+```
+
+**How these compare to the AI-level (`ai`) penalties:**
+
+- `ai` also sends `frequency_penalty` (default `INFER_FREQ_PENALTY=0.10`) and
+  `presence_penalty` (default `INFER_PRESENCE_PENALTY=0.05`) in every OpenAI-style
+  API request. These are *per-request* and can differ across agents/sessions.
+- The server-level settings apply to *all* requests equally and are set once at
+  server start. With the neutral defaults (`repeat_penalty=1.0`, `presence=0.0`,
+  `frequency=0.0`) the active loop-breaking mechanism is the per-request AI-level
+  penalties (`INFER_FREQ_PENALTY` / `INFER_PRESENCE_PENALTY`).
+- For breaking out of thinking/reply loops, a good combination is
+  `LLAMA_REPEAT_PENALTY=1.05` plus `INFER_PRESENCE_PENALTY=0.6` (as reported by
+  XDA Developers), but these values are model/task-specific — always start at
+  neutral and increase gradually.
+- **Repeat penalty** (llama.cpp multiplier) applies a scaling penalty that grows
+  with each reuse of a token; **presence/frequency penalty** (additive) applies a
+  flat penalty per distinct token that has appeared. They are different mechanisms
+  and can be combined.
+
+See `docs/situational_awareness.md` for how the agent detects and breaks loops.
+
 ---
 
 ## Configuration
@@ -136,6 +170,10 @@ All config lives in `~/.local/share/ai/env` (managed by `ai-backend`) and is loa
 | `INFER_STEP_LIMIT` | Cap on agent-loop tool iterations for a task (piped/auto runs are finite now) | 60 (non-tty), 30 (tty) |
 | `INFER_PLAN_STEP_BUDGET` | State-changing actions allowed per approved `present_plan` (PLAN mode); `0` = unlimited | 8 |
 | `INFER_PLAN_AUTOAPPROVE=1` | Auto-approve `present_plan` in PLAN mode (opt-in, for trusted/harnessed/bridge runs only) | off |
+| `LLAMA_REPEAT_PENALTY` | Server-level repeat penalty (llama.cpp multiplier, 1.0 = neutral) | `1.0` |
+| `LLAMA_PRESENCE_PENALTY` | Server-level presence penalty (additive, 0.0 = neutral) | `0.0` |
+| `LLAMA_FREQUENCY_PENALTY` | Server-level frequency penalty (additive, 0.0 = neutral) | `0.0` |
+| `LLAMA_REPEAT_LAST_N` | Number of recent tokens considered for repeat penalty | `64` |
 
 ### MCP servers
 
