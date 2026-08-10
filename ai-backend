@@ -367,6 +367,22 @@ def cmd_serve():
         extra_args.extend(["--spec-type", "draft-mtp"])
         print("[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding.", file=sys.stderr)
         
+    # Server-level sampling penalties (llama.cpp style). Applied to ALL requests.
+    # --repeat-penalty is a multiplier (1.0 = neutral), rest are additive (0.0 = neutral).
+    # These can be overridden per-request via INFER_FREQ_PENALTY / INFER_PRESENCE_PENALTY.
+    repeat_penalty = os.environ.get("LLAMA_REPEAT_PENALTY", env_vars.get("LLAMA_REPEAT_PENALTY", "1.0"))
+    presence_penalty = os.environ.get("LLAMA_PRESENCE_PENALTY", env_vars.get("LLAMA_PRESENCE_PENALTY", "0.0"))
+    frequency_penalty = os.environ.get("LLAMA_FREQUENCY_PENALTY", env_vars.get("LLAMA_FREQUENCY_PENALTY", "0.0"))
+    repeat_last_n = os.environ.get("LLAMA_REPEAT_LAST_N", env_vars.get("LLAMA_REPEAT_LAST_N", "64"))
+    
+    extra_args.extend([
+        "--repeat-penalty", str(repeat_penalty),
+        "--repeat-last-n", str(repeat_last_n),
+        "--presence-penalty", str(presence_penalty),
+        "--frequency-penalty", str(frequency_penalty),
+    ])
+    print(f"[llama-wrapper] Server penalties: repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty} repeat_last_n={repeat_last_n}", file=sys.stderr)
+    
     n_gpu = os.environ.get("LLAMA_N_GPU_LAYERS", env_vars.get("LLAMA_N_GPU_LAYERS", "99"))
     
     batch_size = os.environ.get("LLAMA_BATCH_SIZE", env_vars.get("LLAMA_BATCH_SIZE", "4096"))
