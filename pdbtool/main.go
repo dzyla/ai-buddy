@@ -330,6 +330,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// DEBUG: print parsed atoms
+	for _, a := range atoms {
+		fmt.Fprintf(os.Stderr, "DEBUG: name=%q res=%q chain=%q resSeq=%d xyz=(%.2f,%.2f,%.2f) elem=%q\n",
+			a.Name, a.ResName, a.Chain, a.ResSeq, a.X, a.Y, a.Z, a.Element)
+	}
 	chains := groupByChain(atoms)
 	pairs := analyzeChains(chains, cutoff)
 	printReport(pairs, cutoff)
