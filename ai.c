@@ -778,7 +778,7 @@ static char  api_url[MAX_VAL];
 static char  api_key[MAX_VAL];
 static char  model[MAX_VAL];
 static float temperature_val        = -1.0f;
-static int   max_tokens_val         = 8192;  /* Prevent infinite reasoning loops */
+static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
 static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops (0=off, INFER_FREQ_PENALTY) */
 static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
 static int   no_tools_mode          = 0;
@@ -6381,9 +6381,7 @@ step_limit_check:
                                                     has_more = 1;
                                                 } else {
                                                     messages_json = append_message(messages_json,
-                                                        "{\"role\":\"user\",\"content\":\"Your last response was cut off "
-                                                        "by the token limit. This is almost always because you wrote an over-long 'think' block or dumped too much into one response, which stalls small local models and stops them from ever reaching the deliverable. Do NOT write another long think. Next: keep 'think' to a MAXIMUM of 3 short sentences, then make ONE concrete ACTION tool call (write_file to create your code file, or execute_command to build/run). If you have already completed the deliverable, call task_complete with your summary instead."
-                                                        "best answer.\\\"}");
+    "{\"role\":\"user\",\"content\":\"Your last response was cut off by the token limit. This means you wrote an over-long chain of thought and consumed the whole output budget WITHOUT emitting a tool call - reasoning alone never produces an artifact, and that is exactly why you are stuck. NEXT TIME: write at most 2-3 short sentences of reasoning, then IMMEDIATELY emit ONE action tool call (write_file to create your code file, or execute_command to build/run). Do NOT call task_complete until the deliverable actually exists. Repeat: short reasoning then one action tool call, right now.\"}");
                                                     has_more = 1;
                                                 }
                                             } else {
