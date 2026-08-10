@@ -11,69 +11,42 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Data structures
+// Data model
 // ---------------------------------------------------------------------------
 
-// Atom represents a parsed ATOM/HETATM record from a PDB file.
 type Atom struct {
-	Name    string
-	ResName string
-	Chain   string
-	ResSeq  int
-	ResName3 string // 3-letter residue code (alias of ResName)
-	X, Y, Z float64
-	Element string
+	Name     string
+	ResName  string
+	Chain    string
+	ResSeq   int
+	X, Y, Z  float64
+	Element  string
 }
 
-// ChainAtoms holds the atoms belonging to a single chain, indexed by residue.
 type ChainAtoms struct {
-	Atoms     []Atom
-	ByResidue map[int][]Atom // residue number -> atoms
-}
-
-// ---------------------------------------------------------------------------
-// vdW radii (Angstrom) keyed by element symbol.
-// ---------------------------------------------------------------------------
-
-var vdW = map[string]float64{
-	"H":  1.20, "HE": 1.40, "LI": 1.82, "BE": 1.92,
-	"B":  1.92, "C":  1.70, "N":  1.55, "O":  1.52,
-	"F":  1.47, "NE": 1.54, "NA": 1.02, "MG": 1.28,
-	"AL": 1.84, "SI": 1.84, "P":  1.80, "CL": 1.75,
-	"AR": 1.88, "K":  2.03, "CA": 1.00, "TI": 1.78,
-	"CR": 1.39, "MN": 1.27, "FE": 1.26, "CO": 1.28,
-	"NI": 1.24, "CU": 1.32, "ZN": 1.34, "GA": 1.81,
-	"GE": 1.79, "AS": 1.80, "SE": 1.80, "BR": 1.85,
-	"KR": 2.00, "RB": 2.16, "SR": 2.00, "Y":  1.90,
-	"ZR": 1.75, "NB": 1.74, "MO": 1.73, "TC": 1.69,
-	"RU": 1.68, "RH": 1.67, "PD": 1.63, "AG": 1.72,
-	"CD": 1.55, "IN": 1.93, "SN": 1.83, "SB": 1.81,
-	"TE": 1.78, "I":  1.98, "XE": 2.06, "CS": 2.25,
-	"BA": 2.15, "LA": 1.95, "HFE": 1.30, "OXA": 1.52,
-}
-
-func radiusFor(element string) float64 {
-	elem := strings.ToUpper(strings.TrimSpace(element))
-	if r, ok := vdW[elem]; ok {
-		return r
-	}
-	// Fallback: try single-letter element.
-	for i := 0; i < len(elem); i++ {
-		cand := elem[i : i+1]
-		if r, ok := vdW[cand]; ok {
-			return r
-		}
-	}
-	return 1.70 // default for unknown elements
+	Atoms      []Atom
+	ByResidue  map[int][]Atom
 }
 
 // ---------------------------------------------------------------------------
 // PDB parsing
 // ---------------------------------------------------------------------------
 
-const (
-	recordLen = 6
-)
+// vdW radii (Angstrom) for common elements.  Used for a fast buried-surface
+// approximation.  Source: the Bondi van der Waals radii commonly used in
+// structural biology.
+var vdW = map[string]float64{
+	"H":  1.2, "C": 1.7, "N": 1.55, "O": 1.52, "S": 1.8,
+	"P":  1.8, "F": 1.47, "CL": 1.75, "BR": 1.85, "I": 1.98,
+}
+
+func radiusFor(element string) float64 {
+	r, ok := vdW[strings.ToUpper(element)]
+	if !ok {
+		return 1.7 // default carbon-like
+	}
+	return r
+}
 
 func isAtomRecord(line string) bool {
 	if len(line) < 54 {
@@ -159,7 +132,6 @@ func ParsePDB(path string) ([]Atom, error) {
 
 	var atoms []Atom
 	scanner := bufio.NewScanner(file)
-	scanner.Split(bufio.ScanLines)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if len(line) < 54 {
@@ -168,7 +140,7 @@ func ParsePDB(path string) ([]Atom, error) {
 		if !isAtomRecord(line) {
 			continue
 		}
-	atom, ok := parseLine(line)
+		atom, ok := parseLine(line)
 		if !ok {
 			continue
 		}
@@ -229,9 +201,9 @@ func computePairContacts(aAtoms, bAtoms []Atom, cutoff float64, cutoffSq float64
 			d2 := dx*dx + dy*dy + dz*dz
 			if d2 <= cutoffSq {
 				cp.NContacts++
-			 rp := [2]int{ai.ResSeq, bj.ResSeq}
+				rp := [2]int{ai.ResSeq, bj.ResSeq}
 				cp.ResiduePairs[rp]++
-			 // Buried surface approximation.
+				// Buried surface approximation.
 				rA := radiusFor(ai.Element)
 				rB := radiusFor(bj.Element)
 				d := math.Sqrt(d2)
@@ -345,7 +317,6 @@ func main() {
 	}
 
 	atoms, err := ParsePDB(path)
-	fmt.Fprintf(os.Stderr, "[DEBUG] atoms=%d err=%v\n", len(atoms), err)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
