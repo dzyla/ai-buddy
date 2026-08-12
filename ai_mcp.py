@@ -3660,12 +3660,35 @@ def record_recovery(tool="", args="", prior_error="", phase="execution"):
         _append_lesson("FIX", tool, sig, lesson_text)
     return lesson_text
 
+def _block_signature(block):
+    """Extract the normalised 'signature:' line from a lesson block, if present."""
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("signature:"):
+            return stripped.split(":", 1)[1].strip().lower()
+    return ""
+
+def _sig_error_tokens(sig, tool=""):
+    """Return the set of tokens in a signature that are NOT just the tool name.
+
+    This removes the tool-name words so that overlap is driven by the actual
+    error content rather than the shared tool name."""
+    tool_words = set((tool or "").lower().replace("_", " ").split())
+    return set(sig.split()) - tool_words - {"error", "failed", "the", "a", "an"}
+
 def lessons_for(tool="", error=""):
     """Return persisted lessons relevant to a tool name / error signature.
 
-    Matches lessons whose declared tool equals the given tool, or whose error
-    signature overlaps the current error. Returns '' when nothing matches, else
-    a compact markdown block (capped ~1600 chars) for injection."""
+    Matches lessons whose error signature overlaps the current error meaningfully.
+    A lesson is surfaced only when:
+      1. The exact current signature appears verbatim in the block (precise match), OR
+      2. The block's stored `signature:` line shares enough error-specific tokens
+         with the current error signature (Jaccard similarity >= 0.3 on tokens
+         beyond the shared tool name).
+
+    Pure tool-name-only matches are intentionally suppressed to prevent
+    irrelevant lessons from previous sessions polluting the current session.
+    Returns '' when nothing matches, else a compact markdown block (capped ~1600 chars)."""
     if not os.path.isfile(_lessons_path()):
         return ""
     try:
@@ -3684,6 +3707,8 @@ def lessons_for(tool="", error=""):
         cur.append(line)
     if cur:
         blocks.append("\n".join(cur))
+    # Pre-compute current error tokens (stripped of tool-name words)
+    cur_err_tokens = _sig_error_tokens(sig, target_tool) if sig else set()
     hits, seen = [], set()
     for b in blocks:
         if not b.strip():
@@ -3691,9 +3716,21 @@ def lessons_for(tool="", error=""):
         key = b.splitlines()[0]
         if key in seen:
             continue
-        tool_match = target_tool and _block_tool(b) == target_tool
-        sig_match = sig and sig in b.lower()
-        if tool_match or sig_match:
+        # Exact verbatim match of full current signature inside the block
+        sig_match = bool(sig and sig in b.lower())
+        # Token-overlap match: compare error-specific tokens of stored signature
+        # against current error tokens (ignores tool-name-only overlap)
+        overlap_match = False
+        if not sig_match and target_tool and _block_tool(b) == target_tool:
+            stored_sig = _block_signature(b)
+            if stored_sig:
+                stored_err_tokens = _sig_error_tokens(stored_sig, target_tool)
+                if cur_err_tokens and stored_err_tokens:
+                    intersection = cur_err_tokens & stored_err_tokens
+                    union = cur_err_tokens | stored_err_tokens
+                    jaccard = len(intersection) / len(union) if union else 0.0
+                    overlap_match = jaccard >= 0.3
+        if sig_match or overlap_match:
             seen.add(key)
             hits.append(b)
     if not hits:
