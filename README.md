@@ -128,15 +128,22 @@ All of the above also work via environment variables on `ai-backend serve`
 (`CUDA_VISIBLE_DEVICES`, `LLAMA_TENSOR_SPLIT`), matching how `install.sh` sets
 `CUDA_VISIBLE_DEVICES` in the systemd unit.
 
-### Local llama.cpp server
+### Local llama.cpp server (OG vs Unsloth flavors)
 
 To set up a local inference server with GPU acceleration and on-demand auto-start:
 
 ```bash
-./install.sh llama
+# Option A: Unsloth flavor (branch: iq1-narrow) — SOTA dynamic quants (Q1_0, TQ1_0, TQ2_0) & fast decode
+./install.sh llama unsloth
+
+# Option B: Standard upstream ggml-org/llama.cpp (branch: master)
+./install.sh llama og
+
+# Update llama.cpp (pulls latest commits and rebuilds for the active flavor)
+./install.sh --update-llama
 ```
 
-This builds llama.cpp (auto-detects CUDA/ROCm/Vulkan), downloads a model from HuggingFace (interactive), and creates a systemd user service that starts on the first `ai` call and shuts down after 120 s of idle.
+This builds llama.cpp tools (`llama-server`, `llama-cli`, `llama-mtmd-cli`, `llama-gguf-split`), downloads a model from HuggingFace (interactive), and creates a systemd user service that starts on the first `ai` call and shuts down after 120 s of idle.
 
 ```bash
 # Logs
@@ -147,6 +154,30 @@ ai-backend llama ~/.local/share/ai/models/my-model.gguf
 systemctl --user restart llama-server
 ```
 
+### Qwen3.8 & Unsloth Dynamic Quants
+
+`ai-backend` and `ai` provide full, out-of-the-box support for **Qwen3.8** (including **Qwen3.8-27B** and **Qwen3.8-2.4T-A95B**), featuring Unsloth recommended sampling presets, native MTP (Multi-Token Prediction) speculative decoding, and hybrid thinking controls.
+
+```bash
+# 1. Download & use Qwen3.8
+ai-backend use qwen3.8         # downloads/activates unsloth/Qwen3.8-27B-GGUF (UD-Q4_K_XL)
+ai-backend use qwen3.8-2.4t    # downloads/activates unsloth/Qwen3.8-2.4T-A95B-GGUF (Q1_0)
+
+# 2. Switch recommended sampling presets
+ai-backend mode thinking       # recommended thinking settings:
+                               # temp=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_pen=0.0, repeat_pen=1.0, reasoning_effort=xhigh
+ai-backend mode instruct       # recommended non-thinking (instruct) settings:
+                               # temp=0.7, top_p=0.80, top_k=20, min_p=0.0, presence_pen=1.5, repeat_pen=1.0, reasoning_effort=none
+
+# 3. Multi-Token Prediction (MTP) speculative decoding
+ai-backend mtp on              # enable MTP speculative decoding (--spec-type draft-mtp)
+ai-backend mtp 2               # set speculative tokens count (draft-n-max=2)
+ai-backend mtp off             # disable MTP
+
+# 4. Hybrid reasoning depth
+ai-backend reasoning xhigh     # options: xhigh (default), medium, low, none
+```
+
 ### Server-level sampling penalties
 
 `ai-backend serve` passes sampling penalties directly to `llama-server` via
@@ -155,10 +186,12 @@ These are global for every request served by the process. You configure them wit
 environment variables in `~/.local/share/ai/env`:
 
 ```bash
-export LLAMA_REPEAT_PENALTY="1.05"        # 1.0 = neutral; >1 scales penalty with reuse
-export LLAMA_PRESENCE_PENALTY="0.6"       # >0 pushes away from tokens already used
+export LLAMA_REPEAT_PENALTY="1.0"         # 1.0 = neutral (default for Qwen3.8 thinking)
+export LLAMA_PRESENCE_PENALTY="0.0"       # 0.0 = neutral in thinking mode; 1.5 in instruct mode
 export LLAMA_FREQUENCY_PENALTY="0.0"      # additive frequency penalty (0.0 = neutral)
 export LLAMA_REPEAT_LAST_N="64"           # tokens considered for repeat penalty
+export LLAMA_MTP="1"                      # enable MTP speculative decoding
+export LLAMA_SPEC_DRAFT_N_MAX="2"         # draft tokens count for MTP
 ```
 
 **How these compare to the AI-level (`ai`) penalties:**
@@ -203,10 +236,18 @@ All config lives in `~/.local/share/ai/env` (managed by `ai-backend`) and is loa
 | `INFER_STEP_LIMIT` | Cap on agent-loop tool iterations for a task (piped/auto runs are finite now) | 60 (non-tty), 30 (tty) |
 | `INFER_PLAN_STEP_BUDGET` | State-changing actions allowed per approved `present_plan` (PLAN mode); `0` = unlimited | 8 |
 | `INFER_PLAN_AUTOAPPROVE=1` | Auto-approve `present_plan` in PLAN mode (opt-in, for trusted/harnessed/bridge runs only) | off |
+| `INFER_TEMPERATURE` | Request-level sampling temperature (e.g. 1.0 for thinking, 0.7 for instruct) | off |
+| `INFER_TOP_P` | Request-level top-p nucleus sampling (e.g. 0.95 for thinking, 0.80 for instruct) | off |
+| `INFER_TOP_K` | Request-level top-k sampling (e.g. 20) | off |
+| `INFER_MIN_P` | Request-level min-p sampling (e.g. 0.0) | off |
+| `INFER_REASONING_EFFORT` | Reasoning depth for hybrid models (`xhigh`, `medium`, `low`, `none`) | off |
+| `INFER_PRESERVE_THINKING` | Preserve thinking trace across turns in multi-turn chats | off |
 | `LLAMA_REPEAT_PENALTY` | Server-level repeat penalty (llama.cpp multiplier, 1.0 = neutral) | `1.0` |
 | `LLAMA_PRESENCE_PENALTY` | Server-level presence penalty (additive, 0.0 = neutral) | `0.0` |
 | `LLAMA_FREQUENCY_PENALTY` | Server-level frequency penalty (additive, 0.0 = neutral) | `0.0` |
 | `LLAMA_REPEAT_LAST_N` | Number of recent tokens considered for repeat penalty | `64` |
+| `LLAMA_MTP` | Enable Multi-Token Prediction speculative decoding (1/0) | `0` |
+| `LLAMA_SPEC_DRAFT_N_MAX` | Speculative draft token count (e.g. 2 for MTP, 3 for dspark) | `2` |
 
 ### MCP servers
 
@@ -283,6 +324,12 @@ dmesg | tail -20 | ai "any hardware warnings?"
 | `-r` | `--resume` | `INFER_RESUME=1` | Resume the previous conversation |
 | `-q` | `--quiet` | `INFER_QUIET=1` | Suppress thinking output |
 | `-n` | `--no-tools` | | Direct answer, skip the agent loop |
+| `-t` | `--temperature` | `INFER_TEMPERATURE` | Sampling temperature (e.g. 1.0 for thinking, 0.7 for instruct) |
+| `-p` | `--top-p` | `INFER_TOP_P` | Top-p nucleus sampling (e.g. 0.95 for thinking, 0.80 for instruct) |
+| `-k` | `--top-k` | `INFER_TOP_K` | Top-k sampling (e.g. 20) |
+| | `--min-p` | `INFER_MIN_P` | Min-p sampling (e.g. 0.0) |
+| | `--reasoning` | `INFER_REASONING_EFFORT` | Reasoning depth for hybrid models (`xhigh`, `medium`, `low`, `none`) |
+| | `--preserve-thinking` | `INFER_PRESERVE_THINKING=1` | Preserve thinking trace across conversation turns |
 | `-h` | `--help` | | Print help |
 
 ### Permission modes (manual / plan / auto)

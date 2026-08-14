@@ -34,8 +34,11 @@ make test               # run C test + pytest suite
 ### Install
 
 ```bash
-./install.sh            # installs to ~/.local/bin
-./install.sh uninstall  # remove all installed artifacts
+./install.sh                  # installs to ~/.local/bin
+./install.sh llama unsloth    # build & set up Unsloth llama.cpp (iq1-narrow) inference server
+./install.sh llama og         # build & set up standard ggml-org/llama.cpp inference server
+./install.sh --update-llama   # update & rebuild llama.cpp for active flavor
+./install.sh uninstall        # remove all installed artifacts
 ```
 
 ### Run
@@ -106,7 +109,7 @@ export INFER_API_KEY="your-key"
 export INFER_MODEL="your-model-name"
 ```
 
-### Server-level sampling penalties (llama.cpp)
+### Server-level sampling penalties & Qwen3.8 settings (llama.cpp / Unsloth)
 
 `ai-backend serve` forwards sampling penalties directly to `llama-server`. These apply
 globally to every request while the process is running:
@@ -117,6 +120,20 @@ globally to every request while the process is running:
 | `LLAMA_PRESENCE_PENALTY` | presence penalty (additive; 0.0 = neutral) | `0.0` |
 | `LLAMA_FREQUENCY_PENALTY` | frequency penalty (additive; 0.0 = neutral) | `0.0` |
 | `LLAMA_REPEAT_LAST_N` | recent tokens considered for repeat penalty | `64` |
+| `LLAMA_MTP` | Multi-Token Prediction (MTP) speculative decoding (1/0) | `0` |
+| `LLAMA_SPEC_DRAFT_N_MAX` | Speculative tokens draft count | `2` (MTP) / `3` (dspark) |
+
+**Qwen3.8 and Unsloth Integration:**
+
+- **Unsloth llama.cpp flavor:** `./install.sh llama unsloth` installs the `iq1-narrow`
+  Unsloth fork supporting dynamic quants (`IQ1_XXXS` / `Q1_0`, `TQ1_0`, etc.), fast decode,
+  and native MTP speculative decoding (`--spec-type draft-mtp`).
+- **Qwen3.8 Presets & Mode commands:**
+  - `ai-backend use qwen3.8` (or `qwen3.8-27b`, `qwen3.8-2.4t`) automatically routes and downloads Unsloth GGUFs.
+  - `ai-backend mode thinking`: applies Unsloth recommended thinking settings (`temp=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence=0.0`, `repeat=1.0`, `reasoning_effort=xhigh`).
+  - `ai-backend mode instruct`: applies non-thinking settings (`temp=0.7`, `top_p=0.80`, `top_k=20`, `presence=1.5`, `repeat=1.0`, `reasoning_effort=none`).
+  - `ai-backend mtp on`: enables MTP speculative decoding.
+  - `ai` CLI flags: `-p/--top-p`, `-k/--top-k`, `--min-p`, `--reasoning`, `--preserve-thinking`.
 
 **How they compare to the AI-level penalties (`ai`):**
 
