@@ -184,13 +184,22 @@ ai-backend yarn off            # back to native 256K
 ai-backend yarn 2              # custom scale (2 -> ~512K)
 
 # 3. Multi-Token Prediction (MTP) speculative decoding
+#    The head ships inside the Qwen3.8-27B GGUF (blk.64.nextn.*); no conversion.
+#    `ai-backend mtp on` pins --parallel 1 (the MTP draft ctx is single-seq).
 ai-backend mtp on              # enable MTP speculative decoding (--spec-type draft-mtp)
-ai-backend mtp 2               # set speculative tokens count (draft-n-max=2)
+ai-backend mtp 2               # set speculative tokens count (draft-n-max=2, daily default)
 ai-backend mtp off             # disable MTP
+ai-backend probe               # streaming decode-speed A/B probe (dev/probe_mtp.py)
+                               # run once on baseline, once with MTP: the delta is the number
 
 # 4. Hybrid reasoning depth
 ai-backend reasoning xhigh     # options: xhigh (default), medium, low, none
 ```
+
+Measured on this box (RTX PRO 6000 97GB, Q6_K, 131K ctx, thinking off): MTP
+`n-max 2` takes decode from **52.9 → 99.9 tok/s (+89%)**, draft acceptance
+0.51–0.97. The 24GB reference recipe (sudoingX/qwen38-mtp) reports +33–39%;
+the 97GB card's bandwidth headroom makes the built-in head pay off harder.
 
 ### Server-level sampling penalties
 

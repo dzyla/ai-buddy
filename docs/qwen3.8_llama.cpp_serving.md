@@ -351,6 +351,51 @@ more tokens, can raise accuracy on continued conversations.
   `LLAMA_DRAFT_MODEL_PATH` to the dspark file while serving Qwen3.8 — it's harmless
   (ignored) but pointless.
 
+## MTP speculative decoding (Qwen3.8-27B only)
+
+Qwen3.8-27B's MTP head ships **inside the GGUF** (`blk.64.nextn.*` tensors) —
+no conversion, no separate draft file. llama.cpp's `--spec-type draft-mtp`
+loads it and drafts tokens that the main model verifies.
+
+```bash
+ai-backend mtp on          # LLAMA_MTP=1 + spec-type=draft-mtp (draft-n-max=2 default)
+ai-backend mtp 3           # draft 3 tokens instead of 2 (pure-code sessions only)
+ai-backend mtp off         # back to plain decode
+```
+
+**`--parallel 1` is pinned automatically.** The built-in MTP draft context is
+created single-sequence (`n_seq_max=1`), so the recipe requires one slot.
+`ai-backend serve` emits `--parallel 1` whenever MTP is active (override with
+`LLAMA_N_PARALLEL=<n>` if you must).
+
+**Measured on this box** (Qwen3.8-27B Q6_K, RTX PRO 6000 97GB, 131K ctx, q8_0
+KV, thinking off, `dev/probe_mtp.py` — every generated token clocked, TTFT
+excluded, 3 prompts x 3 runs):
+
+| | baseline | MTP (n-max 2) | delta |
+|---|---|---|---|
+| code prompt | 52.7 tok/s | 113.2 tok/s | +115% |
+| prose prompt | 53.1 tok/s | 81.2 tok/s | +53% |
+| bash prompt | 52.7 tok/s | 103.4 tok/s | +96% |
+| **overall (mean)** | **52.9 tok/s** | **99.9 tok/s** | **+89%** |
+
+Draft acceptance 0.51–0.97 per task (mean draft len 2.6–2.9) — comfortably
+above the reference recipe's 0.76–0.82 (24GB cards). The 97GB card's VRAM
+bandwidth headroom makes the head pay for itself harder than on 24GB.
+
+Reference numbers (sudoingX/qwen38-mtp, 24GB cards): RTX 3090 31.0→41.3 tok/s
+(+33%), RTX 5090 mobile 36.7→50.9 tok/s (+39%), n-max 2.
+
+Tuning `n-max` (reference sweep, 5090 mobile): 2 = daily (best overall +
+prose), 3 = pure-code sessions, 4 = diminishing (acceptance 0.65). Prose pays
+for deep drafts first.
+
+Caveats:
+- `--parallel 1` — single slot, no concurrent requests under MTP.
+- Small prompt-processing hit (device→host embedding transfers for the draft).
+- Speeds are day-one `qwen3_5` code-path numbers; hybrid attention kernels are
+  young and upstream work should raise the floor.
+
 ## Multi-GPU
 
 - `ai-backend gpus` shows detected cards + current selection.
@@ -409,7 +454,9 @@ config that can't fit.
   penalties neutral, `LLAMA_CTX_SIZE=1048576` in the env file but the **systemd
   unit bakes `LLAMA_CTX_SIZE=131072`**, so the live server runs at 128K until you
   `ai-backend ctx <size>`. YaRN is **off** by default — enable it (`ai-backend yarn on`)
-  before actually serving past 256K.
+  before actually serving past 256K. MTP is **off** by default — `ai-backend mtp on`
+  pins `--parallel 1` and adds `--spec-type draft-mtp --spec-draft-n-max 2` (measured
+  +89% decode on this card; see the MTP section).
 - Serve lands on the 97 GB card (auto = biggest). Q6_K + 256K fits comfortably on
   it; MTP is the main speed lever.
 

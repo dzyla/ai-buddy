@@ -231,8 +231,11 @@ ln -sf "${BIN_DIR}/ai-backend"    "${BIN_DIR}/ai-use.sh"
 ln -sf "${BIN_DIR}/ai-backend"    "${BIN_DIR}/llama-server-wrapper.sh"
 cp "${SCRIPT_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/pubmed_mcp_server.py"
 cp "${SCRIPT_DIR}/deep_research.py"   "${BIN_DIR}/deep_research.py"
+# The MTP probe tool: ai-backend probe looks here when dev/ isn't alongside the binary.
+mkdir -p "${HOME}/.local/share/ai"
+cp "${SCRIPT_DIR}/dev/probe_mtp.py" "${HOME}/.local/share/ai/probe_mtp.py" 2>/dev/null || true
 chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
-echo "==> Installed: ai  libremote_harness.so  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py"
+echo "==> Installed: ai  libremote_harness.so  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py  probe_mtp.py"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."

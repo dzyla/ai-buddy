@@ -22,6 +22,7 @@ SYSTEMD_SERVICE = Path.home() / ".config" / "systemd" / "user" / "llama-server.s
 SYSTEMD_SOCKET = Path.home() / ".config" / "systemd" / "user" / "llama-server.socket"
 BIN_DIR = Path.home() / ".local" / "bin"
 PORT = 8080
+DEFAULT_PROBE_URL = f"http://127.0.0.1:{PORT}"
 PUBMED_KEY = "myapp_kZnDpemyN9z43CqNrOYEE-LhAH9_UsxhWTavLkWv22Y"
 
 def load_env():
@@ -965,6 +966,15 @@ def cmd_serve():
             print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) with draft {os.path.basename(mtp_draft_path)} (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
         else:
             print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
+        # The built-in MTP draft context is created with n_seq_max=1, so the
+        # recipe (sudoingX/qwen38-mtp) pins --parallel 1. Respect an explicit
+        # LLAMA_N_PARALLEL override, otherwise pin 1 while MTP is active.
+        n_parallel = os.environ.get("LLAMA_N_PARALLEL", env_vars.get("LLAMA_N_PARALLEL", ""))
+        if n_parallel:
+            extra_args.extend(["--parallel", str(n_parallel)])
+        else:
+            extra_args.extend(["--parallel", "1"])
+            print("[llama-wrapper] MTP active: pinning --parallel 1 (single slot; the MTP draft context is single-sequence). Set LLAMA_N_PARALLEL to override.", file=sys.stderr)
 
     # Reasoning models (DeepSeek V4, Qwen 3.8, Qwen 3.6, etc.) need the chat template + reasoning
     # handling enabled, else chat completions degenerate into raw CoT garbage.
@@ -1370,6 +1380,38 @@ def cmd_mtp(target=None, extra=None):
         print("Usage: ai-backend mtp <on|off|1|2|3|draft <path>>", file=sys.stderr)
 
 
+def cmd_probe(target=None):
+    """Streaming decode-speed probe (dev/probe_mtp.py) against a live server.
+
+    Clocks every generated token (TTFT excluded) and reports per-prompt medians —
+    the paired A/B method from sudoingX/qwen38-mtp. Run once against a baseline
+    serve and once with MTP (`ai-backend mtp on`), everything else identical: the
+    delta is the honest number.
+    """
+    import importlib.util
+    # The probe tool ships in dev/ next to the repo; install.sh also copies it to
+    # ~/.local/share/ai/ so an installed ai-backend (in ~/.local/bin) can find it.
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "dev" / "probe_mtp.py",
+        Path.home() / ".local" / "share" / "ai" / "probe_mtp.py",
+    ]
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
+        print(f"probe tool not found (looked in: {', '.join(map(str, candidates))})", file=sys.stderr)
+        sys.exit(1)
+    spec = importlib.util.spec_from_file_location("probe_mtp", str(p))
+    pm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pm)
+
+    url = DEFAULT_PROBE_URL if target in (None, "") else target
+    try:
+        pm.probe(url)
+    except Exception as e:
+        print(f"probe failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_mode(mode_name=None):
     """Configure recommended settings for thinking vs instruct mode (e.g. for Qwen3.8)."""
     if not mode_name:
@@ -1674,6 +1716,7 @@ Usage:
   ai-backend yarn <on|off|<scale>>      Enable YaRN RoPE scaling to extend context (on -> ~1M for Qwen3.8)
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
   ai-backend mtp <on|off|tokens|draft>  Configure Multi-Token Prediction speculative decoding
+  ai-backend probe [url]                 Streaming decode-speed A/B probe (dev/probe_mtp.py); baseline vs MTP
   ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup
   ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
   ai-backend gpus [all|<devs>|auto|split <p>]   Select GPUs (single vs multi-GPU split)
@@ -1731,6 +1774,8 @@ def main():
     elif cmd in ("mtp", "spec"):
         extra = args[2] if len(args) > 2 else None
         cmd_mtp(args[1] if len(args) > 1 else None, extra)
+    elif cmd in ("probe", "speed", "benchmark"):
+        cmd_probe(args[1] if len(args) > 1 else None)
     elif cmd in ("mode", "preset"):
         cmd_mode(args[1] if len(args) > 1 else None)
     elif cmd in ("yarn", "rope"):
