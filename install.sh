@@ -537,19 +537,15 @@ print(lines[idx].split(') ', 1)[1])
     systemctl --user stop llama-server.service llama-server.socket 2>/dev/null || true
 
     # Prepare environment lines for systemd
-    # Detect GPU topology & select single GPU preference
-    SINGLE_GPU="1"
-    if command -v nvidia-smi &>/dev/null; then
-        BEST_GPU=$(nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits | sort -t',' -k2 -nr | head -n1 | cut -d',' -f1 | tr -d ' ')
-        [ -n "$BEST_GPU" ] && SINGLE_GPU="$BEST_GPU"
-    fi
+    # Do NOT pin a specific GPU index into the unit: serve resolves the biggest
+    # card that fits the active model at startup (and re-resolves it), so a baked
+    # index would go stale if the topology or the model changes.
 
     # Prepare environment lines for systemd
     SYSTEMD_ENV=""
     if [ -n "${CUDA_BIN_DIR:-}" ]; then
         SYSTEMD_ENV="Environment=PATH=${BIN_DIR}:${CUDA_BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=CUDA_PATH=${CUDA_ROOT}
-Environment=CUDA_VISIBLE_DEVICES=${SINGLE_GPU}
 Environment=LLAMA_CTX_SIZE=131072"
         if [ -n "${CUDA_LIB_DIR:-}" ]; then
             SYSTEMD_ENV="${SYSTEMD_ENV}
@@ -603,8 +599,9 @@ SERVICE_EOF
         if ! grep -q "CUDA_VISIBLE_DEVICES" "${DATA_DIR}/env" 2>/dev/null; then
             cat >> "${DATA_DIR}/env" <<ENV_EOF
 
-# Single GPU & Max Context Optimization
-export CUDA_VISIBLE_DEVICES="${SINGLE_GPU}"
+# GPU selection: "auto" = serve picks the biggest card that fits the active model
+# at startup (override with a specific index via `ai-backend gpus <sel>`).
+export CUDA_VISIBLE_DEVICES="auto"
 export LLAMA_CTX_SIZE="131072"
 # CUDA Environment Paths
 export PATH="${CUDA_BIN_DIR}:${PATH}"
