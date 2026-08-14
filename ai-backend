@@ -72,16 +72,22 @@ def write_env(url, model, llama_model_path=None, extra_vars=None):
     ]
     if llama_model_path:
         lines.append(f'export LLAMA_MODEL_PATH="{llama_model_path}"')
+    draft_path = current.get("LLAMA_DRAFT_MODEL_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH")
+    if draft_path:
+        lines.append(f'export LLAMA_DRAFT_MODEL_PATH="{draft_path}"')
     lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
     if gpu_layers:
         lines.append(f'export LLAMA_N_GPU_LAYERS="{gpu_layers}"')
+    tensor_split = current.get("LLAMA_TENSOR_SPLIT")
+    if tensor_split:
+        lines.append(f'export LLAMA_TENSOR_SPLIT="{tensor_split}"')
     lines.append(f'export LLAMA_REPEAT_PENALTY="{repeat_penalty}"')
     lines.append(f'export LLAMA_PRESENCE_PENALTY="{presence_penalty}"')
     lines.append(f'export LLAMA_FREQUENCY_PENALTY="{frequency_penalty}"')
     lines.append(f'export LLAMA_REPEAT_LAST_N="{repeat_last_n}"')
     lines.append(f'export PUBMED_API_KEY="{PUBMED_KEY}"')
     
-    seen = {"CUDA_VISIBLE_DEVICES", "INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "LLAMA_FREQUENCY_PENALTY", "LLAMA_REPEAT_LAST_N", "PUBMED_API_KEY"}
+    seen = {"CUDA_VISIBLE_DEVICES", "INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_DRAFT_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "LLAMA_TENSOR_SPLIT", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "LLAMA_FREQUENCY_PENALTY", "LLAMA_REPEAT_LAST_N", "PUBMED_API_KEY"}
     for k, v in current.items():
         if k not in seen:
             lines.append(f'export {k}="{v}"')
@@ -245,6 +251,23 @@ def download_hf_target(target):
             dest = download_file(repo, part_rel_path)
             if p == 1:
                 first_dest = dest
+
+        # Multi-part GGUFs are frequently too large for one card — check and hint.
+        try:
+            total_gb = sum(os.path.getsize(dest) for dest in
+                           [first_dest] + [MODEL_DIR / f"{prefix}-{p:05d}-of-{total_parts:05d}.gguf"
+                           for p in range(2, total_parts + 1)]) / 1e9
+        except Exception:
+            total_gb = 0
+        largest_gb = 0
+        for g in list_gpu_info():
+            largest_gb = max(largest_gb, g["total_mib"] / 1024)
+        print(f"Total model size: {total_gb:.1f} GB", file=sys.stderr)
+        if total_gb > 0 and largest_gb and total_gb > largest_gb * 0.95:
+            print(f"NOTE: model ({total_gb:.1f} GB) exceeds a single GPU ({largest_gb:.1f} GB).",
+                  file=sys.stderr)
+            print("Run `ai-backend gpus all` to spread it across every card (auto tensor-split).",
+                  file=sys.stderr)
         return first_dest
     else:
         return download_file(repo, rel_path)
@@ -294,18 +317,7 @@ def is_systemd_service_active():
     except Exception:
         return False
 
-def calculate_auto_ctx(model_path):
-    vram_free = 0
-    if shutil.which("nvidia-smi"):
-        try:
-            res = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5
-            )
-            vram_free = int(res.stdout.splitlines()[0].strip())
-        except Exception:
-            pass
-            
+def calculate_auto_ctx(model_path, vram_free=None):
     ram_free = 0
     try:
         with open("/proc/meminfo", "r") as f:
@@ -315,6 +327,18 @@ def calculate_auto_ctx(model_path):
                     break
     except Exception:
         pass
+
+    if vram_free is None:
+        vram_free = 0
+        if shutil.which("nvidia-smi"):
+            try:
+                res = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                vram_free = int(res.stdout.splitlines()[0].strip())
+            except Exception:
+                pass
         
     try:
         model_mb = os.path.getsize(model_path) // (1024 * 1024)
@@ -346,27 +370,289 @@ def calculate_auto_ctx(model_path):
     print(f"[llama-wrapper] Auto ctx: {ctx} [{source}] (GPU free: {vram_free} MiB, RAM free: {ram_free} MiB, factor: {factor})", file=sys.stderr)
     return ctx
 
+def list_gpu_info():
+    """Return [{index, name, total_mib, free_mib}, ...] from nvidia-smi (empty if unavailable)."""
+    gpus = []
+    if not shutil.which("nvidia-smi"):
+        return gpus
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in res.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                gpus.append({"index": int(parts[0]), "name": parts[1],
+                             "total_mib": int(parts[2]), "free_mib": int(parts[3])})
+    except Exception:
+        pass
+    return gpus
+
+def parse_gpu_sel(sel):
+    """Turn a gpu selection string into a list of CUDA indices.
+    'all' -> every detected GPU; '0,1' -> [0,1]; '1' -> [1]; None -> None."""
+    if sel is None:
+        return None
+    s = str(sel).strip().lower().replace("gpu", "").replace(" ", "")
+    if s in ("all", "*"):
+        gpus = list_gpu_info()
+        return [g["index"] for g in gpus] if gpus else None
+    if s == "":
+        return None
+    idxs = []
+    for part in s.split(","):
+        if part == "":
+            continue
+        try:
+            idxs.append(int(part))
+        except ValueError:
+            return None
+    return idxs or None
+
+def best_single_gpu_idx():
+    """Index of the detected GPU with the most total VRAM, else '1'."""
+    gpus = list_gpu_info()
+    if not gpus:
+        return "1"
+    return str(max(gpus, key=lambda g: g["total_mib"])["index"])
+
+def default_gpu_selection():
+    """Auto: single largest GPU if it holds the active model, else all detected GPUs."""
+    env_vars = load_env()
+    model_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
+    gpus = list_gpu_info()
+    if not gpus:
+        return "1"
+    best = max(gpus, key=lambda g: g["total_mib"])
+    if model_path and os.path.exists(model_path):
+        model_gb = split_total_size(model_path)
+        # Weights must fully fit on the single card (with a small safety margin).
+        if model_gb > 0 and model_gb > (best["free_mib"] / 1024) * 0.95:
+            idxs = sorted(g["index"] for g in gpus)
+            return ",".join(str(i) for i in idxs)
+    return str(best["index"])
+
+def split_total_size(file_path):
+    """Total size in GB of a GGUF, summing sibling '-NNNNN-of-MMNNN.gguf' parts.
+    Falls back to the file's own size when it isn't part of a split."""
+    p = Path(file_path)
+    m = re.search(r'^(.*?)-(\d{5})-of-(\d{5})\.gguf$', p.name)
+    if not m:
+        try:
+            return os.path.getsize(p) / 1e9
+        except Exception:
+            return 0
+    prefix, part, total = m.group(1), int(m.group(2)), int(m.group(3))
+    total_bytes = 0
+    for i in range(1, total + 1):
+        sibling = p.parent / f"{prefix}-{i:05d}-of-{total:05d}.gguf"
+        if sibling.exists():
+            total_bytes += os.path.getsize(sibling)
+    return total_bytes / 1e9
+
+def compute_tensor_split(gpu_indices, ctx_reserve=2048):
+    """Proportional --tensor-split string across GPUs by (free VRAM - reserve).
+    Returns None unless 2+ GPUs. NOTE: tensor-split is weights split, so the
+    biggest GPU takes proportionally more layers."""
+    if not gpu_indices or len(gpu_indices) < 2:
+        return None
+    by_idx = {g["index"]: g for g in list_gpu_info()}
+    frees = []
+    for i in gpu_indices:
+        free = by_idx.get(i, {}).get("free_mib", 0)
+        frees.append(max(0, free - ctx_reserve))
+    total = sum(frees)
+    if total <= 0:
+        return ",".join(["1.0"] + ["0.0"] * (len(frees) - 1))
+    props = [f / total for f in frees]
+    return ",".join(f"{p:.3f}" for p in props)
+
+def read_gguf_block_count(path):
+    """Number of transformer layers (block_count) from a GGUF header, else None.
+    Uses gguf-py when importable (installed or the llama.cpp repo copy)."""
+    _gg = None
+    try:
+        import gguf as _gg
+    except Exception:
+        pass
+    if _gg is None:
+        for cand in (
+            str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
+            "/home/dzyla/Code/llama.cpp/gguf-py",
+        ):
+            if os.path.isdir(cand):
+                sys.path.insert(0, cand)
+                try:
+                    import gguf as _gg
+                    break
+                except Exception:
+                    _gg = None
+    if _gg is None:
+        return None
+    try:
+        r = _gg.GGUFReader(str(path))
+        for f in r.fields.values():
+            if f.name.endswith(".block_count"):
+                return int(f.contents())
+    except Exception:
+        pass
+    return None
+
+
+def is_deepseek_model(model_path):
+    """True when the model belongs to the DeepSeek family — the only model
+    family the dspark draft / dsv4 speculative-decode path supports."""
+    return "deepseek" in os.path.basename(str(model_path)).lower()
+
+
+def find_dspark_draft(main_path=None):
+    """Locate a DeepSeek dspark draft model for the active main model.
+
+    The dspark draft is DeepSeek V4-specific and MUST only be attached to a
+    DeepSeek main model: llama.cpp aborts building the dsv4 graph against any
+    other architecture (e.g. a dense model like BigBang). So this returns None
+    whenever the main model is not DeepSeek, even if a draft path is configured.
+
+    Check order: explicit LLAMA_DRAFT_MODEL_PATH -> sibling in the model dir ->
+    any dspark-*.gguf in the models dir. Returns path or None.
+    """
+    env_vars = load_env()
+    if not main_path:
+        main_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
+    if not main_path or not is_deepseek_model(main_path):
+        return None
+    d = os.environ.get("LLAMA_DRAFT_MODEL_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH")
+    if d and os.path.exists(d):
+        return d
+    if main_path:
+        try:
+            for f in sorted(os.listdir(os.path.dirname(os.path.abspath(str(main_path))))):
+                if "dspark" in f.lower() and f.endswith(".gguf"):
+                    return os.path.join(os.path.dirname(os.path.abspath(str(main_path))), f)
+        except Exception:
+            pass
+    if MODEL_DIR.exists():
+        for p in sorted(MODEL_DIR.iterdir()):
+            if p.suffix == ".gguf" and "dspark" in p.name.lower():
+                return str(p)
+    return None
+
+
+def compute_main_ngl_for_draft(main_path, draft_path, vram_free_mib):
+    """Main-model -ngl that leaves the draft VRAM room to load fully on GPU.
+    Plain -ngl auto is unsafe here: llama.cpp fills the GPU with the main model and
+    the draft then OOMs. So reserve enough for the draft plus compute/KV buffers and
+    offload the rest of the main model to GPU."""
+    try:
+        draft_mib = os.path.getsize(draft_path) // (1024 * 1024)
+    except Exception:
+        draft_mib = 1
+    main_gb = split_total_size(main_path)
+    blk = read_gguf_block_count(main_path) or 32
+    per_layer = (main_gb * 1024) / blk
+    if per_layer <= 0:
+        return None
+    reserve = 4096  # main compute buffer + KV + safety
+    avail = max(0, (vram_free_mib or 0) - draft_mib - reserve)
+    ngl = int(avail / per_layer) if per_layer > 0 else 0
+    return max(1, min(ngl, blk))
+
+
+def persist_env_changes(changes):
+    """Apply {key: value} changes to ~/.local/share/ai/env preserving the rest.
+    value None removes the key (auto)."""
+    env_vars = load_env()
+    for k, v in changes.items():
+        if v is None:
+            env_vars.pop(k, None)
+        else:
+            env_vars[k] = v
+    url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
+    model = env_vars.get("INFER_MODEL", "llama")
+    llama_path = env_vars.get("LLAMA_MODEL_PATH")
+    write_env(url, model, llama_path, env_vars)
+
+def sync_gpu_to_systemd(cuda_dev):
+    """Keep the systemd unit's CUDA_VISIBLE_DEVICES in sync with the env file."""
+    if not SYSTEMD_SERVICE.exists():
+        return
+    try:
+        content = SYSTEMD_SERVICE.read_text()
+        new_content = re.sub(
+            r'^Environment=CUDA_VISIBLE_DEVICES=.*',
+            f'Environment=CUDA_VISIBLE_DEVICES={cuda_dev}',
+            content, flags=re.MULTILINE,
+        )
+        if new_content != content:
+            SYSTEMD_SERVICE.write_text(new_content)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            print(f"[ai-backend] Synced systemd CUDA_VISIBLE_DEVICES={cuda_dev}")
+    except Exception as e:
+        print(f"Warning syncing systemd GPU config: {e}", file=sys.stderr)
+
 def cmd_serve():
     env_vars = load_env()
     model_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
     if not model_path or not os.path.exists(model_path):
         print(f"Error: LLAMA_MODEL_PATH not found or invalid: {model_path}", file=sys.stderr)
         sys.exit(1)
-        
+
     idle_timeout = int(os.environ.get("LLAMA_IDLE_TIMEOUT", env_vars.get("LLAMA_IDLE_TIMEOUT", "120")))
     ctx_override = os.environ.get("LLAMA_CTX_SIZE", env_vars.get("LLAMA_CTX_SIZE"))
-    
+
+    # Resolve which GPUs to use: default to all GPUs when the active model is too
+    # big for the single largest card, otherwise that single card. Overridable via
+    # CUDA_VISIBLE_DEVICES (e.g. "0,1,2,3", "1", "all").
+    cuda_dev = os.environ.get("CUDA_VISIBLE_DEVICES") or env_vars.get("CUDA_VISIBLE_DEVICES")
+    draft_path = find_dspark_draft(model_path)
+    if not draft_path:
+        # A dspark draft was configured but the active model isn't DeepSeek, so
+        # it will be (correctly) ignored. Surface this so it's not puzzling why
+        # speculative decoding is off. Attaching it anyway crashes llama.cpp
+        # (dsv4 graph built against an incompatible model → abort).
+        legacy_draft = os.environ.get("LLAMA_DRAFT_MODEL_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH")
+        if legacy_draft and not is_deepseek_model(model_path):
+            print(f"[llama-wrapper] NOTE: LLAMA_DRAFT_MODEL_PATH is set ({legacy_draft}) but the active "
+                  f"model ({os.path.basename(model_path)}) is not DeepSeek — ignoring the dspark draft "
+                  f"(it is DeepSeek V4-specific). Run `ai-backend draft off` to clear it.", file=sys.stderr)
+    if draft_path:
+        # dspark draft co-locates with the main model on one GPU (main + draft in
+        # the same VRAM, overflow to RAM). Do NOT spread across cards via
+        # tensor-split or auto multi-GPU: that splits the draft and main apart.
+        cuda_dev = cuda_dev or best_single_gpu_idx()
+    if not cuda_dev:
+        cuda_dev = default_gpu_selection()
+    gpu_indices = parse_gpu_sel(cuda_dev)
+    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_dev
+    print(f"[llama-wrapper] Using CUDA_VISIBLE_DEVICES={cuda_dev} "
+          f"({len(gpu_indices or [])} GPU{'s' if len(gpu_indices or []) != 1 else ''})",
+          file=sys.stderr)
+
+    # Aggregate free VRAM across all selected GPUs (KV cache spreads across them).
+    agg_vram_free = 0
+    by_idx = {g["index"]: g for g in list_gpu_info()}
+    for i in (gpu_indices or []):
+        agg_vram_free += by_idx.get(i, {}).get("free_mib", 0)
+
     if ctx_override:
         ctx_size = int(ctx_override)
         print(f"[llama-wrapper] Using explicit ctx: {ctx_size}", file=sys.stderr)
     else:
-        ctx_size = calculate_auto_ctx(model_path)
-        
+        ctx_size = calculate_auto_ctx(model_path, vram_free=agg_vram_free or None)
+
     extra_args = []
     if "mtp" in os.path.basename(model_path).lower():
         extra_args.extend(["--spec-type", "draft-mtp"])
         print("[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding.", file=sys.stderr)
-        
+
+    # DeepSeek V4 (and other reasoning models) need the chat template + reasoning
+    # handling enabled, else chat completions degenerate into raw CoT garbage.
+    # --jinja uses the GGUF-embedded chat template; --reasoning on parses the
+    # model's reasoning block into reasoning_content instead of leaking it.
+    extra_args.extend(["--jinja", "--reasoning", "on"])
+
     # Server-level sampling penalties (llama.cpp style). Applied to ALL requests.
     # --repeat-penalty is a multiplier (1.0 = neutral), rest are additive (0.0 = neutral).
     # These can be overridden per-request via INFER_FREQ_PENALTY / INFER_PRESENCE_PENALTY.
@@ -384,7 +670,64 @@ def cmd_serve():
     print(f"[llama-wrapper] Server penalties: repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty} repeat_last_n={repeat_last_n}", file=sys.stderr)
     
     n_gpu = os.environ.get("LLAMA_N_GPU_LAYERS", env_vars.get("LLAMA_N_GPU_LAYERS", "99"))
+
+    # DeepSeek V4 Flash dspark draft: wire the draft model into speculative decoding.
+    # Two adjustments are required for correctness on a single GPU:
+    #  1) cap the main model -ngl so it reserves VRAM for the draft (see
+    #     compute_main_ngl_for_draft); plain 'auto' would fill the GPU and OOM the draft.
+    #     This is skipped when n-cpu-moe is active, because keeping MoE experts in RAM
+    #     already frees enough VRAM for both the main model and the draft.
+    #  2) pass -md + --spec-type draft-dspark + --spec-draft-n-max so the server
+    #     actually uses the draft.
+    if draft_path:
+        n_cpu_moe_active = int(os.environ.get("LLAMA_N_CPU_MOE", env_vars.get("LLAMA_N_CPU_MOE", "0"))) > 0
+        n_glx = os.environ.get("LLAMA_N_GPU_LAYERS") or env_vars.get("LLAMA_N_GPU_LAYERS")
+        if not n_cpu_moe_active and (not n_glx or n_glx == "99"):
+            computed = compute_main_ngl_for_draft(model_path, draft_path, agg_vram_free or None)
+            if computed:
+                n_gpu = str(computed)
+                print(f"[llama-wrapper] Main -ngl capped to {computed} to reserve VRAM for dspark draft.",
+                      file=sys.stderr)
+        spec_draft_n_max = os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "3"))
+        spec_draft_ngl = os.environ.get("LLAMA_N_GPU_LAYERS_DRAFT", env_vars.get("LLAMA_N_GPU_LAYERS_DRAFT", "99"))
+        extra_args.extend([
+            "-md", draft_path,
+            "--spec-type", "draft-dspark",
+            "--spec-draft-n-max", str(spec_draft_n_max),
+            "--spec-draft-ngl", str(spec_draft_ngl),
+        ])
+        print(f"[llama-wrapper] dspark draft: {os.path.basename(draft_path)} "
+              f"(spec-draft-n-max={spec_draft_n_max}, draft-ngl={spec_draft_ngl})",
+              file=sys.stderr)
+
+    # Multi-GPU tensor split: when 2+ cards are selected and the user hasn't pinned
+    # an explicit split, apportion model weights across cards proportionally to each
+    # card's free VRAM (biggest card carries the most layers).
+    tensor_split = os.environ.get("LLAMA_TENSOR_SPLIT", env_vars.get("LLAMA_TENSOR_SPLIT"))
+    if not tensor_split and gpu_indices and len(gpu_indices) > 1:
+        tensor_split = compute_tensor_split(gpu_indices)
+    if tensor_split:
+        extra_args.extend(["--tensor-split", tensor_split])
+        print(f"[llama-wrapper] Multi-GPU tensor-split: {tensor_split}", file=sys.stderr)
+    elif gpu_indices and len(gpu_indices) == 1:
+        print(f"[llama-wrapper] Single-GPU serving (GPU {gpu_indices[0]}).", file=sys.stderr)
     
+    # KV cache type. Quantised (q8_0) cache keeps the KV cache small enough to
+    # spread across GPUs — critical for large MoE models (e.g. DeepSeek V4 Flash)
+    # where a fp16 KV cache gets pinned to one card and OOMs it. Overridable per
+    # model via LLAMA_CACHE_TYPE_K / LLAMA_CACHE_TYPE_V.
+    cache_type_k = os.environ.get("LLAMA_CACHE_TYPE_K", env_vars.get("LLAMA_CACHE_TYPE_K", "q8_0"))
+    cache_type_v = os.environ.get("LLAMA_CACHE_TYPE_V", env_vars.get("LLAMA_CACHE_TYPE_V", "q8_0"))
+
+    # DeepSeek V4 (and other reasoning MoE models): keep the MoE expert weights
+    # of the FIRST N layers in CPU RAM instead of VRAM. For very large MoE models
+    # this lets a single big GPU hold the ~full model while experts page from RAM,
+    # avoiding the cross-GPU tensor-split that degenerates output. 0/absent = off.
+    n_cpu_moe = int(os.environ.get("LLAMA_N_CPU_MOE", env_vars.get("LLAMA_N_CPU_MOE", "0")))
+    if n_cpu_moe > 0:
+        extra_args.extend(["--n-cpu-moe", str(n_cpu_moe)])
+        print(f"[llama-wrapper] Keeping MoE experts of first {n_cpu_moe} layers in CPU RAM.", file=sys.stderr)
+
     batch_size = os.environ.get("LLAMA_BATCH_SIZE", env_vars.get("LLAMA_BATCH_SIZE", "4096"))
     ubatch_size = os.environ.get("LLAMA_UBATCH_SIZE", env_vars.get("LLAMA_UBATCH_SIZE", "2048"))
     threads_count = os.environ.get("LLAMA_THREADS", env_vars.get("LLAMA_THREADS", "16"))
@@ -402,6 +745,8 @@ def cmd_serve():
         "--ctx-size", str(ctx_size),
         "--n-gpu-layers", str(n_gpu),
         "--flash-attn", "on",
+        "--cache-type-k", cache_type_k,
+        "--cache-type-v", cache_type_v,
         "--batch-size", str(batch_size),
         "--ubatch-size", str(ubatch_size),
         "--threads", str(threads_count),
@@ -504,7 +849,7 @@ def cmd_status():
     env_vars = load_env()
     print("=== Active Backend ===")
     if env_vars:
-        for k in ("INFER_BASE_URL", "INFER_MODEL", "LLAMA_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS"):
+        for k in ("INFER_BASE_URL", "INFER_MODEL", "LLAMA_MODEL_PATH", "LLAMA_DRAFT_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS"):
             if k in env_vars:
                 print(f"  {k:<18} = {env_vars[k]}")
     else:
@@ -619,6 +964,30 @@ def cmd_auto():
             print("No active backend or model found.")
             sys.exit(1)
 
+def cmd_draft(target=None):
+    """Set, clear, or report the dspark draft model used for speculative decoding."""
+    if target is None or target in ("off", "none", "clear", "unset"):
+        if target in ("off", "none", "clear", "unset"):
+            persist_env_changes({"LLAMA_DRAFT_MODEL_PATH": None})
+            print("Draft model cleared (speculative decoding disabled on next serve).")
+        else:
+            existing = find_dspark_draft()
+            print(f"Active draft model: {existing or '(none — run: ai-backend draft <path> or auto)'}")
+        return
+    if target == "auto":
+        d = find_dspark_draft()
+        if not d:
+            print("No dspark draft found next to the active model or in the models dir.", file=sys.stderr)
+            sys.exit(1)
+        target = d
+    p = Path(target).expanduser().resolve()
+    if not p.exists():
+        print(f"Draft model not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    persist_env_changes({"LLAMA_DRAFT_MODEL_PATH": str(p)})
+    print(f"Draft model set: {p}")
+
+
 def cmd_ctx(size=None):
     if not size:
         print("Usage: ai-backend ctx <size|auto>")
@@ -647,6 +1016,69 @@ def cmd_gpu_layers(n=None):
             sys.exit(1)
         patch_env_key("LLAMA_N_GPU_LAYERS", n)
         print(f"GPU layers set to {n}.")
+
+def cmd_gpus(sel=None):
+    """Select which GPUs llama-server uses (single vs all). Persists to env + systemd."""
+    gpus = list_gpu_info()
+    env_vars = load_env()
+    current = env_vars.get("CUDA_VISIBLE_DEVICES")
+    ts = env_vars.get("LLAMA_TENSOR_SPLIT")
+
+    if sel is None:
+        print("=== GPUs ===")
+        if not gpus:
+            print("  (nvidia-smi not found)")
+        else:
+            for g in gpus:
+                mark = " ⇐ selected" if current and str(g["index"]) in current.split(",") else ""
+                free_gb = g["free_mib"] / 1024
+                tot_gb = g["total_mib"] / 1024
+                print(f"  GPU{g['index']}  {g['name']:<36} {tot_gb:6.1f} GB total, {free_gb:6.1f} GB free{mark}")
+        print(f"\nActive CUDA_VISIBLE_DEVICES: {current or '(unset, will auto-select)'}")
+        print(f"Tensor split: {ts or '(auto/computed at serve)'}")
+        print("\nUsage:")
+        print("  ai-backend gpus all               Use every detected GPU (multi-GPU split)")
+        print("  ai-backend gpus 0,2,3             Use specific GPUs")
+        print("  ai-backend gpus 1                 Use a single GPU")
+        print("  ai-backend gpus auto              Auto: single largest if it holds the model, else all")
+        print("  ai-backend gpus split 1,1,2,1     Pin an explicit --tensor-split")
+        return
+
+    if sel == "auto":
+        cuda_dev = default_gpu_selection()
+        persist_env_changes({"CUDA_VISIBLE_DEVICES": cuda_dev, "LLAMA_TENSOR_SPLIT": None})
+        sync_gpu_to_systemd(cuda_dev)
+        print(f"Auto-selected CUDA_VISIBLE_DEVICES={cuda_dev}")
+        return
+
+    if sel == "split":
+        # `split` expects a second arg (the proportions); handled below via main().
+        return
+
+    if sel == "all":
+        idxs = [g["index"] for g in gpus] if gpus else []
+        if not idxs:
+            print("No GPUs detected via nvidia-smi.", file=sys.stderr)
+            sys.exit(1)
+        cuda_dev = ",".join(str(i) for i in sorted(idxs))
+        persist_env_changes({"CUDA_VISIBLE_DEVICES": cuda_dev, "LLAMA_TENSOR_SPLIT": None})
+        sync_gpu_to_systemd(cuda_dev)
+        print(f"Using all GPUs: CUDA_VISIBLE_DEVICES={cuda_dev}")
+        print("Tensor split will be computed automatically from per-GPU VRAM at serve time.")
+        return
+
+    idxs = parse_gpu_sel(sel)
+    if not idxs:
+        print(f"Invalid GPU selection: {sel}", file=sys.stderr)
+        sys.exit(1)
+    cuda_dev = ",".join(str(i) for i in sorted(idxs))
+    persist_env_changes({"CUDA_VISIBLE_DEVICES": cuda_dev, "LLAMA_TENSOR_SPLIT": None})
+    sync_gpu_to_systemd(cuda_dev)
+    if len(idxs) == 1:
+        print(f"Using single GPU: CUDA_VISIBLE_DEVICES={cuda_dev}")
+    else:
+        print(f"Using GPUs: CUDA_VISIBLE_DEVICES={cuda_dev}")
+        print("Tensor split will be computed automatically from per-GPU VRAM at serve time.")
 
 def patch_env_key(key, value):
     env_vars = load_env()
@@ -693,13 +1125,17 @@ Usage:
   ai-backend list                       List all downloaded GGUF models
   ai-backend auto                       Switch to best running backend
   ai-backend ctx <size|auto>            Set or clear explicit context size
+  ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup
   ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
+  ai-backend gpus [all|<devs>|auto|split <p>]   Select GPUs (single vs multi-GPU split)
   ai-backend serve                      Run llama-server with auto context sizing
 
 Examples:
   ai-backend use hf://AtomicChat/Ling-3.0-flash-GGUF/AD-IQ3_M/Ling-3.0-flash-AD-IQ3_M-00001-of-00002.gguf
   ai-backend use my-model.gguf
   ai-backend ctx 16384
+  ai-backend gpus all                   # spread a >1-GPU model across every card
+  ai-backend gpus split 1,1,1,4         # explicit tensor-split proportions
 """)
 
 def main():
@@ -740,8 +1176,21 @@ def main():
         cmd_auto()
     elif cmd == "ctx":
         cmd_ctx(args[1] if len(args) > 1 else None)
+    elif cmd in ("draft", "dspark"):
+        cmd_draft(args[1] if len(args) > 1 else None)
     elif cmd in ("gpu-layers", "gpulayers"):
         cmd_gpu_layers(args[1] if len(args) > 1 else None)
+    elif cmd in ("gpus", "gpu", "tensor-split"):
+        # `gpus split <props>` pins an explicit tensor split; everything else selects devices.
+        if len(args) > 1 and args[1] == "split":
+            props = args[2] if len(args) > 2 else None
+            if not props:
+                print("Usage: ai-backend gpus split <prop1,prop2,...>", file=sys.stderr)
+                sys.exit(1)
+            persist_env_changes({"LLAMA_TENSOR_SPLIT": props})
+            print(f"Tensor split pinned to {props}. (passed as --tensor-split to llama-server at serve)")
+        else:
+            cmd_gpus(args[1] if len(args) > 1 else None)
     elif cmd.startswith("hf://") or "/" in cmd or cmd.endswith(".gguf") or os.path.exists(cmd):
         cmd_use(cmd)
     else:

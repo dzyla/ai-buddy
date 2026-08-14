@@ -92,8 +92,41 @@ ai-backend use hf://meta-llama/Llama-3.2-3B-Instruct-GGUF
 
 ```bash
 ai-backend ctx 8192         # Set explicit context window (or 'auto')
-ai-backend gpu-layers 24    # Set GPU layer offload count (or 'auto')
+ai-backend gpu-layers 24    # Set GPU offload layer count (or 'auto')
 ```
+
+### Multi-GPU serving (models larger than one card)
+
+`ai-backend` can spread a model across every GPU when it won't fit a single card.
+Use `ai-backend gpus` to inspect your GPUs and select which ones to use:
+
+```bash
+ai-backend gpus              # show detected GPUs, active selection & tensor split
+ai-backend gpus all          # use every detected GPU (multi-GPU tensor-split)
+ai-backend gpus 0,1,2,3      # use specific GPUs
+ai-backend gpus 1            # use a single GPU
+ai-backend gpus auto         # auto: single largest card if it holds the model, else all
+ai-backend gpus split 1,1,1,4# pin an explicit --tensor-split (biggest card last here)
+```
+
+When two or more GPUs are selected, `ai-backend serve` automatically computes a
+`--tensor-split` proportional to each card's free VRAM, so the largest card carries
+the most layers. Free VRAM is summed across the selected cards for auto context
+sizing, since the KV cache spreads across all of them. The selection is persisted to
+`~/.local/share/ai/env` and kept in sync with the systemd unit.
+
+Downloading a multi-part split GGUF that's larger than one card prints a hint to run
+`ai-backend gpus all`:
+
+```bash
+ai-backend download bartowski/DeepSeek-V4-Flash-0731-GGUF   # multi-part split
+# NOTE: model (156.4 GB) exceeds a single GPU (95.6 GB).
+# Run `ai-backend gpus all` to spread it across every card (auto tensor-split).
+```
+
+All of the above also work via environment variables on `ai-backend serve`
+(`CUDA_VISIBLE_DEVICES`, `LLAMA_TENSOR_SPLIT`), matching how `install.sh` sets
+`CUDA_VISIBLE_DEVICES` in the systemd unit.
 
 ### Local llama.cpp server
 
