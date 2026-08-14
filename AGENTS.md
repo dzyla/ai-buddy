@@ -210,6 +210,7 @@ globally to every request while the process is running:
 
 ### Zulip Bridge
 - `zulip_ai_bridge.py` — Zulip bot bridge that pipes messages to the `ai` CLI.
+- **Permission mode:** defaults to `auto` (full autonomy) over Zulip — the bot investigates AND executes. Override with `BRIDGE_AI_MODE=plan|manual` for restricted access. The bridge is already gated to the owner via `ZULIP_USER` / detected owner, so auto is safe here and actually useful (plan mode over Zulip just posts plans and halts — no interactive approve flow). Built-in `/ping` command for liveness checks.
 - **File parsing:** automatically downloads uploaded files (PDFs, images, spreadsheets, code, etc.) and extracts their text content before passing to the agent. Supports text, PDF (pdfplumber/pypdfium2), image OCR (tesseract), CSV/Excel (openpyxl), and archives.
 - **ContextWindowManager:** manages conversation context to stay within the AI model's context window, truncating messages as needed.
 - **Automatic reconnection:** the bridge uses exponential backoff to reconnect on connection errors.
