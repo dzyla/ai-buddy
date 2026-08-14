@@ -14,7 +14,7 @@ Document and manage llama.cpp server sampling options, Unsloth dynamic quants, M
 - `LLAMA_FREQUENCY_PENALTY` (additive, default 0.0, neutral)
 - `LLAMA_REPEAT_LAST_N` (default 64)
 - `LLAMA_MTP` (1/0, enable Multi-Token Prediction speculative decoding with `--spec-type draft-mtp`)
-- `LLAMA_SPEC_DRAFT_N_MAX` (speculative tokens count, default 2 for MTP, 3 for dspark)
+- `LLAMA_SPEC_DRAFT_N_MAX` (speculative tokens count, default 3 for MTP/dspark)
 - `LLAMA_MTP_DRAFT_PATH` (optional companion MTP draft model path)
 
 ## Qwen3.8 Recommended Settings (Unsloth)

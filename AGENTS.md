@@ -121,7 +121,7 @@ globally to every request while the process is running:
 | `LLAMA_FREQUENCY_PENALTY` | frequency penalty (additive; 0.0 = neutral) | `0.0` |
 | `LLAMA_REPEAT_LAST_N` | recent tokens considered for repeat penalty | `64` |
 | `LLAMA_MTP` | Multi-Token Prediction (MTP) speculative decoding (1/0) | `0` |
-| `LLAMA_SPEC_DRAFT_N_MAX` | Speculative tokens draft count | `2` (MTP) / `3` (dspark) |
+| `LLAMA_SPEC_DRAFT_N_MAX` | Speculative tokens draft count | `3` (MTP/dspark) |
 
 **Qwen3.8 and Unsloth Integration:**
 

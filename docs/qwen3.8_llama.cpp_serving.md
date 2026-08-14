@@ -138,7 +138,7 @@ llama-server \
   --jinja --reasoning on \
   --repeat-penalty 1.0 --repeat-last-n 64 \
   --presence-penalty 0.0 --frequency-penalty 0.0 \
-  --spec-type draft-mtp --spec-draft-n-max 2     # only when MTP is on
+  --spec-type draft-mtp --spec-draft-n-max 3     # only when MTP is on (3 is benchmark winner)
 ```
 
 Notes on the flags:
