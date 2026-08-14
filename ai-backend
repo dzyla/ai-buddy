@@ -38,14 +38,19 @@ def load_env():
                     env_vars[k.strip()] = v
     return env_vars
 
-def write_env(url, model, llama_model_path=None, extra_vars=None):
+def write_env(url, model, llama_model_path=None, extra_vars=None, authoritative=False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not url.endswith("/"):
         url += "/"
-    
-    current = load_env()
-    if extra_vars:
-        current.update(extra_vars)
+
+    if authoritative:
+        # extra_vars is the complete, already-merged state (deletions applied).
+        # Use it as-is so deleted keys are NOT resurrected by a fresh load_env().
+        current = dict(extra_vars or {})
+    else:
+        current = load_env()
+        if extra_vars:
+            current.update(extra_vars)
 
     cuda_dev = current.get("CUDA_VISIBLE_DEVICES", "auto")
     ctx_size = current.get("LLAMA_CTX_SIZE", "131072")
@@ -839,7 +844,9 @@ def persist_env_changes(changes):
     url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
     model = env_vars.get("INFER_MODEL", "llama")
     llama_path = env_vars.get("LLAMA_MODEL_PATH")
-    write_env(url, model, llama_path, env_vars)
+    # Pass the full merged state (deletions applied) as authoritative so
+    # write_env does not re-merge the on-disk copy and resurrect deleted keys.
+    write_env(url, model, llama_path, env_vars, authoritative=True)
 
 def sync_gpu_to_systemd(cuda_dev):
     """Keep the systemd unit's CUDA_VISIBLE_DEVICES in sync with the env file.
@@ -979,6 +986,21 @@ def cmd_serve():
     ])
     print(f"[llama-wrapper] Server penalties: repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty} repeat_last_n={repeat_last_n}", file=sys.stderr)
     
+    # YaRN RoPE scaling: expand the context window beyond the model's native
+    # training length (e.g. Qwen3.8-27B 262144 -> ~1M at scale 4). Set via
+    # `ai-backend yarn`. llama.cpp auto-derives the other YaRN knobs (ext-factor,
+    # attn-factor, beta-slow/fast) from scale + orig-ctx, so only these three are
+    # needed. Only emitted when the user has opted in.
+    rope_scaling = os.environ.get("LLAMA_ROPE_SCALING") or env_vars.get("LLAMA_ROPE_SCALING", "")
+    rope_scale = os.environ.get("LLAMA_ROPE_SCALE") or env_vars.get("LLAMA_ROPE_SCALE", "")
+    yarn_orig = os.environ.get("LLAMA_YARN_ORIG_CTX") or env_vars.get("LLAMA_YARN_ORIG_CTX", "")
+    if rope_scaling and rope_scaling.strip() and rope_scale:
+        extra_args.extend(["--rope-scaling", rope_scaling.strip()])
+        extra_args.extend(["--rope-scale", str(rope_scale)])
+        if yarn_orig and yarn_orig.strip():
+            extra_args.extend(["--yarn-orig-ctx", str(int(yarn_orig))])
+        print(f"[llama-wrapper] YaRN: --rope-scaling {rope_scaling} --rope-scale {rope_scale} --yarn-orig-ctx {yarn_orig or '(auto)'}", file=sys.stderr)
+
     n_gpu = os.environ.get("LLAMA_N_GPU_LAYERS", env_vars.get("LLAMA_N_GPU_LAYERS", "99"))
 
     # DeepSeek V4 Flash dspark draft: wire the draft model into speculative decoding.
@@ -1356,11 +1378,14 @@ def cmd_mode(mode_name=None):
         for k in ("INFER_TEMPERATURE", "INFER_TOP_P", "INFER_TOP_K", "INFER_MIN_P", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "INFER_REASONING_EFFORT"):
             print(f"  {k:<22} = {env_vars.get(k, '(default)')}")
         print("\nUsage:")
-        print("  ai-backend mode thinking   # Qwen3.8 recommended thinking defaults (temp 1.0, top_p 0.95, top_k 20, pres_pen 0.0, repeat_pen 1.0)")
-        print("  ai-backend mode instruct   # Qwen3.8 recommended non-thinking defaults (temp 0.7, top_p 0.80, top_k 20, pres_pen 1.5, repeat_pen 1.0)")
+        print("  ai-backend mode thinking   # Qwen3.8 thinking defaults (temp 1.0, top_p 0.95, top_k 20, pres_pen 0.0, repeat_pen 1.0, effort xhigh)")
+        print("  ai-backend mode xhigh      # same as thinking: deepest reasoning (effort xhigh)")
+        print("  ai-backend mode normal     # thinking, medium effort (balanced speed/accuracy)")
+        print("  ai-backend mode low        # thinking, low effort (fastest, cost-optimised)")
+        print("  ai-backend mode instruct   # Qwen3.8 non-thinking defaults (temp 0.7, top_p 0.80, top_k 20, pres_pen 1.5, repeat_pen 1.0, effort none)")
         return
     mode_name = mode_name.lower().strip()
-    if mode_name in ("thinking", "think", "reasoning", "reason"):
+    if mode_name in ("thinking", "think", "reasoning", "reason", "xhigh", "high"):
         persist_env_changes({
             "INFER_TEMPERATURE": "1.0",
             "INFER_TOP_P": "0.95",
@@ -1373,6 +1398,32 @@ def cmd_mode(mode_name=None):
         })
         print("Applied Qwen3.8 thinking mode settings:")
         print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=xhigh")
+    elif mode_name in ("normal", "medium"):
+        persist_env_changes({
+            "INFER_TEMPERATURE": "1.0",
+            "INFER_TOP_P": "0.95",
+            "INFER_TOP_K": "20",
+            "INFER_MIN_P": "0.0",
+            "LLAMA_REPEAT_PENALTY": "1.0",
+            "LLAMA_PRESENCE_PENALTY": "0.0",
+            "LLAMA_FREQUENCY_PENALTY": "0.0",
+            "INFER_REASONING_EFFORT": "medium",
+        })
+        print("Applied Qwen3.8 normal (medium) mode settings:")
+        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=medium")
+    elif mode_name in ("low",):
+        persist_env_changes({
+            "INFER_TEMPERATURE": "1.0",
+            "INFER_TOP_P": "0.95",
+            "INFER_TOP_K": "20",
+            "INFER_MIN_P": "0.0",
+            "LLAMA_REPEAT_PENALTY": "1.0",
+            "LLAMA_PRESENCE_PENALTY": "0.0",
+            "LLAMA_FREQUENCY_PENALTY": "0.0",
+            "INFER_REASONING_EFFORT": "low",
+        })
+        print("Applied Qwen3.8 low (fast thinking) mode settings:")
+        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=low")
     elif mode_name in ("instruct", "non-thinking", "chat"):
         persist_env_changes({
             "INFER_TEMPERATURE": "0.7",
@@ -1387,8 +1438,64 @@ def cmd_mode(mode_name=None):
         print("Applied Qwen3.8 instruct (non-thinking) mode settings:")
         print("  temperature=0.7  top_p=0.80  top_k=20  min_p=0.0  presence_penalty=1.5  repeat_penalty=1.0  reasoning_effort=none")
     else:
-        print(f"Unknown mode '{mode_name}'. Use 'thinking' or 'instruct'.", file=sys.stderr)
+        print(f"Unknown mode '{mode_name}'. Use 'thinking|normal|low|instruct'.", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_yarn(sel=None):
+    """Enable/configure YaRN RoPE scaling to expand the context window beyond the
+    model's native training length (Qwen3.8-27B: native 262144; scale 4 -> ~1M).
+
+    Persists LLAMA_ROPE_SCALING / LLAMA_ROPE_SCALE / LLAMA_YARN_ORIG_CTX to the env
+    file; `ai-backend serve` translates them into --rope-scaling/--rope-scale/
+    --yarn-orig-ctx on the llama-server command line. The other YaRN knobs
+    (ext-factor, attn-factor, beta-slow/fast) are auto-derived by llama.cpp from
+    scale + orig-ctx, so they are not set explicitly.
+
+    Usage:
+      ai-backend yarn            # show current YaRN state
+      ai-backend yarn on         # YaRN scale 4 (native 262144 -> ~1M)
+      ai-backend yarn off        # disable (native context only)
+      ai-backend yarn 2          # scale 2 (-> ~512K); scale 8 -> ~2M
+    """
+    env_vars = load_env()
+    scaling = (env_vars.get("LLAMA_ROPE_SCALING") or "").strip()
+    scale = (env_vars.get("LLAMA_ROPE_SCALE") or "").strip()
+    orig = (env_vars.get("LLAMA_YARN_ORIG_CTX") or "").strip()
+
+    def _state():
+        if scaling and scaling.lower() != "yarn":
+            return f"rope-scaling={scaling}"
+        if not scaling or not scale:
+            return "off (native context only)"
+        mult = float(scale)
+        native = int(orig) if orig.isdigit() else 262144
+        return f"yarn scale={scale} (orig-ctx {orig or '262144'} -> ~{int(native*mult):,} tokens)"
+
+    if sel is None:
+        print(f"YaRN: {_state()}")
+        print(f"  LLAMA_ROPE_SCALING={scaling or '(unset)'}  LLAMA_ROPE_SCALE={scale or '(unset)'}  LLAMA_YARN_ORIG_CTX={orig or '(unset)'}")
+        print("\nUsage: ai-backend yarn <on|off|<scale>>   (on = scale 4 -> ~1M for Qwen3.8-27B)")
+        return
+
+    sel = sel.strip().lower()
+    if sel in ("off", "0", "disable", "clear", "unset", "none"):
+        persist_env_changes({"LLAMA_ROPE_SCALING": None, "LLAMA_ROPE_SCALE": None, "LLAMA_YARN_ORIG_CTX": None})
+        print("YaRN disabled — server will use the model's native context only.")
+        return
+    if sel in ("on", "1", "enable", "default"):
+        scale, orig = "4.0", "262144"
+    else:
+        try:
+            scale = f"{float(sel):g}"
+        except ValueError:
+            print(f"Unknown YaRN option '{sel}'. Use on|off|<scale number>.", file=sys.stderr)
+            sys.exit(1)
+        orig = "262144"
+    persist_env_changes({"LLAMA_ROPE_SCALING": "yarn", "LLAMA_ROPE_SCALE": scale, "LLAMA_YARN_ORIG_CTX": orig})
+    native = int(orig)
+    print(f"YaRN enabled: scale={scale} (orig-ctx {orig} -> ~{int(native*float(scale)):,} tokens).")
+    print("Takes effect on the next (re)serve; pair with `ai-backend ctx <size>` if you also raise the context.")
 
 
 def cmd_reasoning(effort=None):
@@ -1527,7 +1634,7 @@ def patch_env_key(key, value):
     url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
     model = env_vars.get("INFER_MODEL", "llama")
     llama_path = env_vars.get("LLAMA_MODEL_PATH")
-    write_env(url, model, llama_path, env_vars)
+    write_env(url, model, llama_path, env_vars, authoritative=True)
 
 
 def sync_ctx_to_systemd(ctx_size):
@@ -1563,7 +1670,8 @@ Usage:
   ai-backend list                       List all downloaded GGUF models
   ai-backend auto                       Switch to best running backend
   ai-backend ctx <size|auto>            Set or clear explicit context size
-  ai-backend mode <thinking|instruct>   Apply Qwen3.8 recommended sampling settings
+  ai-backend mode <thinking|normal|low|instruct>   Apply Qwen3.8 recommended sampling settings
+  ai-backend yarn <on|off|<scale>>      Enable YaRN RoPE scaling to extend context (on -> ~1M for Qwen3.8)
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
   ai-backend mtp <on|off|tokens|draft>  Configure Multi-Token Prediction speculative decoding
   ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup
@@ -1625,6 +1733,8 @@ def main():
         cmd_mtp(args[1] if len(args) > 1 else None, extra)
     elif cmd in ("mode", "preset"):
         cmd_mode(args[1] if len(args) > 1 else None)
+    elif cmd in ("yarn", "rope"):
+        cmd_yarn(args[1] if len(args) > 1 else None)
     elif cmd in ("reasoning", "reasoning-effort"):
         cmd_reasoning(args[1] if len(args) > 1 else None)
     elif cmd in ("gpu-layers", "gpulayers"):

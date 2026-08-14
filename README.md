@@ -164,10 +164,24 @@ ai-backend use qwen3.8         # downloads/activates unsloth/Qwen3.8-27B-GGUF (U
 ai-backend use qwen3.8-2.4t    # downloads/activates unsloth/Qwen3.8-2.4T-A95B-GGUF (Q1_0)
 
 # 2. Switch recommended sampling presets
+#    thinking/xhigh = deep reasoning · normal = medium · low = fast · instruct = no CoT
 ai-backend mode thinking       # recommended thinking settings:
                                # temp=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_pen=0.0, repeat_pen=1.0, reasoning_effort=xhigh
 ai-backend mode instruct       # recommended non-thinking (instruct) settings:
                                # temp=0.7, top_p=0.80, top_k=20, min_p=0.0, presence_pen=1.5, repeat_pen=1.0, reasoning_effort=none
+ai-backend mode normal         # thinking + medium reasoning (balanced)
+ai-backend mode low            # thinking + low reasoning (fastest)
+
+# One-shot / live sampling (no re-persist, no server restart)
+ai --mode xhigh "..."          # one-shot preset for this call
+ai -i                          # then inside the REPL:
+                               #   :mode xhigh / :mode normal / :mode low / :mode instruct
+                               #   :mode            (show current sampling)
+
+# 2b. YaRN — extend context beyond native 256K (Qwen3.8-27B)
+ai-backend yarn on             # scale 4 -> ~1,048,576 tokens (pairs with `ai-backend ctx 1048576`)
+ai-backend yarn off            # back to native 256K
+ai-backend yarn 2              # custom scale (2 -> ~512K)
 
 # 3. Multi-Token Prediction (MTP) speculative decoding
 ai-backend mtp on              # enable MTP speculative decoding (--spec-type draft-mtp)
