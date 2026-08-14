@@ -130,10 +130,10 @@ globally to every request while the process is running:
   and native MTP speculative decoding (`--spec-type draft-mtp`).
 - **Qwen3.8 Presets & Mode commands:**
   - `ai-backend use qwen3.8` (or `qwen3.8-27b`, `qwen3.8-2.4t`) automatically routes and downloads Unsloth GGUFs.
-  - `ai-backend mode thinking`: applies Unsloth recommended thinking settings (`temp=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence=0.0`, `repeat=1.0`, `reasoning_effort=xhigh`).
-  - `ai-backend mode instruct`: applies non-thinking settings (`temp=0.7`, `top_p=0.80`, `top_k=20`, `presence=1.5`, `repeat=1.0`, `reasoning_effort=none`).
+  - `ai-backend mode <preset>`: `thinking`/`xhigh` (effort xhigh), `normal` (medium), `low` (low), `instruct` (none). Each applies the full preset (`temp`, `top_p`, `top_k`, `min_p`, `presence`, `repeat`, `reasoning_effort`) to the env file.
+  - `ai-backend yarn <on|off|<scale>>`: enables YaRN RoPE scaling to extend context beyond the model's native 256K (on → scale 4 → ~1M). Persists `LLAMA_ROPE_SCALING`/`LLAMA_ROPE_SCALE`/`LLAMA_YARN_ORIG_CTX`; `serve` emits `--rope-scaling yarn --rope-scale 4.0 --yarn-orig-ctx 262144`.
   - `ai-backend mtp on`: enables MTP speculative decoding.
-  - `ai` CLI flags: `-p/--top-p`, `-k/--top-k`, `--min-p`, `--reasoning`, `--preserve-thinking`.
+  - `ai` CLI flags: `--mode <preset>` (one-shot sampling preset, same as `:mode` in the REPL), `:mode [preset]` (live per-session REPL command), `-p/--top-p`, `-k/--top-k`, `--min-p`, `--reasoning`, `--preserve-thinking`.
 
 **How they compare to the AI-level penalties (`ai`):**
 

@@ -783,6 +783,7 @@ static int   top_k_val              = -1;
 static float min_p_val              = -1.0f;
 static char  *reasoning_effort_val  = NULL;
 static int   preserve_thinking_val  = 0;
+static char  *mode_preset_val       = NULL; /* --mode <xhigh|normal|low|instruct> */
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
 static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops (0=off, INFER_FREQ_PENALTY) */
 static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
@@ -3828,6 +3829,56 @@ static void load_env_file() {
     fclose(fp);
 }
 
+/* Live sampling presets for the interactive REPL. Sets the per-request sampling
+   statics (read when each request payload is built) so the switch takes effect on
+   the NEXT turn with no server restart and no env-file edit. Values mirror
+   `ai-backend mode` (which persists to ~/.local/share/ai/env for new processes).
+   Per-request penalties follow the Qwen3.8 doc: neutral (0.0) in thinking mode,
+   presence 1.5 in instruct mode. frequency/presence of 0.0 are omitted from the
+   request (the builder only emits penalties > 0). */
+static int apply_mode_preset(const char *name) {
+    static const char *effort = NULL;
+    float t = -1.0f, p = -1.0f, minp = -1.0f, pres = 0.0f;
+    int k = -1;
+
+    if (strcasecmp(name, "xhigh") == 0) {
+        t = 1.0f; p = 0.95f; k = 20; minp = 0.0f; pres = 0.0f; effort = "xhigh";
+    } else if (strcasecmp(name, "normal") == 0 || strcasecmp(name, "medium") == 0) {
+        t = 1.0f; p = 0.95f; k = 20; minp = 0.0f; pres = 0.0f; effort = "medium";
+    } else if (strcasecmp(name, "low") == 0) {
+        t = 1.0f; p = 0.95f; k = 20; minp = 0.0f; pres = 0.0f; effort = "low";
+    } else if (strcasecmp(name, "instruct") == 0 || strcasecmp(name, "chat") == 0) {
+        t = 0.7f; p = 0.80f; k = 20; minp = 0.0f; pres = 1.5f; effort = "none";
+    } else {
+        return 0;
+    }
+
+    free(reasoning_effort_val);
+    reasoning_effort_val = strdup(effort);
+    temperature_val = t;
+    top_p_val = p;
+    top_k_val = k;
+    min_p_val = minp;
+    presence_penalty_val = pres;
+    /* frequency_penalty_val is intentionally NOT touched: it is this box's
+       loop-breaker (INFER_FREQ_PENALTY, default 0.10) and the Qwen3.8 doc does
+       not define a frequency penalty, so keep whatever the env set. */
+    return 1;
+}
+
+static void print_mode_current(void) {
+    printf("  \033[2mcurrent sampling (this session):\033[0m\n");
+    printf("  temperature=%s  top_p=%s  top_k=%s  min_p=%s\n",
+           temperature_val >= 0.0f ? "set" : "default",
+           top_p_val >= 0.0f ? "set" : "default",
+           top_k_val > 0 ? "set" : "default",
+           min_p_val >= 0.0f ? "set" : "default");
+    printf("  presence_penalty=%.2f  frequency_penalty=%.2f  reasoning_effort=%s\n",
+           presence_penalty_val, frequency_penalty_val,
+           (reasoning_effort_val && *reasoning_effort_val) ? reasoning_effort_val : "(default)");
+    printf("  presets: xhigh (deep) · normal (medium) · low (fast) · instruct (no CoT)\n");
+}
+
 int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -3920,6 +3971,8 @@ int main(int argc, char **argv) {
             printf("  -k, --top-k N        Set top-k sampling (e.g. 20).\n");
             printf("  --min-p N            Set min-p sampling (e.g. 0.0).\n");
             printf("  --reasoning EFFORT   Set reasoning effort for hybrid models (xhigh, medium, low, none).\n");
+            printf("  --mode PRESET        Sampling preset: xhigh (deep) / normal (medium) / low (fast) / instruct (no CoT).\n");
+            printf("                       Sets temp/top-p/top-k/min-p/presence/reasoning in one step.\n");
             printf("  --preserve-thinking  Preserve thinking trace across turns in multi-turn chats.\n");
             printf("  -f, --file PATH      Attach a file as context (text or image).\n");
             printf("  -m, --model MODEL    Override the default model for this call.\n");
@@ -4081,6 +4134,10 @@ int main(int argc, char **argv) {
             i++;
         } else if (strcmp(argv[i], "--preserve-thinking") == 0) {
             preserve_thinking_val = 1;
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            free(mode_preset_val);
+            mode_preset_val = strdup(argv[i+1]);
+            i++;
         } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
                     strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
             i++;
@@ -4158,6 +4215,15 @@ int main(int argc, char **argv) {
     if (env_freq_pen && *env_freq_pen) frequency_penalty_val = (float)atof(env_freq_pen);
     char *env_pres_pen = getenv("INFER_PRESENCE_PENALTY");
     if (env_pres_pen && *env_pres_pen) presence_penalty_val = (float)atof(env_pres_pen);
+    /* --mode preset overrides the env-file sampling (env is the per-machine default;
+       the explicit flag is the per-invocation choice). */
+    if (mode_preset_val && *mode_preset_val) {
+        if (apply_mode_preset(mode_preset_val)) {
+            fprintf(stderr, "\033[2m[ai] mode preset '%s' applied\033[0m\n", mode_preset_val);
+        } else {
+            fprintf(stderr, "\033[33m[ai] warning: unknown --mode '%s' (xhigh/normal/low/instruct); using defaults\033[0m\n", mode_preset_val);
+        }
+    }
     char *env_ctxwin = getenv("INFER_CONTEXT_WINDOW");
     if (env_ctxwin && *env_ctxwin) context_window = atoi(env_ctxwin);
     char *env_timeout = getenv("INFER_TASK_TIMEOUT");
@@ -4310,6 +4376,7 @@ int main(int argc, char **argv) {
              strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
              strcmp(argv[i], "--min-p") == 0 ||
              strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
+             strcmp(argv[i], "--mode") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
@@ -4337,6 +4404,7 @@ int main(int argc, char **argv) {
              strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
              strcmp(argv[i], "--min-p") == 0 ||
              strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
+             strcmp(argv[i], "--mode") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
@@ -4372,6 +4440,7 @@ int main(int argc, char **argv) {
              strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
              strcmp(argv[i], "--min-p") == 0 ||
              strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
+             strcmp(argv[i], "--mode") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
@@ -4708,6 +4777,33 @@ int main(int argc, char **argv) {
                     run_query_this_turn = 0;
                     continue;
                 }
+                if (strcmp(user_input, ":mode") == 0) {
+                    print_mode_current();
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strncmp(user_input, ":mode ", 6) == 0) {
+                    char preset[32] = "";
+                    const char *src = user_input + 6;
+                    while (*src == ' ') src++;
+                    strncpy(preset, src, sizeof(preset) - 1);
+                    preset[sizeof(preset) - 1] = '\0';
+                    if (apply_mode_preset(preset)) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                                 "Sampling preset '%s' active for the next turns of this session.\n"
+                                 "  temperature=%.2f  top_p=%.2f  top_k=%d  min_p=%.1f\n"
+                                 "  presence_penalty=%.2f  frequency_penalty=%.2f  reasoning_effort=%s",
+                                 preset, temperature_val, top_p_val, top_k_val, min_p_val,
+                                 presence_penalty_val, frequency_penalty_val, reasoning_effort_val);
+                        print_info_box("Mode Switched", msg);
+                    } else {
+                        print_info_box("Unknown Mode",
+                            "Presets: :mode xhigh · :mode normal · :mode low · :mode instruct");
+                    }
+                    run_query_this_turn = 0;
+                    continue;
+                }
                 if (strcmp(user_input, ":jobs") == 0 || strcmp(user_input, ":tasks") == 0) {
                     print_jobs_and_tasks_status();
                     run_query_this_turn = 0;
@@ -4725,6 +4821,7 @@ int main(int argc, char **argv) {
                 if (strcmp(user_input, ":help") == 0) {
                     print_info_box("Interactive Commands",
                         "  :details       Toggle details (tools & thinking output on/off)\n"
+                        "  :mode [preset] Live sampling preset: xhigh/normal/low/instruct (no arg = show)\n"
                         "  :compact       Summarise + reset context (keeps semantic history)\n"
                         "  :clear         Wipe conversation history entirely\n"
                         "  :status        Show context size and model info\n"
