@@ -778,6 +778,11 @@ static char  api_url[MAX_VAL];
 static char  api_key[MAX_VAL];
 static char  model[MAX_VAL];
 static float temperature_val        = -1.0f;
+static float top_p_val              = -1.0f;
+static int   top_k_val              = -1;
+static float min_p_val              = -1.0f;
+static char  *reasoning_effort_val  = NULL;
+static int   preserve_thinking_val  = 0;
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
 static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops (0=off, INFER_FREQ_PENALTY) */
 static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
@@ -3911,6 +3916,11 @@ int main(int argc, char **argv) {
             printf("  -q, --quiet          Suppress think tool reasoning output.\n");
             printf("  -n, --no-tools       Skip the agent loop — get a direct text response (fast).\n");
             printf("  -t, --temperature N  Set sampling temperature (e.g. 0.0 for deterministic, 1.0 for creative).\n");
+            printf("  -p, --top-p N        Set top-p nucleus sampling (e.g. 0.95 for thinking, 0.80 for instruct).\n");
+            printf("  -k, --top-k N        Set top-k sampling (e.g. 20).\n");
+            printf("  --min-p N            Set min-p sampling (e.g. 0.0).\n");
+            printf("  --reasoning EFFORT   Set reasoning effort for hybrid models (xhigh, medium, low, none).\n");
+            printf("  --preserve-thinking  Preserve thinking trace across turns in multi-turn chats.\n");
             printf("  -f, --file PATH      Attach a file as context (text or image).\n");
             printf("  -m, --model MODEL    Override the default model for this call.\n");
             printf("  -s, --set-default M  Set the global default model in shell configs.\n");
@@ -3931,7 +3941,7 @@ int main(int argc, char **argv) {
             printf("Examples:\n");
             printf("  ai \"what's the tar command to extract .tar.gz?\"\n");
             printf("  ai -n \"what is RNA?\"                 # direct answer, no tool loop\n");
-            printf("  ai -t 0.2 \"write a haiku about Rust\"  # low temperature\n");
+            printf("  ai -t 1.0 -p 0.95 \"design an auth middleware\" # Qwen3.8 thinking settings\n");
             printf("  ai -f error.log \"why is it crashing?\"\n");
             printf("  ps aux | head -n 20 | ai \"what's eating memory?\"\n");
             printf("  ai -i \"let's look at this project\"\n");
@@ -3992,7 +4002,7 @@ int main(int argc, char **argv) {
     setenv("INFER_API_KEY", env_key, 1);
     setenv("INFER_MODEL", env_model, 1);
 
-    // Parse flags
+    // Re-parse all flags in detailed pass
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
             interactive_mode = 1;
@@ -4057,6 +4067,20 @@ int main(int argc, char **argv) {
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
             temperature_val = (float)atof(argv[i+1]);
             i++;
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--top-p") == 0) && i + 1 < argc) {
+            top_p_val = (float)atof(argv[i+1]);
+            i++;
+        } else if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0) && i + 1 < argc) {
+            top_k_val = atoi(argv[i+1]);
+            i++;
+        } else if (strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+            min_p_val = (float)atof(argv[i+1]);
+            i++;
+        } else if ((strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0) && i + 1 < argc) {
+            reasoning_effort_val = strdup(argv[i+1]);
+            i++;
+        } else if (strcmp(argv[i], "--preserve-thinking") == 0) {
+            preserve_thinking_val = 1;
         } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
                     strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
             i++;
@@ -4116,6 +4140,18 @@ int main(int argc, char **argv) {
 
     char *env_temp = getenv("INFER_TEMPERATURE");
     if (env_temp && *env_temp) temperature_val = (float)atof(env_temp);
+    char *env_topp = getenv("INFER_TOP_P");
+    if (env_topp && *env_topp) top_p_val = (float)atof(env_topp);
+    char *env_topk = getenv("INFER_TOP_K");
+    if (env_topk && *env_topk) top_k_val = atoi(env_topk);
+    char *env_minp = getenv("INFER_MIN_P");
+    if (env_minp && *env_minp) min_p_val = (float)atof(env_minp);
+    char *env_reasoning = getenv("INFER_REASONING_EFFORT");
+    if (env_reasoning && *env_reasoning && !reasoning_effort_val) reasoning_effort_val = strdup(env_reasoning);
+    char *env_preserve_think = getenv("INFER_PRESERVE_THINKING");
+    if (env_preserve_think && (strcmp(env_preserve_think, "1") == 0 || strcasecmp(env_preserve_think, "true") == 0)) {
+        preserve_thinking_val = 1;
+    }
     char *env_maxtok = getenv("INFER_MAX_TOKENS");
     if (env_maxtok && *env_maxtok) max_tokens_val = atoi(env_maxtok);
     char *env_freq_pen = getenv("INFER_FREQ_PENALTY");
@@ -4229,10 +4265,15 @@ int main(int argc, char **argv) {
                     || strcmp(argv[i], "--auto") == 0) continue;
                 if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
                 if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
-        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
+                if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
                 if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+                if (strcmp(argv[i], "--preserve-thinking") == 0) continue;
                 if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
                      strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+                     strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--top-p") == 0 ||
+                     strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
+                     strcmp(argv[i], "--min-p") == 0 ||
+                     strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
                      strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
                     i++; continue;
                 }
@@ -4256,14 +4297,19 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
-                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
-                    || strcmp(argv[i], "--auto") == 0) continue;
+        if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+            || strcmp(argv[i], "--auto") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
         if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) continue;
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+        if (strcmp(argv[i], "--preserve-thinking") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--top-p") == 0 ||
+             strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
+             strcmp(argv[i], "--min-p") == 0 ||
+             strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
@@ -4279,18 +4325,18 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
-                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
-                    || strcmp(argv[i], "--auto") == 0) continue;
+        if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+            || strcmp(argv[i], "--auto") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+        if (strcmp(argv[i], "--preserve-thinking") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
-             strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
-             strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
-            i++; continue;
-        }
-        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
-             strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--top-p") == 0 ||
+             strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
+             strcmp(argv[i], "--min-p") == 0 ||
+             strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
@@ -4314,12 +4360,18 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) continue;
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) continue;
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--continue") == 0) continue;
-                if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
-                    || strcmp(argv[i], "--auto") == 0) continue;
+        if (strcmp(argv[i], "--plan") == 0 || strcmp(argv[i], "--manual") == 0
+            || strcmp(argv[i], "--auto") == 0) continue;
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) continue;
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-tools") == 0) continue;
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
+        if (strcmp(argv[i], "--preserve-thinking") == 0) continue;
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0 ||
              strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temperature") == 0 ||
+             strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--top-p") == 0 ||
+             strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0 ||
+             strcmp(argv[i], "--min-p") == 0 ||
+             strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0 ||
              strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0 ||
              strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--goal") == 0) && i + 1 < argc) {
             i++; continue;
@@ -4332,7 +4384,6 @@ int main(int argc, char **argv) {
             }
             continue;
         }
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) continue;
         if (image_path && strcmp(argv[i], image_path) == 0) continue;
         if (added) strcat(prompt, " ");
         strcat(prompt, argv[i]);
@@ -4899,11 +4950,20 @@ step_limit_check:
                 }
 
                 /* Build optional parameter fields */
-                char opt_fields[256] = "";
+                char opt_fields[512] = "";
                 int opt_len = 0;
                 if (temperature_val >= 0.0f)
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"temperature\":%.2f", temperature_val);
+                if (top_p_val >= 0.0f)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"top_p\":%.2f", top_p_val);
+                if (top_k_val > 0)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"top_k\":%d", top_k_val);
+                if (min_p_val >= 0.0f)
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"min_p\":%.2f", min_p_val);
                 if (max_tokens_val > 0)
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"max_tokens\":%d", max_tokens_val);
@@ -4915,6 +4975,16 @@ step_limit_check:
                 if (presence_penalty_val > 0.0f)
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"presence_penalty\":%.2f", presence_penalty_val);
+                if (reasoning_effort_val && *reasoning_effort_val) {
+                    char *esc_effort = json_escape(reasoning_effort_val);
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"reasoning_effort\":\"%s\"", esc_effort);
+                    free(esc_effort);
+                }
+                if (preserve_thinking_val) {
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"preserve_thinking\":true");
+                }
 
                 char *esc_model = json_escape(model);
                 char *payload = NULL;

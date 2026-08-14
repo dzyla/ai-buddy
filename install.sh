@@ -87,12 +87,15 @@ if [ "${1:-}" = "--update-llama" ]; then
     if [ -d "${LLAMA_SRC}/.git" ]; then
         echo "--> Fetching latest from upstream..."
         cd "${LLAMA_SRC}"
-        git fetch --all --tags --prune
-        git pull origin master
-        echo "--> Pull complete."
+        FLAVOR="og"
+        [ -f "${DATA_DIR}/llama_flavor" ] && FLAVOR=$(cat "${DATA_DIR}/llama_flavor")
+        CURR_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "master")
+        git fetch origin "$CURR_BRANCH" --depth=1 || git fetch --all --tags --prune
+        git checkout -B "$CURR_BRANCH" FETCH_HEAD 2>/dev/null || git reset --hard FETCH_HEAD
+        echo "--> Pull complete (${FLAVOR} flavor, branch: ${CURR_BRANCH})."
     else
         echo "--> llama.cpp not found at ${LLAMA_SRC} — nothing to update."
-        echo "   Run './install.sh llama' first to clone and build it."
+        echo "   Run './install.sh llama' (or './install.sh llama unsloth') first to clone and build it."
         exit 0
     fi
 
@@ -150,10 +153,7 @@ if [ "${1:-}" = "--update-llama" ]; then
     fi
 
     echo "==> Rebuilding llama.cpp tools..."
-    # Tools to build: llama-server (serving) + llama-cli (interactive) by default.
-    # Extra tools via LLAMA_EXTRA_TARGETS (space-separated), e.g.
-    # "llama-perplexity llama-bench llama-quantize llama-gguf-split llama-llava-cli".
-    LLAMA_TOOLS="llama-server llama-cli"
+    LLAMA_TOOLS="llama-server llama-cli llama-mtmd-cli llama-gguf-split"
     [ -n "${LLAMA_EXTRA_TARGETS:-}" ] && LLAMA_TOOLS="${LLAMA_TOOLS} ${LLAMA_EXTRA_TARGETS}"
     rm -rf "${LLAMA_SRC}/build"
     cmake -B "${LLAMA_SRC}/build" -S "${LLAMA_SRC}" \
@@ -257,10 +257,47 @@ if [ "${1:-}" = "snap" ]; then
 fi
 
 
-# ── Subcommand: llama ─────────────────────────────────────────────────────────
-if [ "${1:-}" = "llama" ]; then
+# ── Subcommand: llama / unsloth ──────────────────────────────────────────────
+if [ "${1:-}" = "llama" ] || [ "${1:-}" = "unsloth" ] || [ "${1:-}" = "llama-unsloth" ]; then
     echo ""
     echo "==> Setting up local llama.cpp inference server..."
+
+    # Determine flavor: unsloth vs og
+    CHOSEN_FLAVOR="${LLAMA_FLAVOR:-}"
+    if [ "${1:-}" = "unsloth" ] || [ "${1:-}" = "llama-unsloth" ] || [ "${2:-}" = "unsloth" ] || [ "${2:-}" = "--unsloth" ]; then
+        CHOSEN_FLAVOR="unsloth"
+    elif [ "${2:-}" = "og" ] || [ "${2:-}" = "--og" ] || [ "${2:-}" = "standard" ]; then
+        CHOSEN_FLAVOR="og"
+    fi
+
+    if [ -z "$CHOSEN_FLAVOR" ]; then
+        if [ -f "${DATA_DIR}/llama_flavor" ]; then
+            CHOSEN_FLAVOR=$(cat "${DATA_DIR}/llama_flavor")
+        fi
+    fi
+
+    if [ -z "$CHOSEN_FLAVOR" ]; then
+        echo "Choose llama.cpp backend flavor:"
+        echo "  1) Unsloth llama.cpp (branch: iq1-narrow) — SOTA dynamic quants & fast inference for Qwen3.8/DeepSeek"
+        echo "  2) Original ggml-org/llama.cpp (branch: master) — standard upstream release"
+        read -rp "Flavor [1/2, default: 1 (unsloth)]: " FLAVOR_CHOICE
+        if [ "$FLAVOR_CHOICE" = "2" ] || [ "$FLAVOR_CHOICE" = "og" ]; then
+            CHOSEN_FLAVOR="og"
+        else
+            CHOSEN_FLAVOR="unsloth"
+        fi
+    fi
+
+    if [ "$CHOSEN_FLAVOR" = "unsloth" ]; then
+        LLAMA_REPO="https://github.com/unslothai/llama.cpp"
+        LLAMA_BRANCH="${LLAMA_BRANCH:-iq1-narrow}"
+        echo "==> Selected Unsloth llama.cpp (${LLAMA_BRANCH})"
+    else
+        LLAMA_REPO="https://github.com/ggml-org/llama.cpp"
+        LLAMA_BRANCH="${LLAMA_BRANCH:-master}"
+        echo "==> Selected upstream ggml-org/llama.cpp (${LLAMA_BRANCH})"
+    fi
+    echo "$CHOSEN_FLAVOR" > "${DATA_DIR}/llama_flavor"
 
     # Build dependencies
     missing_llama=()
@@ -272,12 +309,23 @@ if [ "${1:-}" = "llama" ]; then
         sudo apt-get install -y cmake git curl python3 build-essential
     fi
 
-    # Clone or update llama.cpp
+    # Clone or switch llama.cpp
     if [ ! -d "${LLAMA_SRC}/.git" ]; then
-        echo "==> Cloning llama.cpp..."
-        git clone --depth=1 https://github.com/ggml-org/llama.cpp "$LLAMA_SRC"
+        echo "==> Cloning llama.cpp from ${LLAMA_REPO} (${LLAMA_BRANCH})..."
+        git clone --branch "$LLAMA_BRANCH" --depth=1 "$LLAMA_REPO" "$LLAMA_SRC"
     else
-        echo "==> llama.cpp already cloned — skipping."
+        cd "$LLAMA_SRC"
+        REMOTE_URL=$(git config --get remote.origin.url || echo "")
+        CURR_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        if [ "$REMOTE_URL" != "$LLAMA_REPO" ] || [ "$CURR_BRANCH" != "$LLAMA_BRANCH" ]; then
+            echo "==> Switching llama.cpp remote/branch to ${LLAMA_REPO} (${LLAMA_BRANCH})..."
+            git remote set-url origin "$LLAMA_REPO" 2>/dev/null || git remote add origin "$LLAMA_REPO"
+            git fetch origin "$LLAMA_BRANCH" --depth=1
+            git checkout -B "$LLAMA_BRANCH" FETCH_HEAD
+            git reset --hard FETCH_HEAD
+        else
+            echo "==> llama.cpp already cloned from ${LLAMA_REPO} (${LLAMA_BRANCH}) — skipping clone."
+        fi
     fi
 
     # Robust CUDA / GPU detection
@@ -341,12 +389,9 @@ if [ "${1:-}" = "llama" ]; then
     fi
 
     # Build with best available GPU backend
-    if [ ! -f "${BIN_DIR}/llama-server" ]; then
+    if [ ! -f "${BIN_DIR}/llama-server" ] || [ "${FORCE_REBUILD:-0}" = "1" ]; then
         echo "==> Building llama.cpp tools (this takes a few minutes)..."
-        # llama-server (serving) + llama-cli (interactive) by default. Add extra
-        # llama.cpp tools via LLAMA_EXTRA_TARGETS (space-separated), e.g.
-        # "llama-perplexity llama-bench llama-quantize llama-gguf-split".
-        LLAMA_TOOLS="llama-server llama-cli"
+        LLAMA_TOOLS="llama-server llama-cli llama-mtmd-cli llama-gguf-split"
         [ -n "${LLAMA_EXTRA_TARGETS:-}" ] && LLAMA_TOOLS="${LLAMA_TOOLS} ${LLAMA_EXTRA_TARGETS}"
         rm -rf "${LLAMA_SRC}/build"
         cmake -B "${LLAMA_SRC}/build" -S "$LLAMA_SRC" \
@@ -427,6 +472,8 @@ if [ "${1:-}" = "llama" ]; then
         echo ""
         echo "Select a model to download:"
         PRESET_REPOS=(
+            "unsloth/Qwen3.8-27B-GGUF"
+            "unsloth/Qwen3.8-2.4T-A95B-GGUF"
             "unsloth/gemma-4-E4B-it-qat-GGUF"
             "unsloth/gemma-4-12b-it-GGUF"
             "Qwen/Qwen3.6-35B-A3B"

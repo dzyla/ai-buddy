@@ -68,3 +68,25 @@ def test_find_dspark_draft_returns_for_deepseek(ab, monkeypatch, tmp_path):
 def test_find_dspark_draft_no_explicit_draft(ab):
     """With no configured/inferable draft there is nothing to attach."""
     assert ab.find_dspark_draft("whatever/DeepSeek-V4.gguf") is None
+
+
+def test_is_qwen38_model(ab):
+    assert ab.is_qwen38_model("unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf") is True
+    assert ab.is_qwen38_model("models/Qwen3_8-27B-Instruct.gguf") is True
+    assert ab.is_qwen38_model("models/qwen3.8-2.4t-a95b-q1_0.gguf") is True
+    assert ab.is_qwen38_model("models/Qwen3.6-35B-A3B.gguf") is False
+    assert ab.is_qwen38_model("models/DeepSeek-V4.gguf") is False
+
+
+def test_is_qwen_model(ab):
+    assert ab.is_qwen_model("unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf") is True
+    assert ab.is_qwen_model("models/Qwen3.6-35B-A3B.gguf") is True
+    assert ab.is_qwen_model("models/DeepSeek-V4.gguf") is False
+
+
+def test_find_mtp_draft(ab, monkeypatch, tmp_path):
+    mtp_draft = tmp_path / "Qwen3.8-27B-MTP.gguf"
+    mtp_draft.write_bytes(b"x")
+    main_model = str(tmp_path / "Qwen3.8-27B-UD-Q4_K_XL.gguf")
+    monkeypatch.setenv("LLAMA_MTP_DRAFT_PATH", str(mtp_draft))
+    assert ab.find_mtp_draft(main_model) == str(mtp_draft)

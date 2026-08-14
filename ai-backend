@@ -507,6 +507,17 @@ def is_deepseek_model(model_path):
     return "deepseek" in os.path.basename(str(model_path)).lower()
 
 
+def is_qwen38_model(model_path):
+    """True when the model belongs to the Qwen3.8 family."""
+    name = os.path.basename(str(model_path)).lower()
+    return "qwen3.8" in name or "qwen3_8" in name or "qwen-3.8" in name or "qwen38" in name
+
+
+def is_qwen_model(model_path):
+    """True when the model belongs to the Qwen family."""
+    return "qwen" in os.path.basename(str(model_path)).lower()
+
+
 def find_dspark_draft(main_path=None):
     """Locate a DeepSeek dspark draft model for the active main model.
 
@@ -536,6 +547,33 @@ def find_dspark_draft(main_path=None):
     if MODEL_DIR.exists():
         for p in sorted(MODEL_DIR.iterdir()):
             if p.suffix == ".gguf" and "dspark" in p.name.lower():
+                return str(p)
+    return None
+
+
+def find_mtp_draft(main_path=None):
+    """Locate an MTP draft model for the active main model if separate.
+    Check order: explicit LLAMA_MTP_DRAFT_PATH / LLAMA_DRAFT_MODEL_PATH ->
+    sibling MTP GGUF -> any mtp GGUF in models dir."""
+    env_vars = load_env()
+    if not main_path:
+        main_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
+    if not main_path:
+        return None
+    d = os.environ.get("LLAMA_MTP_DRAFT_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH")
+    if d and os.path.exists(d) and "mtp" in os.path.basename(d).lower():
+        return d
+    if main_path:
+        main_dir = os.path.dirname(os.path.abspath(str(main_path)))
+        try:
+            for f in sorted(os.listdir(main_dir)):
+                if "mtp" in f.lower() and f.endswith(".gguf") and f != os.path.basename(str(main_path)):
+                    return os.path.join(main_dir, f)
+        except Exception:
+            pass
+    if MODEL_DIR.exists():
+        for p in sorted(MODEL_DIR.iterdir()):
+            if p.suffix == ".gguf" and "mtp" in p.name.lower() and str(p) != str(main_path):
                 return str(p)
     return None
 
@@ -607,18 +645,19 @@ def cmd_serve():
     # CUDA_VISIBLE_DEVICES (e.g. "0,1,2,3", "1", "all").
     cuda_dev = os.environ.get("CUDA_VISIBLE_DEVICES") or env_vars.get("CUDA_VISIBLE_DEVICES")
     draft_path = find_dspark_draft(model_path)
+    mtp_draft_path = find_mtp_draft(model_path)
+
     if not draft_path:
         # A dspark draft was configured but the active model isn't DeepSeek, so
         # it will be (correctly) ignored. Surface this so it's not puzzling why
-        # speculative decoding is off. Attaching it anyway crashes llama.cpp
-        # (dsv4 graph built against an incompatible model → abort).
+        # speculative decoding is off.
         legacy_draft = os.environ.get("LLAMA_DRAFT_MODEL_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH")
-        if legacy_draft and not is_deepseek_model(model_path):
+        if legacy_draft and not is_deepseek_model(model_path) and "mtp" not in legacy_draft.lower():
             print(f"[llama-wrapper] NOTE: LLAMA_DRAFT_MODEL_PATH is set ({legacy_draft}) but the active "
                   f"model ({os.path.basename(model_path)}) is not DeepSeek — ignoring the dspark draft "
                   f"(it is DeepSeek V4-specific). Run `ai-backend draft off` to clear it.", file=sys.stderr)
-    if draft_path:
-        # dspark draft co-locates with the main model on one GPU (main + draft in
+    if draft_path or mtp_draft_path:
+        # Draft co-locates with the main model on one GPU (main + draft in
         # the same VRAM, overflow to RAM). Do NOT spread across cards via
         # tensor-split or auto multi-GPU: that splits the draft and main apart.
         cuda_dev = cuda_dev or best_single_gpu_idx()
@@ -643,19 +682,31 @@ def cmd_serve():
         ctx_size = calculate_auto_ctx(model_path, vram_free=agg_vram_free or None)
 
     extra_args = []
-    if "mtp" in os.path.basename(model_path).lower():
-        extra_args.extend(["--spec-type", "draft-mtp"])
-        print("[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding.", file=sys.stderr)
+    
+    # Check MTP (Multi-Token Prediction) speculative decoding for Qwen3.8 / Qwen / MTP quants
+    use_mtp = (
+        os.environ.get("LLAMA_MTP") in ("1", "true", "on")
+        or env_vars.get("LLAMA_MTP") in ("1", "true", "on")
+        or "mtp" in os.path.basename(model_path).lower()
+        or (mtp_draft_path is not None)
+    )
+    if use_mtp:
+        spec_type = os.environ.get("LLAMA_SPEC_TYPE", env_vars.get("LLAMA_SPEC_TYPE", "draft-mtp"))
+        spec_draft_n_max = os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "2"))
+        extra_args.extend(["--spec-type", spec_type, "--spec-draft-n-max", str(spec_draft_n_max)])
+        if mtp_draft_path:
+            extra_args.extend(["-md", mtp_draft_path])
+            print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) with draft {os.path.basename(mtp_draft_path)} (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
+        else:
+            print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
 
-    # DeepSeek V4 (and other reasoning models) need the chat template + reasoning
+    # Reasoning models (DeepSeek V4, Qwen 3.8, Qwen 3.6, etc.) need the chat template + reasoning
     # handling enabled, else chat completions degenerate into raw CoT garbage.
-    # --jinja uses the GGUF-embedded chat template; --reasoning on parses the
-    # model's reasoning block into reasoning_content instead of leaking it.
     extra_args.extend(["--jinja", "--reasoning", "on"])
 
     # Server-level sampling penalties (llama.cpp style). Applied to ALL requests.
     # --repeat-penalty is a multiplier (1.0 = neutral), rest are additive (0.0 = neutral).
-    # These can be overridden per-request via INFER_FREQ_PENALTY / INFER_PRESENCE_PENALTY.
+    # For Qwen 3.8 (and similar models), default penalties should be neutral (repeat=1.0, presence=0.0).
     repeat_penalty = os.environ.get("LLAMA_REPEAT_PENALTY", env_vars.get("LLAMA_REPEAT_PENALTY", "1.0"))
     presence_penalty = os.environ.get("LLAMA_PRESENCE_PENALTY", env_vars.get("LLAMA_PRESENCE_PENALTY", "0.0"))
     frequency_penalty = os.environ.get("LLAMA_FREQUENCY_PENALTY", env_vars.get("LLAMA_FREQUENCY_PENALTY", "0.0"))
@@ -672,13 +723,6 @@ def cmd_serve():
     n_gpu = os.environ.get("LLAMA_N_GPU_LAYERS", env_vars.get("LLAMA_N_GPU_LAYERS", "99"))
 
     # DeepSeek V4 Flash dspark draft: wire the draft model into speculative decoding.
-    # Two adjustments are required for correctness on a single GPU:
-    #  1) cap the main model -ngl so it reserves VRAM for the draft (see
-    #     compute_main_ngl_for_draft); plain 'auto' would fill the GPU and OOM the draft.
-    #     This is skipped when n-cpu-moe is active, because keeping MoE experts in RAM
-    #     already frees enough VRAM for both the main model and the draft.
-    #  2) pass -md + --spec-type draft-dspark + --spec-draft-n-max so the server
-    #     actually uses the draft.
     if draft_path:
         n_cpu_moe_active = int(os.environ.get("LLAMA_N_CPU_MOE", env_vars.get("LLAMA_N_CPU_MOE", "0"))) > 0
         n_glx = os.environ.get("LLAMA_N_GPU_LAYERS") or env_vars.get("LLAMA_N_GPU_LAYERS")
@@ -926,6 +970,28 @@ def cmd_use(target=None):
                 print(f"Switched to gemma4 ({ep})")
                 return
 
+    # Check known model aliases / shortcuts
+    target_lower = target.lower().strip()
+    presets = {
+        "qwen3.8": "unsloth/Qwen3.8-27B-GGUF",
+        "qwen3.8-27b": "unsloth/Qwen3.8-27B-GGUF",
+        "qwen3.8-2.4t": "unsloth/Qwen3.8-2.4T-A95B-GGUF",
+        "qwen3.8-a95b": "unsloth/Qwen3.8-2.4T-A95B-GGUF",
+        "qwen3_8": "unsloth/Qwen3.8-27B-GGUF",
+        "qwen38": "unsloth/Qwen3.8-27B-GGUF",
+        "qwen3.6": "Qwen/Qwen3.6-35B-A3B",
+        "gemma4-12b": "unsloth/gemma-4-12b-it-GGUF",
+    }
+    if target_lower in presets:
+        # Check if matching model already exists locally
+        for m in list_local_models():
+            m_name = m.name.lower()
+            if target_lower in m_name or target_lower.replace(".", "_") in m_name or target_lower.replace(".", "") in m_name:
+                print(f"Found local matching model: {m}")
+                apply_model_path(m)
+                return
+        target = presets[target_lower]
+
     local_path = Path(target).expanduser().resolve() if os.path.exists(target) else MODEL_DIR / target
     if local_path.exists() and local_path.is_file():
         apply_model_path(local_path)
@@ -986,6 +1052,97 @@ def cmd_draft(target=None):
         sys.exit(1)
     persist_env_changes({"LLAMA_DRAFT_MODEL_PATH": str(p)})
     print(f"Draft model set: {p}")
+
+
+def cmd_mtp(target=None, extra=None):
+    """Set, clear, or report MTP (Multi-Token Prediction) speculative decoding."""
+    if target is None:
+        env_vars = load_env()
+        mtp = env_vars.get("LLAMA_MTP", "off")
+        spec_n = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "2")
+        draft = env_vars.get("LLAMA_MTP_DRAFT_PATH") or find_mtp_draft()
+        print(f"MTP state: {mtp} (spec-draft-n-max: {spec_n}, draft: {draft or 'internal/auto'})")
+        return
+    if target in ("off", "0", "disable", "clear", "unset"):
+        persist_env_changes({"LLAMA_MTP": "0", "LLAMA_MTP_DRAFT_PATH": None})
+        print("MTP speculative decoding disabled.")
+    elif target in ("on", "1", "enable"):
+        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_TYPE": "draft-mtp"})
+        print("MTP speculative decoding enabled (spec-type=draft-mtp).")
+    elif target == "draft" and extra:
+        p = Path(extra).expanduser().resolve()
+        if not p.exists():
+            print(f"MTP draft file not found: {p}", file=sys.stderr)
+            sys.exit(1)
+        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_MTP_DRAFT_PATH": str(p), "LLAMA_SPEC_TYPE": "draft-mtp"})
+        print(f"MTP draft model set: {p}")
+    elif target.isdigit():
+        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_DRAFT_N_MAX": target, "LLAMA_SPEC_TYPE": "draft-mtp"})
+        print(f"MTP speculative tokens set to {target} (draft-n-max={target}).")
+    else:
+        print("Usage: ai-backend mtp <on|off|1|2|3|draft <path>>", file=sys.stderr)
+
+
+def cmd_mode(mode_name=None):
+    """Configure recommended settings for thinking vs instruct mode (e.g. for Qwen3.8)."""
+    if not mode_name:
+        env_vars = load_env()
+        print("Current mode settings:")
+        for k in ("INFER_TEMPERATURE", "INFER_TOP_P", "INFER_TOP_K", "INFER_MIN_P", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "INFER_REASONING_EFFORT"):
+            print(f"  {k:<22} = {env_vars.get(k, '(default)')}")
+        print("\nUsage:")
+        print("  ai-backend mode thinking   # Qwen3.8 recommended thinking defaults (temp 1.0, top_p 0.95, top_k 20, pres_pen 0.0, repeat_pen 1.0)")
+        print("  ai-backend mode instruct   # Qwen3.8 recommended non-thinking defaults (temp 0.7, top_p 0.80, top_k 20, pres_pen 1.5, repeat_pen 1.0)")
+        return
+    mode_name = mode_name.lower().strip()
+    if mode_name in ("thinking", "think", "reasoning", "reason"):
+        persist_env_changes({
+            "INFER_TEMPERATURE": "1.0",
+            "INFER_TOP_P": "0.95",
+            "INFER_TOP_K": "20",
+            "INFER_MIN_P": "0.0",
+            "LLAMA_REPEAT_PENALTY": "1.0",
+            "LLAMA_PRESENCE_PENALTY": "0.0",
+            "LLAMA_FREQUENCY_PENALTY": "0.0",
+            "INFER_REASONING_EFFORT": "xhigh",
+        })
+        print("Applied Qwen3.8 thinking mode settings:")
+        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=xhigh")
+    elif mode_name in ("instruct", "non-thinking", "chat"):
+        persist_env_changes({
+            "INFER_TEMPERATURE": "0.7",
+            "INFER_TOP_P": "0.80",
+            "INFER_TOP_K": "20",
+            "INFER_MIN_P": "0.0",
+            "LLAMA_REPEAT_PENALTY": "1.0",
+            "LLAMA_PRESENCE_PENALTY": "1.5",
+            "LLAMA_FREQUENCY_PENALTY": "0.0",
+            "INFER_REASONING_EFFORT": "none",
+        })
+        print("Applied Qwen3.8 instruct (non-thinking) mode settings:")
+        print("  temperature=0.7  top_p=0.80  top_k=20  min_p=0.0  presence_penalty=1.5  repeat_penalty=1.0  reasoning_effort=none")
+    else:
+        print(f"Unknown mode '{mode_name}'. Use 'thinking' or 'instruct'.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_reasoning(effort=None):
+    """Set or query reasoning effort (xhigh, medium, low, none)."""
+    if not effort:
+        env_vars = load_env()
+        print(f"Reasoning effort: {env_vars.get('INFER_REASONING_EFFORT', 'default (xhigh for thinking)')}")
+        return
+    effort = effort.lower().strip()
+    if effort in ("xhigh", "high", "medium", "low", "none", "off"):
+        val = "none" if effort == "off" else effort
+        persist_env_changes({"INFER_REASONING_EFFORT": val})
+        print(f"Reasoning effort set to: {val}")
+    elif effort in ("auto", "reset", "default"):
+        persist_env_changes({"INFER_REASONING_EFFORT": None})
+        print("Reasoning effort reset to default.")
+    else:
+        print("Usage: ai-backend reasoning <xhigh|medium|low|none|auto>", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_ctx(size=None):
@@ -1121,21 +1278,25 @@ Usage:
   ai-backend status                     Show status of backends and models
   ai-backend download <hf_uri|repo>     Download model from Hugging Face
                                          (supports hf://... URIs and split GGUFs)
-  ai-backend use <model|path|hf_uri>    Switch active model (downloads if needed)
+  ai-backend use <model|path|hf_uri|preset> Switch active model (downloads if needed)
   ai-backend list                       List all downloaded GGUF models
   ai-backend auto                       Switch to best running backend
   ai-backend ctx <size|auto>            Set or clear explicit context size
+  ai-backend mode <thinking|instruct>   Apply Qwen3.8 recommended sampling settings
+  ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
+  ai-backend mtp <on|off|tokens|draft>  Configure Multi-Token Prediction speculative decoding
   ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup
   ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
   ai-backend gpus [all|<devs>|auto|split <p>]   Select GPUs (single vs multi-GPU split)
   ai-backend serve                      Run llama-server with auto context sizing
 
 Examples:
-  ai-backend use hf://AtomicChat/Ling-3.0-flash-GGUF/AD-IQ3_M/Ling-3.0-flash-AD-IQ3_M-00001-of-00002.gguf
-  ai-backend use my-model.gguf
-  ai-backend ctx 16384
+  ai-backend use qwen3.8                # use Qwen3.8-27B (Unsloth GGUF)
+  ai-backend use qwen3.8-2.4t           # use Qwen3.8-2.4T-A95B
+  ai-backend mode thinking              # recommended Qwen3.8 thinking parameters
+  ai-backend mtp on                     # enable MTP speculative decoding
+  ai-backend ctx 262144                 # full 256K context for Qwen3.8
   ai-backend gpus all                   # spread a >1-GPU model across every card
-  ai-backend gpus split 1,1,1,4         # explicit tensor-split proportions
 """)
 
 def main():
@@ -1169,8 +1330,8 @@ def main():
         dest = download_hf_target(target)
         print(f"Model downloaded: {dest}")
         apply_model_path(dest)
-    elif cmd in ("use", "set", "switch", "local", "llama", "qwen3", "qwen3-6", "qwen3-30", "gemma4"):
-        target = args[1] if len(args) > 1 else (cmd if cmd in ("qwen3", "qwen3-6", "qwen3-30", "gemma4") else None)
+    elif cmd in ("use", "set", "switch", "local", "llama", "qwen3", "qwen3-6", "qwen3-30", "qwen3.8", "qwen3.8-27b", "qwen3.8-2.4t", "gemma4"):
+        target = args[1] if len(args) > 1 else (cmd if cmd not in ("use", "set", "switch", "local", "llama") else None)
         cmd_use(target)
     elif cmd == "auto":
         cmd_auto()
@@ -1178,6 +1339,13 @@ def main():
         cmd_ctx(args[1] if len(args) > 1 else None)
     elif cmd in ("draft", "dspark"):
         cmd_draft(args[1] if len(args) > 1 else None)
+    elif cmd in ("mtp", "spec"):
+        extra = args[2] if len(args) > 2 else None
+        cmd_mtp(args[1] if len(args) > 1 else None, extra)
+    elif cmd in ("mode", "preset"):
+        cmd_mode(args[1] if len(args) > 1 else None)
+    elif cmd in ("reasoning", "reasoning-effort"):
+        cmd_reasoning(args[1] if len(args) > 1 else None)
     elif cmd in ("gpu-layers", "gpulayers"):
         cmd_gpu_layers(args[1] if len(args) > 1 else None)
     elif cmd in ("gpus", "gpu", "tensor-split"):
