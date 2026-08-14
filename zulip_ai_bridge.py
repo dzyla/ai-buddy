@@ -570,6 +570,28 @@ class ZulipAiBridge:
 
         return prompt
 
+    def _ai_mode(self):
+        """Resolve the AI permission mode for subprocess `ai` invocations.
+
+        Defaults to "auto" so the bridge actually executes work instead of
+        halting to ask for confirmation on every state-changing action, which
+        is useless over Zulip (no interactive approve prompt). Override per
+        deployment by setting the BRIDGE_AI_MODE env var (auto/plan/manual).
+        """
+        return os.environ.get("BRIDGE_AI_MODE", "auto").strip().lower()
+
+    def _truncate_reply(self, text, max_chars=9000):
+        """Truncate a reply to fit Zulip's per-message size limit.
+
+        Zulip rejects messages above ~10000 characters. Keep the head (where
+        the answer lives) and append a notice that the tail was cut, so the
+        bot never silently fails to deliver long output.
+        """
+        if len(text) <= max_chars:
+            return text
+        head = text[:max_chars].rstrip()
+        return f"{head}\n\n*…[reply truncated — {len(text) - max_chars} chars omitted]*"
+
     def _process_message(self, msg, content):
         """Run the ai agent and send the result back. Runs in a background thread."""
         tid = threading.get_ident()
@@ -583,9 +605,9 @@ class ZulipAiBridge:
         # Build a clean environment for the subprocess.
         # Inherit everything from the bridge's own env (which has the full PATH
         # and conda setup from the service file / interactive launch). Auto-approve
-        # is only forced in "auto" mode; plan/manual modes must NOT auto-approve so
-        # the agent's state-changing actions are blocked until approved via present_plan.
-        ai_mode = os.environ.get("BRIDGE_AI_MODE", "plan").strip().lower()
+        # is forced in "auto" mode; plan/manual modes must NOT auto-approve so the
+        # agent's state-changing actions are blocked until approved via present_plan.
+        ai_mode = self._ai_mode()
         run_env = os.environ.copy()
         if ai_mode == "auto":
             run_env["INFER_AUTO_APPROVE"] = "1"
@@ -601,24 +623,27 @@ class ZulipAiBridge:
         if sender_email:
             run_env["AI_REMINDER_ZULIP_TO"] = sender_email
 
-        # Run the local `ai` CLI in plan-mode by default so the agent investigates,
-        # reports findings, and asks before making changes, rather than acting
-        # unilaterally. Override with the BRIDGE_AI_MODE env var:
-        #   "auto"   = full autonomy (current/legacy behaviour)
-        #   "plan"   = investigate, present a plan, ask for approval before changing state
+        # Run the local `ai` CLI. The bridge defaults to AUTO mode so the agent
+        # actually investigates AND executes (read + write) rather than halting
+        # to ask for confirmation on every state-changing action — a bridge that
+        # just posts "here is my plan" and stops is not useful over Zulip, where
+        # there is no interactive approve prompt. The bridge is already gated to
+        # the owner (ZULIP_USER / detected owner), so auto is safe here.
+        # Override per-deployment with the BRIDGE_AI_MODE env var:
+        #   "auto"   = full autonomy (default) — investigates and executes
+        #   "plan"   = investigate & report, present a plan, wait for approval
         #   "manual" = require approval for every state-changing action
         # -q suppresses the think tool reasoning output.
         # Streaming intermediate content is suppressed automatically because
         # stdout is a pipe (non-TTY), so only the final answer is captured.
         # With schedule_task properly used, the agent returns immediately for timed work.
-        ai_mode = os.environ.get("BRIDGE_AI_MODE", "plan").strip().lower()
         mode_flags = []
         if ai_mode == "auto":
             mode_flags = ["--auto"]
         elif ai_mode == "manual":
             mode_flags = ["--manual"]
         else:
-            mode_flags = ["--plan"]  # default
+            mode_flags = ["--plan"]
 
         ai_cmd = ["ai", "-q"] + mode_flags + [prompt]
         task_timeout = int(os.environ.get("INFER_TASK_TIMEOUT", 0)) or 600
@@ -649,7 +674,7 @@ class ZulipAiBridge:
         except Exception as e:
             response_text = f"⚠️ Failed to run local `ai` CLI: {str(e)}"
 
-        self._send_reply(msg, response_text)
+        self._send_reply(msg, self._truncate_reply(response_text))
         print(f"[thread-{tid}] Done.")
 
     def handle_message(self, msg):
@@ -685,6 +710,18 @@ class ZulipAiBridge:
             return
 
         content = msg['content'].strip()
+
+        # Built-in commands (cheap, no agent round-trip)
+        if content.startswith('/ping'):
+            self._send_reply(msg, "🟢 Zulip AI Bridge is alive.")
+            return
+        if content.startswith('/mode'):
+            self._send_reply(
+                msg,
+                f"AI mode: **{self._ai_mode()}** "
+                "(set BRIDGE_AI_MODE=auto|plan|manual to change)",
+            )
+            return
 
         # If the bot is mentioned in a stream, strip the mention syntax (e.g. @**AI Bot**)
         if msg['type'] != 'private' and content.startswith('@**'):

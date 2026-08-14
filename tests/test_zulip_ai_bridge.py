@@ -270,3 +270,79 @@ def test_download_file_allows_trusted_redirect():
         success, err = bridge._download_file("https://example.zulipchat.com/original", "/tmp/trusted.bin")
     assert success is True
     assert err is None
+
+
+# ---------------------------------------------------------------------------
+# ZulipAiBridge._ai_mode / _truncate_reply (mode + delivery behaviour)
+# ---------------------------------------------------------------------------
+
+class _ModeClient(MockZulipClient):
+    def send_message(self, payload):
+        self.last_sent = payload
+        return {"result": "success", "id": 1}
+
+
+def test_ai_mode_defaults_to_auto(monkeypatch):
+    """Without BRIDGE_AI_MODE set, the bridge should default to auto mode."""
+    from zulip_ai_bridge import ZulipAiBridge
+    monkeypatch.delenv("BRIDGE_AI_MODE", raising=False)
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._ai_mode() == "auto"
+
+
+def test_ai_mode_reads_env(monkeypatch):
+    from zulip_ai_bridge import ZulipAiBridge
+    monkeypatch.setenv("BRIDGE_AI_MODE", "plan")
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    assert bridge._ai_mode() == "plan"
+
+
+def test_truncate_reply_short_untouched():
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    text = "short reply"
+    assert bridge._truncate_reply(text) == text
+
+
+def test_truncate_reply_long_cut():
+    from zulip_ai_bridge import ZulipAiBridge
+    bridge = ZulipAiBridge(client=MockZulipClient())
+    text = "x" * 20000
+    out = bridge._truncate_reply(text, max_chars=9000)
+    assert len(out) < len(text)
+    assert "truncated" in out
+
+
+def test_process_message_uses_auto_flags(monkeypatch):
+    """In auto mode, the subprocess should be invoked with --auto and
+    INFER_AUTO_APPROVE set, and send an empty reply only when ai returns nothing."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    monkeypatch.delenv("BRIDGE_AI_MODE", raising=False)
+    client = _ModeClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {
+        "type": "private",
+        "sender_email": "owner@example.com",
+        "content": "do something",
+    }
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env_auto"] = kwargs.get("env", {}).get("INFER_AUTO_APPROVE")
+        class R:
+            returncode = 0
+            stdout = "done"
+            stderr = ""
+        return R()
+
+    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run):
+        bridge._process_message(msg, "do something")
+
+    assert any(f == "--auto" for f in captured["cmd"])
+    assert captured["env_auto"] == "1"
+    assert "done" in client.last_sent["content"]
