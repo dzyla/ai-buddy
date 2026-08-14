@@ -47,7 +47,7 @@ def write_env(url, model, llama_model_path=None, extra_vars=None):
     if extra_vars:
         current.update(extra_vars)
 
-    cuda_dev = current.get("CUDA_VISIBLE_DEVICES", "1")
+    cuda_dev = current.get("CUDA_VISIBLE_DEVICES", "auto")
     ctx_size = current.get("LLAMA_CTX_SIZE", "131072")
     gpu_layers = current.get("LLAMA_N_GPU_LAYERS", "99")
     
@@ -317,7 +317,7 @@ def is_systemd_service_active():
     except Exception:
         return False
 
-def calculate_auto_ctx(model_path, vram_free=None):
+def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indices=None, use_mtp=False):
     ram_free = 0
     try:
         with open("/proc/meminfo", "r") as f:
@@ -330,7 +330,10 @@ def calculate_auto_ctx(model_path, vram_free=None):
 
     if vram_free is None:
         vram_free = 0
-        if shutil.which("nvidia-smi"):
+        if gpu_indices:
+            by_idx = {g["index"]: g for g in list_gpu_info()}
+            vram_free = sum(by_idx.get(i, {}).get("free_mib", 0) for i in gpu_indices)
+        elif shutil.which("nvidia-smi"):
             try:
                 res = subprocess.run(
                     ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -339,31 +342,48 @@ def calculate_auto_ctx(model_path, vram_free=None):
                 vram_free = int(res.stdout.splitlines()[0].strip())
             except Exception:
                 pass
-        
+
     try:
-        model_mb = os.path.getsize(model_path) // (1024 * 1024)
+        model_mb = split_total_size(model_path) * 1024
     except Exception:
         model_mb = 4096
-        
+
     factor = float(os.environ.get("LLAMA_CTX_SIZE_FACTOR", "1.0"))
     ctx_max = int(os.environ.get("LLAMA_CTX_SIZE_MAX", "262144"))
-    
-    fixed_mb = int(model_mb * 0.703)
-    kv_gpu = 0.01518
-    kv_ram = 0.00400
+
+    # KV spill into CPU RAM only happens when some layers live on the CPU
+    # (partial offload) — with every layer on the GPU the whole KV cache is GPU-resident.
+    layers = (read_gguf_arch(model_path) or {}).get("layers")
+    try:
+        partial_offload = int(str(n_gpu_layers)) < (layers or 10**9)
+    except (TypeError, ValueError):
+        partial_offload = False
+    if vram_free <= 0:
+        partial_offload = True  # no GPU info at all → CPU-only, KV lives in RAM
+
+    est = estimate_vram_mb(model_path, 0, use_mtp=use_mtp)  # base: weights + SSM state + overhead, no KV
+    if est:
+        base_mb = est["total_mb"]
+        kv_gpu = max(est.get("kv_per_tok_mib", 0.01518), 0.001)
+        kv_ram = 0.00400
+    else:
+        base_mb = model_mb * 0.703 + 3072  # legacy heuristic + flat overhead
+        kv_gpu = 0.01518
+        kv_ram = 0.00400
+
     safety_gpu = 2048
     safety_ram = 4096
-    
-    gpu_budget = max(0, vram_free - fixed_mb - safety_gpu)
+
+    gpu_budget = max(0, vram_free - base_mb - safety_gpu)
     ctx_gpu_only = int(gpu_budget / kv_gpu)
-    
-    ram_budget = max(0, ram_free - safety_ram)
-    ctx_ram_extend = int(ram_budget / kv_ram)
-    
+
+    ram_budget = max(0, ram_free - safety_ram) if partial_offload else 0
+    ctx_ram_extend = int(ram_budget / kv_ram) if partial_offload else 0
+
     ctx_base = min(ctx_max, ctx_gpu_only + ctx_ram_extend)
     ctx = int(ctx_base * factor)
     ctx = min(ctx_max, max(4096, (ctx // 512) * 512))
-    
+
     source = "GPU" if ctx <= ctx_gpu_only else "GPU+RAM"
     if source == "GPU+RAM":
         print(f"[llama-wrapper] GPU-only fits {ctx_gpu_only} tokens — extending to {ctx} via CPU RAM KV offload", file=sys.stderr)
@@ -412,7 +432,13 @@ def parse_gpu_sel(sel):
     return idxs or None
 
 def best_single_gpu_idx():
-    """Index of the detected GPU with the most total VRAM, else '1'."""
+    """Index of the detected GPU with the most total VRAM, else '1'.
+
+    Used to co-locate a speculative draft with the main model on one card
+    (the draft can't be tensor-split). The serve-time default is
+    `default_gpu_selection`, which falls back to every card for a model too
+    big for the single largest one.
+    """
     gpus = list_gpu_info()
     if not gpus:
         return "1"
@@ -433,6 +459,30 @@ def default_gpu_selection():
             idxs = sorted(g["index"] for g in gpus)
             return ",".join(str(i) for i in idxs)
     return str(best["index"])
+
+def resolve_serve_gpu(need_single_card=False):
+    """Resolve which GPU(s) `serve` runs on.
+
+    Precedence:
+      1. An explicit user pin — `CUDA_VISIBLE_DEVICES` in the process env or the
+         env file (e.g. `ai-backend gpus 0` / `gpus 0,2` / `gpus all`) is honored
+         verbatim.
+      2. No pin (absent or the "auto" sentinel) -> the single biggest card (most
+         VRAM) that holds the active model; if the model's weights don't fit the
+         largest single card, every detected card is used (tensor-split). This is
+         the "biggest card by default" behaviour — no stale pin is needed to steer it.
+
+    `need_single_card` forces the single biggest card regardless of fit: a
+    speculative draft (dspark/MTP) must co-locate with the main model on one GPU
+    and cannot be tensor-split.
+    """
+    env_vars = load_env()
+    explicit = os.environ.get("CUDA_VISIBLE_DEVICES") or env_vars.get("CUDA_VISIBLE_DEVICES")
+    if explicit and explicit.strip() and explicit.strip() != "auto":
+        return explicit.strip()
+    if need_single_card:
+        return best_single_gpu_idx()
+    return default_gpu_selection()
 
 def split_total_size(file_path):
     """Total size in GB of a GGUF, summing sibling '-NNNNN-of-MMNNN.gguf' parts.
@@ -468,6 +518,185 @@ def compute_tensor_split(gpu_indices, ctx_reserve=2048):
         return ",".join(["1.0"] + ["0.0"] * (len(frees) - 1))
     props = [f / total for f in frees]
     return ",".join(f"{p:.3f}" for p in props)
+
+def read_gguf_arch(path):
+    """Key architecture fields from a GGUF header, else None.
+
+    Returns {"arch", "layers", "kv_heads", "head_dim", "full_attn_interval",
+    "nextn"} — enough to size the KV cache (and SSM state for hybrid models)
+    from first principles instead of a one-size-fits-all per-token guess.
+    Uses gguf-py when importable (site-packages or the llama.cpp repo copy).
+    """
+    _gg = None
+    try:
+        import gguf as _gg
+    except Exception:
+        pass
+    if _gg is None:
+        for cand in (
+            str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
+            "/home/dzyla/Code/llama.cpp/gguf-py",
+        ):
+            if os.path.isdir(cand):
+                sys.path.insert(0, cand)
+                try:
+                    import gguf as _gg
+                    break
+                except Exception:
+                    _gg = None
+    if _gg is None:
+        return None
+    try:
+        r = _gg.GGUFReader(str(path))
+        vals = {}
+        for f in r.fields.values():
+            n = f.name
+            if n == "general.architecture":
+                try:
+                    vals["arch"] = str(f.contents())
+                except Exception:
+                    pass
+                continue
+            if "." not in n:
+                continue
+            base, key = n.rsplit(".", 1)
+            if key in ("block_count", "head_count_kv", "head_dim", "key_length",
+                       "value_length", "full_attention_interval", "nextn_predict_layers",
+                       "state_size", "inner_size", "group_count", "conv_kernel",
+                       "time_step_rank"):
+                try:
+                    vals.setdefault(base, {})[key] = f.contents()
+                except Exception:
+                    pass
+        arch = vals.get("arch")
+        if not arch:
+            return None
+        # Architecture fields may be split across nested namespaces (e.g.
+        # "qwen35.attention.*" / "qwen35.ssm.*") — merge them all into one dict.
+        a = dict(vals.get(arch, {}))
+        for ns, fields in vals.items():
+            if ns.startswith(arch + ".") and isinstance(fields, dict):
+                a.update(fields)
+        layers = a.get("block_count")
+        if not layers:
+            return None
+        kv_heads = a.get("head_count_kv") or 0
+        head_dim = a.get("head_dim") or a.get("key_length") or 0
+        ssm = None
+        if "state_size" in a and "inner_size" in a and "group_count" in a:
+            ssm = {
+                "state": int(a["state_size"]),
+                "inner": int(a["inner_size"]),
+                "groups": int(a["group_count"]),
+                "conv": int(a.get("conv_kernel") or 4),
+                "dtime": int(a.get("time_step_rank") or 0),
+            }
+        return {
+            "arch": arch,
+            "layers": int(layers),
+            "kv_heads": int(kv_heads),
+            "head_dim": int(head_dim),
+            "full_attn_interval": int(a.get("full_attention_interval") or 1),
+            "nextn": int(a.get("nextn_predict_layers") or 0),
+            "ssm": ssm,
+        }
+    except Exception:
+        return None
+
+def estimate_vram_mb(model_path, ctx, use_mtp=False):
+    """Rough GPU-VRAM footprint (MiB) of running `model_path` at `ctx` tokens.
+
+    Covers weights (file size, +~5% for descaled compute copies), the fixed
+    recurrent state of hybrid/SSM layers (Mamba-style state + conv, ~1 GiB for
+    Qwen3.8-27B), a flat 3 GB overhead (graphs, buffers, compute buffers,
+    flash-attn scratch), and the q8_0 KV cache of the full-attention layers
+    (for hybrid models only a fraction of layers carry full attention).
+    Returns None when the GGUF header can't be read — callers should fall back
+    to the legacy heuristic. Also reports kv_per_tok_mib for per-token sizing.
+    """
+    arch = read_gguf_arch(model_path)
+    try:
+        weights_mb = split_total_size(model_path) * 1024
+    except Exception:
+        return None
+    if not arch or not arch["layers"]:
+        return None
+    layers = arch["layers"]
+    n_full = (layers + arch["full_attn_interval"] - 1) // arch["full_attn_interval"]
+    kv_heads = arch["kv_heads"]
+    head_dim = arch["head_dim"]
+    kv_per_tok_mb = 2 * max(kv_heads, 1) * max(head_dim, 1) * 1.03 * n_full / (1024 * 1024)  # q8_0 K+V, MiB/tok
+    total = weights_mb * 1.05 + 3072  # weights + flat overhead
+    ssm = arch.get("ssm")
+    if ssm:
+        # Per SSM layer: a state matrix [groups, inner, state] (fp16) plus a
+        # conv buffer [groups, inner, conv] (fp16). No token dependence.
+        per_layer = 2 * ssm["groups"] * ssm["inner"] * (ssm["state"] + ssm["conv"])
+        total += per_layer * layers / (1024 * 1024)
+    if use_mtp and arch.get("nextn"):
+        # MTP head: small extra weights + its own KV slot per token.
+        total += weights_mb * 0.08
+        kv_per_tok_mb *= 1.03
+    return {
+        "total_mb": int(total + kv_per_tok_mb * ctx),
+        "kv_per_tok_mib": kv_per_tok_mb,
+        "weights_mb": int(weights_mb),
+        "layers": layers,
+    }
+
+def vram_preflight(model_path, ctx_size, gpu_indices, n_gpu="99", use_mtp=False, n_cpu_moe=0):
+    """Pre-flight VRAM check before spawning llama-server.
+
+    Prints a warning (returns True) and lets the launch proceed when the model
+    looks like it fits; prints an actionable error and returns False — callers
+    must abort — when it clearly cannot fit. Configs that legitimately spill
+    into system RAM (partial offload: n-gpu-layers < model layers, or MoE
+    experts kept in CPU RAM via --n-cpu-moe) are only warned about, never
+    hard-blocked.
+    """
+    est = estimate_vram_mb(model_path, ctx_size, use_mtp=use_mtp)
+    if not est:
+        print("[llama-wrapper] NOTE: could not estimate VRAM footprint (GGUF unreadable?) — skipping pre-flight check.", file=sys.stderr)
+        return True
+    by_idx = {g["index"]: g for g in list_gpu_info()}
+    free = [by_idx.get(i, {}).get("free_mib", 0) for i in (gpu_indices or [])]
+    if not free or not any(free):
+        print("[llama-wrapper] NOTE: no nvidia-smi VRAM info — skipping pre-flight check.", file=sys.stderr)
+        return True
+    free_total = sum(f for f in free if f > 0)
+    needed = est["total_mb"]
+    layers = est.get("layers")
+    partial = False
+    try:
+        partial = int(str(n_gpu)) < (layers or 10**9)
+    except (TypeError, ValueError):
+        pass
+    if partial or n_cpu_moe > 0:
+        why = f"partial offload (-ngl {n_gpu} < {layers} layers)" if partial else f"--n-cpu-moe {n_cpu_moe} experts in CPU RAM"
+        print(f"[llama-wrapper] NOTE: {why} — VRAM check relaxed (some state lives in system RAM).", file=sys.stderr)
+        return True
+    overage = needed - free_total
+    if overage <= max(2048, needed * 0.02):
+        return True
+    single = len(gpu_indices or []) == 1
+    sel = ",".join(str(i) for i in (gpu_indices or []))
+    cards = [by_idx.get(i, {}).get("name", f"GPU{i}") for i in (gpu_indices or [])]
+    print(f"[llama-wrapper] ERROR: model will not fit in VRAM.", file=sys.stderr)
+    print(f"[llama-wrapper]   model:        {os.path.basename(str(model_path))}", file=sys.stderr)
+    print(f"[llama-wrapper]   estimated:    {needed / 1024:.1f} GiB (weights {est['weights_mb'] / 1024:.1f} + KV/state + overhead) at ctx {ctx_size}" + (f" + MTP" if use_mtp else ""), file=sys.stderr)
+    print(f"[llama-wrapper]   available:    {free_total / 1024:.1f} GiB free on {sel} ({' + '.join(cards)})", file=sys.stderr)
+    print(f"[llama-wrapper]   short by:     ~{overage / 1024:.1f} GiB", file=sys.stderr)
+    print(f"[llama-wrapper] Fixes (pick one):", file=sys.stderr)
+    if not single:
+        print(f"[llama-wrapper]   - use a bigger single card:  ai-backend gpus 1   (or: CUDA_VISIBLE_DEVICES=1 ai-backend serve)", file=sys.stderr)
+    if use_mtp:
+        print(f"[llama-wrapper]   - drop MTP speculative decode: ai-backend mtp off", file=sys.stderr)
+    auto_ctx = max(4096, int((free_total - est['weights_mb'] * 1.05 - 5120) / max(est['kv_per_tok_mib'], 0.001)) // 512 * 512)
+    print(f"[llama-wrapper]   - lower the context:           ai-backend ctx {min(auto_ctx, 262144)}   (or ai-backend ctx auto to size it from free VRAM)", file=sys.stderr)
+    if single:
+        print(f"[llama-wrapper]   - or spread across cards:       ai-backend gpus all", file=sys.stderr)
+    print(f"[llama-wrapper] Aborting before launching llama-server (it would have OOM'd mid-load).", file=sys.stderr)
+    return False
 
 def read_gguf_block_count(path):
     """Number of transformer layers (block_count) from a GGUF header, else None.
@@ -613,20 +842,44 @@ def persist_env_changes(changes):
     write_env(url, model, llama_path, env_vars)
 
 def sync_gpu_to_systemd(cuda_dev):
-    """Keep the systemd unit's CUDA_VISIBLE_DEVICES in sync with the env file."""
+    """Keep the systemd unit's CUDA_VISIBLE_DEVICES in sync with the env file.
+
+    A concrete selection ('1', '0,2', 'all', ...) pins the unit to those card(s).
+    The 'auto' sentinel means "serve picks the biggest card at startup", so the
+    pin is removed from the unit — leaving it pinned would force a specific card
+    and defeat the biggest-card default (e.g. a stale pin to a small card).
+    """
     if not SYSTEMD_SERVICE.exists():
         return
     try:
         content = SYSTEMD_SERVICE.read_text()
-        new_content = re.sub(
-            r'^Environment=CUDA_VISIBLE_DEVICES=.*',
-            f'Environment=CUDA_VISIBLE_DEVICES={cuda_dev}',
-            content, flags=re.MULTILINE,
-        )
+        if cuda_dev in (None, "", "auto"):
+            new_content = re.sub(
+                r'^Environment=CUDA_VISIBLE_DEVICES=.*\n?',
+                '',
+                content, flags=re.MULTILINE,
+            )
+        else:
+            if re.search(r'^Environment=CUDA_VISIBLE_DEVICES=', content, flags=re.MULTILINE):
+                new_content = re.sub(
+                    r'^Environment=CUDA_VISIBLE_DEVICES=.*',
+                    f'Environment=CUDA_VISIBLE_DEVICES={cuda_dev}',
+                    content, flags=re.MULTILINE,
+                )
+            else:
+                # No existing pin: insert one right after the [Service] section.
+                new_content = re.sub(
+                    r'^\[Service\]\n',
+                    f'[Service]\nEnvironment=CUDA_VISIBLE_DEVICES={cuda_dev}\n',
+                    content, flags=re.MULTILINE,
+                )
         if new_content != content:
             SYSTEMD_SERVICE.write_text(new_content)
             subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-            print(f"[ai-backend] Synced systemd CUDA_VISIBLE_DEVICES={cuda_dev}")
+            if cuda_dev in (None, "", "auto"):
+                print("[ai-backend] Cleared systemd GPU pin — serve will auto-select the biggest card.")
+            else:
+                print(f"[ai-backend] Synced systemd CUDA_VISIBLE_DEVICES={cuda_dev}")
     except Exception as e:
         print(f"Warning syncing systemd GPU config: {e}", file=sys.stderr)
 
@@ -640,12 +893,17 @@ def cmd_serve():
     idle_timeout = int(os.environ.get("LLAMA_IDLE_TIMEOUT", env_vars.get("LLAMA_IDLE_TIMEOUT", "120")))
     ctx_override = os.environ.get("LLAMA_CTX_SIZE", env_vars.get("LLAMA_CTX_SIZE"))
 
-    # Resolve which GPUs to use: default to all GPUs when the active model is too
-    # big for the single largest card, otherwise that single card. Overridable via
-    # CUDA_VISIBLE_DEVICES (e.g. "0,1,2,3", "1", "all").
-    cuda_dev = os.environ.get("CUDA_VISIBLE_DEVICES") or env_vars.get("CUDA_VISIBLE_DEVICES")
+    # Draft / speculative decoding: decided up front because it changes both the
+    # GPU choice (a draft must co-locate with the main model on one card) and the
+    # ctx sizing (MTP adds state).
     draft_path = find_dspark_draft(model_path)
     mtp_draft_path = find_mtp_draft(model_path)
+    use_mtp = (
+        os.environ.get("LLAMA_MTP") in ("1", "true", "on")
+        or env_vars.get("LLAMA_MTP") in ("1", "true", "on")
+        or "mtp" in os.path.basename(model_path).lower()
+        or (mtp_draft_path is not None)
+    )
 
     if not draft_path:
         # A dspark draft was configured but the active model isn't DeepSeek, so
@@ -656,13 +914,17 @@ def cmd_serve():
             print(f"[llama-wrapper] NOTE: LLAMA_DRAFT_MODEL_PATH is set ({legacy_draft}) but the active "
                   f"model ({os.path.basename(model_path)}) is not DeepSeek — ignoring the dspark draft "
                   f"(it is DeepSeek V4-specific). Run `ai-backend draft off` to clear it.", file=sys.stderr)
+
+    # Resolve which GPUs to use. An explicit pin (process env or `ai-backend gpus
+    # ...` in the env file) is honored verbatim; otherwise serve defaults to the
+    # single biggest card that holds the active model, or every card (tensor-split)
+    # when no single card fits the weights.
     if draft_path or mtp_draft_path:
-        # Draft co-locates with the main model on one GPU (main + draft in
-        # the same VRAM, overflow to RAM). Do NOT spread across cards via
-        # tensor-split or auto multi-GPU: that splits the draft and main apart.
-        cuda_dev = cuda_dev or best_single_gpu_idx()
-    if not cuda_dev:
-        cuda_dev = default_gpu_selection()
+        # A speculative draft (dspark/MTP) must co-locate with the main model on
+        # ONE card — it can't be tensor-split — so no pin means the biggest card.
+        cuda_dev = resolve_serve_gpu(need_single_card=True)
+    else:
+        cuda_dev = resolve_serve_gpu()
     gpu_indices = parse_gpu_sel(cuda_dev)
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_dev
     print(f"[llama-wrapper] Using CUDA_VISIBLE_DEVICES={cuda_dev} "
@@ -679,17 +941,14 @@ def cmd_serve():
         ctx_size = int(ctx_override)
         print(f"[llama-wrapper] Using explicit ctx: {ctx_size}", file=sys.stderr)
     else:
-        ctx_size = calculate_auto_ctx(model_path, vram_free=agg_vram_free or None)
+        ctx_size = calculate_auto_ctx(
+            model_path, vram_free=agg_vram_free or None,
+            n_gpu_layers=os.environ.get("LLAMA_N_GPU_LAYERS", env_vars.get("LLAMA_N_GPU_LAYERS", "99")),
+            gpu_indices=gpu_indices, use_mtp=use_mtp,
+        )
 
     extra_args = []
-    
-    # Check MTP (Multi-Token Prediction) speculative decoding for Qwen3.8 / Qwen / MTP quants
-    use_mtp = (
-        os.environ.get("LLAMA_MTP") in ("1", "true", "on")
-        or env_vars.get("LLAMA_MTP") in ("1", "true", "on")
-        or "mtp" in os.path.basename(model_path).lower()
-        or (mtp_draft_path is not None)
-    )
+
     if use_mtp:
         spec_type = os.environ.get("LLAMA_SPEC_TYPE", env_vars.get("LLAMA_SPEC_TYPE", "draft-mtp"))
         spec_draft_n_max = os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "2"))
@@ -780,7 +1039,13 @@ def cmd_serve():
     # Set to 90% of our Python-level idle_timeout so the server sleeps first,
     # then we terminate if it stays idle even longer.
     sleep_idle = max(30, idle_timeout - 30)
-    
+
+    # Pre-flight VRAM check: refuse to launch a server that cannot fit the
+    # model + context (the old behaviour was an opaque mid-load cudaMalloc OOM).
+    # Configs that spill to system RAM (partial offload / --n-cpu-moe) are relaxed.
+    if not vram_preflight(model_path, ctx_size, gpu_indices, n_gpu=n_gpu, use_mtp=use_mtp, n_cpu_moe=n_cpu_moe):
+        sys.exit(1)
+
     cmd = [
         "llama-server",
         "--model", model_path,
@@ -1175,37 +1440,53 @@ def cmd_gpu_layers(n=None):
         print(f"GPU layers set to {n}.")
 
 def cmd_gpus(sel=None):
-    """Select which GPUs llama-server uses (single vs all). Persists to env + systemd."""
+    """Select which GPUs llama-server uses (single vs all). Persists to env + systemd.
+
+    The default is 'auto': serve resolves the biggest card that holds the active
+    model at startup (or every card if none single card fits). 'auto' is stored as
+    the env-file sentinel, never baked into a fixed index, so a topology or load
+    change can't strand serve on a small card."""
     gpus = list_gpu_info()
     env_vars = load_env()
     current = env_vars.get("CUDA_VISIBLE_DEVICES")
     ts = env_vars.get("LLAMA_TENSOR_SPLIT")
+
+    def _is_auto(v):
+        return not v or v == "auto"
 
     if sel is None:
         print("=== GPUs ===")
         if not gpus:
             print("  (nvidia-smi not found)")
         else:
+            # For 'auto', show the card(s) serve would pick at startup.
+            effective = default_gpu_selection() if _is_auto(current) else current
+            eff_idxs = set(str(i) for i in (effective.split(",") if effective else []))
             for g in gpus:
-                mark = " ⇐ selected" if current and str(g["index"]) in current.split(",") else ""
+                mark = " ⇐ selected" if str(g["index"]) in eff_idxs else ""
                 free_gb = g["free_mib"] / 1024
                 tot_gb = g["total_mib"] / 1024
                 print(f"  GPU{g['index']}  {g['name']:<36} {tot_gb:6.1f} GB total, {free_gb:6.1f} GB free{mark}")
-        print(f"\nActive CUDA_VISIBLE_DEVICES: {current or '(unset, will auto-select)'}")
+            if _is_auto(current):
+                print(f"\nActive: auto — serve picks the biggest card that fits (currently: {effective})")
+            else:
+                print(f"\nActive CUDA_VISIBLE_DEVICES: {current}")
         print(f"Tensor split: {ts or '(auto/computed at serve)'}")
         print("\nUsage:")
+        print("  ai-backend gpus auto              Default: biggest card that fits (re-resolved at serve)")
         print("  ai-backend gpus all               Use every detected GPU (multi-GPU split)")
         print("  ai-backend gpus 0,2,3             Use specific GPUs")
         print("  ai-backend gpus 1                 Use a single GPU")
-        print("  ai-backend gpus auto              Auto: single largest if it holds the model, else all")
         print("  ai-backend gpus split 1,1,2,1     Pin an explicit --tensor-split")
         return
 
     if sel == "auto":
-        cuda_dev = default_gpu_selection()
-        persist_env_changes({"CUDA_VISIBLE_DEVICES": cuda_dev, "LLAMA_TENSOR_SPLIT": None})
-        sync_gpu_to_systemd(cuda_dev)
-        print(f"Auto-selected CUDA_VISIBLE_DEVICES={cuda_dev}")
+        # Persist the sentinel, not a baked index: serve re-resolves the biggest
+        # card at startup, and the systemd pin is cleared so it can't force a card.
+        persist_env_changes({"CUDA_VISIBLE_DEVICES": "auto", "LLAMA_TENSOR_SPLIT": None})
+        sync_gpu_to_systemd("auto")
+        print(f"GPU selection: auto — serve will use the biggest card that fits "
+              f"(currently: {default_gpu_selection()}).")
         return
 
     if sel == "split":
