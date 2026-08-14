@@ -270,7 +270,7 @@ All config lives in `~/.local/share/ai/env` (managed by `ai-backend`) and is loa
 | `LLAMA_FREQUENCY_PENALTY` | Server-level frequency penalty (additive, 0.0 = neutral) | `0.0` |
 | `LLAMA_REPEAT_LAST_N` | Number of recent tokens considered for repeat penalty | `64` |
 | `LLAMA_MTP` | Enable Multi-Token Prediction speculative decoding (1/0) | `0` |
-| `LLAMA_SPEC_DRAFT_N_MAX` | Speculative draft token count (e.g. 2 for MTP, 3 for dspark) | `2` |
+| `LLAMA_SPEC_DRAFT_N_MAX` | Speculative draft token count (e.g. 3 for MTP/dspark) | `3` |
 
 ### MCP servers
 

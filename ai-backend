@@ -959,7 +959,7 @@ def cmd_serve():
 
     if use_mtp:
         spec_type = os.environ.get("LLAMA_SPEC_TYPE", env_vars.get("LLAMA_SPEC_TYPE", "draft-mtp"))
-        spec_draft_n_max = os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "2"))
+        spec_draft_n_max = os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "3"))
         extra_args.extend(["--spec-type", spec_type, "--spec-draft-n-max", str(spec_draft_n_max)])
         if mtp_draft_path:
             extra_args.extend(["-md", mtp_draft_path])
@@ -1356,7 +1356,7 @@ def cmd_mtp(target=None, extra=None):
     if target is None:
         env_vars = load_env()
         mtp = env_vars.get("LLAMA_MTP", "off")
-        spec_n = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "2")
+        spec_n = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "3")
         draft = env_vars.get("LLAMA_MTP_DRAFT_PATH") or find_mtp_draft()
         print(f"MTP state: {mtp} (spec-draft-n-max: {spec_n}, draft: {draft or 'internal/auto'})")
         return

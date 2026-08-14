@@ -254,7 +254,7 @@ def test_serve_mtp_on_emits_spec_and_parallel_one(ab, serve_stubs, monkeypatch, 
         ab.cmd_serve()
     cmd = serve_stubs.get("cmd") or []
     assert _flag_after(cmd, "--spec-type") == "draft-mtp"
-    assert _flag_after(cmd, "--spec-draft-n-max") == "2"
+    assert _flag_after(cmd, "--spec-draft-n-max") == "3"
     assert _flag_after(cmd, "--parallel") == "1", "MTP must pin --parallel 1 by default"
 
 
@@ -281,12 +281,12 @@ def test_serve_mtp_off_no_spec_no_parallel_pin(ab, serve_stubs, monkeypatch, cap
 
 def test_serve_mtp_custom_nmax(ab, serve_stubs, monkeypatch, capsys):
     monkeypatch.setenv("LLAMA_MTP", "1")
-    monkeypatch.setenv("LLAMA_SPEC_DRAFT_N_MAX", "3")
+    monkeypatch.setenv("LLAMA_SPEC_DRAFT_N_MAX", "4")
     monkeypatch.setenv("LLAMA_CTX_SIZE", "131072")
     with pytest.raises(SystemExit):
         ab.cmd_serve()
     cmd = serve_stubs.get("cmd") or []
-    assert _flag_after(cmd, "--spec-draft-n-max") == "3"
+    assert _flag_after(cmd, "--spec-draft-n-max") == "4"
 
 
 # ---------------------------------------------------------------------------
@@ -301,16 +301,16 @@ def test_cmd_mtp_on_off_query(ab, hermetic, capsys):
     assert env.get("LLAMA_SPEC_TYPE") == "draft-mtp"
     ab.cmd_mtp()
     out = capsys.readouterr().out
-    assert "MTP state: 1" in out and "spec-draft-n-max: 2" in out
+    assert "MTP state: 1" in out and "spec-draft-n-max: 3" in out
     ab.cmd_mtp("off")
     assert ab.load_env().get("LLAMA_MTP") == "0"
 
 
 def test_cmd_mtp_nmax(ab, hermetic, capsys):
-    ab.cmd_mtp("3")
+    ab.cmd_mtp("4")
     env = ab.load_env()
     assert env.get("LLAMA_MTP") == "1"
-    assert env.get("LLAMA_SPEC_DRAFT_N_MAX") == "3"
+    assert env.get("LLAMA_SPEC_DRAFT_N_MAX") == "4"
 
 
 def _probe_path():
