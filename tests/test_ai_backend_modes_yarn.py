@@ -49,7 +49,8 @@ def hermetic(ab, monkeypatch, tmp_path):
     for var in ("LLAMA_MODEL_PATH", "CUDA_VISIBLE_DEVICES", "LLAMA_MTP", "LLAMA_CTX_SIZE",
                 "LLAMA_CTX_SIZE_FACTOR", "LLAMA_CTX_SIZE_MAX", "LLAMA_N_GPU_LAYERS",
                 "LLAMA_DRAFT_MODEL_PATH", "LLAMA_MTP_DRAFT_PATH",
-                "LLAMA_ROPE_SCALING", "LLAMA_ROPE_SCALE", "LLAMA_YARN_ORIG_CTX"):
+                "LLAMA_ROPE_SCALING", "LLAMA_ROPE_SCALE", "LLAMA_YARN_ORIG_CTX",
+                "LLAMA_N_PARALLEL", "LLAMA_SPEC_TYPE", "LLAMA_SPEC_DRAFT_N_MAX"):
         monkeypatch.delenv(var, raising=False)
     model = tmp_path / "Qwen3.8-27B-test.gguf"
     model.write_bytes(b"fake")
@@ -232,3 +233,145 @@ def test_serve_omits_yarn_flags_when_off(ab, serve_stubs, monkeypatch, capsys):
     cmd = serve_stubs.get("cmd") or []
     for f in ("--rope-scaling", "--rope-scale", "--yarn-orig-ctx"):
         assert f not in cmd, f"{f} should not be present when YaRN is off"
+
+
+# ---------------------------------------------------------------------------
+# MTP serve flag assembly (--spec-type draft-mtp, --parallel 1)
+# ---------------------------------------------------------------------------
+
+def _flag_after(cmd, flag):
+    if flag not in cmd:
+        return None
+    i = cmd.index(flag)
+    return cmd[i + 1] if i + 1 < len(cmd) else None
+
+
+def test_serve_mtp_on_emits_spec_and_parallel_one(ab, serve_stubs, monkeypatch, capsys):
+    """MTP on (no explicit LLAMA_N_PARALLEL) -> --spec-type draft-mtp + --parallel 1."""
+    monkeypatch.setenv("LLAMA_MTP", "1")
+    monkeypatch.setenv("LLAMA_CTX_SIZE", "131072")
+    with pytest.raises(SystemExit):
+        ab.cmd_serve()
+    cmd = serve_stubs.get("cmd") or []
+    assert _flag_after(cmd, "--spec-type") == "draft-mtp"
+    assert _flag_after(cmd, "--spec-draft-n-max") == "2"
+    assert _flag_after(cmd, "--parallel") == "1", "MTP must pin --parallel 1 by default"
+
+
+def test_serve_mtp_respects_explicit_parallel(ab, serve_stubs, monkeypatch, capsys):
+    """An explicit LLAMA_N_PARALLEL overrides the MTP default of 1."""
+    monkeypatch.setenv("LLAMA_MTP", "1")
+    monkeypatch.setenv("LLAMA_N_PARALLEL", "2")
+    monkeypatch.setenv("LLAMA_CTX_SIZE", "131072")
+    with pytest.raises(SystemExit):
+        ab.cmd_serve()
+    cmd = serve_stubs.get("cmd") or []
+    assert _flag_after(cmd, "--parallel") == "2"
+
+
+def test_serve_mtp_off_no_spec_no_parallel_pin(ab, serve_stubs, monkeypatch, capsys):
+    """No MTP -> no spec flags and no forced --parallel."""
+    monkeypatch.setenv("LLAMA_CTX_SIZE", "131072")
+    with pytest.raises(SystemExit):
+        ab.cmd_serve()
+    cmd = serve_stubs.get("cmd") or []
+    assert "--spec-type" not in cmd
+    assert "--parallel" not in cmd, "must not pin --parallel when MTP is off"
+
+
+def test_serve_mtp_custom_nmax(ab, serve_stubs, monkeypatch, capsys):
+    monkeypatch.setenv("LLAMA_MTP", "1")
+    monkeypatch.setenv("LLAMA_SPEC_DRAFT_N_MAX", "3")
+    monkeypatch.setenv("LLAMA_CTX_SIZE", "131072")
+    with pytest.raises(SystemExit):
+        ab.cmd_serve()
+    cmd = serve_stubs.get("cmd") or []
+    assert _flag_after(cmd, "--spec-draft-n-max") == "3"
+
+
+# ---------------------------------------------------------------------------
+# cmd_mtp state + probe tool wiring
+# ---------------------------------------------------------------------------
+
+def test_cmd_mtp_on_off_query(ab, hermetic, capsys):
+    ab.cmd_mtp("on")
+    capsys.readouterr()  # discard the "enabled" line
+    env = ab.load_env()
+    assert env.get("LLAMA_MTP") == "1"
+    assert env.get("LLAMA_SPEC_TYPE") == "draft-mtp"
+    ab.cmd_mtp()
+    out = capsys.readouterr().out
+    assert "MTP state: 1" in out and "spec-draft-n-max: 2" in out
+    ab.cmd_mtp("off")
+    assert ab.load_env().get("LLAMA_MTP") == "0"
+
+
+def test_cmd_mtp_nmax(ab, hermetic, capsys):
+    ab.cmd_mtp("3")
+    env = ab.load_env()
+    assert env.get("LLAMA_MTP") == "1"
+    assert env.get("LLAMA_SPEC_DRAFT_N_MAX") == "3"
+
+
+def _probe_path():
+    # dev/probe_mtp.py lives next to the REAL ai-backend (SRC), not the tmp copy.
+    return Path(SRC).resolve().parent / "dev" / "probe_mtp.py"
+
+
+def test_probe_tool_module_loads_and_reports(ab, tmp_path):
+    """dev/probe_mtp.py is importable and its probe() returns a well-shaped dict
+    against a tiny in-process mock server (no real llama-server)."""
+    import importlib.util as iu
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    p = _probe_path()
+    assert p.exists(), f"probe tool missing at {p}"
+    spec = iu.spec_from_file_location("probe_mtp_under_test", str(p))
+    pm = iu.module_from_spec(spec)
+    spec.loader.exec_module(pm)
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            # 3 content deltas, no reasoning -> 3 clocked tokens.
+            payload = (
+                b'data: ' + __import__("json").dumps({"choices": [{"index": 0, "delta": {"content": "a "}}]}).encode() + b"\n"
+                b'data: ' + __import__("json").dumps({"choices": [{"index": 0, "delta": {"content": "b "}}]}).encode() + b"\n"
+                b'data: ' + __import__("json").dumps({"choices": [{"index": 0, "delta": {"content": "c "}}]}).encode() + b"\n"
+                b'data: [DONE]\n'
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        res = pm.probe(f"http://127.0.0.1:{port}", prompts=["hello"], runs=1,
+                       max_tokens=10, thinking=False, verbose=False)
+        assert res["overall_median"] > 0
+        assert len(res["per_prompt"]) == 1
+        assert res["per_prompt"][0]["median"] > 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_cmd_probe_dispatch_wiring(ab, capsys):
+    """dev/probe_mtp.py resolves next to the real ai-backend (no server needed:
+    we only check the path-resolution + import path, not a live run)."""
+    import importlib.util as iu
+    p = _probe_path()
+    assert p.exists()
+    spec = iu.spec_from_file_location("probe_mtp_wiring", str(p))
+    pm = iu.module_from_spec(spec)
+    spec.loader.exec_module(pm)
+    assert callable(pm.probe)
+    assert callable(pm.run_once)
+    assert len(pm.PROMPTS) == 3
