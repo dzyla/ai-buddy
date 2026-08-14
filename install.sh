@@ -3,10 +3,15 @@
 #
 # Usage:
 #   ./install.sh              Build and install ai CLI to ~/.local/bin
-#   ./install.sh --update-llama Pull latest llama.cpp and rebuild llama-server
+#   ./install.sh --update-llama Pull latest llama.cpp and rebuild llama-server + llama-cli
 #   ./install.sh llama         Also set up a local llama.cpp inference server
 #   ./install.sh snap          Also detect and configure an installed AI snap
 #   ./install.sh uninstall     Uninstall the CLI, systemd services, and wrapper scripts
+#
+# The llama build compiles llama-server (serving) and llama-cli (interactive) by
+# default and installs both. To also build other llama.cpp tools, export
+# LLAMA_EXTRA_TARGETS (space-separated cmake targets), e.g.:
+#   LLAMA_EXTRA_TARGETS="llama-perplexity llama-bench llama-quantize llama-gguf-split" ./install.sh llama
 #
 # Everything installs to ~/.local/bin — no sudo required.
 # To uninstall: ./install.sh uninstall
@@ -144,12 +149,17 @@ if [ "${1:-}" = "--update-llama" ]; then
         echo "==> No GPU backend found — building CPU-only."
     fi
 
-    echo "==> Rebuilding llama-server..."
+    echo "==> Rebuilding llama.cpp tools..."
+    # Tools to build: llama-server (serving) + llama-cli (interactive) by default.
+    # Extra tools via LLAMA_EXTRA_TARGETS (space-separated), e.g.
+    # "llama-perplexity llama-bench llama-quantize llama-gguf-split llama-llava-cli".
+    LLAMA_TOOLS="llama-server llama-cli"
+    [ -n "${LLAMA_EXTRA_TARGETS:-}" ] && LLAMA_TOOLS="${LLAMA_TOOLS} ${LLAMA_EXTRA_TARGETS}"
     rm -rf "${LLAMA_SRC}/build"
     cmake -B "${LLAMA_SRC}/build" -S "${LLAMA_SRC}" \
         -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $GPU_FLAGS
     cmake --build "${LLAMA_SRC}/build" --config Release \
-        --target llama-server -j"$(nproc)"
+        --target ${LLAMA_TOOLS} -j"$(nproc)"
 
     # Stop existing llama-server if running to avoid "Text file busy" on copy
     if pgrep -x llama-server &>/dev/null; then
@@ -158,9 +168,15 @@ if [ "${1:-}" = "--update-llama" ]; then
         sleep 1
     fi
 
-    cp "${LLAMA_SRC}/build/bin/llama-server" "${BIN_DIR}/"
-    chmod +x "${BIN_DIR}/llama-server"
-    echo "==> llama-server updated and installed to ${BIN_DIR}/llama-server"
+    for tool in ${LLAMA_TOOLS}; do
+        if [ -f "${LLAMA_SRC}/build/bin/${tool}" ]; then
+            cp "${LLAMA_SRC}/build/bin/${tool}" "${BIN_DIR}/"
+            chmod +x "${BIN_DIR}/${tool}"
+            echo "==> ${tool} updated and installed to ${BIN_DIR}/${tool}"
+        else
+            echo "==> WARNING: ${tool} not built (missing ${LLAMA_SRC}/build/bin/${tool})"
+        fi
+    done
     exit 0
 fi
 
@@ -326,15 +342,24 @@ if [ "${1:-}" = "llama" ]; then
 
     # Build with best available GPU backend
     if [ ! -f "${BIN_DIR}/llama-server" ]; then
-        echo "==> Building llama-server (this takes a few minutes)..."
+        echo "==> Building llama.cpp tools (this takes a few minutes)..."
+        # llama-server (serving) + llama-cli (interactive) by default. Add extra
+        # llama.cpp tools via LLAMA_EXTRA_TARGETS (space-separated), e.g.
+        # "llama-perplexity llama-bench llama-quantize llama-gguf-split".
+        LLAMA_TOOLS="llama-server llama-cli"
+        [ -n "${LLAMA_EXTRA_TARGETS:-}" ] && LLAMA_TOOLS="${LLAMA_TOOLS} ${LLAMA_EXTRA_TARGETS}"
         rm -rf "${LLAMA_SRC}/build"
         cmake -B "${LLAMA_SRC}/build" -S "$LLAMA_SRC" \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $GPU_FLAGS
         cmake --build "${LLAMA_SRC}/build" --config Release \
-            --target llama-server -j"$(nproc)"
-        cp "${LLAMA_SRC}/build/bin/llama-server" "${BIN_DIR}/"
-        chmod +x "${BIN_DIR}/llama-server"
-        echo "==> llama-server installed to ${BIN_DIR}/llama-server"
+            --target ${LLAMA_TOOLS} -j"$(nproc)"
+        for tool in ${LLAMA_TOOLS}; do
+            if [ -f "${LLAMA_SRC}/build/bin/${tool}" ]; then
+                cp "${LLAMA_SRC}/build/bin/${tool}" "${BIN_DIR}/"
+                chmod +x "${BIN_DIR}/${tool}"
+                echo "==> ${tool} installed to ${BIN_DIR}/${tool}"
+            fi
+        done
     else
         echo "==> llama-server already built — skipping. Remove ${BIN_DIR}/llama-server to force rebuild."
     fi
