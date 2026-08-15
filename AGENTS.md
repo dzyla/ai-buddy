@@ -99,6 +99,28 @@ Every conversation is backed up to both `~/.cache/ai/sessions/` (fast) and the p
 `list_sessions`, and `get_session`, which let the agent recall and learn from past
 conversations (documented in the `search_history` skill).
 
+Index design (see `ai_mcp.py`, the "Searchable conversation history" section):
+- **Incremental by default**: `search_history` only appends new log lines / changed
+  session files (offset + size/mtime fingerprints in `hmeta`). A full wipe-and-rebuild
+  happens only when the DB is missing, the schema changed, or the log shrank. A no-op
+  fast path skips all work when the sources are provably unchanged, so warm searches
+  are ~1 ms.
+- **Dedup by session id**: a session present in both the cache and the persistent dir
+  is indexed once. The index also stores each session's raw messages JSON
+  (`history_sessions`), making it a durable archive: `get_session` and `list_sessions`
+  still serve a session whose on-disk files were pruned (marked `[archive]`).
+- **Atomic writes**: `save_session` (ai_session.c) writes to `<file>.tmp.<pid>` + fsync
+  + rename, so a crash/SIGINT can't leave a torn session JSON.
+- **Resume fallback**: `ai -r <id>` falls back to the persistent mirror when the cache
+  file is gone.
+- **Bounded cache (archive-first retention)**: at run exit the binary calls
+  `ai_mcp.py prune-sessions`, which deletes only the OLDEST cache session files once
+  they are preserved in the persistent mirror or fully archived in the index. Keep the
+  newest `INFER_SESSION_RETENTION` files (default 400; `0` disables). Never touches
+  `last.json` or un-archived sessions. Opt-in archive aging: `INFER_ARCHIVE_RETENTION=<days>`.
+- WAL journal mode is enabled on the index DB. Tests: `tests/test_history_index.py`
+  (unit + binary integration, all offline).
+
 ### Configure
 
 Set your model endpoint in `~/.local/share/ai/env`:

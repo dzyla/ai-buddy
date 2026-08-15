@@ -168,7 +168,38 @@ def test_list_sessions_shows_archive_only(hist):
     assert "[archive]" in out
 
 
-# ── C: cache retention prunes old session files, keeps the newest ────────────
+# ── retention (python-side, archive-first) prunes old, mirrored sessions ─────
+def test_retention_prunes_older_sessions(hist, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("INFER_SESSION_RETENTION", "2")
+    base = time.time() - 5000
+    for i in range(1, 9):
+        _write_session(hist.cache, f"sess_r{i:02d}", prompt=f"rq{i}", answer=f"ra{i}")
+        _write_session(hist.data, f"sess_r{i:02d}", prompt=f"rq{i}", answer=f"ra{i}")
+        p = str(hist.cache / f"sess_r{i:02d}.json")
+        os.utime(p, (base + i, base + i))
+        q = str(hist.data / f"sess_r{i:02d}.json")
+        os.utime(q, (base + i, base + i))
+    ai_mcp.rebuild_history_index()
+    # Un-mirrored session created AFTER the rebuild: not in the persistent
+    # mirror and not archived yet, so retention must KEEP it.
+    _write_session(hist.cache, "sess_unmirrored", prompt="uq", answer="ua")
+    up = str(hist.cache / "sess_unmirrored.json")
+    os.utime(up, (base - 100, base - 100))  # oldest
+    conn = sqlite3.connect(str(hist.db))
+    removed = ai_mcp._prune_cache_sessions(conn)
+    conn.close()
+    remaining = {f for f in os.listdir(str(hist.cache)) if f.endswith(".json")}
+    assert removed >= 5
+    # Newest kept
+    assert "sess_r08.json" in remaining
+    # Oldest mirrored pruned
+    assert "sess_r01.json" not in remaining
+    # Un-mirrored AND un-archived must be kept
+    assert "sess_unmirrored.json" in remaining
+
+
+# ── binary helpers (shared with the resume-fallback test) ────────────────────
 def _free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
     return port
@@ -217,32 +248,6 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     return subprocess.run([AI_BIN] + args, cwd=REPO, env=env,
                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
                           timeout=timeout)
-
-
-def test_cache_retention_prunes_oldest(tmp_path):
-    home = tmp_path / "home"; home.mkdir()
-    sess_dir = home / ".cache" / "ai" / "sessions"; sess_dir.mkdir(parents=True)
-    # Five pre-existing sessions with staggered mtimes (sess_0001 oldest).
-    base = time.time() - 5000
-    for i in range(1, 6):
-        p = sess_dir / f"sess_000{i}.json"
-        p.write_text(json.dumps([{"role": "user", "content": f"q{i}"},
-                                 {"role": "assistant", "content": f"a{i}"}]))
-        os.utime(p, (base + i * 100, base + i * 100))
-    cap = str(tmp_path / "cap.jsonl")
-    with MockServer(cap, MOCK_TASK_COMPLETE="ok") as srv:
-        run_binary(str(home), srv.base_url, ["do something"],
-                   extra_env={"INFER_SESSION_RETENTION": "2"})
-    remaining = {f.name for f in sess_dir.glob("*.json")}
-    # The 3 oldest of our five must have been pruned (keep=2 total, plus the
-    # binary's own fresh session takes the newest slot).
-    assert "sess_0001.json" not in remaining
-    assert "sess_0002.json" not in remaining
-    assert "sess_0003.json" not in remaining
-    # The newest of ours survives.
-    assert "sess_0005.json" in remaining
-    # last.json is never pruned and the run wrote its own session.
-    assert "last.json" in remaining
 
 
 # ── C: --resume falls back to the persistent mirror when the cache is cleared

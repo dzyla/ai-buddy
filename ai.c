@@ -6826,6 +6826,15 @@ step_limit_check:
     free(prompt);
     /* Persist this conversation so a later `ai -r` / `ai --resume` can continue it. */
     save_session(messages_json);
+    /* Bounded cache retention (archive-first: only deletes cache session files
+       already preserved in the persistent mirror / index archive). */
+    {
+        char prune_cmd[2048];
+        snprintf(prune_cmd, sizeof(prune_cmd),
+                 "python3 %s prune-sessions >/dev/null 2>&1", mcp_script);
+        char *prune_out = run_shell_command(prune_cmd, NULL);
+        if (prune_out) free(prune_out);
+    }
     free(messages_json);
     if (tools_json) free(tools_json);
     if (current_prompt) free(current_prompt);
