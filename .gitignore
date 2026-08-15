@@ -117,3 +117,7 @@ pdbtool/pdbtool
 # dev/ generated data & large test fixtures
 dev/*.png
 dev/uniref90__subsampled_1000.fasta
+
+# One-off local debug scripts (X11 cookie/screenshot probes)
+ckfix.py
+xshot.py
