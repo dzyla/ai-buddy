@@ -3667,35 +3667,80 @@ static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk) {
     return res;
 }
 
-static int detect_context_window(CURL *c, const char *cur_api_url) {
-    char models_url[1024];
-    const char *chat_ptr = strstr(cur_api_url, "chat/completions");
-    if (chat_ptr) {
-        size_t prefix_len = chat_ptr - cur_api_url;
-        snprintf(models_url, sizeof(models_url), "%.*smodels", (int)prefix_len, cur_api_url);
-    } else {
-        return 0;
-    }
-    
-    struct response m_chunk = {0};
-    curl_easy_setopt(c, CURLOPT_URL, models_url);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&m_chunk);
-    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
-    
-    CURLcode m_res = perform_curl_with_retry(c, &m_chunk);
-    int detected_win = 0;
-    if (m_res == CURLE_OK && m_chunk.data) {
-        char *n_ctx_ptr = strstr(m_chunk.data, "\"n_ctx\"");
-        if (n_ctx_ptr) {
-            char *ptr = n_ctx_ptr + 7;
-            while (*ptr && !isdigit((unsigned char)*ptr)) ptr++;
-            if (*ptr) {
-                detected_win = atoi(ptr);
+static int extract_json_int_field(const char *json, const char *key) {
+    if (!json || !key) return 0;
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    while (p) {
+        p += strlen(pattern);
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        if (*p == ':') {
+            p++;
+            while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+            if (isdigit((unsigned char)*p)) {
+                return atoi(p);
             }
+        }
+        p = strstr(p, pattern);
+    }
+    return 0;
+}
+
+static int detect_context_window(CURL *c, const char *cur_api_url) {
+    int detected_win = 0;
+    
+    // 1. Try /props on the llama.cpp server root (e.g. http://127.0.0.1:8080/props).
+    // llama-server returns the active runtime context (n_ctx), which includes YaRN / --ctx-size.
+    char props_url[1024] = {0};
+    const char *scheme_end = strstr(cur_api_url, "://");
+    if (scheme_end) {
+        const char *host_start = scheme_end + 3;
+        const char *path_start = strchr(host_start, '/');
+        if (path_start) {
+            size_t host_len = path_start - cur_api_url;
+            snprintf(props_url, sizeof(props_url), "%.*s/props", (int)host_len, cur_api_url);
         }
     }
     
-    if (m_chunk.data) free(m_chunk.data);
+    if (props_url[0]) {
+        struct response p_chunk = {0};
+        curl_easy_setopt(c, CURLOPT_URL, props_url);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&p_chunk);
+        curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+        CURLcode p_res = perform_curl_with_retry(c, &p_chunk);
+        if (p_res == CURLE_OK && p_chunk.data) {
+            detected_win = extract_json_int_field(p_chunk.data, "n_ctx");
+        }
+        if (p_chunk.data) free(p_chunk.data);
+    }
+    
+    // 2. If /props did not return context window, try /v1/models (OpenAI / vLLM / Ollama / GGUF fallback)
+    if (detected_win <= 0) {
+        char models_url[1024];
+        const char *chat_ptr = strstr(cur_api_url, "chat/completions");
+        if (chat_ptr) {
+            size_t prefix_len = chat_ptr - cur_api_url;
+            snprintf(models_url, sizeof(models_url), "%.*smodels", (int)prefix_len, cur_api_url);
+        } else {
+            models_url[0] = '\0';
+        }
+        
+        if (models_url[0]) {
+            struct response m_chunk = {0};
+            curl_easy_setopt(c, CURLOPT_URL, models_url);
+            curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&m_chunk);
+            curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+            CURLcode m_res = perform_curl_with_retry(c, &m_chunk);
+            if (m_res == CURLE_OK && m_chunk.data) {
+                detected_win = extract_json_int_field(m_chunk.data, "max_model_len");
+                if (detected_win <= 0) detected_win = extract_json_int_field(m_chunk.data, "context_length");
+                if (detected_win <= 0) detected_win = extract_json_int_field(m_chunk.data, "context_window");
+                if (detected_win <= 0) detected_win = extract_json_int_field(m_chunk.data, "n_ctx");
+            }
+            if (m_chunk.data) free(m_chunk.data);
+        }
+    }
     
     // Restore Curl state
     curl_easy_setopt(c, CURLOPT_URL, cur_api_url);
@@ -4225,6 +4270,7 @@ int main(int argc, char **argv) {
         }
     }
     char *env_ctxwin = getenv("INFER_CONTEXT_WINDOW");
+    if (!env_ctxwin || !*env_ctxwin) env_ctxwin = getenv("LLAMA_CTX_SIZE");
     if (env_ctxwin && *env_ctxwin) context_window = atoi(env_ctxwin);
     char *env_timeout = getenv("INFER_TASK_TIMEOUT");
     if (env_timeout && *env_timeout) task_timeout_sec = atoi(env_timeout);
