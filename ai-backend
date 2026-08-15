@@ -54,7 +54,7 @@ def write_env(url, model, llama_model_path=None, extra_vars=None, authoritative=
             current.update(extra_vars)
 
     cuda_dev = current.get("CUDA_VISIBLE_DEVICES", "auto")
-    ctx_size = current.get("LLAMA_CTX_SIZE", "131072")
+    ctx_size = current.get("LLAMA_CTX_SIZE")
     gpu_layers = current.get("LLAMA_N_GPU_LAYERS", "99")
     
     # Server-level sampling penalties (llama.cpp style).
@@ -81,7 +81,8 @@ def write_env(url, model, llama_model_path=None, extra_vars=None, authoritative=
     draft_path = current.get("LLAMA_DRAFT_MODEL_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH")
     if draft_path:
         lines.append(f'export LLAMA_DRAFT_MODEL_PATH="{draft_path}"')
-    lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
+    if ctx_size:
+        lines.append(f'export LLAMA_CTX_SIZE="{ctx_size}"')
     if gpu_layers:
         lines.append(f'export LLAMA_N_GPU_LAYERS="{gpu_layers}"')
     tensor_split = current.get("LLAMA_TENSOR_SPLIT")
@@ -355,7 +356,18 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
         model_mb = 4096
 
     factor = float(os.environ.get("LLAMA_CTX_SIZE_FACTOR", "1.0"))
-    ctx_max = int(os.environ.get("LLAMA_CTX_SIZE_MAX", "262144"))
+    env_vars = load_env()
+    rope_scaling = (os.environ.get("LLAMA_ROPE_SCALING") or env_vars.get("LLAMA_ROPE_SCALING", "")).strip().lower()
+    rope_scale = os.environ.get("LLAMA_ROPE_SCALE") or env_vars.get("LLAMA_ROPE_SCALE", "")
+    yarn_orig = os.environ.get("LLAMA_YARN_ORIG_CTX") or env_vars.get("LLAMA_YARN_ORIG_CTX", "262144")
+    if rope_scaling == "yarn" and rope_scale:
+        try:
+            default_max = int(int(yarn_orig) * float(rope_scale))
+        except (ValueError, TypeError):
+            default_max = 262144 * 4
+    else:
+        default_max = 262144
+    ctx_max = int(os.environ.get("LLAMA_CTX_SIZE_MAX", env_vars.get("LLAMA_CTX_SIZE_MAX", str(default_max))))
 
     # KV spill into CPU RAM only happens when some layers live on the CPU
     # (partial offload) — with every layer on the GPU the whole KV cache is GPU-resident.
@@ -1203,15 +1215,17 @@ def cmd_status():
             print(f"  {snap:<10} {status:<10} {ep}")
             
     llama_running = False
-    try:
-        with urllib.request.urlopen(f"http://localhost:{PORT}/health", timeout=2) as resp:
-            if resp.status == 200:
-                llama_running = True
-    except Exception:
-        pass
+    for host in ("127.0.0.1", "localhost"):
+        try:
+            with urllib.request.urlopen(f"http://{host}:{PORT}/health", timeout=1.5) as resp:
+                if resp.status == 200:
+                    llama_running = True
+                    break
+        except Exception:
+            pass
         
     llama_status = "[RUNNING]" if llama_running else "[stopped]"
-    print(f"  llama      {llama_status:<10} http://localhost:{PORT}/v1/")
+    print(f"  llama      {llama_status:<10} http://127.0.0.1:{PORT}/v1/")
     
     print("\n=== Downloaded Models ===")
     models = list_local_models()
@@ -1563,16 +1577,31 @@ def cmd_ctx(size=None):
     if not size:
         print("Usage: ai-backend ctx <size|auto>")
         return
-    if size == "auto":
-        patch_env_key("LLAMA_CTX_SIZE", None)
+    s = size.strip().lower()
+    if s == "auto":
+        persist_env_changes({"LLAMA_CTX_SIZE": None, "INFER_CONTEXT_WINDOW": None})
         print("Context size reset to auto (calculated from available VRAM/RAM).")
     else:
-        if not size.isdigit():
-            print(f"Invalid size '{size}'. Use a number or 'auto'.", file=sys.stderr)
+        parsed = None
+        if s.endswith("k"):
+            try:
+                parsed = str(int(float(s[:-1]) * 1024))
+            except ValueError:
+                pass
+        elif s.endswith("m"):
+            try:
+                parsed = str(int(float(s[:-1]) * 1024 * 1024))
+            except ValueError:
+                pass
+        elif s.isdigit():
+            parsed = s
+
+        if not parsed:
+            print(f"Invalid size '{size}'. Use a number (e.g. 524288, 512k, 256k) or 'auto'.", file=sys.stderr)
             sys.exit(1)
-        patch_env_key("LLAMA_CTX_SIZE", size)
-        sync_ctx_to_systemd(size)
-        print(f"Context size locked to {size} tokens.")
+        persist_env_changes({"LLAMA_CTX_SIZE": parsed, "INFER_CONTEXT_WINDOW": parsed})
+        sync_ctx_to_systemd(parsed)
+        print(f"Context size locked to {parsed} tokens.")
 
 def cmd_gpu_layers(n=None):
     if not n:
@@ -1752,7 +1781,7 @@ def main():
         cmd_status()
     elif cmd in ("list", "ls", "models"):
         cmd_list()
-    elif cmd in ("serve", "run", "wrapper"):
+    elif cmd in ("serve", "server", "run", "wrapper"):
         cmd_serve()
     elif cmd in ("download", "get", "gguf"):
         target = args[1] if len(args) > 1 else None

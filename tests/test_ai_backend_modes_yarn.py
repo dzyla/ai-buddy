@@ -375,3 +375,33 @@ def test_cmd_probe_dispatch_wiring(ab, capsys):
     assert callable(pm.probe)
     assert callable(pm.run_once)
     assert len(pm.PROMPTS) == 3
+
+
+def test_cmd_ctx_shorthand_units(ab, hermetic, capsys):
+    """Test 512k, 1m, 256k parsing in cmd_ctx."""
+    ab.cmd_ctx("512k")
+    env = ab.load_env()
+    assert env.get("LLAMA_CTX_SIZE") == "524288"
+    assert env.get("INFER_CONTEXT_WINDOW") == "524288"
+
+    ab.cmd_ctx("1m")
+    env = ab.load_env()
+    assert env.get("LLAMA_CTX_SIZE") == "1048576"
+    assert env.get("INFER_CONTEXT_WINDOW") == "1048576"
+
+    ab.cmd_ctx("auto")
+    env = ab.load_env()
+    assert "LLAMA_CTX_SIZE" not in env
+    assert "INFER_CONTEXT_WINDOW" not in env
+
+
+def test_calculate_auto_ctx_yarn_scaling(ab, hermetic, monkeypatch):
+    """When YaRN scale is 2, auto ctx max should scale to 524288."""
+    monkeypatch.setenv("LLAMA_ROPE_SCALING", "yarn")
+    monkeypatch.setenv("LLAMA_ROPE_SCALE", "2")
+    monkeypatch.setenv("LLAMA_YARN_ORIG_CTX", "262144")
+    monkeypatch.setattr(ab, "estimate_vram_mb", lambda *a, **kw: {"total_mb": 1000, "kv_per_tok_mib": 0.001})
+    monkeypatch.setattr(ab, "read_gguf_arch", lambda *a, **kw: {"layers": 32})
+    ctx = ab.calculate_auto_ctx("fake.gguf", vram_free=1000000)
+    assert ctx > 262144
+
