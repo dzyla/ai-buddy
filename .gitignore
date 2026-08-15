@@ -20,7 +20,8 @@ dist/
 *.deb
 
 # Local machine specific temporary files
-~lock.CLAUDE.md#1a2c.pdb
+~lock.*
+1a2c.pdb
 test_rcsb_api.py
 test_rcsb_api_v2.py
 test.mmcif
@@ -109,3 +110,10 @@ Krogan_Zyla_Collaboration_Proposals.md
 # Temp / build artifacts
 *.new
 libremote_harness.so
+
+# pdbtool Go binary (built artifact; source is tracked)
+pdbtool/pdbtool
+
+# dev/ generated data & large test fixtures
+dev/*.png
+dev/uniref90__subsampled_1000.fasta

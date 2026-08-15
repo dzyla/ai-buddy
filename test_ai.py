@@ -25,7 +25,7 @@ def build_ai_binary():
     skills_dst = os.path.expanduser("~/.config/ai/skills")
     os.makedirs(skills_dst, exist_ok=True)
     if os.path.exists(skills_src):
-        subprocess.run(f"cp -r {skills_src}/. {skills_dst}/", shell=True)
+        subprocess.run(["cp", "-r", skills_src + "/.", skills_dst])
     yield
 
 def get_active_backend_env():
