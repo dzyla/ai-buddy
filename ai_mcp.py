@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.error
 import re
 import time
+import io
 import xml.etree.ElementTree as ET
 import sqlite3
 
@@ -1010,7 +1011,7 @@ def vault_write(title, content, links=""):
             # Parse links (comma separated) and format as [[Link]]
             link_list = [l.strip() for l in links.split(",") if l.strip()]
             if link_list:
-                full_content += "\\n\\n---\\n**Links:** " + ", ".join([f"[[{l}]]" for l in link_list])
+                full_content += "\n\n---\n**Links:** " + ", ".join([f"[[{l}]]" for l in link_list])
                 
         with open(path, "w") as f:
             f.write(full_content)
@@ -1056,9 +1057,9 @@ def vault_search(query):
             
         results = []
         for t, c in rows:
-            preview = c[:200].replace("\\n", " ") + ("..." if len(c) > 200 else "")
+            preview = c[:200].replace("\n", " ") + ("..." if len(c) > 200 else "")
             results.append(f"- **{t}**: {preview}")
-        return "\\n".join(results)
+        return "\n".join(results)
     except Exception as e:
         return f"Error searching vault: {e}"
 
@@ -1081,7 +1082,7 @@ def vault_backlinks(title):
             return f"No backlinks found for '{title}'."
             
         results = [f"- [[{t[0]}]]" for t in rows]
-        return f"Notes linking to '{title}':\\n" + "\\n".join(results)
+        return f"Notes linking to '{title}':\n" + "\n".join(results)
     except Exception as e:
         return f"Error finding backlinks: {e}"
 
@@ -2073,6 +2074,582 @@ def computer_control(arguments):
     else:
         return f"Error: Unknown action '{action}'."
 
+# ── Core investigation tools (ported from the Hermes toolset) ─────────────────
+# search_files: content search (regex) + find-by-name (glob) with a pure-Python
+# walker, so a model can locate a symbol without burning context on grep/rg/find
+# via execute_command. todo: a session-scoped task list the model keeps fresh so
+# a small model can see where it is in a multi-step task without holding it in
+# memory (file-system-as-persistent-memory pattern — the list survives
+# interruptions and is recapitulated by `todo` with no arguments). clarify:
+# proactive user questions with numbered options (harness workflow pattern: the
+# agent asks for clarity instead of guessing on ambiguous tasks).
+
+import fnmatch as _fnmatch
+
+def search_files(pattern, path=".", target="content", file_glob=None,
+                 limit=50, context=0, output_mode="content"):
+    """Search file contents (regex) or find files by name (glob).
+
+    Returns matches with file:line prefixes, a file list, or match counts —
+    depending on output_mode — capped at `limit` lines. Never searches /.
+    """
+    if not pattern:
+        return "Error: pattern is required."
+    base = os.path.abspath(os.path.expanduser(path or "."))
+    if not os.path.exists(base):
+        return f"Error: path '{path}' does not exist. Use list_directory to check it."
+    limit = max(1, min(int(limit or 50), 500))
+    context = max(0, min(int(context or 0), 10))
+    output_mode = output_mode or "content"
+
+    # Respect a .gitignore-ish denylist so we don't walk build artifacts.
+    skip_dirs = {".git", "__pycache__", ".pytest_cache", "node_modules",
+                 ".cache", "build", "dist", ".venv", "venv", "target"}
+
+    if target == "files":
+        # Find files by name/glob pattern, most recently modified first.
+        hits = []
+        try:
+            if os.path.isfile(base):
+                hits = [base]
+            else:
+                for root, dirs, files in os.walk(base):
+                    dirs[:] = [d for d in dirs if d not in skip_dirs]
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        try:
+                            if "*" in pattern or "?" in pattern:
+                                if _fnmatch.fnmatch(fn, pattern):
+                                    hits.append(full)
+                            elif fn == pattern or fn.endswith(pattern):
+                                hits.append(full)
+                        except Exception:
+                            continue
+        except Exception as e:
+            return f"Error searching files: {e}"
+        def _mtime(p):
+            try:
+                return os.path.getmtime(p)
+            except Exception:
+                return 0
+        hits.sort(key=_mtime, reverse=True)
+        shown = hits[:limit]
+        if not shown:
+            return f"No files matching '{pattern}' under {path}."
+        rel = lambda p: p[len(base) + 1:] if p.startswith(base) else p
+        listing = "\n".join(f"{'[DIR] ' if os.path.isdir(p) else '      '}{rel(p)}"
+                            for p in shown)
+        more = f"\n... ({len(hits) - len(shown)} more, raised the limit to see them)" \
+            if len(hits) > len(shown) else ""
+        return f"Found {len(hits)} file(s):\n{listing}{more}"
+
+    # content search (pure Python walker; skips binary/build dirs)
+    lines_out = []
+    matched_files = []
+    total = 0
+    if os.path.isfile(base):
+        candidates = [base]
+    else:
+        candidates = []
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for fn in files:
+                if file_glob and not _fnmatch.fnmatch(fn, file_glob):
+                    continue
+                candidates.append(os.path.join(root, fn))
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        # Not a valid regex — fall back to fixed-string search.
+        rx = re.compile(re.escape(pattern))
+    for full in candidates:
+        if total >= limit:
+            break
+        try:
+            if os.path.getsize(full) > 5 * 1024 * 1024:
+                continue
+            with open(full, "r", encoding="utf-8", errors="ignore") as f:
+                flines = f.readlines()
+        except (OSError, UnicodeError):
+            continue  # binary/unreadable — skip
+        fmatches = []
+        for i, line in enumerate(flines, 1):
+            if rx.search(line):
+                fmatches.append(i)
+                if len(fmatches) > limit:
+                    break
+        if fmatches:
+            matched_files.append(full)
+            for i in fmatches:
+                if total >= limit:
+                    break
+                if output_mode == "files_only":
+                    lines_out.append(full)
+                    total += 1
+                    break
+                if output_mode == "count":
+                    lines_out.append(f"{full}: {len(fmatches)}")
+                    total += 1
+                    break
+                lo = max(1, i - context)
+                hi = min(len(flines), i + context)
+                for j in range(lo, hi + 1):
+                    marker = ":" if j == i else "-"
+                    lines_out.append(f"{full}{marker}{j}: {flines[j - 1].rstrip()}")
+                total += 1
+            if context > 0 and total < limit:
+                lines_out.append("")
+    if not lines_out:
+        return f"No matches for '{pattern}' under {path}." + (
+            f" (glob: {file_glob})" if file_glob else "")
+    header = f"{len(matched_files)} file(s) matched '{pattern}':"
+    out = header + "\n" + "\n".join(lines_out[:limit])
+    if total > len([l for l in lines_out if l.strip()]):
+        out += "\n... (truncated at limit)"
+    return out
+
+def _todo_path():
+    # Session-scoped when the C loop tells us which session we're in, so
+    # parallel/resumed sessions keep separate lists; falls back to a global
+    # file for direct ai_mcp.py invocations (tests, bridges).
+    sid = os.environ.get("INFER_SESSION_ID", "").strip()
+    if sid:
+        safe = "".join(c for c in sid if c.isalnum() or c in "_-")
+        return os.path.expanduser("~/.config/ai/todo_%s.json" % safe)
+    return os.path.expanduser("~/.config/ai/todo.json")
+
+def _todo_load():
+    p = _todo_path()
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def _todo_save(items):
+    try:
+        p = _todo_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+    except Exception as e:
+        return f" (warning: could not persist todo: {e})"
+    return ""
+
+def _todo_render(items):
+    if not items:
+        return "TODO list is empty. Call todo with a 'todos' array to create it for multi-step tasks."
+    lines = ["Current task list (use todo to update statuses as you go):"]
+    status_mark = {"pending": "[ ]", "in_progress": "[~]",
+                   "completed": "[x]", "cancelled": "[-]"}
+    for it in items:
+        st = it.get("status", "pending")
+        lines.append(f"{status_mark.get(st, '[?]')} {it.get('id', '?')}: "
+                     f"{it.get('content', '')} ({st})")
+    done = sum(1 for i in items if i.get("status") == "completed")
+    lines.append(f"{done}/{len(items)} done.")
+    return "\n".join(lines)
+
+def todo(todos=None, merge=False):
+    """Session-scoped task list. Call with NO arguments to read the current
+    list. Pass a 'todos' array of {id, content, status} items to create
+    (merge=false, the default) or update (merge=true) it. Statuses:
+    pending | in_progress | completed | cancelled. Use for tasks with 3+
+    steps so a small model can always see where it is; mark items completed
+    immediately when done — don't batch."""
+    if todos is None:
+        return _todo_render(_todo_load())
+    if not isinstance(todos, list):
+        return "Error: 'todos' must be an array of {id, content, status} objects."
+    for t in todos:
+        if not isinstance(t, dict) or not t.get("id"):
+            return "Error: each todo item needs an 'id'."
+        # content is required when creating a new item; in merge mode you may
+        # update only the status of an existing item (its content is kept).
+        if not merge and not t.get("content"):
+            return "Error: each new todo item needs 'content' (or use merge=True to update an existing item by id)."
+    items = _todo_load()
+    if not merge:
+        items = []
+    by_id = {str(i.get("id")): i for i in items}
+    for t in todos:
+        tid = str(t["id"])
+        if tid in by_id:
+            for k in ("content", "status"):
+                if t.get(k):
+                    by_id[tid][k] = t[k]
+        else:
+            items.append({"id": tid, "content": t["content"],
+                          "status": t.get("status", "pending")})
+            by_id[tid] = items[-1]
+    warn = _todo_save(items)
+    return _todo_render(items) + warn
+
+def clarify(question, choices=None, multi_select=False, timeout_seconds=0):
+    """Ask the user a question and wait for their answer before continuing.
+    Use when a task is ambiguous and proceeding the wrong way wastes work:
+    present 2-4 numbered options (the user picks one, or types their own).
+    Without options it is an open-ended question. In non-interactive runs
+    (bridges, schedulers, cron) this returns a NOTE telling you to make a
+    sensible default choice and proceed — never block waiting for a human."""
+    q = (question or "").strip()
+    if not q:
+        return "Error: 'question' is required."
+    opts = []
+    if isinstance(choices, str):
+        opts = [c.strip() for c in choices.split(",") if c.strip()]
+    elif isinstance(choices, list):
+        opts = [str(c).strip() for c in choices if str(c).strip()]
+    opts = opts[:8]
+    # Interactive path: ask on the controlling terminal (like the approval
+    # prompts in ai.c). Only interactive when the C loop says a human is on
+    # stdin (INFER_INTERACTIVE=1) — or, as a fallback, stdin is itself a tty.
+    # In pipes/bridges/schedulers there is no one to answer → default-and-go.
+    interactive = (os.environ.get("INFER_INTERACTIVE") == "1"
+                   or sys.stdin.isatty()) \
+        and os.environ.get("INFER_NON_INTERACTIVE") not in ("1", "true")
+    if not interactive:
+        note = ("[CLARIFY NON-INTERACTIVE] No human is present to answer "
+                f"({q[:160]})")
+        if opts:
+            note += (f". Options were: " + " | ".join(opts[:4]) +
+                     ". Choose the first (recommended) option yourself and proceed; "
+                     "state your assumption in the final summary.")
+        else:
+            note += ". Make a sensible default choice, proceed, and state the assumption in the final summary."
+        return note
+    lines = [f"\n  CLARIFY: {q}"]
+    if opts:
+        for i, o in enumerate(opts, 1):
+            lines.append(f"    {i}. {o}")
+        lines.append("  number (1-%d), free text, or Enter for option 1: " % len(opts))
+    else:
+        lines.append("  answer: ")
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        return "[CLARIFY NON-INTERACTIVE] Could not open a terminal; proceed with a sensible default and state the assumption."
+    import select
+    try:
+        for ln in lines:
+            tty.write(ln)
+        tty.flush()
+        if timeout_seconds > 0:
+            r, _, _ = select.select([tty], [], [], timeout_seconds)
+            if not r:
+                return "[CLARIFY TIMEOUT] No answer in time; proceed with a sensible default and state the assumption."
+        ans = tty.readline().strip()
+    finally:
+        tty.close()
+    if not ans:
+        return f"[CLARIFY] Answer: (default) {opts[0] if opts else 'proceed'}"
+    if opts and ans.isdigit() and 1 <= int(ans) <= len(opts):
+        return f"[CLARIFY] Answer: {opts[int(ans) - 1]}"
+    return f"[CLARIFY] Answer: {ans}"
+
+# ── Browser automation (headless Chromium via a persistent Playwright daemon) ─
+# Each browser_* call talks to a small long-lived daemon over a unix socket, so
+# page state (URL, login, JS context) survives across tool calls. The daemon
+# auto-starts, idles out after BROWSER_IDLE_TIMEOUT seconds, and every page
+# action is logged to the session transcript path for auditability.
+
+BROWSER_SOCKET = os.path.expanduser("~/.cache/ai/browser.sock")
+BROWSER_LOG = os.path.expanduser("~/.cache/ai/browser_actions.log")
+BROWSER_IDLE_TIMEOUT = 600
+
+def _browser_log(line):
+    try:
+        os.makedirs(os.path.dirname(BROWSER_LOG), exist_ok=True)
+        with open(BROWSER_LOG, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+    except Exception:
+        pass
+
+def _browser_daemon_main():
+    """Runs inside the daemon process: serve JSON commands over the socket."""
+    import socket as _socket
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        _browser_log("DAEMON FATAL: playwright import failed: %s" % e)
+        return
+    os.makedirs(os.path.dirname(BROWSER_SOCKET), exist_ok=True)
+    try:
+        os.unlink(BROWSER_SOCKET)
+    except OSError:
+        pass
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(BROWSER_SOCKET)
+    srv.listen(4)
+    srv.settimeout(15)
+    idle_since = time.time()
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True)
+    context = browser.new_context(user_agent=("Mozilla/5.0 (X11; Linux x86_64) "
+                                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                              "Chrome/126.0.0.0 Safari/537.36"))
+    page = context.new_page()
+    last_action = None
+    try:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except _socket.timeout:
+                if time.time() - idle_since > BROWSER_IDLE_TIMEOUT:
+                    break
+                continue
+            conn.settimeout(90)
+            try:
+                data = b""
+                while b"\n" not in data:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                if not data:
+                    conn.close()
+                    continue
+                req = json.loads(data.decode("utf-8", "replace").strip())
+                idle_since = time.time()
+                action = req.get("action")
+                last_action = action
+                res = {}
+                if action == "goto":
+                    page.goto(req.get("url", "about:blank"), timeout=int(req.get("timeout_ms", 30000)))
+                    res = {"url": page.url, "title": page.title()}
+                elif action == "back":
+                    page.go_back()
+                    res = {"url": page.url, "title": page.title()}
+                elif action == "content":
+                    res = {"title": page.title(), "url": page.url,
+                           "text": page.evaluate("() => document.body ? document.body.innerText : ''")[:int(req.get("max_chars", 20000))]}
+                elif action == "html":
+                    res = {"html": page.content()[:int(req.get("max_chars", 100000))]}
+                elif action == "click":
+                    page.click(req.get("selector", ""), timeout=int(req.get("timeout_ms", 15000)))
+                    res = {"url": page.url, "title": page.title()}
+                elif action == "fill":
+                    page.fill(req.get("selector", ""), str(req.get("value", "")), timeout=int(req.get("timeout_ms", 15000)))
+                    res = {"ok": True}
+                elif action == "select":
+                    page.select_option(req.get("selector", ""), req.get("value", ""), timeout=int(req.get("timeout_ms", 15000)))
+                    res = {"ok": True}
+                elif action == "press":
+                    page.keyboard.press(req.get("key", "Enter"))
+                    res = {"ok": True}
+                elif action == "js":
+                    res = {"result": page.evaluate("() => (%s)" % req.get("expr", "1"))}
+                elif action == "wait":
+                    if req.get("selector"):
+                        page.wait_for_selector(req["selector"], timeout=int(req.get("timeout_ms", 30000)))
+                    else:
+                        page.wait_for_load_state("networkidle", timeout=int(req.get("timeout_ms", 30000)))
+                    res = {"ok": True, "url": page.url}
+                elif action == "screenshot":
+                    pth = req.get("path") or os.path.join(os.path.expanduser("~"), ".cache", "ai", "browser_shot.png")
+                    pth = os.path.expanduser(pth)
+                    os.makedirs(os.path.dirname(pth), exist_ok=True)
+                    page.screenshot(path=pth)
+                    res = {"path": pth}
+                elif action == "links":
+                    items = page.evaluate("""() => Array.from(document.querySelectorAll('a[href]'))
+                        .slice(0, 200).map(a => ({text: (a.innerText||'').trim().slice(0,80), href: a.href}))
+                        .filter(x => x.href && !x.href.startsWith('javascript:'))""")
+                    res = {"links": items}
+                elif action == "status":
+                    res = {"alive": True, "url": page.url, "title": page.title(),
+                           "idle_seconds": int(time.time() - idle_since)}
+                elif action == "shutdown":
+                    res = {"bye": True}
+                    conn.sendall((json.dumps(res) + "\n").encode())
+                    break
+                else:
+                    res = {"error": "unknown action %r" % action}
+                conn.sendall((json.dumps(res, default=str) + "\n").encode())
+            except Exception as e:
+                try:
+                    conn.sendall((json.dumps({"error": str(e)[:500]}) + "\n").encode())
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            browser.close()
+            pw.stop()
+        except Exception:
+            pass
+        try:
+            os.unlink(BROWSER_SOCKET)
+        except OSError:
+            pass
+        _browser_log("DAEMON EXIT last_action=%s" % last_action)
+
+def _browser_ensure_daemon():
+    """Start the daemon if the socket is not answering."""
+    import socket as _socket
+    if os.path.exists(BROWSER_SOCKET):
+        try:
+            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(BROWSER_SOCKET)
+            s.close()
+            return True
+        except OSError:
+            try:
+                os.unlink(BROWSER_SOCKET)
+            except OSError:
+                pass
+    env = dict(os.environ)
+    env.pop("DISPLAY", None)
+    logf = open(os.devnull, "w")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "browser-daemon"],
+                     env=env, stdout=logf, stderr=logf,
+                     start_new_session=True)
+    for _ in range(40):  # up to 20s for playwright to boot
+        time.sleep(0.5)
+        if os.path.exists(BROWSER_SOCKET):
+            try:
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(BROWSER_SOCKET)
+                s.close()
+                return True
+            except OSError:
+                continue
+    return False
+
+def _browser_command(action, **kw):
+    """Send one command to the browser daemon. ALWAYS returns a dict
+    (with an 'error' key on any failure) — callers never see a string."""
+    import socket as _socket
+    if not _browser_ensure_daemon():
+        return {"error": "could not start the browser daemon (playwright + chromium required: `playwright install chromium`)"}
+    req = {"action": action}
+    req.update(kw)
+    s = None
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(120)
+        s.connect(BROWSER_SOCKET)
+        s.sendall((json.dumps(req) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        _browser_log("CMD %s %s" % (action, json.dumps({k: v for k, v in kw.items() if k != 'expr'})[:200]))
+        res = json.loads(data.decode("utf-8", "replace").strip() or "{}")
+        if not isinstance(res, dict):
+            res = {"error": "malformed daemon response"}
+    except Exception as e:
+        res = {"error": str(e)[:300]}
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return res
+
+class _BrowserError(Exception):
+    """Raised when a browser daemon command fails; browser() turns it into
+    a model-visible 'Error: ...' string."""
+
+def _browser_checked(action, **kw):
+    """Send a command, return its result dict, raise _BrowserError on failure."""
+    r = _browser_command(action, **kw)
+    if r.get("error"):
+        raise _BrowserError("browser %s failed: %s" % (action, r["error"]))
+    return r
+
+def browser(action, url=None, selector=None, value=None, key=None, expr=None,
+            wait_ms=None, max_chars=None, path=None):
+    """Drive a persistent headless Chromium browser. Actions:
+      goto(url)          — navigate (state persists across calls)
+      content()          — visible text of the current page (for JS-rendered pages)
+      html()             — raw HTML of the current page
+      links()            — up to 200 {text, href} of the current page
+      click(selector)    — click an element (CSS selector)
+      fill(selector, value) — type into an input/textarea
+      select(selector, value) — pick a dropdown option
+      press(key)         — press a key (Enter, Tab, Escape, ...)
+      js(expr)           — evaluate a JS expression, return the result
+      wait(selector?)    — wait for a selector or networkidle
+      back()             — go back
+      screenshot(path?)  — save a PNG of the page
+      status()           — current url/title/idle time
+      shutdown           — stop the daemon
+    Use for JS-only sites, forms, and anything fetch_webpage can't read.
+    For a plain page, fetch_webpage is faster — use browser for interactivity."""
+    try:
+        if action == "goto":
+            if not url:
+                return "Error: goto needs a url."
+            r = _browser_checked("goto", url=url, timeout_ms=wait_ms or 30000)
+            return "Navigated to %s\nTitle: %s" % (r.get("url"), r.get("title"))
+        if action == "content":
+            r = _browser_checked("content", max_chars=max_chars or 20000)
+            return ("[page: %s]\n%s" % (r.get("title"), r.get("text", "")))
+        if action == "html":
+            r = _browser_checked("html", max_chars=max_chars or 100000)
+            return r.get("html", "")
+        if action == "links":
+            r = _browser_checked("links")
+            if not r.get("links"):
+                return "No links found on the page."
+            return "\n".join("%s -> %s" % (l.get("text") or "(no text)", l.get("href"))
+                             for l in r["links"][:150])
+        if action == "click":
+            if not selector:
+                return "Error: click needs a selector."
+            r = _browser_checked("click", selector=selector, timeout_ms=wait_ms or 15000)
+            return "Clicked %s (now on %s)" % (selector, r.get("url"))
+        if action == "fill":
+            if not selector:
+                return "Error: fill needs a selector."
+            _browser_checked("fill", selector=selector, value=value or "")
+            return "Filled %s" % selector
+        if action == "select":
+            if not selector:
+                return "Error: select needs a selector."
+            _browser_checked("select", selector=selector, value=value or "")
+            return "Selected %s in %s" % (value, selector)
+        if action == "press":
+            _browser_checked("press", key=key or "Enter")
+            return "Pressed %s" % (key or "Enter")
+        if action == "js":
+            if not expr:
+                return "Error: js needs an expr."
+            r = _browser_checked("js", expr=expr)
+            return json.dumps(r.get("result"), default=str)
+        if action == "wait":
+            r = _browser_checked("wait", selector=selector, timeout_ms=wait_ms or 30000)
+            return "Waited (now on %s)" % r.get("url")
+        if action == "back":
+            r = _browser_checked("back")
+            return "Back (now on %s)" % r.get("url")
+        if action == "screenshot":
+            r = _browser_checked("screenshot", path=path)
+            return "[IMAGE_DATA_SUCCESS:%s] Screenshot saved." % r.get("path")
+        if action == "status":
+            r = _browser_checked("status")
+            return "url: %s\ntitle: %s\nidle: %ss" % (r.get("url"), r.get("title"), r.get("idle_seconds"))
+        if action == "shutdown":
+            _browser_checked("shutdown")
+            return "Browser daemon stopped."
+        return "Error: unknown browser action '%s'. Use: goto, content, html, links, click, fill, select, press, js, wait, back, screenshot, status, shutdown." % action
+    except _BrowserError as e:
+        return "Error: %s" % e
+    except Exception as e:
+        return "Error in browser: %s" % e
+
 def list_directory(path="."):
     try:
         abs_path = os.path.abspath(os.path.expanduser(path))
@@ -3041,6 +3618,14 @@ TOOL_REQUIRED_ARGS = {
     "start_background_process": ["command"],
     "check_process_status": [],
     "stop_process": ["pid"],
+    "search_files": ["pattern"],
+    "clarify": ["question"],
+    "browser": ["action"],
+    "spawn_agent": ["name", "prompt"],
+    "resume_agent": ["agent_id", "message"],
+    "get_context_snippet": ["index"],
+    "search_context": ["query"],
+    "structured_query": ["target"],
     "schedule_task":   ["task_id", "prompt", "interval_seconds"],
     "unschedule_task": ["task_id"],
     "list_scheduled_tasks": [],
@@ -4095,7 +4680,24 @@ def record_recovery(tool="", args="", prior_error="", phase="execution", chain_i
                 % (tool or "?", _chain_stats(cid)["recovered"],
                    (prior_error or "?")[:160]))
         _append_lesson("MASTER", tool, cid, body)
+        _master_skill_note(tool, cid, prior_error, args)
     return lesson_text
+
+def _master_skill_note(tool, chain_id, prior_error, approach):
+    """When a chain is promoted to MASTER, also drop a learning note into the
+    skill system (the closed loop: error chain mastered -> persisted skill), so
+    a human (or the model via skill_update) can fold the proven fix into a
+    durable skill. Gated by INFER_MASTER_SKILL_NOTE (default on)."""
+    if os.environ.get("INFER_MASTER_SKILL_NOTE", "1") in ("0", "false"):
+        return
+    try:
+        san = _re.sub(r"[^a-z0-9_]+", "_", (tool or "learned").lower()).strip("_") or "learned"
+        note = ("[MASTERED ERROR CHAIN %s] `%s` resolved this recurring error and the fix held: %s. "
+                "Proven approach: `%s`. Consider skill_update('%s') to fold this into a durable skill."
+                % (chain_id[:40], tool or "?", (prior_error or "?")[:120], (approach or "")[:120], san))
+        _append_learning_log(note)
+    except Exception:
+        pass
 
 def _chain_stats(chain_id):
     """Count failures/recoveries of one error chain from the ledger."""
@@ -4261,6 +4863,63 @@ def _tool_health_brief(limit=4):
         lines.append("- %s: %d/%d calls failed (%.0f%%)" % (t, fails, count, rate * 100))
     return "\n".join(lines)
 
+def _metrics_lesson_sync(min_fails=3):
+    """Close the metrics -> lessons loop (tool health).
+
+    Scans ~/.cache/ai/metrics.jsonl and, for every tool+error signature seen
+    >= min_fails times that has no lesson yet, writes a PITFALL lesson so the
+    harness surfaces it on the next occurrence and in the session recap.
+    This makes flaky tools that the model 'succeeds' at working around still
+    feed the self-improvement loop (the follow-up the chains doc called for).
+    Returns the list of newly created lesson signatures (empty when nothing
+    new). Deterministic and cheap: one pass over the metrics file."""
+    metrics_file = os.path.expanduser("~/.cache/ai/metrics.jsonl")
+    if not os.path.isfile(metrics_file):
+        return []
+    counts = {}
+    try:
+        with open(metrics_file, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("success", True):
+                    continue
+                t = (d.get("tool") or "?").strip()
+                err = str(d.get("error") or "").strip()
+                if not err:
+                    continue
+                sig = _err_signature(t, err)
+                counts[(t, sig, err[:160])] = counts.get((t, sig, err[:160]), 0) + 1
+    except Exception:
+        return []
+    created = []
+    for (t, sig, err), n in counts.items():
+        if n < min_fails:
+            continue
+        if _has_lesson("PITFALL", t, sig):
+            continue
+        body = ("Metric-detected recurring failure (%dx so far): `%s` failed with:\n"                "> %s\n"                "This tool is flaky for this error — check '## FIX' lessons and "\
+                "show-metrics before retrying the same call." % (n, t or "?", err))
+        try:
+            _append_lesson("PITFALL", t, sig, body)
+            created.append(sig)
+        except Exception:
+            pass
+    return created
+
+def metrics_lesson_sync(min_fails=3):
+    """CLI/model-facing wrapper around _metrics_lesson_sync."""
+    created = _metrics_lesson_sync(min_fails=min_fails)
+    if created:
+        return ("Recorded %d new metric-derived PITFALL lesson(s):\n%s"
+                % (len(created), "\n".join("- %s" % c[:80] for c in created)))
+    return "No new recurring metric errors to lesson-ify (already covered or below threshold)."
+
 def session_recap(max_chars=1600):
     """Session-start recapitulation: the compact digest the harness injects
     into the system prompt before the first turn, so every session starts from
@@ -4272,6 +4931,14 @@ def session_recap(max_chars=1600):
       - Recent lessons (newest FIX/PITFALL blocks)
       - Recent sessions (from the searchable history index)
       - Flaky tools (tool-health view from metrics)"""
+    # Close the tool-health loop: turn recurring metric errors into PITFALL
+    # lessons before building the recap, so the flaky-tools section is backed
+    # by actionable lessons (not just a warning). Gated, cheap, deterministic.
+    if os.environ.get("INFER_METRICS_LESSON_SYNC", "1") not in ("0", "false"):
+        try:
+            _metrics_lesson_sync()
+        except Exception:
+            pass
     sections = []
     masters = [b for b in _lesson_blocks() if b.startswith("## MASTER")]
     if masters:
@@ -4348,6 +5015,10 @@ def main():
     action = sys.argv[1]
     mcp_servers = load_config()
 
+    if action == "browser-daemon":
+        _browser_daemon_main()
+        sys.exit(0)
+
     if action == "run-scheduler":
         if len(sys.argv) < 3:
             sys.exit(1)
@@ -4416,6 +5087,16 @@ def main():
 
     if action == "self-improve-status":
         print(self_improve_status())
+        sys.exit(0)
+
+    if action == "sync-metrics-lessons":
+        mf = 3
+        if len(sys.argv) > 2:
+            try:
+                mf = max(2, int(sys.argv[2]))
+            except Exception:
+                pass
+        print(metrics_lesson_sync(min_fails=mf))
         sys.exit(0)
 
     if action == "session-recap":
@@ -4566,7 +5247,210 @@ def main():
             }
         })
 
-        # 2. execute_command
+
+        # 2. search_files — locate code/symbols without grep/rg via execute_command
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search file contents with a regex pattern (target='content', default) or find files by name (target='files', glob pattern like '*.py'). Returns matches as file:line: text, or a file list / match counts. Far more token-efficient than running grep/rg/find via execute_command. Constrained to 'path' (default '.'); never search from /.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Regex to search for (content) or filename glob (files target, e.g. '*.md')."},
+                        "path": {"type": "string", "description": "Directory or file to search in (default current dir)."},
+                        "target": {"type": "string", "enum": ["content", "files"], "description": "'content' searches inside files (default); 'files' finds files by name."},
+                        "file_glob": {"type": "string", "description": "Only search files matching this glob (content target), e.g. '*.py'."},
+                        "limit": {"type": "integer", "description": "Max results (default 50)."},
+                        "context": {"type": "integer", "description": "Context lines around each match (default 0)."},
+                        "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "'content' (default) shows matching lines; 'files_only' lists files; 'count' shows per-file match counts."}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        })
+
+        # 2b. todo — session task list the model keeps fresh (file-backed)
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "todo",
+                "description": "Maintain a task list for multi-step work (3+ steps). Call with NO arguments to read the current list. Pass a 'todos' array of {id, content, status} objects to create it (merge=false, default) or update existing items by id (merge=true). status is one of: pending, in_progress, completed, cancelled. Mark items completed immediately when done; only ONE item in_progress at a time. The list persists to disk so it survives interruptions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "description": "Task items. Omit entirely to read the current list.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string", "description": "Unique item id."},
+                                    "content": {"type": "string", "description": "What the step is."},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]}
+                                },
+                                "required": ["id", "content"]
+                            }
+                        },
+                        "merge": {"type": "boolean", "description": "true: update existing items by id and add new ones. false (default): replace the whole list."}
+                    }
+                }
+            }
+        })
+
+        # 2c. clarify — ask the user when the task is ambiguous
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "clarify",
+                "description": "Ask the user a question and wait for their answer before continuing. Use when the task is ambiguous and a wrong guess wastes real work: give 2-4 numbered 'choices' (first = recommended; the user can also type their own). Omit choices for an open-ended question. In non-interactive runs (bridges, schedulers) it returns a note telling you to pick a sensible default and proceed — never block waiting for a human.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question itself (no options inside the text)."},
+                        "choices": {"type": "array", "items": {"type": "string"}, "description": "Up to 4 options as separate strings; the user picks one or types their own. Put the recommended option FIRST."},
+                        "multi_select": {"type": "boolean", "description": "true: user may pick several options."},
+                        "timeout_seconds": {"type": "integer", "description": "Optional: give up waiting after N seconds and proceed with a default."}
+                    },
+                    "required": ["question"]
+                }
+            }
+        })
+
+        # 2d. browser — persistent headless Chromium (state survives across calls)
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "browser",
+                "description": "Drive a persistent headless Chromium browser for JS-only sites, forms and interactive pages (fetch_webpage cannot do these). Actions: goto(url), content(), html(), links(), click(selector), fill(selector, value), select(selector, value), press(key), js(expr), wait(selector?), back(), screenshot(path?), status(), shutdown. Page state (current URL, inputs, JS context) persists across browser calls. For a plain static page prefer fetch_webpage — it is faster.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["goto", "content", "html", "links", "click", "fill", "select", "press", "js", "wait", "back", "screenshot", "status", "shutdown"]},
+                        "url": {"type": "string", "description": "For goto."},
+                        "selector": {"type": "string", "description": "CSS selector for click/fill/select/wait."},
+                        "value": {"type": "string", "description": "For fill/select."},
+                        "key": {"type": "string", "description": "For press: Enter, Tab, Escape, ..."},
+                        "expr": {"type": "string", "description": "For js: a JS expression to evaluate."},
+                        "wait_ms": {"type": "integer", "description": "Timeout in ms for the action."},
+                        "max_chars": {"type": "integer", "description": "Cap for content/html output."},
+                        "path": {"type": "string", "description": "For screenshot: where to save the PNG."}
+                    },
+                    "required": ["action"]
+                }
+            }
+        })
+
+        # 2e. delegation & context pool (were hidden before — now first-class)
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "description": "Register a named persistent agent (stored under ~/.config/ai/agents). Use together with resume_agent to run a recurring helper agent that keeps its own conversation history across invocations. For one-shot parallel work prefer delegate_task instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Short name for the agent (e.g. 'researcher')."},
+                        "prompt": {"type": "string", "description": "What the agent is for (stored as its mission)."},
+                        "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed tool list."}
+                    },
+                    "required": ["name", "prompt"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "resume_agent",
+                "description": "Send a message to a previously spawned agent (agent_id from spawn_agent/list_agents) and return its response. The agent's history persists on disk between resumes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"},
+                        "message": {"type": "string", "description": "The user message for this turn."}
+                    },
+                    "required": ["agent_id", "message"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_agents",
+                "description": "List all registered agents (id, name, status, mission). Read-only.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "append_to_context_pool",
+                "description": "Store a snippet of context in the shared pool that persists across agents/sessions (e.g. a key finding, a decision, a path). Other agents and future sessions can retrieve it with search_context / get_context_snippet.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"entry": {"type": "string", "description": "The text to store."}},
+                    "required": ["entry"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "search_context",
+                "description": "Search the shared context pool (from append_to_context_pool and command output) for an entry containing the query. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_context_snippet",
+                "description": "Fetch one stored context-pool entry by its numeric index. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"index": {"type": "string"}},
+                    "required": ["index"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "structured_query",
+                "description": "Query a file or command output like a pipeline: target='file:/path' or 'command:ls -la', plus filter (regex), transform (head:N | tail:N | sort | unique), aggregate (count | first | last). Use to count/grep/summarise without writing a script.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "description": "'file:<path>', 'command:<cmd>', or literal text."},
+                        "filter": {"type": "string", "description": "Regex — keep only matching lines."},
+                        "transform": {"type": "string", "description": "head:N, tail:N, sort, unique."},
+                        "aggregate": {"type": "string", "description": "count, first, last."}
+                    },
+                    "required": ["target"]
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "session_report",
+                "description": "Log the outcome of this session (success bool, failure modes, notes) to ~/.config/ai/session_outcomes.json. Call near task_complete for non-trivial sessions so the self-improvement loop has outcome data.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "success": {"type": "boolean", "description": "Did the session achieve its goal?"},
+                        "failure_modes": {"type": "array", "items": {"type": "string"}, "description": "What went wrong (empty if none)."},
+                        "notes": {"type": "string", "description": "One-line summary of the outcome."}
+                    }
+                }
+            }
+        })
+
+        # 3. execute_command
         openai_tools.append({
             "type": "function",
             "function": {
@@ -5758,6 +6642,7 @@ def main():
                 arguments = json.loads(repair_json(args_json))
             except Exception as e:
                 print(json.dumps({"error": f"Failed to parse arguments JSON even after repair: {e}"}))
+                sys.exit(0)
 
         arguments = normalize_tool_arguments(tool_name, arguments)
 
@@ -5790,8 +6675,64 @@ def main():
                 sys.exit(0)
 
         _t0 = time.time()
+        # Capture this tool's stdout through a tee so the metric records REAL
+        # success + error text (previously every call was logged success=True
+        # with no error, which is why [FLAKY] detection and metrics-driven
+        # lessons never fired). Error markers mirror the harness's own is_err
+        # detection in ai.c so the ledger and the metrics agree.
+        _buf = io.StringIO()
+        _real_out = sys.stdout
+        class _TeeOut:
+            def write(self, s):
+                try:
+                    _real_out.write(s)
+                except Exception:
+                    pass
+                try:
+                    _buf.write(s)
+                except Exception:
+                    pass
+                return len(s)
+            def flush(self):
+                try:
+                    _real_out.flush()
+                except Exception:
+                    pass
+        sys.stdout = _TeeOut()
+        _crashed = {"v": False}
+        _prev_hook = sys.excepthook
+        def _crash_hook(exc_type, exc, tb):
+            _crashed["v"] = True
+            if _prev_hook is not None:
+                _prev_hook(exc_type, exc, tb)
+            else:
+                import traceback
+                traceback.print_exception(exc_type, exc, tb)
+        sys.excepthook = _crash_hook
         import atexit
-        atexit.register(lambda: log_metric(tool_name, (time.time() - _t0) * 1000))
+        def _finish_metric():
+            try:
+                sys.stdout = _real_out
+            except Exception:
+                pass
+            out = _buf.getvalue()
+            head = out.lstrip()[:200]
+            success = True
+            err = None
+            if _crashed["v"]:
+                success = False
+                err = "uncaught exception in tool"
+            elif (head.startswith("Error") or head.startswith('{"error"')
+                    or "failed (exit" in out or "[SYSTEM WARNING:" in out
+                    or "[Command Failed" in out):
+                success = False
+                err = head
+            try:
+                log_metric(tool_name, (time.time() - _t0) * 1000,
+                           success=success, error=err)
+            except Exception:
+                pass
+        atexit.register(_finish_metric)
 
         # Route custom tools
         if tool_name == "think" or server_name == "think":
@@ -6017,7 +6958,7 @@ def main():
             print(result)
         elif tool_name == "structured_query" or server_name == "structured_query":
             target = arguments.get("target", "")
-            filter_expr = arguments.get("filter_expr")
+            filter_expr = arguments.get("filter_expr", arguments.get("filter"))
             transform = arguments.get("transform")
             aggregate = arguments.get("aggregate")
             result = structured_query(target, filter_expr=filter_expr, transform=transform, aggregate=aggregate)
@@ -6396,6 +7337,57 @@ def main():
             # direct ai_mcp.py invocations.
             plan = arguments.get("plan", "")
             print('{"ok": true, "note": "present_plan acknowledged (handled natively by the agent loop in ai.c). If you are in plan mode, the user will be asked to approve or reject this plan."}')
+        elif tool_name == "search_files" or server_name == "search_files":
+            try:
+                print(search_files(
+                    pattern=arguments.get("pattern", ""),
+                    path=arguments.get("path", "."),
+                    target=arguments.get("target", "content"),
+                    file_glob=arguments.get("file_glob"),
+                    limit=arguments.get("limit", 50),
+                    context=arguments.get("context", 0),
+                    output_mode=arguments.get("output_mode", "content"),
+                ))
+            except Exception as e:
+                print(f"Error in search_files: {e}")
+        elif tool_name == "todo" or server_name == "todo":
+            try:
+                print(todo(todos=arguments.get("todos"),
+                           merge=bool(arguments.get("merge", False))))
+            except Exception as e:
+                print(f"Error in todo: {e}")
+        elif tool_name == "clarify" or server_name == "clarify":
+            try:
+                print(clarify(
+                    question=arguments.get("question", ""),
+                    choices=arguments.get("choices"),
+                    multi_select=bool(arguments.get("multi_select", False)),
+                    timeout_seconds=arguments.get("timeout_seconds", 0),
+                ))
+            except Exception as e:
+                print(f"Error in clarify: {e}")
+        elif tool_name == "browser" or server_name == "browser":
+            try:
+                print(browser(
+                    action=arguments.get("action", ""),
+                    url=arguments.get("url"),
+                    selector=arguments.get("selector"),
+                    value=arguments.get("value"),
+                    key=arguments.get("key"),
+                    expr=arguments.get("expr"),
+                    wait_ms=arguments.get("wait_ms"),
+                    max_chars=arguments.get("max_chars"),
+                    path=arguments.get("path"),
+                ))
+            except Exception as e:
+                print(f"Error in browser: {e}")
+        elif tool_name == "append_to_context_pool" or server_name == "append_to_context_pool":
+            try:
+                append_to_context_pool(arguments.get("entry", ""))
+                pool = _load_context_pool()
+                print("Context pool entry stored (id: %d)." % (len(pool) - 1))
+            except Exception as e:
+                print(f"Error in append_to_context_pool: {e}")
         elif tool_name == "search_history" or server_name == "search_history":
             try:
                 print(search_history(query=arguments.get("query", ""), limit=arguments.get("limit", 8)))

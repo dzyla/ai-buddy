@@ -99,11 +99,23 @@ static const tool_meta_t g_tool_meta[] = {
     {"load_skill",          "⊞",  CL_PURPLE},
     {"check_time",          "◷",  CL_CYAN},
     {"get_clipboard",       "⎘",  CL_DIM},
-    {"list_processes",      "⬡",  CL_CYAN},
+    {"list_processes",      "⬡",  CL_DIM},
     {"list_scheduled_tasks","⊞",  CL_MAGENTA},
     {"start_background_process","⊞", CL_MAGENTA},
     {"stop_process",        "⊞",  CL_MAGENTA},
     {"check_process_status","⊞",  CL_MAGENTA},
+    {"search_files",        "⌕",  CL_GREEN},
+    {"todo",                "📋", CL_CYAN},
+    {"clarify",             "❔", CL_YELLOW},
+    {"browser",             "🌐", CL_BLUE},
+    {"spawn_agent",         "⊞",  CL_MAGENTA},
+    {"resume_agent",        "⊞",  CL_MAGENTA},
+    {"list_agents",         "⊞",  CL_DIM},
+    {"structured_query",    "⌕",  CL_GREEN},
+    {"session_report",      "📝", CL_DIM},
+    {"append_to_context_pool","⊞", CL_PURPLE},
+    {"get_context_snippet", "⊞",  CL_DIM},
+    {"search_context",      "⊞",  CL_DIM},
     {NULL, NULL, NULL}
 };
 
@@ -1020,8 +1032,9 @@ static int tool_is_mutating(const char *name) {
         "write_file","edit_file","save_memory","remember",
         "learn_rule","vault_write","schedule_task","set_reminder",
         "unschedule_task","start_background_process","stop_process","delegate_task",
-        "spawn_agent","resume_agent","append_context_pool",
+        "spawn_agent","resume_agent","append_to_context_pool",
         "skill_create","skill_update","skill_note",
+        "browser","todo","structured_query","session_report",
         NULL
     };
     for (int i = 0; mut[i]; i++)
@@ -1043,6 +1056,7 @@ static int tool_is_readonly(const char *name) {
         "vault_read","vault_search","vault_backlinks","pubmed_search",
         "gcal_list_events","gcal_check_availability","check_time","list_scheduled_tasks",
         "search_history","list_sessions","get_session","present_plan","task_complete",
+        "search_files","list_agents","get_context_snippet","search_context","clarify",
         "scientific__pdb_parse","scientific__uniprot_search","scientific__align_sequences",
         "scientific__data_analysis","scientific__security_audit",
         NULL
@@ -3983,6 +3997,14 @@ int main(int argc, char **argv) {
     int is_stdin_tty = isatty(STDIN_FILENO);
     int interactive_mode = 0;
     int quiet_mode = 0;
+
+    /* Export the session id + interactivity to child processes (ai_mcp.py):
+       the todo list is scoped per session, and clarify() needs to know
+       whether a human is at the keyboard (ask) or not (pick a default and
+       proceed). Inherited by every run_shell_command subprocess. */
+    setenv("INFER_SESSION_ID", current_session_id, 1);
+    if (is_stdin_tty) setenv("INFER_INTERACTIVE", "1", 1);
+    else              unsetenv("INFER_INTERACTIVE");
 
     // Parse set-default and version options first (all exit early)
     for (int i = 1; i < argc; i++) {

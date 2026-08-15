@@ -31,11 +31,12 @@ fasta_parser.py
 create_valid_mmcif.py
 
 # ─────────────────────────────────────────
-# Non-app: data files
+# Non-app: data files (scoped to data/ so app configs like mcp.json
+# can still be tracked)
 # ─────────────────────────────────────────
-*.csv
-*.json
-*.txt
+data/*.csv
+data/*.json
+data/*.txt
 
 # ─────────────────────────────────────────
 # Non-app: analysis and experiment results
