@@ -4,7 +4,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
-#include <dirent.h>
 #include <sys/stat.h>
 #define JSMN_HEADER
 #include "jsmn.h"
@@ -181,63 +180,6 @@ static int atomic_write_file(const char *path, const char *data) {
     return 0;
 }
 
-/* Bound the cache session dir: keep the newest INFER_SESSION_RETENTION
-   session files (default 200) and unlink the older ones. Safe because the
-   persistent mirror (~/.local/share/ai/sessions) + the index archive keep the
-   data. Skips last.json and any in-flight .tmp files. */
-typedef struct { char name[256]; long mtime; } sess_entry_t;
-
-static int sess_entry_cmp(const void *a, const void *b) {
-    const sess_entry_t *ea = (const sess_entry_t *)a;
-    const sess_entry_t *eb = (const sess_entry_t *)b;
-    return (eb->mtime > ea->mtime) - (eb->mtime < ea->mtime); /* newest first */
-}
-
-static void prune_cache_sessions(void) {
-    const char *home = getenv("HOME");
-    if (!home) return;
-    const char *env = getenv("INFER_SESSION_RETENTION");
-    long keep = env ? atol(env) : 200;
-    if (keep <= 0) return;
-    char dir[1100];
-    snprintf(dir, sizeof(dir), "%s/.cache/ai/sessions", home);
-    DIR *d = opendir(dir);
-    if (!d) return;
-    sess_entry_t *list = NULL;
-    int n = 0, cap = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (strcmp(de->d_name, "last.json") == 0) continue;
-        size_t L = strlen(de->d_name);
-        if (L < 6 || strcmp(de->d_name + L - 5, ".json") != 0) continue;
-        char p[1300];
-        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
-        struct stat st;
-        if (stat(p, &st) != 0) continue;
-        if (n == cap) {
-            cap = cap ? cap * 2 : 1024;
-            sess_entry_t *nl = realloc(list, (size_t)cap * sizeof(sess_entry_t));
-            if (!nl) break;
-            list = nl;
-        }
-        snprintf(list[n].name, sizeof(list[n].name), "%s", de->d_name);
-        list[n].mtime = (long)st.st_mtime;
-        n++;
-    }
-    closedir(d);
-    if (!list) return;
-    if (n > keep) {
-        qsort(list, (size_t)n, sizeof(sess_entry_t), sess_entry_cmp);
-        for (int i = (int)keep; i < n; i++) {
-            char p[1300];
-            snprintf(p, sizeof(p), "%s/%s", dir, list[i].name);
-            unlink(p);
-        }
-    }
-    free(list);
-}
-
 void save_session(const char *messages_json) {
     char path[1200];
     if (!messages_json) return;
@@ -249,7 +191,6 @@ void save_session(const char *messages_json) {
         atomic_write_file(path, messages_json);
     if (backup_session_file_path(path, sizeof(path), NULL) == 0)
         atomic_write_file(path, messages_json);
-    prune_cache_sessions();
 }
 
 char* load_session_transcript(char *messages_json, const char *mcp_script) {

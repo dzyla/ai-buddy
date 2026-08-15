@@ -1132,13 +1132,36 @@ def _ensure_history_schema(conn):
     # on-disk session files were pruned.
     conn.execute("""CREATE TABLE IF NOT EXISTS history_sessions(
         session_id TEXT PRIMARY KEY, raw TEXT, body TEXT, turns INTEGER,
-        size INTEGER, mtime REAL, fts_rowid INTEGER)""")
+        size INTEGER, mtime REAL, fts_rowid INTEGER, prune_source INTEGER)""")
     # Regular (content-storing) FTS5 table: one row per turn (rowid=seq) and
     # one row per session (rowid=BASE+archive rowid).
     conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
         source, session_id, ts, prompt, response, body)""")
     conn.execute("CREATE TABLE IF NOT EXISTS hmeta(k TEXT PRIMARY KEY, v TEXT)")
     conn.commit()
+
+
+def _assistant_text(m):
+    """Text of an assistant message. Tool-call messages have content=null, so
+    fall back to the task_complete summary when one is present."""
+    txt = m.get("content", "")
+    if isinstance(txt, list):
+        txt = " ".join(str(c.get("text", "")) for c in txt if isinstance(c, dict))
+    txt = str(txt or "").strip()
+    if txt:
+        return txt
+    for tc in (m.get("tool_calls") or []):
+        fn = (tc or {}).get("function", {}) if isinstance(tc, dict) else {}
+        if fn.get("name") == "task_complete":
+            try:
+                a = json.loads(fn.get("arguments") or "{}")
+                for k in ("summary", "text", "response", "result", "final_answer", "message", "answer"):
+                    v = a.get(k)
+                    if v and str(v).strip():
+                        return str(v).strip()
+            except Exception:
+                continue
+    return ""
 
 
 def _transcript_body(messages):
@@ -1149,15 +1172,18 @@ def _transcript_body(messages):
         if not isinstance(m, dict):
             continue
         role = m.get("role", "")
-        txt = m.get("content", "")
-        if isinstance(txt, list):
-            txt = " ".join(str(c.get("text", "")) for c in txt if isinstance(c, dict))
-        txt = str(txt).strip()
-        if role == "user" and txt:
-            last_user = txt
-            parts.append("USER: " + txt)
-        elif role == "assistant" and txt:
-            parts.append("ASSISTANT: " + txt)
+        if role == "user":
+            txt = m.get("content", "")
+            if isinstance(txt, list):
+                txt = " ".join(str(c.get("text", "")) for c in txt if isinstance(c, dict))
+            txt = str(txt or "").strip()
+            if txt:
+                last_user = txt
+                parts.append("USER: " + txt)
+        elif role == "assistant":
+            txt = _assistant_text(m)
+            if txt:
+                parts.append("ASSISTANT: " + txt)
     return "\n".join(parts), last_user
 
 
@@ -1220,9 +1246,12 @@ def _index_turn_row(conn, seq, rec, line_no):
     return True
 
 
-def _upsert_session_row(conn, sid, raw, body, prompt, turns, size, mtime):
+def _upsert_session_row(conn, sid, raw, body, prompt, turns, size, mtime,
+                        prune_source=1):
     """Insert/replace the archive row + its FTS row for one session id.
-    Replaces any prior FTS row for the same id so a session is indexed once."""
+    prune_source: 1 = row came from a disk file (age-prunable if opt-in set),
+    0 = preserved archive copy (never age-pruned). Replaces any prior FTS row
+    for the same id so a session is indexed once."""
     if len(raw) > 120_000:
         raw = raw[:120_000] + "...[raw archive truncated]"
     old = conn.execute(
@@ -1231,9 +1260,9 @@ def _upsert_session_row(conn, sid, raw, body, prompt, turns, size, mtime):
         conn.execute("DELETE FROM history_fts WHERE rowid=?", (old[0],))
         conn.execute("DELETE FROM history_sessions WHERE session_id=?", (sid,))
     cur = conn.execute(
-        "INSERT INTO history_sessions(session_id, raw, body, turns, size, mtime, fts_rowid) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (sid, raw, body[:8000], turns, size, float(mtime), 0))
+        "INSERT INTO history_sessions(session_id, raw, body, turns, size, mtime, fts_rowid, prune_source) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (sid, raw, body[:8000], turns, size, float(mtime), 0, prune_source))
     fts_rowid = _SESSION_ROWID_BASE + cur.lastrowid
     conn.execute(
         "UPDATE history_sessions SET fts_rowid=? WHERE session_id=?", (fts_rowid, sid))
@@ -1343,26 +1372,34 @@ def _archive_preserved(conn):
     """Snapshot archive rows (so a rebuild can keep sessions whose on-disk
     files were pruned — the index is the durable copy of history)."""
     try:
-        return {sid: (raw, body, turns, size, mtime)
-                for sid, raw, body, turns, size, mtime in conn.execute(
-                    "SELECT session_id, raw, body, turns, size, mtime FROM history_sessions")}
+        return {sid: (raw, body, turns, size, mtime, ps)
+                for sid, raw, body, turns, size, mtime, ps in conn.execute(
+                    "SELECT session_id, raw, body, turns, size, mtime, "
+                    "COALESCE(prune_source, 1) FROM history_sessions")}
     except Exception:
         return {}
 
 
-def _prune_archive_sessions(conn, on_disk_ids, max_age_days=90):
-    """Drop archive-only rows older than max_age_days (INFER_ARCHIVE_RETENTION
-    env overrides). On-disk sessions are never pruned here. Returns removed count."""
+def _prune_archive_sessions(conn, on_disk_ids):
+    """Opt-in bounded archive: with INFER_ARCHIVE_RETENTION=<days> set, drop
+    archive-only rows (prune_source=1, i.e. originally from a disk file) whose
+    mtime is older than the cutoff. Preserved archive copies (prune_source=0)
+    and on-disk sessions are never pruned here. Default: keep everything."""
+    env = os.environ.get("INFER_ARCHIVE_RETENTION", "").strip()
+    if not env:
+        return 0
     try:
-        days = float(os.environ.get("INFER_ARCHIVE_RETENTION", "90"))
+        days = float(env)
     except Exception:
-        days = 90.0
+        return 0
+    if days <= 0:
+        return 0
     cutoff = time.time() - days * 86400
     removed = 0
     try:
-        for sid, fts_rowid, mt in conn.execute(
-                "SELECT session_id, fts_rowid, mtime FROM history_sessions").fetchall():
-            if sid in on_disk_ids:
+        for sid, fts_rowid, mt, ps in conn.execute(
+                "SELECT session_id, fts_rowid, mtime, prune_source FROM history_sessions").fetchall():
+            if sid in on_disk_ids or (ps or 1) != 1:
                 continue
             if (mt or 0) >= cutoff:
                 continue
@@ -1408,12 +1445,12 @@ def rebuild_history_index():
                         n_sessions += 1
             # Restore sessions whose on-disk files were pruned (durable archive).
             n_preserved = 0
-            for sid, (raw, body, turns, size, mtime) in preserved.items():
+            for sid, (raw, body, turns, size, mtime, ps) in preserved.items():
                 if sid in on_disk_ids:
                     continue
                 if conn.execute("SELECT 1 FROM history_sessions WHERE session_id=?", (sid,)).fetchone():
                     continue
-                _upsert_session_row(conn, sid, raw, body, "", turns, size, mtime)
+                _upsert_session_row(conn, sid, raw, body, "", turns, size, mtime, prune_source=ps)
                 n_preserved += 1
             n_pruned = _prune_archive_sessions(conn, on_disk_ids)
             _hmeta_set(conn, "log_size", os.path.getsize(HISTORY_LOG) if os.path.isfile(HISTORY_LOG) else 0)
@@ -1429,6 +1466,70 @@ def rebuild_history_index():
         return f"[history] Indexed {n_turns} turn(s) / {n_sessions} session(s): {HISTORY_DB}"
     except Exception as e:
         return f"Error building history index: {e}"
+
+
+def _prune_cache_sessions(conn):
+    """Bounded cache retention, archive-FIRST: delete old cache session files
+    only once they are durably preserved — present in the persistent mirror
+    (~/.local/share/ai/sessions) OR fully archived in the index (raw not
+    truncated). Keep the newest INFER_SESSION_RETENTION files (default 400).
+    last.json and in-flight .tmp files are never touched. Returns removed count."""
+    env = os.environ.get("INFER_SESSION_RETENTION", "").strip()
+    try:
+        keep = int(env) if env else 400
+    except Exception:
+        keep = 400
+    if keep <= 0:
+        return 0
+    # Throttle: at most one prune scan per 10 min (this runs on the search hot
+    # path, so the directory scan must stay rare).
+    try:
+        row = conn.execute("SELECT v FROM hmeta WHERE k='prune_ts'").fetchone()
+        if row and time.time() - float(row[0]) < 600:
+            return 0
+    except Exception:
+        pass
+    d = CACHE_SESSIONS
+    if not os.path.isdir(d):
+        return 0
+    entries = []
+    try:
+        for fn in os.listdir(d):
+            if not fn.endswith(".json") or fn == "last.json":
+                continue
+            p = os.path.join(d, fn)
+            try:
+                st = os.stat(p)
+            except Exception:
+                continue
+            entries.append((st.st_mtime, fn, p, st.st_size))
+    except Exception:
+        return 0
+    if len(entries) <= keep:
+        return 0
+    entries.sort(reverse=True)  # newest first
+    removed = 0
+    for _mt, fn, p, size in entries[keep:]:
+        sid = fn[:-5]
+        mirrored = os.path.isfile(os.path.join(DATA_SESSIONS, fn))
+        if not mirrored:
+            try:
+                row = conn.execute(
+                    "SELECT size FROM history_sessions WHERE session_id=?", (sid,)).fetchone()
+            except Exception:
+                row = None
+            if not (row and row[0] == size and size <= 120_000):
+                continue  # not durably preserved — keep the file
+        try:
+            os.unlink(p)
+            removed += 1
+        except Exception:
+            pass
+    try:
+        _hmeta_set(conn, "prune_ts", time.time())
+    except Exception:
+        pass
+    return removed
 
 
 def _history_is_stale():
@@ -1469,18 +1570,30 @@ def _sources_unchanged(conn):
 
 def _ensure_history_ready():
     """Make the index current: full rebuild when needed, incremental sync
-    otherwise, no-op when the sources are provably unchanged. Called by
-    search_history so searches are always fresh but stay ~O(1)."""
+    otherwise, no-op when the sources are provably unchanged. Then enforce
+    bounded cache retention (archive-first — never deletes a session the index
+    and persistent mirror do not already hold). Called by search_history so
+    searches are always fresh but stay ~O(1)."""
     if _history_needs_full_rebuild():
         rebuild_history_index()
+        conn = sqlite3.connect(HISTORY_DB)
+        try:
+            _prune_cache_sessions(conn)
+            conn.commit()
+        finally:
+            conn.close()
         return
     conn = sqlite3.connect(HISTORY_DB)
     try:
         _ensure_history_schema(conn)
         if _sources_unchanged(conn):
+            _prune_cache_sessions(conn)
+            conn.commit()
             return
         _sync_history_index(conn)
         _hmeta_set(conn, "log_size", os.path.getsize(HISTORY_LOG) if os.path.isfile(HISTORY_LOG) else 0)
+        conn.commit()
+        _prune_cache_sessions(conn)
         conn.commit()
     finally:
         conn.close()
@@ -4127,6 +4240,20 @@ def main():
             print(json.dumps(compressed))
         except Exception:
             print("[]")
+        sys.exit(0)
+
+    if action == "prune-sessions":
+        # Bounded cache retention (archive-first): safe to run at every exit —
+        # it only removes cache session files already preserved in the
+        # persistent mirror or fully archived in the index.
+        try:
+            os.makedirs(os.path.dirname(HISTORY_DB), exist_ok=True)
+            conn = sqlite3.connect(HISTORY_DB)
+            _ensure_history_schema(conn)
+            _prune_cache_sessions(conn)
+            conn.close()
+        except Exception:
+            pass
         sys.exit(0)
 
     if action == "session-transcript":
