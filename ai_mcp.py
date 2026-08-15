@@ -6292,7 +6292,7 @@ def main():
             "type": "function",
             "function": {
                 "name": "check_time",
-                "description": "Returns the current local date and time.",
+                "description": "Returns the current local date, time, and day of the week.",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -6869,8 +6869,8 @@ def main():
                 print(json.dumps({"error": f"Unknown action: {action}"}))
         elif tool_name == "check_time" or server_name == "check_time":
             import datetime
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(now)
+            now = datetime.datetime.now()
+            print(now.strftime("%A, %Y-%m-%d %H:%M:%S"))
         elif tool_name == "schedule_task" or server_name == "schedule_task":
             task_id = arguments.get("task_id")
             prompt = arguments.get("prompt")
