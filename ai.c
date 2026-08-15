@@ -868,7 +868,50 @@ static struct {
     char tool[140];
     char args[400];
     char error[600];
+    char chain_id[100];
 } g_si_failed[SI_MAX_TRACKED];
+
+/* Compute the error-chain id in C. MUST match ai_mcp._chain_id exactly:
+   "chain_" + (normalised signature)[:80] with spaces -> "_". The signature
+   normalisation mirrors _err_signature: lowercase, each run of digits -> a
+   single '#', each run of non-[a-z0-9#%] -> a single ' ', trimmed. Computing
+   it once at failure time and reusing the stored id on recovery guarantees the
+   failure and its fix always land in the SAME chain, regardless of error length. */
+static char *si_chain_id(const char *tool, const char *error) {
+    size_t n = strlen(tool ? tool : "") + 1 + strlen(error ? error : "") + 1;
+    char *s = malloc(n);
+    if (!s) return NULL;
+    snprintf(s, n, "%s %s", tool ? tool : "", error ? error : "");
+    for (size_t i = 0; s[i]; i++) s[i] = (char)tolower((unsigned char)s[i]);
+    /* pass 1: each run of digits -> single '#' */
+    char *t = malloc(strlen(s) + 1);
+    size_t ti = 0;
+    for (size_t i = 0; s[i];) {
+        if (isdigit((unsigned char)s[i])) { t[ti++] = '#'; while (s[i] && isdigit((unsigned char)s[i])) i++; }
+        else t[ti++] = s[i++];
+    }
+    t[ti] = '\0'; free(s); s = t;
+    /* pass 2: each run of non-[a-z0-9#%] -> single ' ' */
+    char *u = malloc(strlen(s) + 1);
+    size_t ui = 0;
+    for (size_t i = 0; s[i];) {
+        if (isalnum((unsigned char)s[i]) || s[i] == '#' || s[i] == '%') u[ui++] = s[i++];
+        else { u[ui++] = ' '; while (s[i] && !(isalnum((unsigned char)s[i]) || s[i] == '#' || s[i] == '%')) i++; }
+    }
+    u[ui] = '\0'; free(s); s = u;
+    /* pass 3: trim, take first 80 chars, spaces -> '_', prepend "chain_" */
+    size_t start = 0; while (s[start] == ' ') start++;
+    size_t end = strlen(s); while (end > start && s[end - 1] == ' ') end--;
+    size_t sl = end - start; if (sl > 80) sl = 80;
+    size_t out_len = 6 + sl + 1;
+    char *out = malloc(out_len);
+    if (!out) { free(s); return NULL; }
+    memcpy(out, "chain_", 6);
+    for (size_t i = 0; i < sl; i++) out[6 + i] = (s[start + i] == ' ') ? '_' : s[start + i];
+    out[6 + sl] = '\0';
+    free(s);
+    return out;
+}
 
 /* ── Situational awareness (state log) ──
    Small models drop context and lose track of where they are mid-task. This is a
@@ -1069,7 +1112,7 @@ const char *SYSTEM_PROMPT =
     "  - THINK DISCIPLINE: keep every `think` to a MAXIMUM of 2-3 short sentences. NEVER write your code, plan, or analysis in full inside `think` - that wastes the whole output budget and stalls the task. Write code to a file with write_file, then build/run it with execute_command. A task with zero write_file/execute_command calls after a few turns is failing - stop thinking and ACT.\n"
     "  4. TESTS - empirically verify each change: compile (`make`) and/or run the relevant test, or read the output. Never claim success without evidence.\n"
     "  5. SOLUTION - call task_complete with a summary of what you did, how you verified it, and any lesson learned.\n"
-    "- SELF-IMPROVEMENT: The harness AUTOMATICALLY records your tool failures and the fixes that recovered them (persisted across sessions), and surfaces them when you hit the same error again. Treat [REMEMBERED FROM PAST SESSIONS] and [RECURRING FAILURE] messages as instructions. Still proactively persist reusable techniques with skill_create / skill_update / skill_note.\n"
+    "- SELF-IMPROVEMENT: The harness AUTOMATICALLY records your tool failures and the fixes that recovered them (persisted across sessions), and surfaces them when you hit the same error again. At the start of this session a SESSION RECAP block was injected listing MASTERED error chains, recent lessons, recent sessions, and flaky tools - treat its MASTERED chains as proven fixes (apply the recorded approach first when that error appears) and use search_history/get_session to pull the full transcripts it references. Treat [REMEMBERED FROM PAST SESSIONS] and [RECURRING FAILURE] messages as instructions. Still proactively persist reusable techniques with skill_create / skill_update / skill_note.\n"
     "- When a tool result contains [RECURRING FAILURE], you have made this exact mistake before - stop and use the past FIX lesson or a genuinely new approach.\n"
     "- The tests phase is mandatory: a change is only done once it is verified, not when you believe it works.\n\n"
     "CITATIONS:\n"
@@ -4573,11 +4616,27 @@ int main(int argc, char **argv) {
         rag_memories = run_shell_command(cmd, NULL);
     }
 
+    /* Self-improvement session-start recap: mastered error chains, recent
+       lessons, recent sessions, and flaky tools — recapitulated into the
+       system prompt so every session starts from what past sessions learned
+       and did. Disable with INFER_SESSION_RECAP=0. */
+    char *si_recap = NULL;
+    {
+        const char *_rc = getenv("INFER_SESSION_RECAP");
+        if (!_rc || atoi(_rc) != 0) {
+            char rc_cmd[8192];
+            snprintf(rc_cmd, sizeof(rc_cmd), "python3 %s session-recap 2>/dev/null", mcp_script);
+            si_recap = run_shell_command(rc_cmd, NULL);
+            if (si_recap && !*si_recap) { free(si_recap); si_recap = NULL; }
+        }
+    }
+
     char *safe_system = json_escape(active_system_prompt);
     char *safe_ctx = json_escape(sys_ctx);
     char *safe_mem = memory ? json_escape(memory) : NULL;
     char *safe_triggers = triggers ? json_escape(triggers) : NULL;
     char *safe_rag = rag_memories ? json_escape(rag_memories) : NULL;
+    char *safe_si_recap = si_recap ? json_escape(si_recap) : NULL;
     char *sys_msg = NULL;
 
     /* Load AGENTS.md if enabled */
@@ -4588,6 +4647,7 @@ int main(int argc, char **argv) {
                   + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
                   + (safe_mem ? strlen(safe_mem) + 64 : 0)
                   + (safe_rag ? strlen(safe_rag) + 64 : 0)
+                  + (safe_si_recap ? strlen(safe_si_recap) + 128 : 0)
                   + (agents_md ? strlen(agents_md) + 64 : 0)
                   + (g_goal_text ? strlen(g_goal_text) + 256 : 0) + 256;
 
@@ -4612,6 +4672,9 @@ int main(int argc, char **argv) {
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", tm_info);
     clen += snprintf(content + clen, mlen - clen,
                      "\n\n[IMPORTANT: Current system time is %s. Always reference the current year, month, and day in your responses. Do not assume outdated dates.]", time_buf);
+    if (safe_si_recap && strlen(safe_si_recap) > 0)
+        clen += snprintf(content + clen, mlen - clen,
+                         "\n\n--- Self-Improvement Session Recap (start from what past sessions learned; obey its MASTERED chains when the same error appears) ---\n%s", safe_si_recap);
     if (agents_md)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\n--- Project Context (AGENTS.md) ---\n%s", agents_md);
@@ -4633,6 +4696,8 @@ int main(int argc, char **argv) {
     if (safe_mem) free(safe_mem);
     if (safe_triggers) free(safe_triggers);
     if (safe_rag) free(safe_rag);
+    if (safe_si_recap) free(safe_si_recap);
+    if (si_recap) free(si_recap);
     if (rag_memories) free(rag_memories);
     if (sys_ctx) free(sys_ctx);
     if (active_system_prompt) free(active_system_prompt);
@@ -6351,13 +6416,22 @@ step_limit_check:
                                           (tool_output && strstr(tool_output, "-- failed (exit") != NULL);
 
                                       if (si_failed) {
-                                          /* persist the failure + detect recurrence */
+                                          /* persist the failure + detect recurrence.
+                                             chain_id links this failure to its error
+                                             chain (same mistake across sessions); the
+                                             later success reuses the stored id. */
+                                          char *si_cid = si_chain_id(si_name, tool_output);
                                           char *ej_args = json_escape(unescaped_args ? unescaped_args : "");
                                           char *ej_err  = json_escape(tool_output);
-                                          char si_pay[9000];
-                                          snprintf(si_pay, sizeof(si_pay),
-                                                   "{\"tool\":\"%s\",\"args\":\"%s\",\"error\":\"%s\",\"phase\":\"execution\"}",
-                                                   si_name, ej_args, ej_err);
+                                          char si_pay[9200];
+                                          if (si_cid)
+                                              snprintf(si_pay, sizeof(si_pay),
+                                                       "{\"tool\":\"%s\",\"args\":\"%s\",\"error\":\"%s\",\"phase\":\"execution\",\"chain_id\":\"%s\"}",
+                                                       si_name, ej_args, ej_err, si_cid);
+                                          else
+                                              snprintf(si_pay, sizeof(si_pay),
+                                                       "{\"tool\":\"%s\",\"args\":\"%s\",\"error\":\"%s\",\"phase\":\"execution\"}",
+                                                       si_name, ej_args, ej_err);
                                           free(ej_args); free(ej_err);
                                           {
                                               char si_cmd[10000];
@@ -6379,7 +6453,12 @@ step_limit_check:
                                               snprintf(g_si_failed[_slot].tool, sizeof(g_si_failed[_slot].tool), "%s", si_name);
                                               snprintf(g_si_failed[_slot].args,  sizeof(g_si_failed[_slot].args),  "%s", unescaped_args ? unescaped_args : "");
                                               snprintf(g_si_failed[_slot].error, sizeof(g_si_failed[_slot].error), "%s", tool_output);
+                                              if (si_cid)
+                                                  snprintf(g_si_failed[_slot].chain_id, sizeof(g_si_failed[_slot].chain_id), "%s", si_cid);
+                                              else
+                                                  g_si_failed[_slot].chain_id[0] = '\0';
                                           }
+                                          free(si_cid);
                                           /* surface any past lesson for this exact mistake (cross-session memory) */
                                           {
                                               char *ej_err2 = json_escape(tool_output);
@@ -6411,10 +6490,15 @@ step_limit_check:
                                           if (_slot >= 0) {
                                               char *ej_args = json_escape(unescaped_args ? unescaped_args : "");
                                               char *ej_prev = json_escape(g_si_failed[_slot].error);
-                                              char si_rpay[9000];
-                                              snprintf(si_rpay, sizeof(si_rpay),
-                                                       "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\"}",
-                                                       si_name, ej_args, ej_prev);
+                                              char si_rpay[9200];
+                                              if (g_si_failed[_slot].chain_id[0])
+                                                  snprintf(si_rpay, sizeof(si_rpay),
+                                                           "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\",\"chain_id\":\"%s\"}",
+                                                           si_name, ej_args, ej_prev, g_si_failed[_slot].chain_id);
+                                              else
+                                                  snprintf(si_rpay, sizeof(si_rpay),
+                                                           "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\"}",
+                                                           si_name, ej_args, ej_prev);
                                               free(ej_args); free(ej_prev);
                                               {
                                                   char si_rcmd[10000];

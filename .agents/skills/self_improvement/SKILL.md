@@ -10,13 +10,26 @@ skill system so future sessions — including your own — start from today's di
 This is how the harness improves over time.
 
 ## How the harness learns automatically (you don't have to opt in)
-Every tool failure is recorded to `~/.config/ai/self_improve/ledger.jsonl`. When the
-SAME failure signature is seen repeatedly, an auto-generated "recurring pitfall"
+Every tool failure is recorded to `~/.config/ai/self_improve/ledger.jsonl`, linked to an
+**error chain** — a stable id for that one mistake, however many times it recurs. When the
+SAME failure signature is seen repeatedly, an auto-generated "recurring pitfall" (PITFALL)
 lesson is persisted to `lessons.md`. When a tool that failed earlier in a task later
-SUCCEEDS, the working approach is auto-learned as a FIX lesson. On any future error,
-the harness injects matching past lessons into the tool result as
-"[REMEMBERED FROM PAST SESSIONS (self-improvement)]". So even a small model that never
-volunteers to persist still inherits what past sessions learned.
+SUCCEEDS, the working approach is auto-learned as a FIX lesson in the SAME chain. Once a
+chain has been recovered ≥ INFER_CHAIN_MASTERED times (default 2) and hasn't failed since,
+it is promoted to a MASTER lesson. A new failure on a mastered chain de-masters it until
+it is recovered again.
+
+Two ways past learning reaches you:
+1. **On error**: the harness injects matching lessons into the failing tool result as
+   "[REMEMBERED FROM PAST SESSIONS (self-improvement)]".
+2. **At session start**: a [SESSION RECAP] block is injected into your system prompt —
+   mastered error chains (proven fixes), recent lessons, the recent sessions (with ids),
+   and flaky tools. So even a small model that never volunteers to persist still inherits
+   what past sessions learned and did.
+
+Use the recap actively: when a MASTERED chain matches an error you're hitting, apply its
+recorded approach FIRST. When the recap references a recent session you need in detail,
+call `get_session(<id>)` (or `search_history`).
 
 You still add value on top by using skill_create / skill_update / skill_note for
 techniques the harness can't deduce (multi-step workflows, domain facts, tool quirks).

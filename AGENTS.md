@@ -82,13 +82,46 @@ rolling log is bounded and per-task. Disable with `INFER_STATE_CONTEXT=0`. Tool-
 tool message (not just the terminal), and failed `execute_command` output
 (`— failed (exit N)`) is correctly labelled `error`. See `docs/situational_awareness.md`.
 
-### Continuous self-improvement (skills)
+### Continuous self-improvement (skills + error chains)
 
 `ai_mcp.py` provides `skill_create`, `skill_update`, and `skill_note` so the agent can
 persist what it learns into skills — written to `.agents/skills/` (checked into the repo)
 and synced to `~/.config/ai/skills/` (global). A learning log lives at
 `~/.config/ai/skills_learning_log.md`. `ai.c` surfaces a user notification when a skill is
 created/updated. The `self_improvement` skill instructs the agent when to persist learnings.
+
+On top of skills, the harness runs a **deterministic error-chain self-improvement loop**
+(no model discipline required), under `~/.config/ai/self_improve/`:
+- **Failure ledger** (`ledger.jsonl`): every tool failure and every recovery is recorded,
+  each linked to a stable **error chain** (`chain_id`, from `ai_mcp._chain_id`). A chain is
+  one mistake however many times it recurs. The C loop computes the id at failure time
+  (`si_chain_id` in `ai.c`, an exact mirror of `_chain_id`) and reuses it on the later
+  success, so a failure and its fix always land in the SAME chain.
+- **Lesson store** (`lessons.md`): `## PITFALL` (a chain seen ≥
+  `INFER_SELF_IMPROVE_RECURRENCE`, default 2), `## FIX` (error → working approach), and
+  `## MASTER` (a chain promoted after ≥ `INFER_CHAIN_MASTERED`, default 2, recoveries with
+  no failure after the last one — i.e. the fix kept holding). A new failure on a mastered
+  chain de-masters it until it is recovered again, so a stale fix is never trusted blindly.
+- **Error-time injection**: on any failure the harness queries `lessons_for` and prepends
+  matching past lessons as `[REMEMBERED FROM PAST SESSIONS (self-improvement)]`.
+- **Session-start recap** (`ai_mcp.py session-recap`, injected into the system prompt by
+  `ai.c`): each new session is recapitulated with MASTERED error chains, recent FIX/PITFALL
+  lessons, the recent sessions (from the searchable history index), and flaky tools (from
+  `~/.cache/ai/metrics.jsonl`) — the Obsidian-style "what was done / what not to forget"
+  digest. Disable with `INFER_SESSION_RECAP=0`.
+- **Tool health**: `log_metric` records real success/failure + error text;
+  `ai_mcp.py show-metrics` flags `[FLAKY]` tools (≥5 calls, ≥30% failed) and prints the top
+  recurring errors per tool — the "what to fix first" view of the loop.
+- **MCP errors surface as errors**: `call_tool`/`mcp_result_to_text` normalise an MCP
+  `tools/call` result to text and honour `isError: true`, so MCP tool failures are labelled
+  `error` by the C loop and enter the self-improvement ledger like native tools.
+
+Tests: `tests/test_self_improve.py`, `tests/test_self_improve_e2e.py`, and
+`tests/test_self_improve_chains.py` (chain-id stability, MASTER promotion/demotion,
+failure/recovery share one chain, recap sections, metrics, MCP isError, and C-binary e2e
+proving the recap reaches the model's system prompt). `self-improve-status` prints the
+chain table; `session-recap` prints the current digest. Full design:
+`docs/self_improvement_chains.md`.
 
 ### Searchable conversation history
 

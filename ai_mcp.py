@@ -124,7 +124,7 @@ def init_server(proc):
     send_notification(proc, "notifications/initialized")
     return resp
 
-def log_metric(tool_name, duration_ms, success=True):
+def log_metric(tool_name, duration_ms, success=True, error=None):
     try:
         import datetime
         metrics_file = os.path.expanduser("~/.cache/ai/metrics.jsonl")
@@ -135,6 +135,8 @@ def log_metric(tool_name, duration_ms, success=True):
             "duration_ms": round(duration_ms, 2),
             "success": success
         }
+        if not success and error:
+            entry["error"] = str(error)[:200]
         with open(metrics_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
@@ -161,10 +163,15 @@ def show_metrics():
                     succ = data.get("success", True)
                     total_calls += 1
                     if t not in stats:
-                        stats[t] = {"count": 0, "success": 0, "total_ms": 0.0}
+                        stats[t] = {"count": 0, "success": 0, "total_ms": 0.0,
+                                    "errors": {}}
                     stats[t]["count"] += 1
                     if succ:
                         stats[t]["success"] += 1
+                    else:
+                        e = str(data.get("error", "")).strip().lower()
+                        key = _re.sub(r"\d+", "#", e) or "error"
+                        stats[t]["errors"][key] = stats[t]["errors"].get(key, 0) + 1
                     stats[t]["total_ms"] += dur
                 except Exception:
                     pass
@@ -179,7 +186,21 @@ def show_metrics():
     for t, s in sorted(stats.items(), key=lambda x: x[1]["count"], reverse=True):
         avg_ms = round(s["total_ms"] / s["count"], 1) if s["count"] > 0 else 0.0
         succ_rate = f"{s['success']}/{s['count']}"
-        print(f"{t:<28} | {s['count']:<7} | {succ_rate:<8} | {avg_ms:<14}")
+        flaky = ""
+        fails = s["count"] - s["success"]
+        if s["count"] >= 5 and fails / s["count"] >= 0.3:
+            flaky = "  [FLAKY]"
+        print(f"{t:<28} | {s['count']:<7} | {succ_rate:<8} | {avg_ms:<14}{flaky}")
+    # Top recurring errors (tool health — what to fix first)
+    err_rows = []
+    for t, s in stats.items():
+        for e, n in s.get("errors", {}).items():
+            if n >= 2:
+                err_rows.append((n, t, e[:70]))
+    if err_rows:
+        print("\nRecurring tool errors (fix these first):")
+        for n, t, e in sorted(err_rows, reverse=True)[:8]:
+            print(f"  {n}x {t}: {e}")
 
 def list_tools(server_name, cfg):
     proc = start_server(cfg)
@@ -204,6 +225,47 @@ def list_tools(server_name, cfg):
         except:
             pass
 
+def mcp_result_to_text(result):
+    """Normalise an MCP tools/call result into plain text.
+
+    MCP results are {"content": [{"type": "text", "text": ...}, ...],
+    "isError": bool}. We never return the raw dict: a JSON dump of a big
+    payload would confuse both the model and the harness error detectors,
+    and an isError result must read as an error to the self-improvement loop.
+    """
+    if result is None:
+        return "Error: MCP server returned no result"
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        parts = []
+        for c in result:
+            if isinstance(c, dict) and c.get("type") == "text":
+                t = c.get("text", "")
+                if t:
+                    parts.append(t)
+            elif isinstance(c, str):
+                parts.append(c)
+        return "\n".join(parts) if parts else "(no content)"
+    if isinstance(result, dict):
+        if result.get("isError"):
+            txt = (mcp_result_to_text(result.get("content")) or "MCP tool reported an error").strip()
+            return "Error: " + (txt[7:] if txt.lower().startswith("error: ") else txt)
+        if "content" in result:
+            parts = []
+            for c in result.get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    t = c.get("text", "")
+                    if t:
+                        parts.append(t)
+                elif isinstance(c, str):
+                    parts.append(c)
+            return "\n".join(parts) if parts else "(no content)"
+        if "error" in result:
+            return "Error: " + str(result["error"])
+        return json.dumps(result)
+    return str(result)
+
 def call_tool(server_name, cfg, tool_name, arguments):
     proc = start_server(cfg)
     if not proc:
@@ -211,6 +273,8 @@ def call_tool(server_name, cfg, tool_name, arguments):
     try:
         init_server(proc)
         resp = run_jsonrpc(proc, "tools/call", {"name": tool_name, "arguments": arguments}, req_id=3)
+        if "error" in resp:
+            return {"error": str(resp["error"])}
         return resp.get("result", {})
     except Exception as e:
         return {"error": str(e)}
@@ -376,12 +440,6 @@ def spawn_agent(name, prompt, tools=None, persistent=True):
     with open(os.path.join(AGENT_STORE_DIR, f"{agent_id}.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return f"Spawned agent {name} (ID: {agent_id})"
-
-def _resolve_ai_bin():
-    local_ai = os.path.join(os.getcwd(), "ai")
-    if os.path.isfile(local_ai) and os.access(local_ai, os.X_OK):
-        return local_ai
-    return shutil.which("ai") or "ai"
 
 def resume_agent(agent_id, user_message):
     path = os.path.join(AGENT_STORE_DIR, f"{agent_id}.json")
@@ -3948,8 +4006,31 @@ def _append_lesson(kind, tool, signature, body):
         f.write("\n## %s %s\ntool: %s\nsignature: %s\n> %s\n"
                 % (kind, ts, (tool or ""), (signature or ""), body))
 
-def record_failure(tool="", args="", error="", phase="execution"):
-    """Record a failed tool call in the ledger.
+def _chain_id(tool, error):
+    """Stable id for an ERROR CHAIN: the same mistake, however many times it
+    recurs across sessions. This is the unit of the self-improvement loop:
+    failure -> recovery -> (repeat) -> promotion to a permanent lesson."""
+    return "chain_" + _err_signature(tool, error)[:80].replace(" ", "_")
+
+def _read_ledger():
+    recs = []
+    if os.path.isfile(_ledger_path()):
+        try:
+            with open(_ledger_path(), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        recs.append(json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return recs
+
+def record_failure(tool="", args="", error="", phase="execution", chain_id=None):
+    """Record a failed tool call in the ledger, linked to its error chain.
 
     Returns (recurring_bool, lesson_text). If the SAME failure signature has
     now been seen >= INFER_SELF_IMPROVE_RECURRENCE times and isn't already
@@ -3958,10 +4039,11 @@ def record_failure(tool="", args="", error="", phase="execution"):
     tool = (tool or "").strip()
     error = (error or "").strip()
     sig = _err_signature(tool, error)
+    cid = chain_id or _chain_id(tool, error)
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
            "kind": "failure", "tool": tool,
            "args": (args or "")[:200], "error": error[:300],
-           "signature": sig, "phase": phase}
+           "signature": sig, "chain_id": cid, "phase": phase}
     try:
         with open(_ledger_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
@@ -3979,30 +4061,66 @@ def record_failure(tool="", args="", error="", phase="execution"):
         return True, "[RECURRING FAILURE] " + body
     return False, ""
 
-def record_recovery(tool="", args="", prior_error="", phase="execution"):
+def record_recovery(tool="", args="", prior_error="", phase="execution", chain_id=None):
     """Record that the model recovered from a prior failure of the SAME tool.
 
-    This is harness-driven (no model discipline required): the C loop notices a
-    failed call to a tool, then later a succeeding call to the same tool, and
-    persists the working approach as a FIX lesson. Returns the lesson text."""
+    Harness-driven (no model discipline required): the C loop notices a failed
+    call to a tool, then later a succeeding call to the same tool, and persists
+    the working approach as a FIX lesson. Each recovery is linked to the error
+    chain; once a chain is reliably mastered (>= INFER_CHAIN_MASTERED, default
+    2 recoveries, with no failure after the last recovery) it is promoted to a
+    permanent MASTER lesson that future sessions see at startup."""
     tool = (tool or "").strip()
     prior_error = (prior_error or "").strip()
     args = (args or "").strip()
     sig = _err_signature(tool, prior_error)
+    cid = chain_id or _chain_id(tool, prior_error)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         with open(_ledger_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": ts, "kind": "recovery", "tool": tool,
                                 "approach": args[:200],
                                 "prior_error": prior_error[:300],
-                                "signature": sig}) + "\n")
+                                "signature": sig, "chain_id": cid,
+                                "phase": phase}) + "\n")
     except Exception as e:
         return "Error writing recovery ledger: %s" % e
     lesson_text = ("`%s` failed (%s) then succeeded with approach: `%s`."
                    % (tool or "?", (prior_error or "?")[:160], args[:200]))
     if not _has_lesson("FIX", tool, sig):
         _append_lesson("FIX", tool, sig, lesson_text)
+    if _chain_is_mastered(cid) and not _has_lesson("MASTER", tool, cid):
+        body = ("`%s` error chain resolved %dx and never broke again: %s. "
+                "When this error appears, apply the recorded approach first."
+                % (tool or "?", _chain_stats(cid)["recovered"],
+                   (prior_error or "?")[:160]))
+        _append_lesson("MASTER", tool, cid, body)
     return lesson_text
+
+def _chain_stats(chain_id):
+    """Count failures/recoveries of one error chain from the ledger."""
+    st = {"failures": 0, "recovered": 0, "last_event": ""}
+    for rec in _read_ledger():
+        if rec.get("chain_id") != chain_id:
+            continue
+        if rec.get("kind") == "failure":
+            st["failures"] += 1
+            st["last_event"] = "failure"
+        elif rec.get("kind") == "recovery":
+            st["recovered"] += 1
+            st["last_event"] = "recovery"
+    return st
+
+def _chain_is_mastered(chain_id):
+    """A chain is mastered once it has >= INFER_CHAIN_MASTERED recoveries
+    (default 2) and its most recent ledger event is a recovery (the fix held)."""
+    raw = os.environ.get("INFER_CHAIN_MASTERED", "2")
+    try:
+        need = max(1, int(raw))
+    except Exception:
+        need = 2
+    st = _chain_stats(chain_id)
+    return st["recovered"] >= need and st["last_event"] == "recovery"
 
 def _block_signature(block):
     """Extract the normalised 'signature:' line from a lesson block, if present."""
@@ -4020,6 +4138,25 @@ def _sig_error_tokens(sig, tool=""):
     tool_words = set((tool or "").lower().replace("_", " ").split())
     return set(sig.split()) - tool_words - {"error", "failed", "the", "a", "an"}
 
+def _lesson_blocks():
+    if not os.path.isfile(_lessons_path()):
+        return []
+    try:
+        with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return []
+    blocks, cur = [], []
+    for line in content.splitlines():
+        if line.startswith("## "):
+            if cur:
+                blocks.append("\n".join(cur))
+                cur = []
+        cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    return [b for b in blocks if b.strip()]
+
 def lessons_for(tool="", error=""):
     """Return persisted lessons relevant to a tool name / error signature.
 
@@ -4033,30 +4170,15 @@ def lessons_for(tool="", error=""):
     Pure tool-name-only matches are intentionally suppressed to prevent
     irrelevant lessons from previous sessions polluting the current session.
     Returns '' when nothing matches, else a compact markdown block (capped ~1600 chars)."""
-    if not os.path.isfile(_lessons_path()):
-        return ""
-    try:
-        with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except Exception:
+    blocks = _lesson_blocks()
+    if not blocks:
         return ""
     target_tool = (tool or "").strip().lower()
     sig = _err_signature(tool, error)
-    blocks, cur = [], []
-    for line in content.splitlines():
-        if line.startswith("## "):
-            if cur:
-                blocks.append("\n".join(cur))
-                cur = []
-        cur.append(line)
-    if cur:
-        blocks.append("\n".join(cur))
     # Pre-compute current error tokens (stripped of tool-name words)
     cur_err_tokens = _sig_error_tokens(sig, target_tool) if sig else set()
     hits, seen = [], set()
     for b in blocks:
-        if not b.strip():
-            continue
         key = b.splitlines()[0]
         if key in seen:
             continue
@@ -4084,37 +4206,127 @@ def lessons_for(tool="", error=""):
         joined = joined[:1600] + "\n... (truncated)"
     return joined
 
+def _recent_sessions_brief(limit=3):
+    """One-line-per-recent-session summary from the history index (what was
+    done lately). Tolerates a missing/empty index — returns ''."""
+    try:
+        import datetime as _dt
+        conn = sqlite3.connect(HISTORY_DB)
+        _ensure_history_schema(conn)
+        _sync_history_index(conn)
+        rows = conn.execute(
+            "SELECT session_id, turns, mtime, substr(body,1,120) FROM history_sessions "
+            "ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+    except Exception:
+        return ""
+    lines = []
+    for sid, turns, mt, body in rows:
+        when = _dt.datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M") if mt else "?"
+        p = (body or "").strip().replace("\n", " ")
+        if len(p) > 90:
+            p = p[:90] + "\u2026"
+        lines.append("- %s (%s turns, %s): %s" % (sid, turns or 0, when, p or "(no summary)"))
+    return "\n".join(lines)
+
+def _tool_health_brief(limit=4):
+    """Flakiest tools from ~/.cache/ai/metrics.jsonl (tool-health view of the
+    self-improvement loop). Returns '' when nothing is flaky."""
+    metrics_file = os.path.expanduser("~/.cache/ai/metrics.jsonl")
+    if not os.path.isfile(metrics_file):
+        return ""
+    stats = {}
+    try:
+        with open(metrics_file, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("tool", "?")
+                s = stats.setdefault(t, [0, 0])  # [fails, count]
+                s[1] += 1
+                if not d.get("success", True):
+                    s[0] += 1
+    except Exception:
+        return ""
+    flaky = []
+    for t, (fails, count) in stats.items():
+        if count >= 5 and fails / count >= 0.3:
+            flaky.append((fails / count, t, fails, count))
+    if not flaky:
+        return ""
+    lines = []
+    for rate, t, fails, count in sorted(flaky, reverse=True)[:limit]:
+        lines.append("- %s: %d/%d calls failed (%.0f%%)" % (t, fails, count, rate * 100))
+    return "\n".join(lines)
+
+def session_recap(max_chars=1600):
+    """Session-start recapitulation: the compact digest the harness injects
+    into the system prompt before the first turn, so every session starts from
+    what past sessions learned and did (Obsidian-style 'what was done, and
+    what I must not forget').
+
+    Sections (each omitted when empty; whole output capped at max_chars):
+      - MASTERED error chains (promoted fixes — apply first when the error hits)
+      - Recent lessons (newest FIX/PITFALL blocks)
+      - Recent sessions (from the searchable history index)
+      - Flaky tools (tool-health view from metrics)"""
+    sections = []
+    masters = [b for b in _lesson_blocks() if b.startswith("## MASTER")]
+    if masters:
+        sections.append("MASTERED ERROR CHAINS (apply the recorded approach first):\n"
+                        + "\n".join(masters[-2:])[:600])
+    other = [b for b in _lesson_blocks() if b.startswith("## FIX") or b.startswith("## PITFALL")]
+    if other:
+        sections.append("RECENT LESSONS:\n" + "\n".join(other[-2:])[:450])
+    brief = _recent_sessions_brief(3)
+    if brief:
+        sections.append("RECENT SESSIONS (full transcripts: search_history / get_session):\n" + brief)
+    health = _tool_health_brief(3)
+    if health:
+        sections.append("TOOL HEALTH (flaky tools — verify before trusting):\n" + health)
+    if not sections:
+        return ""
+    out = "[SESSION RECAP — what past sessions learned & did]\n" + "\n\n".join(sections)
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n... (truncated)"
+    return out
+
 def self_improve_status():
     """Human-readable summary of the self-improvement ledger/lessons (debugging)."""
-    nfail = nrec = 0
-    if os.path.isfile(_ledger_path()):
-        try:
-            with open(_ledger_path(), encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except Exception:
-                        continue
-                    if rec.get("kind") == "failure":
-                        nfail += 1
-                    elif rec.get("kind") == "recovery":
-                        nrec += 1
-        except Exception:
-            pass
+    recs = _read_ledger()
+    nfail = sum(1 for r in recs if r.get("kind") == "failure")
+    nrec = sum(1 for r in recs if r.get("kind") == "recovery")
+    chains = {}
+    for r in recs:
+        cid = r.get("chain_id")
+        if not cid:
+            continue
+        st = chains.setdefault(cid, {"failures": 0, "recovered": 0, "tool": r.get("tool", "?")})
+        if r.get("kind") == "failure":
+            st["failures"] += 1
+        else:
+            st["recovered"] += 1
     lessons = ""
     if os.path.isfile(_lessons_path()):
         try:
-            with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
+            with open(_lessons_path(), encoding="utf-8") as f:
                 lessons = f.read()
         except Exception:
             lessons = ""
     lines = ["Self-improvement state (%s):" % _si_dir(),
              "- failures recorded : %d" % nfail,
              "- recoveries recorded: %d" % nrec,
+             "- error chains       : %d" % len(chains),
+             "- mastered chains    : %d" % sum(1 for c in chains if _chain_is_mastered(c)),
              "- lessons.md         : %s" % _lessons_path(),
-             "- recurrence threshold: %d (INFER_SELF_IMPROVE_RECURRENCE)" % _si_recurrence_threshold()]
+             "- recurrence threshold: %d (INFER_SELF_IMPROVE_RECURRENCE)" % _si_recurrence_threshold(),
+             "- mastered threshold  : %s (INFER_CHAIN_MASTERED)" % os.environ.get("INFER_CHAIN_MASTERED", "2")]
+    for cid, st in sorted(chains.items()):
+        flag = " [MASTERED]" if _chain_is_mastered(cid) else ""
+        lines.append("  - %s %s: %d fail / %d recovered%s"
+                     % (st["tool"], cid, st["failures"], st["recovered"], flag))
     if lessons.strip():
         lines.append("--- lessons.md ---")
         lines.append(lessons.strip())
@@ -4204,6 +4416,10 @@ def main():
 
     if action == "self-improve-status":
         print(self_improve_status())
+        sys.exit(0)
+
+    if action == "session-recap":
+        print(session_recap(), end="")
         sys.exit(0)
 
     if action == "trim-messages":
@@ -5545,6 +5761,12 @@ def main():
 
         arguments = normalize_tool_arguments(tool_name, arguments)
 
+        def _emit_tool_text(res):
+            if isinstance(res, dict) and ("content" in res or "isError" in res or "error" in res):
+                print(mcp_result_to_text(res))
+            else:
+                print(res)
+
         # Validate required arguments before dispatch
         required = TOOL_REQUIRED_ARGS.get(tool_name, [])
         if tool_name == "delegate_task":
@@ -6235,7 +6457,7 @@ def main():
                 sys.exit(1)
 
             result = call_tool(server_name, cfg, tool_name, arguments)
-            print(json.dumps(result))
+            _emit_tool_text(result)
 
 if __name__ == "__main__":
     main()
