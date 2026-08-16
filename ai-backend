@@ -1486,45 +1486,60 @@ def cmd_tune(target=None):
 
     print(f"Model size: {model_mb/1024:.1f} GB | Architecture: {arch.get('arch', 'unknown')} | MTP Support: {'Yes' if has_mtp else 'No'}")
 
-    # Recommended memory configuration based on hardware & model size
-    recommended_cache = "q8_0"
-    recommended_ctx = 96000
-
-    if total_vram_mib <= 16500:  # 16GB GPUs (RTX 5080, RTX 4080, etc.)
-        if model_mb > 7000:  # e.g. 27B quant (8-10GB)
-            recommended_cache = "q4_0"
-            recommended_ctx = 96000  # Safe 96k context with >1GB headroom to guarantee 0.0 Shared RAM on Windows/WSL
-        elif model_mb > 4000:  # e.g. 9B-12B (4-6GB)
-            recommended_cache = "q4_0"
-            recommended_ctx = 128000
-        else:
-            recommended_cache = "q8_0"
-            recommended_ctx = 65536
-    elif total_vram_mib <= 25000:  # 24GB GPUs (RTX 3090, 4090, 5090)
-        recommended_cache = "q4_0" if model_mb > 15000 else "q8_0"
-        recommended_ctx = 262144 if model_mb <= 12000 else 131072
-    else:  # Multi-GPU / High VRAM
+    # Recommended KV cache quant: q4_0 for large models (saves VRAM), q8_0 for small ones
+    if model_mb > 10000:
+        recommended_cache = "q4_0"
+    elif model_mb > 4000:
         recommended_cache = "q8_0"
-        recommended_ctx = 262144
+    else:
+        recommended_cache = "q8_0"
+
+    # Compute recommended ctx from available VRAM (baseline: no MTP, q4_0 if recommended)
+    # This is what will be pinned after benchmarking — use best-case (no MTP) for ctx ceiling.
+    recommended_ctx = calculate_auto_ctx(
+        model_path,
+        vram_free=total_vram_mib or None,
+        use_mtp=False,
+    )
+    # Snap to a clean multiple of 4096 and cap at 262144
+    recommended_ctx = min(262144, (recommended_ctx // 4096) * 4096)
+    recommended_ctx = max(4096, recommended_ctx)
 
     print(f"\n[Step 1/3] Memory Optimization:")
     print(f"  → Setting KV Cache Quantization: {recommended_cache} (prevents VRAM spill)")
     cmd_cache_quant(recommended_cache)
 
-    print(f"  → Setting Resident Context Window: {recommended_ctx} tokens")
-    cmd_ctx(str(recommended_ctx))
+    # Clear explicit ctx during benchmarking so start_server can inject a safe
+    # per-candidate value. We apply the recommended ctx at the end.
+    print(f"  → Clearing explicit ctx (will lock to {recommended_ctx} tokens after benchmark)")
+    cmd_ctx("auto")
 
-    # Helper: Wait for server ready
-    def wait_ready(timeout=60):
+
+    # Helper: Wait for server ready, also watching for early server death
+    def wait_ready(proc, timeout=180):
         t0 = time.time()
+        stderr_lines = []
         while time.time() - t0 < timeout:
+            # Check if server died
+            rc = proc.poll()
+            if rc is not None:
+                # Drain stderr for diagnostics
+                try:
+                    out = proc.stderr.read().decode(errors="replace")
+                    stderr_lines = out.splitlines()
+                except Exception:
+                    pass
+                print(f"\n  [Server exited with code {rc}]")
+                for ln in stderr_lines[-8:]:
+                    print(f"    {ln}")
+                return False
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=1) as resp:
                     if resp.status == 200:
                         return True
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(1)
         return False
 
     # Helper: Stream generation
@@ -1581,6 +1596,50 @@ def cmd_tune(target=None):
             pass
         return m
 
+    # Helper: Start server subprocess for benchmarking
+    def start_server(use_mtp_flag=False):
+        """Launch ai-backend serve in a subprocess with a VRAM-safe context size.
+
+        Computes a fresh auto-ctx for each MTP candidate so the VRAM preflight
+        always passes regardless of what's pinned in the env file.
+        stderr=PIPE — read only on server death, never blocks since we drain it
+        only when proc.poll() is non-None.
+        """
+        serve_env = os.environ.copy()
+        # Force-compute a safe ctx for this candidate (ignores any pinned value)
+        gpus = list_gpu_info()
+        agg_free = sum(g.get("free_mib", 0) for g in gpus)
+        safe_ctx = calculate_auto_ctx(
+            model_path,
+            vram_free=agg_free or None,
+            use_mtp=use_mtp_flag,
+        )
+        # Cap to recommended_ctx ceiling so we're benchmarking realistic sizes
+        safe_ctx = min(safe_ctx, recommended_ctx)
+        serve_env["LLAMA_CTX_SIZE"] = str(safe_ctx)
+        print(f"    (using ctx={safe_ctx} for this run)", flush=True)
+        proc = subprocess.Popen(
+            [sys.argv[0], "serve"],
+            env=serve_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return proc
+
+    # Helper: Stop server subprocess
+    def stop_server(proc):
+        """Terminate the server process and wait for it to exit."""
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+
     # 3. Benchmark MTP / Speculative Decoding Candidates
     eval_prompts = [
         ("code", "Write a python function `quickselect(arr, k)` that finds the k-th smallest element in O(n) average time with docstring."),
@@ -1596,19 +1655,27 @@ def cmd_tune(target=None):
 
     for draft_n in candidates:
         tag = "Baseline (No MTP)" if draft_n == 0 else f"MTP (draft-n={draft_n})"
-        print(f"  Testing {tag}...", end="", flush=True)
+        print(f"  Starting server for {tag}...", flush=True)
 
+        # Apply MTP setting to env file, then start the server
         if draft_n == 0:
             cmd_mtp("off")
         else:
             cmd_mtp(str(draft_n))
 
-        if not wait_ready():
-            print(" [Server Start Failed]")
-            continue
+        srv_proc = start_server(use_mtp_flag=(draft_n > 0))
 
-        # Warmup
+        print(f"  Waiting for server (up to 3 min)...", end="", flush=True)
+        if not wait_ready(srv_proc, timeout=180):
+            print(" [Server Start Failed — skipping]")
+            stop_server(srv_proc)
+            continue
+        print(" Ready.", flush=True)
+
+        # Warmup — prime KV cache and GPU before timing
+        print(f"  Warming up...", end="", flush=True)
         generate_eval("warmup", max_tokens=20, thinking=False)
+        print(" Done.", flush=True)
         m0 = get_metrics()
 
         fast_rates = []
@@ -1616,6 +1683,7 @@ def cmd_tune(target=None):
         ttfts = []
 
         for cat, prompt in eval_prompts:
+            print(f"  Benchmarking [{cat}]...", end="", flush=True)
             rate_f, ttft_f, _ = generate_eval(prompt, max_tokens=180, thinking=False)
             rate_t, ttft_t, _ = generate_eval(prompt, max_tokens=200, thinking=True)
             if rate_f > 0:
@@ -1623,6 +1691,7 @@ def cmd_tune(target=None):
                 ttfts.append(ttft_f)
             if rate_t > 0:
                 think_rates.append(rate_t)
+            print(f" {rate_f:.1f} tok/s", flush=True)
 
         m1 = get_metrics()
         draft_tot = m1.get("llamacpp:spec_decode_num_draft_tokens_total", 0) - m0.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
@@ -1633,7 +1702,7 @@ def cmd_tune(target=None):
         med_think = st.median(think_rates) if think_rates else 0.0
         med_ttft = st.median(ttfts) if ttfts else 0.0
 
-        print(f" → Non-Thinking: {med_fast:5.1f} tok/s | Thinking: {med_think:5.1f} tok/s | Acc: {acc_rate:4.1f}%")
+        print(f"  → {tag}: Non-Thinking: {med_fast:5.1f} tok/s | Thinking: {med_think:5.1f} tok/s | Acc: {acc_rate:4.1f}%")
 
         benchmarks.append({
             "draft_n": draft_n,
@@ -1645,10 +1714,15 @@ def cmd_tune(target=None):
             "combined_score": med_fast * 0.6 + med_think * 0.4,
         })
 
+        # Stop the server before starting with the next candidate
+        print(f"  Stopping server...", flush=True)
+        stop_server(srv_proc)
+        time.sleep(3)  # brief pause to let GPU memory and port release
+
     # 4. Select Optimal Configuration
     print(f"\n[Step 3/3] Selecting Best Configuration:")
     if not benchmarks:
-        print("Error: No benchmark runs succeeded.", file=sys.stderr)
+        print("Error: No benchmark runs succeeded. Is llama-server installed and working?", file=sys.stderr)
         return
 
     best = max(benchmarks, key=lambda b: b["combined_score"])
@@ -1663,19 +1737,23 @@ def cmd_tune(target=None):
         cmd_mtp("off")
     else:
         cmd_mtp(str(best["draft_n"]))
-    wait_ready()
+
+    # Now apply the recommended context size (benchmarks done, VRAM is free)
+    print(f"  → Locking context size to {recommended_ctx} tokens")
+    cmd_ctx(str(recommended_ctx))
 
     # Final summary table
     print(f"\n" + "=" * 68)
     print(f"  BENCHMARK & TUNING SUMMARY")
     print(f"=" * 68)
     print(f"  Model:                 {model_name}")
-    print(f"  Resident Context Size: {recommended_ctx} tokens (No RAM spill)")
+    print(f"  Resident Context Size: {recommended_ctx} tokens")
     print(f"  KV Cache Quantization: {recommended_cache}")
     print(f"  Optimal MTP Tokens:    {best['draft_n']} ({best['label']})")
     print(f"  Decode Throughput:     {best['fast_tok_s']:.1f} tok/s non-thinking | {best['think_tok_s']:.1f} tok/s thinking")
     print(f"  Draft Acceptance Rate: {best['acc_rate']:.1f}%")
     print(f"=" * 68)
+    print(f"\n  Settings applied. Run `ai-backend serve` to start the server.")
 
 
 def cmd_mode(mode_name=None):
