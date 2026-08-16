@@ -557,6 +557,7 @@ For details on the architecture, adding tools, and cross-process contracts, see 
 ├── gcal.py               # Google Calendar integration
 ├── pubmed_mcp_server.py  # PubMed MCP server
 ├── deep_research.py      # Deep research tool
+├── robinhood_trader.py   # Robinhood Agentic Trading & Market Hours analysis suite
 ├── zulip_ai_bridge.py    # Zulip AI bridge
 ├── zulip_mcp_server.py   # Zulip MCP server
 ├── tests/                # Test suite

@@ -580,6 +580,18 @@ class ZulipAiBridge:
         """
         return os.environ.get("BRIDGE_AI_MODE", "auto").strip().lower()
 
+    def _resolve_ai_bin(self):
+        """Locate the ai binary on the host system."""
+        if "INFER_BIN_PATH" in os.environ and os.path.isfile(os.environ["INFER_BIN_PATH"]):
+            return os.environ["INFER_BIN_PATH"]
+        repo_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai")
+        if os.path.isfile(repo_bin) and os.access(repo_bin, os.X_OK):
+            return repo_bin
+        local_bin = os.path.expanduser("~/.local/bin/ai")
+        if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
+            return local_bin
+        return "ai"
+
     def _truncate_reply(self, text, max_chars=9000):
         """Truncate a reply to fit Zulip's per-message size limit.
 
@@ -645,7 +657,8 @@ class ZulipAiBridge:
         else:
             mode_flags = ["--plan"]
 
-        ai_cmd = ["ai", "-q"] + mode_flags + [prompt]
+        ai_bin = self._resolve_ai_bin()
+        ai_cmd = [ai_bin, "-q"] + mode_flags + [prompt]
         task_timeout = int(os.environ.get("INFER_TASK_TIMEOUT", 0)) or 600
 
         try:

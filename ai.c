@@ -19,6 +19,9 @@
 #include <sys/select.h>
 #include <errno.h>
 #include <poll.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include "remote_harness.h"
 
 /* ── Remote Server State ───────────────────────────────────────────────────── */
@@ -105,6 +108,8 @@ static const tool_meta_t g_tool_meta[] = {
     {"stop_process",        "⊞",  CL_MAGENTA},
     {"check_process_status","⊞",  CL_MAGENTA},
     {"search_files",        "⌕",  CL_GREEN},
+    {"patch_file",          "⌨",  CL_ORANGE},
+    {"get_environment",     "◷",  CL_CYAN},
     {"todo",                "📋", CL_CYAN},
     {"clarify",             "❔", CL_YELLOW},
     {"browser",             "🌐", CL_BLUE},
@@ -187,6 +192,8 @@ static double get_time_sec_mono(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 char current_session_id[64] = "";
+int         g_private_mode = 0;   /* --private / -P: no history/sessions saved to disk */
+int         g_short_ctx = 0;      /* --short-ctx: small context mode (<16K tokens) */
 static int  g_hide_details = 0;
 static int  g_permission_mode = 0;
 static int  g_plan_approved = 0;   /* plan mode: user approved the presented plan */
@@ -238,8 +245,15 @@ static void add_turn_item(turn_item_type_t type, const char *name, const char *s
     item->content = content ? strdup(content) : NULL;
     item->elapsed_sec = elapsed_sec;
     item->tokens_per_sec = tokens_per_sec;
-    item->turn_count = turn_count;
-    item->tool_count = tool_count;
+}
+
+static void free_turn_items(void) {
+    for (int i = 0; i < g_turn_item_count; i++) {
+        if (g_turn_items[i].name) { free(g_turn_items[i].name); g_turn_items[i].name = NULL; }
+        if (g_turn_items[i].status) { free(g_turn_items[i].status); g_turn_items[i].status = NULL; }
+        if (g_turn_items[i].content) { free(g_turn_items[i].content); g_turn_items[i].content = NULL; }
+    }
+    g_turn_item_count = 0;
 }
 
 static void print_jobs_and_tasks_status(void) {
@@ -860,6 +874,34 @@ static void set_tool_cache(const char *name, const char *args, const char *outpu
     g_tool_cache = node;
 }
 
+static void invalidate_tool_cache_files(void) {
+    ToolCacheNode **curr = &g_tool_cache;
+    while (*curr) {
+        if (strncmp((*curr)->key, "read_file:", 10) == 0 ||
+            strncmp((*curr)->key, "list_directory:", 15) == 0) {
+            ToolCacheNode *to_free = *curr;
+            *curr = to_free->next;
+            if (to_free->key) free(to_free->key);
+            if (to_free->output) free(to_free->output);
+            free(to_free);
+        } else {
+            curr = &((*curr)->next);
+        }
+    }
+}
+
+static void clear_tool_cache(void) {
+    ToolCacheNode *curr = g_tool_cache;
+    while (curr) {
+        ToolCacheNode *next = curr->next;
+        if (curr->key) free(curr->key);
+        if (curr->output) free(curr->output);
+        free(curr);
+        curr = next;
+    }
+    g_tool_cache = NULL;
+}
+
 static int g_dry_run = 0; /* --dry-run flag */
 
 /* ── Git integration (auto-commit after successful commands) ── */
@@ -1029,7 +1071,7 @@ static int tool_is_mutating(const char *name) {
     if (!name) return 0;
     static const char *mut[] = {
         "execute_command","execute_remote_command","remote_exec",
-        "write_file","edit_file","save_memory","remember",
+        "write_file","edit_file","patch_file","save_memory","remember",
         "learn_rule","vault_write","schedule_task","set_reminder",
         "unschedule_task","start_background_process","stop_process","delegate_task",
         "spawn_agent","resume_agent","append_to_context_pool",
@@ -1052,11 +1094,12 @@ static int tool_is_readonly(const char *name) {
     static const char *ro[] = {
         "think","web_search","arxiv_search","fetch_webpage","fetch_smart","read_file",
         "list_directory","recall","list_processes","check_process_status","parallel_fetch",
-        "load_skill","fetch_webpage_js","get_system_status","get_clipboard",
+        "load_skill","fetch_webpage_js","get_system_status","get_clipboard","get_environment",
         "vault_read","vault_search","vault_backlinks","pubmed_search",
         "gcal_list_events","gcal_check_availability","check_time","list_scheduled_tasks",
         "search_history","list_sessions","get_session","present_plan","task_complete",
         "search_files","list_agents","get_context_snippet","search_context","clarify",
+        "python_playground","js_playground",
         "scientific__pdb_parse","scientific__uniprot_search","scientific__align_sequences",
         "scientific__data_analysis","scientific__security_audit",
         NULL
@@ -1236,6 +1279,7 @@ static char* get_system_context() {
 static char* json_escape(const char *src);
 
 static void log_job(const char *prompt, const char *pipe_writer, const char *response, int interactive) {
+    if (g_private_mode) return;
     char *home = getenv("HOME");
     if (!home) return;
     char dir_path[1024];
@@ -3982,10 +4026,14 @@ static void print_mode_current(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+    prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+#endif
+    atexit(free_turn_items);
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     time_t current_time = time(NULL);
-    snprintf(current_session_id, sizeof(current_session_id), "sess_%ld", (long)current_time);
+    snprintf(current_session_id, sizeof(current_session_id), "sess_%ld_%d", (long)current_time, (int)getpid());
     load_env_file();
     char exe_path[512] = "";
     ssize_t r_exe = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -4099,6 +4147,8 @@ int main(int argc, char **argv) {
             printf("  --bg, --background   Run in background mode.\n");
             printf("  --commit-msg MSG     Custom git commit message for auto-commit.\n");
             printf("  --no-copy            Disable auto-copy of last response on task_complete.\n");
+            printf("  --private, -P        Private mode: do not save history, sessions, or metrics to disk.\n");
+            printf("  --short-ctx [N]      Short context mode (optimised for models with <=16K tokens).\n");
             printf("  --trim-threshold N   Set context auto-compact threshold in bytes (default 100000).\n");
             printf("  --tokenizer MODEL    Pre-load tokenizer for precise token counting.\n\n");
             printf("Examples:\n");
@@ -4203,6 +4253,20 @@ int main(int argc, char **argv) {
             i++;
         } else if (strcmp(argv[i], "--no-copy") == 0) {
             g_copy_enabled = 0;
+        } else if (strcmp(argv[i], "--private") == 0 || strcmp(argv[i], "--incognito") == 0 || strcmp(argv[i], "-P") == 0) {
+            g_private_mode = 1;
+            g_git_commit_enabled = 0;
+            setenv("INFER_PRIVATE_MODE", "1", 1);
+        } else if (strcmp(argv[i], "--short-ctx") == 0 || strcmp(argv[i], "--short-context") == 0) {
+            g_short_ctx = 1;
+            trim_threshold = 16000;
+            max_tool_output = 4000;
+            setenv("INFER_SHORT_CTX", "1", 1);
+            setenv("INFER_SESSION_RECAP", "0", 1);
+            if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                trim_threshold = atoi(argv[i+1]);
+                i++;
+            }
         } else if (strcmp(argv[i], "--trim-threshold") == 0 && i + 1 < argc) {
             trim_threshold = atoi(argv[i+1]);
             i++;
@@ -4345,6 +4409,18 @@ int main(int argc, char **argv) {
     if (env_trim && *env_trim) trim_threshold = atoi(env_trim);
     char *env_stub = getenv("INFER_STUB_THRESHOLD");
     if (env_stub && *env_stub) stub_threshold = atoi(env_stub);
+    char *env_priv = getenv("INFER_PRIVATE_MODE");
+    if (env_priv && (strcmp(env_priv, "1") == 0 || strcasecmp(env_priv, "true") == 0)) {
+        g_private_mode = 1;
+        g_git_commit_enabled = 0;
+    }
+    char *env_short = getenv("INFER_SHORT_CTX");
+    if (env_short && (strcmp(env_short, "1") == 0 || strcasecmp(env_short, "true") == 0)) {
+        g_short_ctx = 1;
+        trim_threshold = 16000;
+        max_tool_output = 4000;
+        setenv("INFER_SESSION_RECAP", "0", 1);
+    }
     const char *tool_choice_val = "required";
     char *env_tool_choice = getenv("INFER_TOOL_CHOICE");
     if (env_tool_choice && (strcmp(env_tool_choice, "auto") == 0
@@ -4653,25 +4729,19 @@ int main(int argc, char **argv) {
         }
     }
 
-    char *safe_system = json_escape(active_system_prompt);
-    char *safe_ctx = json_escape(sys_ctx);
-    char *safe_mem = memory ? json_escape(memory) : NULL;
-    char *safe_triggers = triggers ? json_escape(triggers) : NULL;
-    char *safe_rag = rag_memories ? json_escape(rag_memories) : NULL;
-    char *safe_si_recap = si_recap ? json_escape(si_recap) : NULL;
     char *sys_msg = NULL;
 
     /* Load AGENTS.md if enabled */
     char *agents_md = load_agents_md();
 
     /* Build the content string: SYSTEM_PROMPT + ctx + optional triggers + optional memory */
-    size_t mlen = strlen(safe_system) + strlen(safe_ctx)
-                  + (safe_triggers ? strlen(safe_triggers) + 64 : 0)
-                  + (safe_mem ? strlen(safe_mem) + 64 : 0)
-                  + (safe_rag ? strlen(safe_rag) + 64 : 0)
-                  + (safe_si_recap ? strlen(safe_si_recap) + 128 : 0)
+    size_t mlen = strlen(active_system_prompt) + strlen(sys_ctx)
+                  + (triggers ? strlen(triggers) + 64 : 0)
+                  + (memory ? strlen(memory) + 64 : 0)
+                  + (rag_memories ? strlen(rag_memories) + 64 : 0)
+                  + (si_recap ? strlen(si_recap) + 128 : 0)
                   + (agents_md ? strlen(agents_md) + 64 : 0)
-                  + (g_goal_text ? strlen(g_goal_text) + 256 : 0) + 256;
+                  + (g_goal_text ? strlen(g_goal_text) + 256 : 0) + 512;
 
     /* Assemble piece by piece into a temporary content buffer, then JSON-wrap */
     char *content = malloc(mlen);
@@ -4694,9 +4764,9 @@ int main(int argc, char **argv) {
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", tm_info);
     clen += snprintf(content + clen, mlen - clen,
                      "\n\n[IMPORTANT: Current system time is %s. Always reference the current year, month, and day in your responses. Do not assume outdated dates.]", time_buf);
-    if (safe_si_recap && strlen(safe_si_recap) > 0)
+    if (si_recap && strlen(si_recap) > 0)
         clen += snprintf(content + clen, mlen - clen,
-                         "\n\n--- Self-Improvement Session Recap (start from what past sessions learned; obey its MASTERED chains when the same error appears) ---\n%s", safe_si_recap);
+                         "\n\n--- Self-Improvement Session Recap (start from what past sessions learned; obey its MASTERED chains when the same error appears) ---\n%s", si_recap);
     if (agents_md)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\n--- Project Context (AGENTS.md) ---\n%s", agents_md);
@@ -4713,12 +4783,6 @@ int main(int argc, char **argv) {
     messages_json = append_message(messages_json, sys_msg);
     g_system_message_json = strdup(sys_msg); /* saved for compact_session */
 
-    if (safe_system) free(safe_system);
-    if (safe_ctx) free(safe_ctx);
-    if (safe_mem) free(safe_mem);
-    if (safe_triggers) free(safe_triggers);
-    if (safe_rag) free(safe_rag);
-    if (safe_si_recap) free(safe_si_recap);
     if (si_recap) free(si_recap);
     if (rag_memories) free(rag_memories);
     if (sys_ctx) free(sys_ctx);
@@ -5024,6 +5088,19 @@ int main(int argc, char **argv) {
                     g_notifications_enabled ^= 1;
                     printf("%sOS notifications %s\033[0m\n",
                            CL_CYAN, g_notifications_enabled ? "enabled" : "disabled");
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strcmp(user_input, ":private") == 0 || strcmp(user_input, ":incognito") == 0) {
+                    g_private_mode ^= 1;
+                    if (g_private_mode) {
+                        g_git_commit_enabled = 0;
+                        setenv("INFER_PRIVATE_MODE", "1", 1);
+                        print_info_box("Private Mode ON", "No session history, metrics, or telemetry will be saved to disk.");
+                    } else {
+                        unsetenv("INFER_PRIVATE_MODE");
+                        print_info_box("Private Mode OFF", "Session logging and persistence restored.");
+                    }
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -5522,6 +5599,25 @@ step_limit_check:
                 }
 
                 if (should_call_tools && tool_calls_tok != -1 && tok[tool_calls_tok].type == JSMN_ARRAY) {
+                    char *turn_msg_content = NULL;
+                    if (message_tok != -1) {
+                        int msg_end = tok[message_tok].end;
+                        int mk = message_tok + 1;
+                        while (mk < r && tok[mk].start < msg_end) {
+                            if (tok[mk].type == JSMN_STRING) {
+                                int flen = tok[mk].end - tok[mk].start;
+                                if (flen == 7 && strncmp(chunk.data + tok[mk].start, "content", 7) == 0) {
+                                    int c_tok = mk + 1;
+                                    if (c_tok < r && tok[c_tok].type == JSMN_STRING) {
+                                        turn_msg_content = unescape_json_string(chunk.data + tok[c_tok].start, tok[c_tok].end - tok[c_tok].start);
+                                    }
+                                    break;
+                                }
+                            }
+                            mk = json_skip_token(tok, r, mk + 2);
+                        }
+                    }
+
                     int num_calls = tok[tool_calls_tok].size;
                     int current_tok = tool_calls_tok + 1;
 
@@ -5722,30 +5818,57 @@ step_limit_check:
                                        }
                                    }
                                    if (summary) {
-                                       log_job(current_prompt, pipe_writer, summary, interactive_mode);
-                                       char *escaped_summary = shell_escape(summary);
-                                       /* Render markdown via Python helper and print clean response */
-                                       char *rendered = render_markdown(summary);
-                                       double elapsed_sec = get_time_sec_mono() - tool_t0;
-                                       double tps = (elapsed_sec > 0.05 && completion_tokens > 0)
-                                                     ? completion_tokens / elapsed_sec : 0.0;
-                                       fflush(stderr);
-                                       add_turn_item(ITEM_ASSISTANT_RESPONSE, model[0] ? model : "ai", NULL,
-                                                     summary, elapsed_sec, tps, g_turn_count, total_tool_count);
-                                       notify_completion(summary);
-                                       if (rendered && *rendered) {
-                                           print_response_box(model[0] ? model : "ai", rendered,
-                                                              g_turn_count, total_tool_count,
-                                                              elapsed_sec, tps, 0);
-                                           free(rendered);
-                                       } else {
-                                           print_response_box(model[0] ? model : "ai", summary,
-                                                              g_turn_count, total_tool_count,
-                                                              elapsed_sec, tps, 0);
-                                       }
-                                       free(escaped_summary);
-                                       free(summary);
-                                   }
+                                        char *final_reply = summary;
+                                        int free_final_reply = 0;
+
+                                        if (turn_msg_content && *turn_msg_content) {
+                                            int has_real_text = 0;
+                                            for (const char *p = turn_msg_content; *p; p++) {
+                                                if (!isspace((unsigned char)*p)) { has_real_text = 1; break; }
+                                            }
+                                            if (has_real_text) {
+                                                if (strstr(summary, "Small talk") || strstr(summary, "small talk") ||
+                                                    strstr(summary, "no task") || strstr(summary, "No task") ||
+                                                    strstr(summary, "standing by") || strstr(summary, "Standing by") ||
+                                                    strcmp(summary, "Done.") == 0 || strcmp(summary, "Done") == 0 ||
+                                                    strcmp(summary, "Task complete.") == 0 || strcmp(summary, "Task completed.") == 0 ||
+                                                    strcmp(summary, "Finished.") == 0 || strlen(turn_msg_content) >= strlen(summary) + 20) {
+                                                    final_reply = turn_msg_content;
+                                                } else if (strstr(turn_msg_content, summary) == NULL && strstr(summary, turn_msg_content) == NULL) {
+                                                    size_t comb_len = strlen(turn_msg_content) + strlen(summary) + 16;
+                                                    char *comb = malloc(comb_len);
+                                                    snprintf(comb, comb_len, "%s\n\n%s", turn_msg_content, summary);
+                                                    final_reply = comb;
+                                                    free_final_reply = 1;
+                                                }
+                                            }
+                                        }
+
+                                        log_job(current_prompt, pipe_writer, final_reply, interactive_mode);
+                                        char *escaped_summary = shell_escape(final_reply);
+                                        /* Render markdown via Python helper and print clean response */
+                                        char *rendered = render_markdown(final_reply);
+                                        double elapsed_sec = get_time_sec_mono() - tool_t0;
+                                        double tps = (elapsed_sec > 0.05 && completion_tokens > 0)
+                                                      ? completion_tokens / elapsed_sec : 0.0;
+                                        fflush(stderr);
+                                        add_turn_item(ITEM_ASSISTANT_RESPONSE, model[0] ? model : "ai", NULL,
+                                                      final_reply, elapsed_sec, tps, g_turn_count, total_tool_count);
+                                        notify_completion(final_reply);
+                                        if (rendered && *rendered) {
+                                            print_response_box(model[0] ? model : "ai", rendered,
+                                                               g_turn_count, total_tool_count,
+                                                               elapsed_sec, tps, 0);
+                                            free(rendered);
+                                        } else {
+                                            print_response_box(model[0] ? model : "ai", final_reply,
+                                                               g_turn_count, total_tool_count,
+                                                               elapsed_sec, tps, 0);
+                                        }
+                                        if (free_final_reply) free(final_reply);
+                                        free(escaped_summary);
+                                        free(summary);
+                                    }
                                    tool_output = strdup("{\"ok\":true}");
                                    has_more = 0;
                                    task_done = 1;
@@ -6019,7 +6142,7 @@ step_limit_check:
                                                            size_t buf_len = 0;
                                                            char *arr_buf = malloc(buf_cap);
                                                            if (arr_buf) {
-                                                               arr_buf[0] = ' ';
+                                                               arr_buf[0] = ' ';
                                                                for (int e = 0; e < elem_count && cur < arg_r; e++) {
                                                                    if (arg_toks[cur].type == JSMN_STRING || arg_toks[cur].type == JSMN_PRIMITIVE) {
                                                                        char *item = unescape_json_string(unescaped_args + arg_toks[cur].start, arg_toks[cur].end - arg_toks[cur].start);
@@ -6226,9 +6349,12 @@ step_limit_check:
                                                       tool_output = strdup("Error: failed to run command");
                                                   }
 
-                                                  /* Auto-commit on successful command execution */
-                                                  if (exit_code == 0 && g_git_commit_enabled && (g_permission_mode == 0 || g_plan_approved)) {
-                                                      git_commit("command");
+                                                  /* Auto-commit and cache invalidation on successful command execution */
+                                                  if (exit_code == 0) {
+                                                      invalidate_tool_cache_files();
+                                                      if (g_git_commit_enabled && (g_permission_mode == 0 || g_plan_approved)) {
+                                                          git_commit("command");
+                                                      }
                                                   }
                                                   if (g_permission_mode == 1) plan_budget_consume();
                                               }
@@ -6358,7 +6484,11 @@ step_limit_check:
                                       snprintf(call_cmd, sizeof(call_cmd), "python3 %s call-tool %s %s %s", mcp_script, server_name, mcp_tool_name, escaped_args_shell);
                                       tool_output = run_shell_command(call_cmd, NULL);
                                       if (tool_output && strncmp(tool_output, "Error", 5) != 0) {
-                                          set_tool_cache(mcp_tool_name, unescaped_args, tool_output);
+                                          if (tool_is_mutating(mcp_tool_name)) {
+                                              invalidate_tool_cache_files();
+                                          } else {
+                                              set_tool_cache(mcp_tool_name, unescaped_args, tool_output);
+                                          }
                                       }
                                       free(escaped_args_shell);
                                   }
@@ -6667,6 +6797,7 @@ step_limit_check:
                               snprintf(tool_resp, tool_resp_len, "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"name\":\"%s\",\"content\":\"%s\"}", safe_id, safe_name, safe_output);
                               messages_json = append_message(messages_json, tool_resp);
                               free(safe_id);
+                              if (turn_msg_content) { free(turn_msg_content); turn_msg_content = NULL; }
                               free(safe_name);
 
                               // Check if it's an image file returned by read_file/read_image_file
@@ -6702,6 +6833,7 @@ step_limit_check:
                           end_tool_iter:
                           current_tok = json_skip_token(tok, r, current_tok + 1);
                       }
+                      if (turn_msg_content) { free(turn_msg_content); turn_msg_content = NULL; }
 
                       /* Poll stdin for Shift-Tab / :btw typed while tools were executing */
                       if (interactive_mode) poll_agent_stdin();
@@ -6947,6 +7079,7 @@ step_limit_check:
     if (g_system_message_json) free(g_system_message_json);
     curl_slist_free_all(h);
     curl_easy_cleanup(c);
+    clear_tool_cache();
     fprintf(stderr, "\033[2m  session ended · resume: ai -r %s\033[0m\n", current_session_id);
     return 0;
 }

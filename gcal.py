@@ -93,6 +93,11 @@ def get_calendar_service():
                     "   python3 gcal.py auth\n"
                 )
             
+            # Check if running interactively
+            is_interactive = sys.stdin.isatty() and os.environ.get("INFER_NON_INTERACTIVE") not in ("1", "true")
+            if not is_interactive and (len(sys.argv) < 2 or sys.argv[1] != "auth"):
+                raise Exception("Google Calendar authentication required. Please run 'python3 gcal.py auth' in a terminal to authenticate.")
+
             # Run local server flow
             print("Starting authentication flow. A browser window should open shortly.", file=sys.stderr)
             flow = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
@@ -381,6 +386,9 @@ def main():
         calendar_id = sys.argv[6] if len(sys.argv) > 6 else 'primary'
         print(update_event(event_id, summary=summary, start_time=start_time,
                            end_time=end_time, calendar_id=calendar_id))
+    elif action == "auth":
+        get_calendar_service()
+        print("Google Calendar authentication verified.")
     else:
         print(f"Unknown action: {action}")
         sys.exit(1)

@@ -9,6 +9,7 @@ description: llama server options for local AI setup - repeat penalty, presence/
 Document and manage llama.cpp server sampling options, Unsloth dynamic quants, MTP speculative decoding, and model-specific configurations used by `ai-backend` and `ai`.
 
 ## Key Environment Variables & Server Options
+- `LLAMA_CACHE_TYPE_K` / `LLAMA_CACHE_TYPE_V` (KV cache quantization: `q4_0` [saves 4x VRAM], `q8_0` [saves 2x], `f16` [full precision])
 - `LLAMA_REPEAT_PENALTY` (multiplier, default 1.0, neutral)
 - `LLAMA_PRESENCE_PENALTY` (additive, default 0.0, neutral)
 - `LLAMA_FREQUENCY_PENALTY` (additive, default 0.0, neutral)
@@ -42,6 +43,8 @@ Apply easily via:
 ```bash
 ai-backend mode thinking     # sets Qwen3.8 thinking defaults
 ai-backend mode instruct     # sets Qwen3.8 instruct defaults
+ai-backend cache q4_0        # 4-bit KV cache quant (saves 4x VRAM, prevents CPU spillover)
+ai-backend cache q8_0        # 8-bit KV cache quant (saves 2x VRAM)
 ai-backend mtp on            # enables MTP speculative decoding
 ```
 

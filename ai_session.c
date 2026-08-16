@@ -16,6 +16,7 @@ extern int raw_mode_active;
 extern int g_compact_in_progress;
 extern int g_compact_dot_timer;
 extern char *g_system_message_json;
+extern int g_private_mode;
 
 void disable_raw_mode(void);
 char* json_escape(const char *str);
@@ -182,7 +183,7 @@ static int atomic_write_file(const char *path, const char *data) {
 
 void save_session(const char *messages_json) {
     char path[1200];
-    if (!messages_json) return;
+    if (!messages_json || g_private_mode) return;
     if (session_file_path(path, sizeof(path), current_session_id) == 0)
         atomic_write_file(path, messages_json);
     if (backup_session_file_path(path, sizeof(path), current_session_id) == 0)

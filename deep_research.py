@@ -256,12 +256,22 @@ def run_agents_parallel(tasks: list, timeout: int = 300) -> list:
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
 def extract_json(text: str) -> dict:
-    """Find the first complete {...} block in text and parse it."""
+    """Find the first complete {...} block in text and parse it with fallback repair."""
     start = text.find("{")
     end = text.rfind("}") + 1
     if start == -1 or end == 0:
         raise ValueError("No JSON object found in response")
-    return json.loads(text[start:end])
+    raw = text[start:end]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Clean markdown fences, trailing commas, single quotes
+        cleaned = re.sub(r'//.*?\n', '\n', raw)
+        cleaned = re.sub(r',\s*([\]}])', r'\1', cleaned)
+        try:
+            return json.loads(cleaned)
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON even after cleaning: {e}")
 
 # ── main orchestrator ─────────────────────────────────────────────────────────
 

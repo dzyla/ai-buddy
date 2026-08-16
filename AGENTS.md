@@ -186,6 +186,7 @@ globally to every request while the process is running:
 - **Qwen3.8 Presets & Mode commands:**
   - `ai-backend use qwen3.8` (or `qwen3.8-27b`, `qwen3.8-2.4t`) automatically routes and downloads Unsloth GGUFs.
   - `ai-backend mode <preset>`: `thinking`/`xhigh` (effort xhigh), `normal` (medium), `low` (low), `instruct` (none). Each applies the full preset (`temp`, `top_p`, `top_k`, `min_p`, `presence`, `repeat`, `reasoning_effort`) to the env file.
+  - `ai-backend cache <q4_0|q8_0|f16|auto>`: configures KV cache quantization (`LLAMA_CACHE_TYPE_K`/`LLAMA_CACHE_TYPE_V`). `q4_0` saves 4x VRAM (recommended for 16GB GPUs), `q8_0` saves 2x, `f16` full precision.
   - `ai-backend yarn <on|off|<scale>>`: enables YaRN RoPE scaling to extend context beyond the model's native 256K (on → scale 4 → ~1M). Persists `LLAMA_ROPE_SCALING`/`LLAMA_ROPE_SCALE`/`LLAMA_YARN_ORIG_CTX`; `serve` emits `--rope-scaling yarn --rope-scale 4.0 --yarn-orig-ctx 262144`.
   - `ai-backend mtp on`: enables MTP speculative decoding (head ships in the GGUF, `blk.64.nextn.*`); pins `--parallel 1` (the draft ctx is single-sequence — override with `LLAMA_N_PARALLEL`).
   - `ai-backend probe [url]`: streaming decode-speed A/B probe (`dev/probe_mtp.py`); run baseline vs MTP, the delta is the number.
@@ -225,6 +226,7 @@ globally to every request while the process is running:
 ├── gcal.py               # Google Calendar CLI integration (list/create/update/delete/availability)
 ├── pubmed_mcp_server.py  # PubMed MCP server
 ├── deep_research.py      # Deep research tool
+├── robinhood_trader.py   # Robinhood Agentic Trading & US Market Hours analysis suite
 ├── zulip_mcp_server.py   # Zulip MCP server
 ├── zulip_ai_bridge.py    # Zulip bot bridge (file parsing, reconnection, ContextWindowManager)
 ├── .agents/skills/       # Domain skills directory (loaded via load_skill)

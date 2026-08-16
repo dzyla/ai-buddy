@@ -56,7 +56,7 @@ def load_config():
                 print(f"Warning: failed to load config from {path}: {e}", file=sys.stderr)
     return {}
 
-def run_jsonrpc(proc, method, params, req_id):
+def run_jsonrpc(proc, method, params, req_id, timeout=10.0):
     req = {
         "jsonrpc": "2.0",
         "id": req_id,
@@ -64,10 +64,22 @@ def run_jsonrpc(proc, method, params, req_id):
         "params": params
     }
     req_str = json.dumps(req) + "\n"
-    proc.stdin.write(req_str)
-    proc.stdin.flush()
+    try:
+        proc.stdin.write(req_str)
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError) as e:
+        raise Exception(f"Failed to send request to MCP server: {e}")
 
+    import select
+    start_t = time.time()
     while True:
+        elapsed = time.time() - start_t
+        remaining = max(0.1, timeout - elapsed)
+        if elapsed >= timeout:
+            raise TimeoutError(f"Timed out after {timeout}s waiting for MCP response to {method}")
+        r, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not r:
+            raise TimeoutError(f"Timed out after {timeout}s waiting for MCP response to {method}")
         line = proc.stdout.readline()
         if not line:
             raise Exception("Connection closed by server")
@@ -86,8 +98,11 @@ def send_notification(proc, method, params=None):
     if params is not None:
         req["params"] = params
     req_str = json.dumps(req) + "\n"
-    proc.stdin.write(req_str)
-    proc.stdin.flush()
+    try:
+        proc.stdin.write(req_str)
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
 
 def start_server(cfg):
     cmd = []
@@ -99,7 +114,17 @@ def start_server(cfg):
     if not cmd:
         return None
 
+    # In test environments or when headless, block remote MCP servers that open interactive auth browsers
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
+        if any("agent.robinhood.com" in str(x) or "mcp-remote" in str(x) for x in cmd):
+            return None
+
     env = os.environ.copy()
+    env["BROWSER"] = ":"
+    env["NO_BROWSER"] = "1"
+    env["CI"] = "1"
+    env["DISPLAY"] = ""
+    env.pop("WSL_DISTRO_NAME", None)
     if "env" in cfg:
         for k, v in cfg["env"].items():
             env[k] = str(v)
@@ -111,21 +136,24 @@ def start_server(cfg):
         stderr=subprocess.DEVNULL,
         text=True,
         env=env,
-        bufsize=1
+        bufsize=1,
+        start_new_session=True
     )
     return proc
 
-def init_server(proc):
+def init_server(proc, timeout=5.0):
     init_params = {
         "protocolVersion": "2024-11-05",
         "capabilities": {},
         "clientInfo": {"name": "ai", "version": "1.0"}
     }
-    resp = run_jsonrpc(proc, "initialize", init_params, req_id=1)
+    resp = run_jsonrpc(proc, "initialize", init_params, req_id=1, timeout=timeout)
     send_notification(proc, "notifications/initialized")
     return resp
 
 def log_metric(tool_name, duration_ms, success=True, error=None):
+    if os.environ.get("INFER_PRIVATE_MODE") in ("1", "true"):
+        return
     try:
         import datetime
         metrics_file = os.path.expanduser("~/.cache/ai/metrics.jsonl")
@@ -203,28 +231,79 @@ def show_metrics():
         for n, t, e in sorted(err_rows, reverse=True)[:8]:
             print(f"  {n}x {t}: {e}")
 
+def _cleanup_proc(proc):
+    if not proc:
+        return
+    import signal
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        proc.wait(timeout=0.5)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+MCP_CACHE_FILE = os.path.expanduser("~/.cache/ai/mcp_schema_cache.json")
+
+def _get_cached_mcp_tools(server_name, cfg_hash):
+    try:
+        if os.path.exists(MCP_CACHE_FILE):
+            with open(MCP_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                entry = data.get(server_name)
+                if entry and entry.get("hash") == cfg_hash:
+                    return entry.get("tools")
+    except Exception:
+        pass
+    return None
+
+def _save_cached_mcp_tools(server_name, cfg_hash, tools):
+    try:
+        os.makedirs(os.path.dirname(MCP_CACHE_FILE), exist_ok=True)
+        data = {}
+        if os.path.exists(MCP_CACHE_FILE):
+            try:
+                with open(MCP_CACHE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data[server_name] = {"hash": cfg_hash, "ts": time.time(), "tools": tools}
+        with open(MCP_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
 def list_tools(server_name, cfg):
+    import hashlib
+    cfg_hash = hashlib.md5(json.dumps(cfg, sort_keys=True).encode("utf-8")).hexdigest()
+    cached = _get_cached_mcp_tools(server_name, cfg_hash)
+    if cached is not None:
+        return cached
+
     proc = start_server(cfg)
     if not proc:
         return []
     try:
-        init_server(proc)
-        resp = run_jsonrpc(proc, "tools/list", {}, req_id=2)
+        init_server(proc, timeout=5.0)
+        resp = run_jsonrpc(proc, "tools/list", {}, req_id=2, timeout=5.0)
         tools = resp.get("result", {}).get("tools", [])
         namespaced_tools = []
         for t in tools:
             clean_server = "".join(c if c.isalnum() or c == "_" else "_" for c in server_name)
             t["name"] = f"{clean_server}__{t['name']}"
             namespaced_tools.append(t)
+        _save_cached_mcp_tools(server_name, cfg_hash, namespaced_tools)
         return namespaced_tools
     except Exception as e:
-        print(f"Error listing tools from {server_name}: {e}", file=sys.stderr)
+        print(f"Warning: listing tools from {server_name} failed: {e}", file=sys.stderr)
         return []
     finally:
-        try:
-            proc.terminate()
-        except:
-            pass
+        _cleanup_proc(proc)
 
 def mcp_result_to_text(result):
     """Normalise an MCP tools/call result into plain text.
@@ -272,18 +351,15 @@ def call_tool(server_name, cfg, tool_name, arguments):
     if not proc:
         return {"error": "Failed to start server"}
     try:
-        init_server(proc)
-        resp = run_jsonrpc(proc, "tools/call", {"name": tool_name, "arguments": arguments}, req_id=3)
+        init_server(proc, timeout=5.0)
+        resp = run_jsonrpc(proc, "tools/call", {"name": tool_name, "arguments": arguments}, req_id=3, timeout=60.0)
         if "error" in resp:
             return {"error": str(resp["error"])}
         return resp.get("result", {})
     except Exception as e:
         return {"error": str(e)}
     finally:
-        try:
-            proc.terminate()
-        except:
-            pass
+        _cleanup_proc(proc)
 
 # --- Helper functions for improvements ---
 CONTEXT_POOL_FILE = os.path.expanduser("~/.config/ai/context_pool.json")
@@ -382,6 +458,132 @@ def execute_command(command, timeout=120):
     except Exception as e:
         return f"Error executing command: {e}"
 
+def python_playground(code: str, timeout: int = 30) -> str:
+    """Execute Python code in an isolated sandbox with stdout/stderr and expression value capture."""
+    if not code or not code.strip():
+        return "Error: No Python code provided."
+    try:
+        if isinstance(timeout, str):
+            timeout = int(timeout)
+    except ValueError:
+        timeout = 30
+
+    wrapper = f"""import sys, io, ast
+
+_code = {repr(code)}
+
+try:
+    _parsed = ast.parse(_code)
+    _ns = {{"__name__": "__main__"}}
+    if _parsed.body and isinstance(_parsed.body[-1], ast.Expr):
+        _last_expr = _parsed.body.pop()
+        if _parsed.body:
+            exec(compile(_parsed, "<playground>", "exec"), _ns)
+        _res = eval(compile(ast.Expression(_last_expr.value), "<playground>", "eval"), _ns)
+        if _res is not None:
+            print(repr(_res))
+    else:
+        exec(compile(_parsed, "<playground>", "exec"), _ns)
+except Exception:
+    import traceback
+    traceback.print_exc()
+"""
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", wrapper],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True
+        )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            res = ""
+            if out:
+                res += out.rstrip()
+            if err:
+                if res:
+                    res += "\n[stderr]: " + err.rstrip()
+                else:
+                    res = err.rstrip()
+            if proc.returncode != 0 and not err and not out:
+                res = f"Exited with code {proc.returncode}"
+            return res if res else "(executed with no output)"
+        finally:
+            _cleanup_proc(proc)
+    except subprocess.TimeoutExpired:
+        return f"Error: Python execution timed out after {timeout} seconds."
+    except Exception as e:
+        return f"Error running Python playground: {e}"
+
+def js_playground(code: str, timeout: int = 30) -> str:
+    """Execute JavaScript/Node.js code in a sandboxed runner with console output and evaluation results."""
+    if not code or not code.strip():
+        return "Error: No JavaScript code provided."
+    try:
+        if isinstance(timeout, str):
+            timeout = int(timeout)
+    except ValueError:
+        timeout = 30
+
+    import shutil
+    node_bin = shutil.which("node")
+    if not node_bin:
+        return "Error: Node.js runtime ('node') is not installed in PATH."
+
+    wrapper = f"""const vm = require('vm');
+const util = require('util');
+
+const code = {json.dumps(code)};
+
+(async () => {{
+    try {{
+        const sandbox = {{
+            console,
+            process: {{ env: {{}}, cwd: process.cwd, stdout: process.stdout, stderr: process.stderr }},
+            setTimeout, clearTimeout, setInterval, clearInterval,
+            Buffer, URL, URLSearchParams, TextEncoder, TextDecoder,
+            fetch: typeof fetch !== 'undefined' ? fetch : undefined
+        }};
+        vm.createContext(sandbox);
+        const result = await vm.runInContext(code, sandbox, {{ timeout: {timeout * 1000} }});
+        if (result !== undefined) {{
+            console.log(util.inspect(result, {{ depth: 4, colors: false }}));
+        }}
+    }} catch (err) {{
+        console.error(err && err.stack ? err.stack : String(err));
+        process.exit(1);
+    }}
+}})();
+"""
+    try:
+        proc = subprocess.Popen(
+            [node_bin, "-e", wrapper],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True
+        )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            res = ""
+            if out:
+                res += out.rstrip()
+            if err:
+                if res:
+                    res += "\n[stderr]: " + err.rstrip()
+                else:
+                    res = err.rstrip()
+            if proc.returncode != 0 and not err and not out:
+                res = f"Exited with code {proc.returncode}"
+            return res if res else "(executed with no output)"
+        finally:
+            _cleanup_proc(proc)
+    except subprocess.TimeoutExpired:
+        return f"Error: JavaScript execution timed out after {timeout} seconds."
+    except Exception as e:
+        return f"Error running JavaScript playground: {e}"
+
 def structured_query(target, filter_expr=None, transform=None, aggregate=None):
     text = ""
     if target.startswith("file:"):
@@ -450,10 +652,13 @@ def resume_agent(agent_id, user_message):
         data = json.load(f)
     data["history"].append({"role": "user", "content": user_message})
     ai_bin = _resolve_ai_bin()
-    res = subprocess.run([ai_bin, "-y", "-q", user_message], capture_output=True, text=True, timeout=180)
-    out = res.stdout or res.stderr
+    agent_prompt = data.get("prompt", "")
+    full_prompt = f"[Agent Persona / Goal: {agent_prompt}]\n\n{user_message}" if agent_prompt else user_message
+    res = subprocess.run([ai_bin, "-y", "-q", full_prompt], capture_output=True, text=True, timeout=180)
+    out = (res.stdout or res.stderr or "").strip()
     data["history"].append({"role": "assistant", "content": out})
     data["last_activity"] = time.time()
+    data["status"] = "active" if res.returncode == 0 else "error"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return out
@@ -1045,12 +1250,32 @@ def vault_search(query):
         os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
         conn = sqlite3.connect(MEMORY_DB)
         _ensure_vault_schema(conn)
-        safe_query = query.replace("'", "''")
-        rows = conn.execute(
-            "SELECT title, content FROM vault_fts WHERE vault_fts MATCH ? LIMIT 10",
-            (safe_query,),
-        ).fetchall()
-        conn.close()
+        
+        words = re.findall(r"\w+", query)
+        rows = []
+        try:
+            def _try_vault(q, what):
+                if what == "fts":
+                    return conn.execute(
+                        "SELECT title, content FROM vault_fts WHERE vault_fts MATCH ? LIMIT 10",
+                        (q,),
+                    ).fetchall()
+                return conn.execute(
+                    "SELECT title, content FROM vault_fts WHERE content LIKE ? OR title LIKE ? LIMIT 10",
+                    (f"%{q}%", f"%{q}%"),
+                ).fetchall()
+
+            if words:
+                phrase = '"' + " ".join(words) + '"'
+                rows = _try_vault(phrase, "fts") or _try_vault(" AND ".join(words), "fts") or _try_vault(" OR ".join(words), "fts")
+            if not rows and words:
+                rows = []
+                for w in words[:3]:
+                    rows = _try_vault(w, "like")
+                    if rows:
+                        break
+        finally:
+            conn.close()
         
         if not rows:
             return "No matching notes found."
@@ -2333,8 +2558,8 @@ def clarify(question, choices=None, multi_select=False, timeout_seconds=0):
         return "[CLARIFY NON-INTERACTIVE] Could not open a terminal; proceed with a sensible default and state the assumption."
     import select
     try:
-        for ln in lines:
-            tty.write(ln)
+        prompt_str = "\n".join(lines[:-1]) + ("\n" if len(lines) > 1 else "") + lines[-1]
+        tty.write(prompt_str)
         tty.flush()
         if timeout_seconds > 0:
             r, _, _ = select.select([tty], [], [], timeout_seconds)
@@ -2792,8 +3017,16 @@ def read_file(path, start_line=None, end_line=None):
 
         # Line-range read (model requested a specific slice)
         if start_line is not None or end_line is not None:
-            s = max(0, (start_line or 1) - 1)
-            e = min(total_lines, end_line or total_lines)
+            try:
+                s_val = int(start_line) if start_line is not None else 1
+            except (ValueError, TypeError):
+                s_val = 1
+            try:
+                e_val = int(end_line) if end_line is not None else total_lines
+            except (ValueError, TypeError):
+                e_val = total_lines
+            s = max(0, s_val - 1)
+            e = min(total_lines, max(s, e_val))
             snippet = "\n".join(lines[s:e])
             return (f"[{abs_path} | lines {s+1}-{e} of {total_lines}]\n"
                     f"[Use read_file with start_line/end_line to read other sections]\n\n"
@@ -2948,6 +3181,97 @@ def edit_file(path, search_content, replace_content):
                 f"Make sure the search block matches exactly including whitespace.")
     except Exception as e:
         return f"Error editing file: {e}"
+
+def patch_file(path, hunks=None, search=None, replace=None):
+    """Atomically apply one or more search-and-replace patches to a file.
+    hunks is an array of {"search": "...", "replace": "..."} objects.
+    All search blocks must match before any modification is written.
+    Supports fuzzy whitespace tolerance per hunk."""
+    try:
+        abs_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(abs_path):
+            return f"Error: file '{path}' does not exist."
+        
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        patch_list = []
+        if hunks and isinstance(hunks, list):
+            for h in hunks:
+                if isinstance(h, dict) and "search" in h and "replace" in h:
+                    patch_list.append((h["search"], h["replace"]))
+        elif search is not None and replace is not None:
+            patch_list.append((str(search), str(replace)))
+        
+        if not patch_list:
+            return "Error: patch_file requires either 'hunks' array of {search, replace} or 'search' and 'replace' arguments."
+
+        new_content = content
+        applied = 0
+        for s_text, r_text in patch_list:
+            if s_text in new_content:
+                new_content = new_content.replace(s_text, r_text, 1)
+                applied += 1
+            else:
+                s_lines = s_text.splitlines()
+                c_lines = new_content.splitlines()
+                n = len(s_lines)
+                matched_start = -1
+                for i in range(len(c_lines) - n + 1):
+                    if all(c_lines[i + j].rstrip() == s_lines[j].rstrip() for j in range(n)):
+                        matched_start = i
+                        break
+                if matched_start >= 0:
+                    c_lines_ends = new_content.splitlines(keepends=True)
+                    orig_span = "".join(c_lines_ends[matched_start:matched_start + n])
+                    if not s_text.endswith(('\n', '\r')) and orig_span.endswith(('\n', '\r')):
+                        orig_span = orig_span[:-1] if orig_span.endswith('\n') else orig_span[:-2]
+                    new_content = new_content.replace(orig_span, r_text, 1)
+                    applied += 1
+                else:
+                    return f"Error: patch hunk not found in '{path}':\n```\n{s_text[:200]}\n```\nAborted all changes."
+        
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return f"Successfully applied {applied} patch hunk(s) to '{path}'."
+    except Exception as e:
+        return f"Error patching file: {e}"
+
+def get_environment():
+    """Return comprehensive system and environment diagnostics (OS, GPU, Python, Git, Model server)."""
+    import platform, shutil
+    info = {
+        "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        "python": sys.version.split()[0],
+        "cwd": os.getcwd(),
+        "user": os.environ.get("USER", "unknown"),
+        "model": os.environ.get("INFER_MODEL", "default"),
+        "base_url": os.environ.get("INFER_BASE_URL", "default"),
+    }
+    if shutil.which("nvidia-smi"):
+        try:
+            smi = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=5)
+            if smi.returncode == 0 and smi.stdout.strip():
+                parts = [p.strip() for p in smi.stdout.strip().split(",")]
+                if len(parts) >= 4:
+                    info["gpu"] = f"{parts[0]} ({parts[2]}MB / {parts[1]}MB used, {parts[3]}% util)"
+        except Exception:
+            pass
+    if os.path.exists(".git") and shutil.which("git"):
+        try:
+            branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                    capture_output=True, text=True, timeout=3).stdout.strip()
+            status = subprocess.run(["git", "status", "--porcelain"],
+                                    capture_output=True, text=True, timeout=3).stdout.strip()
+            info["git"] = {
+                "branch": branch,
+                "clean": len(status) == 0,
+                "modified_files": len(status.splitlines()) if status else 0
+            }
+        except Exception:
+            pass
+    return json.dumps(info, indent=2)
 
 def render_math(text):
     latex_symbols = {
@@ -4621,6 +4945,8 @@ def record_failure(tool="", args="", error="", phase="execution", chain_id=None)
     now been seen >= INFER_SELF_IMPROVE_RECURRENCE times and isn't already
     captured, an auto-generated recurring-pitfall lesson is persisted and
     returned so the harness can surface it immediately."""
+    if os.environ.get("INFER_PRIVATE_MODE") in ("1", "true"):
+        return False, ""
     tool = (tool or "").strip()
     error = (error or "").strip()
     sig = _err_signature(tool, error)
@@ -4655,6 +4981,8 @@ def record_recovery(tool="", args="", prior_error="", phase="execution", chain_i
     chain; once a chain is reliably mastered (>= INFER_CHAIN_MASTERED, default
     2 recoveries, with no failure after the last recovery) it is promoted to a
     permanent MASTER lesson that future sessions see at startup."""
+    if os.environ.get("INFER_PRIVATE_MODE") in ("1", "true"):
+        return ""
     tool = (tool or "").strip()
     prior_error = (prior_error or "").strip()
     args = (args or "").strip()
@@ -5476,6 +5804,50 @@ def main():
         openai_tools.append({
             "type": "function",
             "function": {
+                "name": "python_playground",
+                "description": "Execute a snippet of Python code in an isolated interactive sandbox. Returns evaluated expressions, print outputs, and exceptions without leaving scratch files on disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "The Python code or expression to run in the playground."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Optional timeout in seconds (default 30s)."
+                        }
+                    },
+                    "required": ["code"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "js_playground",
+                "description": "Execute a snippet of JavaScript / Node.js in an isolated sandbox. Returns console outputs and evaluated expressions without leaving scratch files on disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "The JavaScript code or expression to run in the playground."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Optional timeout in seconds (default 30s)."
+                        }
+                    },
+                    "required": ["code"]
+                }
+            }
+        })
+
+        openai_tools.append({
+            "type": "function",
+            "function": {
                 "name": "execute_remote_command",
                 "description": "Run a command on a remote host via SSH. You must have passwordless SSH access (e.g. key-based) already configured for the host.",
                 "parameters": {
@@ -5702,6 +6074,52 @@ def main():
                         }
                     },
                     "required": ["path", "search_content", "replace_content"]
+                }
+            }
+        })
+
+        # 7b. patch_file
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "patch_file",
+                "description": "Atomically apply one or multiple search-and-replace hunks to a file with fuzzy whitespace matching. If any hunk fails to match, no changes are written.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the file to patch."
+                        },
+                        "hunks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "search": {"type": "string", "description": "Text chunk to search for."},
+                                    "replace": {"type": "string", "description": "Text chunk to replace with."}
+                                },
+                                "required": ["search", "replace"]
+                            },
+                            "description": "Array of {search, replace} objects to apply in order."
+                        },
+                        "search": {"type": "string", "description": "Single search chunk if not using hunks."},
+                        "replace": {"type": "string", "description": "Single replace chunk if not using hunks."}
+                    },
+                    "required": ["path"]
+                }
+            }
+        })
+
+        # 7c. get_environment
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_environment",
+                "description": "Get detailed runtime environment info: OS, Python version, working directory, git branch/status, GPU model and memory usage, and backend model settings.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
                 }
             }
         })
@@ -6601,20 +7019,46 @@ def main():
             }
         })
 
-        for server_name, cfg in mcp_servers.items():
-            tools = list_tools(server_name, cfg)
-            for t in tools:
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": t["name"],
-                        "description": t.get("description", ""),
-                        "parameters": t.get("inputSchema", {
-                            "type": "object",
-                            "properties": {}
+        if os.environ.get("INFER_NO_MCP") not in ("1", "true") and mcp_servers:
+            mcp_cache_dir = os.path.expanduser("~/.cache/ai")
+            os.makedirs(mcp_cache_dir, exist_ok=True)
+            import hashlib
+            cfg_str = json.dumps(mcp_servers, sort_keys=True)
+            cfg_hash = hashlib.sha256(cfg_str.encode()).hexdigest()[:16]
+            mcp_cache_file = os.path.join(mcp_cache_dir, f"mcp_tools_{cfg_hash}.json")
+            
+            cached_mcp_tools = None
+            if os.path.exists(mcp_cache_file) and os.environ.get("INFER_REFRESH_MCP") not in ("1", "true"):
+                try:
+                    with open(mcp_cache_file, "r") as f:
+                        cached_mcp_tools = json.load(f)
+                except Exception:
+                    pass
+
+            if cached_mcp_tools is not None:
+                openai_tools.extend(cached_mcp_tools)
+            else:
+                new_mcp_tools = []
+                for server_name, cfg in mcp_servers.items():
+                    tools = list_tools(server_name, cfg)
+                    for t in tools:
+                        new_mcp_tools.append({
+                            "type": "function",
+                            "function": {
+                                "name": t["name"],
+                                "description": t.get("description", ""),
+                                "parameters": t.get("inputSchema", {
+                                    "type": "object",
+                                    "properties": {}
+                                })
+                            }
                         })
-                    }
-                })
+                openai_tools.extend(new_mcp_tools)
+                try:
+                    with open(mcp_cache_file, "w") as f:
+                        json.dump(new_mcp_tools, f)
+                except Exception:
+                    pass
 
         print(json.dumps(openai_tools))
 
@@ -7021,6 +7465,16 @@ def main():
             search_content = arguments.get("search_content", "")
             replace_content = arguments.get("replace_content", "")
             result = edit_file(path, search_content, replace_content)
+            print(result)
+        elif tool_name == "patch_file" or server_name == "patch_file":
+            path = arguments.get("path", "")
+            hunks = arguments.get("hunks")
+            search = arguments.get("search")
+            replace = arguments.get("replace")
+            result = patch_file(path, hunks=hunks, search=search, replace=replace)
+            print(result)
+        elif tool_name == "get_environment" or server_name == "get_environment":
+            result = get_environment()
             print(result)
         elif tool_name == "delegate_task" or server_name == "delegate_task":
             tasks = arguments.get("tasks")
@@ -7433,6 +7887,22 @@ def main():
                 ))
             except Exception as e:
                 print(f"Error in skill_note: {e}")
+        elif tool_name == "python_playground" or server_name == "python_playground":
+            try:
+                print(python_playground(
+                    code=arguments.get("code", ""),
+                    timeout=arguments.get("timeout", 30)
+                ))
+            except Exception as e:
+                print(f"Error in python_playground: {e}")
+        elif tool_name == "js_playground" or server_name == "js_playground":
+            try:
+                print(js_playground(
+                    code=arguments.get("code", ""),
+                    timeout=arguments.get("timeout", 30)
+                ))
+            except Exception as e:
+                print(f"Error in js_playground: {e}")
         else:
             # Route to MCP server
             cfg = mcp_servers.get(server_name)

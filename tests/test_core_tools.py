@@ -462,7 +462,7 @@ def test_dispatch_no_dead_duplicates(tmp_path):
     assert not dups, "duplicate dispatch entries (dead code): %s" % dups
     for t in ["search_files", "todo", "clarify", "browser", "append_to_context_pool",
               "spawn_agent", "list_agents", "structured_query", "search_context",
-              "get_context_snippet", "session_report"]:
+              "get_context_snippet", "session_report", "python_playground", "js_playground"]:
         assert t in seen, "tool %s not dispatched in call-tool" % t
 
 
@@ -470,8 +470,30 @@ def test_list_tools_includes_new_tools():
     r = subprocess.run([sys.executable, os.path.join(REPO, "ai_mcp.py"), "list-tools"],
                        capture_output=True, text=True, cwd=REPO, timeout=60)
     assert r.returncode == 0
-    for t in ["search_files", "todo", "clarify", "browser", "append_to_context_pool"]:
+    for t in ["search_files", "todo", "clarify", "browser", "append_to_context_pool", "python_playground", "js_playground"]:
         assert '"name": "%s"' % t in r.stdout, "missing tool in list-tools: %s" % t
+
+
+def test_python_playground():
+    import ai_mcp
+    res = ai_mcp.python_playground("a = 10\nb = 20\na + b")
+    assert "30" in res
+
+    # test print + expression
+    res2 = ai_mcp.python_playground("print('hello from py'); 40 + 2")
+    assert "hello from py" in res2
+    assert "42" in res2
+
+
+def test_js_playground():
+    import ai_mcp
+    res = ai_mcp.js_playground("const a = 15; const b = 27; a + b;")
+    assert "42" in res
+
+    # test console.log
+    res2 = ai_mcp.js_playground("console.log('hello from js'); [1, 2, 3].map(x => x * 2);")
+    assert "hello from js" in res2
+    assert "[ 2, 4, 6 ]" in res2
 
 
 def test_sync_metrics_lessons_cli(tmp_path):
