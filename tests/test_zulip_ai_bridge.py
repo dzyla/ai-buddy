@@ -346,3 +346,81 @@ def test_process_message_uses_auto_flags(monkeypatch):
     assert any(f == "--auto" for f in captured["cmd"])
     assert captured["env_auto"] == "1"
     assert "done" in client.last_sent["content"]
+
+
+def test_long_job_detection_and_flags():
+    """Long jobs should be detected, send confirmation, set extended timeout, and pass -c."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    class _CaptureClient(MockZulipClient):
+        def __init__(self):
+            super().__init__()
+            self.sent_messages = []
+            self.reactions = []
+
+        def send_message(self, payload):
+            self.sent_messages.append(payload)
+            return {"result": "success", "id": len(self.sent_messages)}
+
+        def add_reaction(self, payload):
+            self.reactions.append(payload)
+            return {"result": "success"}
+
+    client = _CaptureClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {
+        "id": 42,
+        "type": "private",
+        "sender_email": "owner@example.com",
+        "content": "/long run deep research on kinase inhibitors",
+    }
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["timeout"] = kwargs.get("timeout")
+        class R:
+            returncode = 0
+            stdout = "Research completed successfully."
+            stderr = ""
+        return R()
+
+    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run):
+        bridge._process_message(msg, msg["content"])
+
+    assert bridge._is_long_job(msg["content"])
+    assert "-c" in captured["cmd"]
+    assert captured["timeout"] >= 3600
+    # Confirmation message was sent
+    assert any("Task confirmed in extended execution mode" in m["content"] for m in client.sent_messages)
+    # Final result was sent
+    assert any("Research completed successfully." in m["content"] for m in client.sent_messages)
+
+
+def test_send_full_reply_multipart():
+    """Large replies (>8500 chars) should be split across multiple parts."""
+    from zulip_ai_bridge import ZulipAiBridge
+
+    class _MultiClient(MockZulipClient):
+        def __init__(self):
+            super().__init__()
+            self.sent = []
+
+        def send_message(self, payload):
+            self.sent.append(payload)
+            return {"result": "success", "id": len(self.sent)}
+
+    client = _MultiClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {"type": "private", "sender_email": "owner@example.com"}
+    long_text = ("Paragraph of data.\n\n" * 600)  # ~12,000 chars
+
+    bridge._send_full_reply(msg, long_text)
+    assert len(client.sent) >= 2
+    assert "Part 1" in client.sent[0]["content"]
+    assert "Part 2" in client.sent[1]["content"]
+

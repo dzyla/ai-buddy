@@ -9,6 +9,8 @@ from robinhood_trader import (
     TechnicalIndicators,
     NewsSentimentEngine,
     TradingStrategyEngine,
+    TradingDataManager,
+    PortfolioAuditor,
     ET_ZONE
 )
 
@@ -194,18 +196,35 @@ class TestTradingStrategyEngine:
 class TestRobinhoodExecutor:
     def test_executor_methods_mocked(self, monkeypatch):
         """Verify executor formats requests properly without making live external auth requests."""
-        from robinhood_trader import RobinhoodExecutor
+        from robinhood_trader import RobinhoodExecutor, FinancialData
         
-        # Mock call_mcp_tool to avoid spamming the remote auth endpoint during CI/test runs
         def fake_mcp_call(tool_name, arguments, timeout=15):
             if tool_name == 'get_portfolio':
                 return {'structuredContent': {'data': {'total_value': '8230.28', 'equity_value': '8025.95', 'cash': '200.00'}}}
             elif tool_name == 'get_equity_positions':
                 return {'structuredContent': {'data': {'positions': [{'symbol': 'VTI', 'quantity': '3.012', 'average_buy_price': '329.76'}]}}}
             elif tool_name == 'get_equity_quotes':
-                return {'structuredContent': {'data': {'results': [{'quote': {'symbol': 'VTI', 'last_trade_price': '384.30'}}]}}}
+                return {'structuredContent': {'data': {'results': [{'quote': {'symbol': 'VTI', 'last_trade_price': '384.30', 'previous_close': '380.00'}}]}}}
             elif tool_name == 'get_accounts':
-                return {'structuredContent': {'data': {'accounts': [{'account_number': '837546068'}]}}}
+                return {'structuredContent': {'data': {'accounts': [
+                    {'account_number': '837546068', 'is_default': True, 'agentic_allowed': False},
+                    {'account_number': '517198354', 'nickname': 'Agentic', 'agentic_allowed': True}
+                ]}}}
+            elif tool_name == 'get_equity_historicals':
+                return {'structuredContent': {'data': {'results': [{
+                    'symbol': 'VTI',
+                    'bars': [
+                        {'begins_at': '2026-08-10T00:00:00Z', 'open_price': '378.00', 'high_price': '382.00', 'low_price': '377.00', 'close_price': '380.00', 'volume': 1500000},
+                        {'begins_at': '2026-08-11T00:00:00Z', 'open_price': '380.00', 'high_price': '383.00', 'low_price': '379.00', 'close_price': '381.50', 'volume': 1400000},
+                        {'begins_at': '2026-08-12T00:00:00Z', 'open_price': '381.00', 'high_price': '384.00', 'low_price': '380.00', 'close_price': '383.00', 'volume': 1600000},
+                        {'begins_at': '2026-08-13T00:00:00Z', 'open_price': '383.00', 'high_price': '385.00', 'low_price': '382.00', 'close_price': '384.00', 'volume': 1700000},
+                        {'begins_at': '2026-08-14T00:00:00Z', 'open_price': '384.00', 'high_price': '386.00', 'low_price': '383.50', 'close_price': '384.30', 'volume': 1800000}
+                    ]
+                }]}}}
+            elif tool_name == 'get_equity_technical_indicators':
+                return {'structuredContent': {'data': {'results': [{
+                    'indicators': [{'begins_at': '2026-08-14T00:00:00Z', 'value': 65.4}]
+                }]}}}
             return {}
 
         monkeypatch.setattr(RobinhoodExecutor, "call_mcp_tool", fake_mcp_call)
@@ -222,5 +241,87 @@ class TestRobinhoodExecutor:
         assert float(quotes["VTI"]["last_trade_price"]) == pytest.approx(384.30)
 
         accs = RobinhoodExecutor.get_accounts()
-        assert len(accs) == 1
+        assert len(accs) == 2
         assert accs[0]["account_number"] == "837546068"
+
+        agentic_acc = RobinhoodExecutor.get_agentic_account()
+        assert agentic_acc is not None
+        assert agentic_acc["account_number"] == "517198354"
+        assert RobinhoodExecutor.get_agentic_account_number() == "517198354"
+
+        hist = RobinhoodExecutor.get_equity_historicals(["VTI"])
+        assert "VTI" in hist
+        assert len(hist["VTI"]) == 5
+        assert float(hist["VTI"][-1]["close_price"]) == pytest.approx(384.30)
+
+        ti = RobinhoodExecutor.get_equity_technical_indicators("VTI", "rsi")
+        assert len(ti) == 1
+        assert ti[0]["value"] == pytest.approx(65.4)
+
+        # Verify FinancialData seamlessly routes through RobinhoodExecutor
+        quote = FinancialData.fetch_quote("VTI")
+        assert quote["price"] == pytest.approx(384.30)
+        assert quote["source"] == "robinhood_mcp"
+
+        bars = FinancialData.fetch_historical("VTI")
+        assert len(bars) == 5
+        assert bars[-1]["close"] == pytest.approx(384.30)
+
+
+class TestTradingDataManagerAndAuditor:
+    def test_export_portfolio_and_audit(self, tmp_path):
+        port_data = {
+            "total_value": "8230.28",
+            "equity_value": "8025.95",
+            "cash": "200.00",
+            "buying_power": "200.00"
+        }
+        positions = [
+            {"symbol": "VTI", "quantity": "3.012", "average_buy_price": "329.76"},
+            {"symbol": "INTC", "quantity": "2.327", "average_buy_price": "131.49"},
+            {"symbol": "AEHR", "quantity": "1.574", "average_buy_price": "13.40"},
+            {"symbol": "SES", "quantity": "10.0", "average_buy_price": "3.20"},
+            {"symbol": "SERV", "quantity": "2.0", "average_buy_price": "14.47"}
+        ]
+        quotes = {
+            "VTI": {"last_trade_price": "383.85"},
+            "INTC": {"last_trade_price": "102.54"},
+            "AEHR": {"last_trade_price": "134.05"},
+            "SES": {"last_trade_price": "0.60"},
+            "SERV": {"last_trade_price": "4.98"}
+        }
+
+        # 1. Test TradingDataManager export
+        exp = TradingDataManager.export_portfolio(port_data, positions, quotes, "837546068", output_dir=str(tmp_path))
+        assert os.path.exists(exp["json"])
+        assert os.path.exists(exp["csv"])
+        assert len(exp["processed_positions"]) == 5
+
+        # 2. Test PortfolioAuditor audit
+        audit = PortfolioAuditor.audit(
+            account_number="837546068",
+            port_data=port_data,
+            positions=positions,
+            quotes=quotes
+        )
+        assert audit["account_number"] == "837546068"
+        assert audit["summary"]["total_value"] == pytest.approx(8230.28)
+        assert audit["cash_buffer"]["status"] == "CRITICAL_DEFICIT"
+        assert audit["dead_money"]["count"] >= 2  # SES (-81%), SERV (-65%)
+        assert audit["tax_loss_harvesting"]["loser_count"] >= 3  # INTC, SES, SERV
+        assert audit["big_winners"]["count"] >= 1  # AEHR (+900%)
+
+        # 3. Test Formatted Summary Outputs
+        summary_text = PortfolioAuditor.format_executive_summary(audit)
+        assert "ROBINHOOD PORTFOLIO EXECUTIVE SUMMARY" in summary_text
+        assert "VTI" in summary_text
+        assert "Saved Files" in summary_text
+
+        harvest_text = PortfolioAuditor.format_harvest_losses(audit)
+        assert "TAX-LOSS HARVESTING CANDIDATES" in harvest_text
+        assert "INTC" in harvest_text
+
+        plan_text = PortfolioAuditor.format_rebalance_plan(audit)
+        assert "PORTFOLIO ACTIONABLE REBALANCING PLAN" in plan_text
+        assert "STEP 1: LIQUIDATE DEAD MONEY" in plan_text
+
