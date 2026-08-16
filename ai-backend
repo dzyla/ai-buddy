@@ -1735,12 +1735,23 @@ def cmd_tune(target=None):
 
     if best["draft_n"] == 0:
         cmd_mtp("off")
+        final_use_mtp = False
     else:
         cmd_mtp(str(best["draft_n"]))
+        final_use_mtp = True
 
-    # Now apply the recommended context size (benchmarks done, VRAM is free)
-    print(f"  → Locking context size to {recommended_ctx} tokens")
-    cmd_ctx(str(recommended_ctx))
+    # Re-calculate safe resident context size with the winning MTP choice to fit VRAM accurately
+    final_safe_ctx = calculate_auto_ctx(
+        model_path,
+        vram_free=total_vram_mib or None,
+        use_mtp=final_use_mtp,
+    )
+    final_safe_ctx = min(262144, (final_safe_ctx // 4096) * 4096)
+    final_safe_ctx = max(4096, final_safe_ctx)
+
+    print(f"  → Locking context size to {final_safe_ctx} tokens")
+    cmd_ctx(str(final_safe_ctx))
+    recommended_ctx = final_safe_ctx
 
     # Final summary table
     print(f"\n" + "=" * 68)
