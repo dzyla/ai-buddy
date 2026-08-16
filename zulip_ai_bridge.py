@@ -771,6 +771,30 @@ class ZulipAiBridge:
 
             response_text = clean_response(response_text)
             if not response_text:
+                # Fallback: inspect the latest session to extract the assistant's work / findings
+                try:
+                    last_sess_path = os.path.expanduser("~/.cache/ai/sessions/last.json")
+                    if os.path.isfile(last_sess_path):
+                        with open(last_sess_path, "r", encoding="utf-8") as sf:
+                            sdata = json.load(sf)
+                        msgs = sdata if isinstance(sdata, list) else sdata.get("messages", [])
+                        # Search backwards for the most recent assistant message with actual content
+                        for m in reversed(msgs):
+                            if m.get("role") == "assistant":
+                                c = m.get("content")
+                                if c and isinstance(c, str) and c.strip() and c.strip() != "None":
+                                    response_text = clean_response(c)
+                                    break
+                                # If tool calls were made, summarize the last tool actions
+                                tcs = m.get("tool_calls", [])
+                                if tcs:
+                                    last_tools = [t.get("function", {}).get("name", "tool") for t in tcs if isinstance(t, dict)]
+                                    response_text = f"✅ Agent completed actions ({', '.join(last_tools)}). See session history for full details."
+                                    break
+                except Exception as ex:
+                    print(f"Session fallback extraction failed: {ex}")
+
+            if not response_text:
                 response_text = "*(agent returned no output)*"
 
         except subprocess.TimeoutExpired:

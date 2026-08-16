@@ -6860,7 +6860,7 @@ step_limit_check:
                                                         "{\"role\":\"user\",\"content\":\"[STALL] Your responses keep hitting the "
                                                         "token limit without any progress and without calling task_complete. "
                                                         "STOP taking additional actions. Call task_complete NOW with your best "
-                                                        "summary of work done so far. Do not call any more tools.\\\"}");
+                                                        "summary of work done so far. Do not call any more tools.\"}");
                                                     loop_count = 28; /* allow exactly one more iteration */
                                                     length_nudge_count = 0;
                                                     has_more = 1;
@@ -7024,7 +7024,7 @@ step_limit_check:
             /* Step-limit: ask user whether to continue */
             if (has_more && loop_count >= step_limit) {
                 FILE *tty_f = fopen("/dev/tty", "r+");
-                if (tty_f) {
+                if (tty_f && isatty(STDIN_FILENO)) {
                     fprintf(tty_f,
                         "\n\033[1;33m  %d steps completed. Continue for 30 more?\033[0m\n\033[32my\033[0m/\033[31mn\033[0m: ",
                         loop_count);
@@ -7043,6 +7043,13 @@ step_limit_check:
                         step_limit += 30;
                         goto step_limit_check;
                     }
+                } else if (tty_f) {
+                    fclose(tty_f);
+                }
+                /* If we are stopping without task_complete, print a clean summary notice to stdout if stdout is piped so caller gets results */
+                if (!isatty(STDOUT_FILENO)) {
+                    printf("Task execution reached step limit (%d steps) without explicit task_complete. Completed operations have been saved to session.\n", loop_count);
+                    fflush(stdout);
                 }
                 fprintf(stderr,
                     "\033[1;33m  task stopped after %d steps\033[0m\n",
