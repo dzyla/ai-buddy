@@ -46,6 +46,7 @@ ai-backend mode instruct     # sets Qwen3.8 instruct defaults
 ai-backend cache q4_0        # 4-bit KV cache quant (saves 4x VRAM, prevents CPU spillover)
 ai-backend cache q8_0        # 8-bit KV cache quant (saves 2x VRAM)
 ai-backend mtp on            # enables MTP speculative decoding
+ai-backend tune              # auto-tunes ctx size, cache quant, & draft tokens
 ```
 
 ## Unsloth vs OG llama.cpp

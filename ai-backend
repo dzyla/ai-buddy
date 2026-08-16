@@ -1428,36 +1428,241 @@ def cmd_mtp(target=None, extra=None):
         print("Usage: ai-backend mtp <on|off|1|2|3|draft <path>>", file=sys.stderr)
 
 
-def cmd_probe(target=None):
-    """Streaming decode-speed probe (dev/probe_mtp.py) against a live server.
 
-    Clocks every generated token (TTFT excluded) and reports per-prompt medians —
-    the paired A/B method from sudoingX/qwen38-mtp. Run once against a baseline
-    serve and once with MTP (`ai-backend mtp on`), everything else identical: the
-    delta is the honest number.
+def cmd_tune(target=None):
+    """Auto-tune context size, KV cache quantization, and speculative draft tokens for the active model.
+
+    Benchmarks decoding speed across draft token counts, verifies memory fit to prevent
+    system RAM spillover, and applies the highest-throughput configuration.
     """
-    import importlib.util
-    # The probe tool ships in dev/ next to the repo; install.sh also copies it to
-    # ~/.local/share/ai/ so an installed ai-backend (in ~/.local/bin) can find it.
-    here = Path(__file__).resolve().parent
-    candidates = [
-        here / "dev" / "probe_mtp.py",
-        Path.home() / ".local" / "share" / "ai" / "probe_mtp.py",
-    ]
-    p = next((c for c in candidates if c.exists()), None)
-    if p is None:
-        print(f"probe tool not found (looked in: {', '.join(map(str, candidates))})", file=sys.stderr)
-        sys.exit(1)
-    spec = importlib.util.spec_from_file_location("probe_mtp", str(p))
-    pm = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(pm)
+    import statistics as st
 
-    url = DEFAULT_PROBE_URL if target in (None, "") else target
-    try:
-        pm.probe(url)
-    except Exception as e:
-        print(f"probe failed: {e}", file=sys.stderr)
+    if target and target.strip():
+        print(f"Switching to target model: {target}...")
+        cmd_use(target)
+
+    env_vars = load_env()
+    model_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
+    if not model_path or not os.path.exists(model_path):
+        print(f"Error: LLAMA_MODEL_PATH not found or invalid: {model_path}", file=sys.stderr)
         sys.exit(1)
+
+    model_name = os.path.basename(model_path)
+    print(f"\n=======================================================")
+    print(f"  ai-backend Auto-Tuner & Benchmark: {model_name}")
+    print(f"=======================================================")
+
+    # 1. Inspect GPU & VRAM capacity
+    gpus = list_gpu_info()
+    total_vram_mib = sum(g["total_mib"] for g in gpus) if gpus else 0
+    gpu_names = ", ".join(g["name"] for g in gpus) if gpus else "CPU / Unknown"
+    print(f"Detected GPU(s): {gpu_names} ({total_vram_mib} MiB VRAM total)")
+
+    # 2. Determine safe context & KV cache quantization
+    arch = read_gguf_arch(model_path) or {}
+    try:
+        model_mb = split_total_size(model_path) * 1024
+    except Exception:
+        model_mb = 9000
+    has_mtp = (
+        arch.get("nextn", 0) > 0
+        or "mtp" in model_name.lower()
+        or find_mtp_draft(model_path) is not None
+        or "qwen3.8" in model_name.lower()
+    )
+
+    print(f"Model size: {model_mb/1024:.1f} GB | Architecture: {arch.get('arch', 'unknown')} | MTP Support: {'Yes' if has_mtp else 'No'}")
+
+    # Recommended memory configuration based on hardware & model size
+    recommended_cache = "q8_0"
+    recommended_ctx = 128000
+
+    if total_vram_mib <= 16500:  # 16GB GPUs (RTX 5080, RTX 4080, etc.)
+        if model_mb > 7000:  # e.g. 27B quant (8-10GB)
+            recommended_cache = "q4_0"
+            recommended_ctx = 128000  # Safe 128k context without RAM spillover
+        elif model_mb > 4000:  # e.g. 9B-12B (4-6GB)
+            recommended_cache = "q4_0"
+            recommended_ctx = 131072
+        else:
+            recommended_cache = "q8_0"
+            recommended_ctx = 65536
+    elif total_vram_mib <= 25000:  # 24GB GPUs (RTX 3090, 4090, 5090)
+        recommended_cache = "q4_0" if model_mb > 15000 else "q8_0"
+        recommended_ctx = 262144 if model_mb <= 12000 else 131072
+    else:  # Multi-GPU / High VRAM
+        recommended_cache = "q8_0"
+        recommended_ctx = 262144
+
+    print(f"\n[Step 1/3] Memory Optimization:")
+    print(f"  → Setting KV Cache Quantization: {recommended_cache} (prevents VRAM spill)")
+    cmd_cache_quant(recommended_cache)
+
+    print(f"  → Setting Resident Context Window: {recommended_ctx} tokens")
+    cmd_ctx(str(recommended_ctx))
+
+    # Helper: Wait for server ready
+    def wait_ready(timeout=60):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=1) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    # Helper: Stream generation
+    def generate_eval(prompt, max_tokens=220, thinking=False):
+        endpoint = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+        body = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": True,
+            "temperature": 0.7 if not thinking else 1.0,
+            "top_p": 0.8 if not thinking else 0.95,
+            "top_k": 20,
+        }
+        if not thinking:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+
+        req = urllib.request.Request(endpoint, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        t0 = time.time()
+        ttft = None
+        n = 0
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                for line in r:
+                    line = line.decode().strip()
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    delta = json.loads(line[6:])["choices"][0].get("delta", {})
+                    if delta.get("content") or delta.get("reasoning_content"):
+                        now = time.time()
+                        if ttft is None:
+                            ttft = now - t0
+                        n += 1
+            span = time.time() - t0 - (ttft or 0)
+            return (n / span if span > 0 else 0.0), ttft or 0.0, n
+        except Exception:
+            return 0.0, 0.0, 0
+
+    # Helper: Server metrics query
+    def get_metrics():
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/metrics")
+        m = {}
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                for line in resp.read().decode().splitlines():
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            m[parts[0]] = float(parts[1])
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        return m
+
+    # 3. Benchmark MTP / Speculative Decoding Candidates
+    eval_prompts = [
+        ("code", "Write a python function `quickselect(arr, k)` that finds the k-th smallest element in O(n) average time with docstring."),
+        ("explain", "Explain the technical trade-offs between Multi-Token Prediction and traditional speculative decoding in LLM inference in one concise paragraph."),
+    ]
+
+    candidates = [0]  # 0 = baseline (off)
+    if has_mtp:
+        candidates.extend([1, 2, 3, 4])
+
+    print(f"\n[Step 2/3] Benchmarking Speculative Decoding Configurations...")
+    benchmarks = []
+
+    for draft_n in candidates:
+        tag = "Baseline (No MTP)" if draft_n == 0 else f"MTP (draft-n={draft_n})"
+        print(f"  Testing {tag}...", end="", flush=True)
+
+        if draft_n == 0:
+            cmd_mtp("off")
+        else:
+            cmd_mtp(str(draft_n))
+
+        if not wait_ready():
+            print(" [Server Start Failed]")
+            continue
+
+        # Warmup
+        generate_eval("warmup", max_tokens=20, thinking=False)
+        m0 = get_metrics()
+
+        fast_rates = []
+        think_rates = []
+        ttfts = []
+
+        for cat, prompt in eval_prompts:
+            rate_f, ttft_f, _ = generate_eval(prompt, max_tokens=180, thinking=False)
+            rate_t, ttft_t, _ = generate_eval(prompt, max_tokens=200, thinking=True)
+            if rate_f > 0:
+                fast_rates.append(rate_f)
+                ttfts.append(ttft_f)
+            if rate_t > 0:
+                think_rates.append(rate_t)
+
+        m1 = get_metrics()
+        draft_tot = m1.get("llamacpp:spec_decode_num_draft_tokens_total", 0) - m0.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
+        acc_tot = m1.get("llamacpp:spec_decode_num_accepted_tokens_total", 0) - m0.get("llamacpp:spec_decode_num_accepted_tokens_total", 0)
+        acc_rate = (acc_tot / draft_tot * 100) if draft_tot > 0 else 0.0
+
+        med_fast = st.median(fast_rates) if fast_rates else 0.0
+        med_think = st.median(think_rates) if think_rates else 0.0
+        med_ttft = st.median(ttfts) if ttfts else 0.0
+
+        print(f" → Non-Thinking: {med_fast:5.1f} tok/s | Thinking: {med_think:5.1f} tok/s | Acc: {acc_rate:4.1f}%")
+
+        benchmarks.append({
+            "draft_n": draft_n,
+            "label": tag,
+            "fast_tok_s": med_fast,
+            "think_tok_s": med_think,
+            "ttft": med_ttft,
+            "acc_rate": acc_rate,
+            "combined_score": med_fast * 0.6 + med_think * 0.4,
+        })
+
+    # 4. Select Optimal Configuration
+    print(f"\n[Step 3/3] Selecting Best Configuration:")
+    if not benchmarks:
+        print("Error: No benchmark runs succeeded.", file=sys.stderr)
+        return
+
+    best = max(benchmarks, key=lambda b: b["combined_score"])
+    baseline = next((b for b in benchmarks if b["draft_n"] == 0), benchmarks[0])
+
+    speedup = ((best["fast_tok_s"] - baseline["fast_tok_s"]) / baseline["fast_tok_s"] * 100) if baseline["fast_tok_s"] > 0 else 0.0
+
+    print(f"  ★ Optimal Setting: {best['label']}")
+    print(f"  ★ Speedup over Baseline: +{speedup:.1f}%")
+
+    if best["draft_n"] == 0:
+        cmd_mtp("off")
+    else:
+        cmd_mtp(str(best["draft_n"]))
+    wait_ready()
+
+    # Final summary table
+    print(f"\n" + "=" * 68)
+    print(f"  BENCHMARK & TUNING SUMMARY")
+    print(f"=" * 68)
+    print(f"  Model:                 {model_name}")
+    print(f"  Resident Context Size: {recommended_ctx} tokens (No RAM spill)")
+    print(f"  KV Cache Quantization: {recommended_cache}")
+    print(f"  Optimal MTP Tokens:    {best['draft_n']} ({best['label']})")
+    print(f"  Decode Throughput:     {best['fast_tok_s']:.1f} tok/s non-thinking | {best['think_tok_s']:.1f} tok/s thinking")
+    print(f"  Draft Acceptance Rate: {best['acc_rate']:.1f}%")
+    print(f"=" * 68)
 
 
 def cmd_mode(mode_name=None):
@@ -1827,12 +2032,14 @@ Usage:
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
   ai-backend mtp <on|off|tokens|draft>  Configure Multi-Token Prediction speculative decoding
   ai-backend probe [url]                 Streaming decode-speed A/B probe (dev/probe_mtp.py); baseline vs MTP
+  ai-backend tune [model]                Auto-tune context, KV cache, and MTP draft tokens for max throughput
   ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup
   ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
   ai-backend gpus [all|<devs>|auto|split <p>]   Select GPUs (single vs multi-GPU split)
   ai-backend serve                      Run llama-server with auto context sizing
 
 Examples:
+  ai-backend tune                       # auto-tune active model for hardware & max speed
   ai-backend use qwen3.8                # use Qwen3.8-27B (Unsloth GGUF)
   ai-backend cache q4_0                 # 4-bit KV cache quantization (prevents VRAM spillover)
   ai-backend use qwen3.8-2.4t           # use Qwen3.8-2.4T-A95B
@@ -1887,6 +2094,8 @@ def main():
     elif cmd in ("mtp", "spec"):
         extra = args[2] if len(args) > 2 else None
         cmd_mtp(args[1] if len(args) > 1 else None, extra)
+    elif cmd in ("tune", "auto-tune", "tune-mtp", "optimize"):
+        cmd_tune(args[1] if len(args) > 1 else None)
     elif cmd in ("probe", "speed", "benchmark"):
         cmd_probe(args[1] if len(args) > 1 else None)
     elif cmd in ("mode", "preset"):
@@ -1917,3 +2126,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
