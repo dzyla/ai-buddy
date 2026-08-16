@@ -1368,9 +1368,16 @@ def cmd_auto():
         write_env(ep, "gemma4")
         print(f"Switched to gemma4 ({ep})")
     else:
+        env_vars = load_env()
+        current_model = env_vars.get("LLAMA_MODEL_PATH")
+        if current_model and os.path.exists(current_model):
+            print(f"Active model preserved: {os.path.basename(current_model)}")
+            return
         models = list_local_models()
         if models:
-            apply_model_path(models[0])
+            qwen_candidates = [m for m in models if "qwen3.8" in os.path.basename(m).lower() or "qwen" in os.path.basename(m).lower()]
+            best_model = qwen_candidates[0] if qwen_candidates else max(models, key=lambda m: os.path.getsize(m) if os.path.exists(m) else 0)
+            apply_model_path(best_model)
         else:
             print("No active backend or model found.")
             sys.exit(1)
@@ -1442,10 +1449,16 @@ def cmd_tune(target=None):
         cmd_use(target)
 
     env_vars = load_env()
-    model_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
+    model_path = env_vars.get("LLAMA_MODEL_PATH") or os.environ.get("LLAMA_MODEL_PATH")
     if not model_path or not os.path.exists(model_path):
-        print(f"Error: LLAMA_MODEL_PATH not found or invalid: {model_path}", file=sys.stderr)
-        sys.exit(1)
+        models = list_local_models()
+        if not models:
+            print(f"Error: No GGUF models found to tune.", file=sys.stderr)
+            sys.exit(1)
+        qwen_candidates = [m for m in models if "qwen3.8" in os.path.basename(m).lower() or "qwen" in os.path.basename(m).lower()]
+        best_model = qwen_candidates[0] if qwen_candidates else max(models, key=lambda m: os.path.getsize(m) if os.path.exists(m) else 0)
+        apply_model_path(best_model)
+        model_path = str(best_model)
 
     model_name = os.path.basename(model_path)
     print(f"\n=======================================================")
@@ -1475,15 +1488,15 @@ def cmd_tune(target=None):
 
     # Recommended memory configuration based on hardware & model size
     recommended_cache = "q8_0"
-    recommended_ctx = 128000
+    recommended_ctx = 96000
 
     if total_vram_mib <= 16500:  # 16GB GPUs (RTX 5080, RTX 4080, etc.)
         if model_mb > 7000:  # e.g. 27B quant (8-10GB)
             recommended_cache = "q4_0"
-            recommended_ctx = 128000  # Safe 128k context without RAM spillover
+            recommended_ctx = 96000  # Safe 96k context with >1GB headroom to guarantee 0.0 Shared RAM on Windows/WSL
         elif model_mb > 4000:  # e.g. 9B-12B (4-6GB)
             recommended_cache = "q4_0"
-            recommended_ctx = 131072
+            recommended_ctx = 128000
         else:
             recommended_cache = "q8_0"
             recommended_ctx = 65536

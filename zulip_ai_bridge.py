@@ -396,40 +396,76 @@ class FileParser:
         return content, processed_urls
 
 
-def normalize_text(text):
-    """Join wrapped lines within paragraphs while preserving paragraph breaks.
+def load_env_file():
+    """Load environment variables from ~/.local/share/ai/env."""
+    env_file = os.path.expanduser("~/.local/share/ai/env")
+    loaded = {}
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("export "):
+                        line = line[7:].strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        loaded[k] = v
+        except Exception as e:
+            logger.warning(f"Could not load env file {env_file}: {e}")
+    return loaded
 
-    The LLM output from ``ai`` often places a newline after every sentence
-    (or at arbitrary word-wrapping points).  When posted to Zulip each of
-    those single newlines becomes a hard line break, making the message
-    look choppy and unnatural.  This normaliser collapses single newlines
-    to spaces *inside* paragraphs (blocks separated by blank lines) so the
-    text flows naturally and Zulip can wrap it to the full message width,
-    while still keeping paragraph breaks intact.
-    """
-    # Split into paragraphs by blank lines (two or more consecutive newlines)
-    paragraphs = re.split(r'\n{2,}', text)
-    normalized = []
-    for para in paragraphs:
-        para = para.strip()
-        # Replace any remaining single newlines with a space
-        para = para.replace('\n', ' ')
-        # Collapse runs of multiple spaces into a single space
-        para = re.sub(r' {2,}', ' ', para)
-        if para:
-            normalized.append(para)
-    return '\n\n'.join(normalized)
+
+def normalize_text(text):
+    """Normalize soft-wrapped prose paragraphs while strictly preserving code blocks."""
+    if not text:
+        return ""
+
+    # Split text into code blocks and non-code blocks
+    parts = re.split(r'(```[\s\S]*?```)', text)
+    result = []
+
+    for part in parts:
+        if part.startswith('```') and part.endswith('```'):
+            # Code block - preserve exactly as is
+            result.append(part)
+        else:
+            # Prose blocks
+            paragraphs = re.split(r'\n{2,}', part)
+            norm_paras = []
+            for p in paragraphs:
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+                # If block is code with 4-space or tab indentation, preserve
+                lines = p_clean.split('\n')
+                if any(line.startswith('    ') or line.startswith('\t') for line in lines):
+                    norm_paras.append(p_clean)
+                else:
+                    # Join lines with spaces and collapse multiple spaces
+                    joined = ' '.join(line.strip() for line in lines if line.strip())
+                    joined = re.sub(r' {2,}', ' ', joined)
+                    if joined:
+                        norm_paras.append(joined)
+            result.append('\n\n'.join(norm_paras))
+
+    return ''.join(result)
 
 
 def clean_response(text):
+    if not text:
+        return ""
     # Strip all ANSI escape codes (colour, dim, bold, cursor movement, etc.)
     ansi_escape = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\]\d*;[^\x07]*\x07|[@-Z\\-_])')
     clean = ansi_escape.sub('', text)
+    # Remove carriage returns
+    clean = clean.replace('\r', '')
     # Replace long unicode horizontal lines with standard markdown horizontal rules
     clean = clean.replace("────────────────────────────────────────────", "---")
     # Collapse runs of blank lines to at most two
     clean = re.sub(r'\n{3,}', '\n\n', clean)
-    # Join wrapped lines within paragraphs for natural Zulip rendering
+    # Join wrapped lines in prose while preserving code & tables
     clean = normalize_text(clean)
     return clean.strip()
 
@@ -593,62 +629,119 @@ class ZulipAiBridge:
         return "ai"
 
     def _truncate_reply(self, text, max_chars=9000):
-        """Truncate a reply to fit Zulip's per-message size limit.
-
-        Zulip rejects messages above ~10000 characters. Keep the head (where
-        the answer lives) and append a notice that the tail was cut, so the
-        bot never silently fails to deliver long output.
-        """
+        """Truncate a reply to fit Zulip's per-message size limit."""
         if len(text) <= max_chars:
             return text
         head = text[:max_chars].rstrip()
         return f"{head}\n\n*…[reply truncated — {len(text) - max_chars} chars omitted]*"
+
+    def _send_full_reply(self, msg, response_text):
+        """Deliver replies cleanly, splitting across sequential messages if exceeding Zulip's single-message limit."""
+        if not response_text:
+            self._send_reply(msg, "*(agent returned no output)*")
+            return
+
+        max_chunk = 8500
+        if len(response_text) <= max_chunk:
+            self._send_reply(msg, response_text)
+            return
+
+        # Split into readable chunks (up to 4 parts)
+        chunks = []
+        remaining = response_text
+        while remaining and len(chunks) < 4:
+            if len(remaining) <= max_chunk:
+                chunks.append(remaining)
+                break
+            # Find clean split point (paragraph or newline)
+            split_idx = remaining.rfind('\n\n', 0, max_chunk)
+            if split_idx == -1:
+                split_idx = remaining.rfind('\n', 0, max_chunk)
+            if split_idx == -1 or split_idx < 2000:
+                split_idx = max_chunk
+            chunks.append(remaining[:split_idx].rstrip())
+            remaining = remaining[split_idx:].lstrip()
+
+        if remaining:
+            chunks[-1] += f"\n\n*…[output truncated at {len(response_text)} chars]*"
+
+        for i, chunk in enumerate(chunks):
+            header = f"*(Part {i+1}/{len(chunks)})*\n\n" if len(chunks) > 1 else ""
+            self._send_reply(msg, header + chunk)
+            if i < len(chunks) - 1:
+                time.sleep(0.5)
+
+    def _is_long_job(self, content):
+        """Detect if a request is a long-running, deep research, or complex task."""
+        c = content.strip().lower()
+        if c.startswith(('/long', '/deep', '/job', '--long', '--deep', ':long')):
+            return True
+        long_keywords = [
+            "deep research", "full refactor", "run benchmark", "long task",
+            "take your time", "train model", "design binder", "boltzgen run",
+            "investigate thoroughly", "extensive audit", "long job"
+        ]
+        return any(kw in c for kw in long_keywords)
+
+    def _strip_long_prefix(self, content):
+        """Strip command prefixes like /long, /deep from user prompt."""
+        c = content.strip()
+        for prefix in ('/long', '/deep', '/job', '--long', '--deep', ':long'):
+            if c.lower().startswith(prefix):
+                return c[len(prefix):].strip()
+        return c
 
     def _process_message(self, msg, content):
         """Run the ai agent and send the result back. Runs in a background thread."""
         tid = threading.get_ident()
         print(f"[thread-{tid}] Processing: {content[:80]}")
 
+        is_long = self._is_long_job(content)
+        clean_content = self._strip_long_prefix(content)
+
+        # Timeouts: default 1800s (30 mins), long jobs 7200s (2 hours)
+        default_timeout = int(os.environ.get("BRIDGE_TASK_TIMEOUT", os.environ.get("INFER_TASK_TIMEOUT", 1800)))
+        long_timeout = int(os.environ.get("BRIDGE_LONG_TASK_TIMEOUT", os.environ.get("INFER_LONG_TASK_TIMEOUT", 7200)))
+        task_timeout = long_timeout if is_long else default_timeout
+
+        # If it's a long job, send an immediate confirmation on Zulip and add a reaction
+        if is_long:
+            try:
+                if hasattr(self.client, "add_reaction"):
+                    self.client.add_reaction({
+                        "message_id": msg.get("id"),
+                        "emoji_name": "hourglass_flowing_sand"
+                    })
+            except Exception:
+                pass
+            
+            self._send_reply(
+                msg,
+                f"⏳ **Task confirmed in extended execution mode** (Timeout: {task_timeout}s | Unbounded Steps).\n"
+                f"I am executing this task now and will post the full results here when completed."
+            )
+
         # Fetch context messages and manage context window
         context_messages = self._get_context_messages(msg)
-        context_messages = self._manage_context_window(context_messages, content)
-        prompt = self._construct_prompt_with_context(msg, content, context_messages)
+        context_messages = self._manage_context_window(context_messages, clean_content)
+        prompt = self._construct_prompt_with_context(msg, clean_content, context_messages)
 
-        # Build a clean environment for the subprocess.
-        # Inherit everything from the bridge's own env (which has the full PATH
-        # and conda setup from the service file / interactive launch). Auto-approve
-        # is forced in "auto" mode; plan/manual modes must NOT auto-approve so the
-        # agent's state-changing actions are blocked until approved via present_plan.
+        # Build environment for the subprocess, incorporating ~/.local/share/ai/env
         ai_mode = self._ai_mode()
         run_env = os.environ.copy()
+        for k, v in load_env_file().items():
+            if k not in run_env or not run_env[k]:
+                run_env[k] = v
+
         if ai_mode == "auto":
             run_env["INFER_AUTO_APPROVE"] = "1"
         else:
             run_env.pop("INFER_AUTO_APPROVE", None)
-        # NOTE: Do NOT set INFER_RAW_OUTPUT here — when ai runs with a pipe
-        # (non-TTY stdout) it already outputs only the final clean response.
-        # INFER_RAW_OUTPUT caused streaming intermediate chunks to also be
-        # printed, polluting the output captured by this bridge.
-        # Let set_reminder default the reminder recipient back to whoever asked,
-        # so "remind me tomorrow to ..." works with no email needed.
+
         sender_email = msg.get("sender_email")
         if sender_email:
             run_env["AI_REMINDER_ZULIP_TO"] = sender_email
 
-        # Run the local `ai` CLI. The bridge defaults to AUTO mode so the agent
-        # actually investigates AND executes (read + write) rather than halting
-        # to ask for confirmation on every state-changing action — a bridge that
-        # just posts "here is my plan" and stops is not useful over Zulip, where
-        # there is no interactive approve prompt. The bridge is already gated to
-        # the owner (ZULIP_USER / detected owner), so auto is safe here.
-        # Override per-deployment with the BRIDGE_AI_MODE env var:
-        #   "auto"   = full autonomy (default) — investigates and executes
-        #   "plan"   = investigate & report, present a plan, wait for approval
-        #   "manual" = require approval for every state-changing action
-        # -q suppresses the think tool reasoning output.
-        # Streaming intermediate content is suppressed automatically because
-        # stdout is a pipe (non-TTY), so only the final answer is captured.
-        # With schedule_task properly used, the agent returns immediately for timed work.
         mode_flags = []
         if ai_mode == "auto":
             mode_flags = ["--auto"]
@@ -657,9 +750,11 @@ class ZulipAiBridge:
         else:
             mode_flags = ["--plan"]
 
+        if is_long:
+            mode_flags.append("-c")  # continue until task_complete without bounding at 30/60 steps
+
         ai_bin = self._resolve_ai_bin()
         ai_cmd = [ai_bin, "-q"] + mode_flags + [prompt]
-        task_timeout = int(os.environ.get("INFER_TASK_TIMEOUT", 0)) or 600
 
         try:
             result = subprocess.run(
@@ -681,13 +776,13 @@ class ZulipAiBridge:
         except subprocess.TimeoutExpired:
             response_text = (
                 f"⏱️ The agent timed out after {task_timeout}s. "
-                "For long-running tasks, ask me to **schedule** them so they run in "
-                "the background and notify you when done."
+                "For very long-running jobs, use `/long <prompt>` to run in extended execution mode "
+                "or ask me to schedule a background task."
             )
         except Exception as e:
             response_text = f"⚠️ Failed to run local `ai` CLI: {str(e)}"
 
-        self._send_reply(msg, self._truncate_reply(response_text))
+        self._send_full_reply(msg, response_text)
         print(f"[thread-{tid}] Done.")
 
     def handle_message(self, msg):
@@ -729,11 +824,28 @@ class ZulipAiBridge:
             self._send_reply(msg, "🟢 Zulip AI Bridge is alive.")
             return
         if content.startswith('/mode'):
+            parts = content.split()
+            if len(parts) > 1:
+                new_mode = parts[1].strip().lower()
+                if new_mode in ("auto", "plan", "manual"):
+                    os.environ["BRIDGE_AI_MODE"] = new_mode
+                    self._send_reply(msg, f"✅ Bridge AI mode set to: **{new_mode}**")
+                    return
             self._send_reply(
                 msg,
                 f"AI mode: **{self._ai_mode()}** "
-                "(set BRIDGE_AI_MODE=auto|plan|manual to change)",
+                "(use `/mode auto`, `/mode plan`, or `/mode manual` to switch, or `/long <task>` for extended jobs)",
             )
+            return
+        if content.startswith('/timeout'):
+            parts = content.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                os.environ["BRIDGE_TASK_TIMEOUT"] = parts[1]
+                self._send_reply(msg, f"✅ Default task timeout set to: **{parts[1]}s**")
+                return
+            default_to = os.environ.get("BRIDGE_TASK_TIMEOUT", os.environ.get("INFER_TASK_TIMEOUT", "1800"))
+            long_to = os.environ.get("BRIDGE_LONG_TASK_TIMEOUT", os.environ.get("INFER_LONG_TASK_TIMEOUT", "7200"))
+            self._send_reply(msg, f"⏱️ Timeouts: Standard: **{default_to}s**, Long Jobs: **{long_to}s** (use `/timeout <seconds>` to update)")
             return
 
         # If the bot is mentioned in a stream, strip the mention syntax (e.g. @**AI Bot**)
