@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.error
 import re
 import datetime
+import csv
 from typing import List, Dict, Any, Optional, Tuple
 
 try:
@@ -36,6 +37,8 @@ except Exception:
     ET_ZONE = datetime.timezone(datetime.timedelta(hours=-5), "EST")
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai")
+CACHE_DIR = os.path.expanduser("~/.cache/ai/trading")
+os.makedirs(CACHE_DIR, exist_ok=True)
 TRADING_STATE_FILE = os.path.join(CONFIG_DIR, "robinhood_trading_state.json")
 VAULT_DIR = os.path.join(CONFIG_DIR, "trading_vault")
 
@@ -393,13 +396,17 @@ class MarketHours:
 # ==============================================================================
 
 class FinancialData:
-    """Fetches real-time quotes, fundamentals, and historical OHLCV bars."""
+    """Fetches real-time quotes, fundamentals, and historical OHLCV bars with multi-source fallback."""
 
     USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     @classmethod
     def _http_get(cls, url: str, timeout: int = 10) -> str:
-        req = urllib.request.Request(url, headers={"User-Agent": cls.USER_AGENT})
+        req = urllib.request.Request(url, headers={
+            "User-Agent": cls.USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9"
+        })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
 
@@ -407,12 +414,44 @@ class FinancialData:
     def fetch_quote(cls, ticker: str) -> Dict[str, Any]:
         """Fetches real-time quote, day statistics, and fundamentals for a ticker."""
         ticker = ticker.strip().upper()
+
+        # 1. Primary source: Robinhood MCP Live Quotes
+        try:
+            rh_quotes = RobinhoodExecutor.get_equity_quotes([ticker])
+            if ticker in rh_quotes:
+                q = rh_quotes[ticker]
+                price = float(q.get("last_trade_price") or q.get("last_non_reg_trade_price") or q.get("price") or 0.0)
+                prev_close = float(q.get("adjusted_previous_close") or q.get("previous_close") or price)
+                if price > 0:
+                    change = price - prev_close if prev_close else 0.0
+                    change_pct = (change / prev_close * 100.0) if prev_close else 0.0
+                    bid = float(q.get("bid_price") or price)
+                    ask = float(q.get("ask_price") or price)
+                    return {
+                        "ticker": ticker,
+                        "price": round(price, 2),
+                        "previous_close": round(prev_close, 2),
+                        "change": round(change, 2),
+                        "change_percent": round(change_pct, 2),
+                        "day_high": round(max(price, ask), 2),
+                        "day_low": round(min(price, bid), 2),
+                        "bid": round(bid, 2),
+                        "ask": round(ask, 2),
+                        "volume": int(q.get("volume", 0) or 1000000),
+                        "currency": "USD",
+                        "exchange": "US",
+                        "source": "robinhood_mcp",
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+        except Exception:
+            pass
+
+        # 2. Secondary source: Yahoo Finance chart API
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
         try:
             raw = cls._http_get(url)
             data = json.loads(raw)
             meta = data["chart"]["result"][0]["meta"]
-            indicators = data["chart"]["result"][0]["indicators"]["quote"][0]
             
             price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose", 0.0)
             prev_close = meta.get("chartPreviousClose") or meta.get("previousClose", price)
@@ -436,10 +475,10 @@ class FinancialData:
                 "fifty_two_week_low": meta.get("fiftyTwoWeekLow", 0.0),
                 "currency": meta.get("currency", "USD"),
                 "exchange": meta.get("exchangeName", "NASDAQ"),
+                "source": "yahoo_finance",
                 "timestamp": datetime.datetime.now().isoformat()
             }
         except Exception as e:
-            # Synthetic / fallback mock quote if offline
             return {
                 "ticker": ticker,
                 "price": 100.0,
@@ -453,14 +492,64 @@ class FinancialData:
                 "fifty_two_week_low": 80.0,
                 "currency": "USD",
                 "exchange": "UNKNOWN",
+                "source": "fallback",
                 "error": str(e),
                 "timestamp": datetime.datetime.now().isoformat()
             }
 
     @classmethod
-    def fetch_historical(cls, ticker: str, range_period: str = "3mo", interval: str = "1d") -> List[Dict[str, Any]]:
+    def fetch_historical(cls, ticker: str, range_period: str = "6mo", interval: str = "1d") -> List[Dict[str, Any]]:
         """Fetches historical OHLCV bars (open, high, low, close, volume)."""
         ticker = ticker.strip().upper()
+
+        span_days = 90
+        if "mo" in range_period:
+            try:
+                span_days = int(range_period.replace("mo", "")) * 30
+            except ValueError:
+                span_days = 90
+        elif "y" in range_period:
+            try:
+                span_days = int(range_period.replace("y", "")) * 365
+            except ValueError:
+                span_days = 365
+        elif "d" in range_period:
+            try:
+                span_days = int(range_period.replace("d", ""))
+            except ValueError:
+                span_days = 30
+
+        # 1. Primary source: Robinhood MCP Historical Bars
+        try:
+            rh_hist = RobinhoodExecutor.get_equity_historicals([ticker], interval="day", span_days=span_days)
+            if ticker in rh_hist and len(rh_hist[ticker]) > 0:
+                bars = []
+                for b in rh_hist[ticker]:
+                    try:
+                        begins = b.get("begins_at", "")
+                        dt_str = begins[:10] if len(begins) >= 10 else datetime.datetime.now().strftime("%Y-%m-%d")
+                        c_p = float(b.get("close_price") or 0.0)
+                        o_p = float(b.get("open_price") or c_p)
+                        h_p = float(b.get("high_price") or max(o_p, c_p))
+                        l_p = float(b.get("low_price") or min(o_p, c_p))
+                        vol = int(b.get("volume") or 0)
+                        if c_p > 0:
+                            bars.append({
+                                "datetime": dt_str,
+                                "open": round(o_p, 2),
+                                "high": round(h_p, 2),
+                                "low": round(l_p, 2),
+                                "close": round(c_p, 2),
+                                "volume": vol
+                            })
+                    except Exception:
+                        pass
+                if len(bars) >= 5:
+                    return bars
+        except Exception:
+            pass
+
+        # 2. Secondary source: Yahoo Finance API
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={range_period}"
         try:
             raw = cls._http_get(url)
@@ -851,18 +940,23 @@ class TradingStrategyEngine:
         current_price = quote.get("price", 100.0)
 
         # Indicator calculations if bars available
-        if len(bars) >= 20:
+        if len(bars) >= 5:
             closes = [b["close"] for b in bars]
             highs = [b["high"] for b in bars]
             lows = [b["low"] for b in bars]
             volumes = [b["volume"] for b in bars]
 
-            rsi_series = TechnicalIndicators.rsi(closes, period=14)
+            rsi_period = min(14, max(2, len(closes) - 1))
+            rsi_series = TechnicalIndicators.rsi(closes, period=rsi_period)
             current_rsi = rsi_series[-1] if rsi_series and rsi_series[-1] is not None else 50.0
 
-            sma20_series = TechnicalIndicators.sma(closes, period=20)
-            sma50_series = TechnicalIndicators.sma(closes, period=50)
-            sma200_series = TechnicalIndicators.sma(closes, period=min(200, len(closes)))
+            sma20_period = min(20, len(closes))
+            sma50_period = min(50, len(closes))
+            sma200_period = min(200, len(closes))
+
+            sma20_series = TechnicalIndicators.sma(closes, period=sma20_period)
+            sma50_series = TechnicalIndicators.sma(closes, period=sma50_period)
+            sma200_series = TechnicalIndicators.sma(closes, period=sma200_period)
 
             sma20 = sma20_series[-1] if sma20_series and sma20_series[-1] is not None else current_price
             sma50 = sma50_series[-1] if sma50_series and sma50_series[-1] is not None else current_price
@@ -871,10 +965,12 @@ class TradingStrategyEngine:
             macd_data = TechnicalIndicators.macd(closes)
             macd_hist = macd_data["histogram"][-1] if macd_data["histogram"] and macd_data["histogram"][-1] is not None else 0.0
 
-            bb = TechnicalIndicators.bollinger_bands(closes, period=20)
+            bb_period = min(20, len(closes))
+            bb = TechnicalIndicators.bollinger_bands(closes, period=bb_period)
             bb_pct_b = bb["percent_b"][-1] if bb["percent_b"] and bb["percent_b"][-1] is not None else 0.5
 
-            atr_series = TechnicalIndicators.atr(highs, lows, closes, period=14)
+            atr_period = min(14, max(2, len(closes) - 1))
+            atr_series = TechnicalIndicators.atr(highs, lows, closes, period=atr_period)
             current_atr = atr_series[-1] if atr_series and atr_series[-1] is not None else (current_price * 0.02)
         else:
             current_rsi = 50.0
@@ -1212,6 +1308,26 @@ class RobinhoodExecutor:
     """Direct, high-speed execution bridge for Robinhood Agentic MCP (sub-second order placement)."""
 
     @classmethod
+    def _extract_data(cls, res: Dict[str, Any]) -> Dict[str, Any]:
+        """Extracts structured JSON data safely from MCP response dictionary."""
+        if not res:
+            return {}
+        if isinstance(res.get("structuredContent"), dict) and "data" in res["structuredContent"]:
+            return res["structuredContent"]["data"]
+        if "content" in res and isinstance(res["content"], list) and len(res["content"]) > 0:
+            item = res["content"][0]
+            if isinstance(item, dict) and "text" in item:
+                try:
+                    parsed = json.loads(item["text"])
+                    if isinstance(parsed, dict) and "data" in parsed:
+                        return parsed["data"]
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+        return res
+
+    @classmethod
     def call_mcp_tool(cls, tool_name: str, arguments: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
         """Calls any Robinhood MCP tool in sub-second time without browser prompts."""
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
@@ -1282,19 +1398,55 @@ class RobinhoodExecutor:
     def get_accounts(cls) -> List[Dict[str, Any]]:
         """Fetch all available accounts under the authorized credentials."""
         res = cls.call_mcp_tool('get_accounts', {})
-        return res.get('structuredContent', {}).get('data', {}).get('accounts', [])
+        data = cls._extract_data(res)
+        if isinstance(data, dict):
+            return data.get('accounts', [])
+        return []
 
     @classmethod
-    def get_live_portfolio(cls, account_number: str = "837546068") -> Dict[str, Any]:
+    def get_agentic_account(cls) -> Optional[Dict[str, Any]]:
+        """Finds the dedicated Agentic Sandbox account with agentic_allowed=True."""
+        accounts = cls.get_accounts()
+        for a in accounts:
+            if a.get("agentic_allowed") is True or str(a.get("nickname", "")).lower() == "agentic":
+                return a
+        return accounts[0] if accounts else None
+
+    @classmethod
+    def get_agentic_account_number(cls) -> str:
+        """Returns the account number of the agentic account (or fallback)."""
+        acc = cls.get_agentic_account()
+        return str(acc.get("account_number", "517198354")) if acc else "517198354"
+
+    @classmethod
+    def get_default_account_number(cls) -> str:
+        """Returns default account number or first active account."""
+        accounts = cls.get_accounts()
+        for a in accounts:
+            if a.get("is_default"):
+                return str(a.get("account_number", "837546068"))
+        for a in accounts:
+            if a.get("agentic_allowed"):
+                return str(a.get("account_number", "517198354"))
+        return accounts[0]["account_number"] if accounts else "837546068"
+
+    @classmethod
+    def get_live_portfolio(cls, account_number: Optional[str] = None) -> Dict[str, Any]:
         """Fetch real-time portfolio balance, equity value, cash, and buying power."""
-        res = cls.call_mcp_tool('get_portfolio', {'account_number': account_number})
-        return res.get('structuredContent', {}).get('data', {})
+        acc = account_number or cls.get_default_account_number()
+        res = cls.call_mcp_tool('get_portfolio', {'account_number': acc})
+        data = cls._extract_data(res)
+        return data if isinstance(data, dict) else {}
 
     @classmethod
-    def get_equity_positions(cls, account_number: str = "837546068") -> List[Dict[str, Any]]:
+    def get_equity_positions(cls, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch active equity holdings and quantities."""
-        res = cls.call_mcp_tool('get_equity_positions', {'account_number': account_number})
-        return res.get('structuredContent', {}).get('data', {}).get('positions', [])
+        acc = account_number or cls.get_default_account_number()
+        res = cls.call_mcp_tool('get_equity_positions', {'account_number': acc})
+        data = cls._extract_data(res)
+        if isinstance(data, dict):
+            return data.get('positions', [])
+        return []
 
     @classmethod
     def get_equity_quotes(cls, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -1302,9 +1454,10 @@ class RobinhoodExecutor:
         quotes_map = {}
         batch_size = 30
         for i in range(0, len(symbols), batch_size):
-            batch = symbols[i:i + batch_size]
+            batch = [s.upper().strip() for s in symbols[i:i + batch_size]]
             res = cls.call_mcp_tool('get_equity_quotes', {'symbols': batch})
-            results = res.get('structuredContent', {}).get('data', {}).get('results', [])
+            data = cls._extract_data(res)
+            results = data.get('results', []) if isinstance(data, dict) else []
             for r in results:
                 q = r.get('quote', {})
                 sym = q.get('symbol')
@@ -1313,13 +1466,51 @@ class RobinhoodExecutor:
         return quotes_map
 
     @classmethod
+    def get_equity_historicals(cls, symbols: List[str], interval: str = "day", span_days: int = 90) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetches OHLCV historical bars via Robinhood MCP."""
+        start_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=span_days)).strftime("%Y-%m-%dT00:00:00Z")
+        out = {}
+        batch_size = 10
+        for i in range(0, len(symbols), batch_size):
+            batch = [s.upper().strip() for s in symbols[i:i + batch_size]]
+            res = cls.call_mcp_tool('get_equity_historicals', {
+                'symbols': batch,
+                'interval': interval,
+                'start_time': start_time
+            })
+            data = cls._extract_data(res)
+            results = data.get('results', []) if isinstance(data, dict) else []
+            for r in results:
+                sym = r.get('symbol')
+                bars = r.get('bars', [])
+                if sym:
+                    out[sym] = bars
+        return out
+
+    @classmethod
+    def get_equity_technical_indicators(cls, symbol: str, indicator_type: str = "rsi", interval: str = "day", span_days: int = 90) -> List[Dict[str, Any]]:
+        """Computes technical indicator series via Robinhood MCP."""
+        start_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=span_days)).strftime("%Y-%m-%dT00:00:00Z")
+        res = cls.call_mcp_tool('get_equity_technical_indicators', {
+            'symbol': symbol.upper().strip(),
+            'type': indicator_type.lower().strip(),
+            'interval': interval,
+            'start_time': start_time
+        })
+        data = cls._extract_data(res)
+        results = data.get('results', []) if isinstance(data, dict) else []
+        if results and 'indicators' in results[0]:
+            return results[0]['indicators']
+        return []
+
+    @classmethod
     def execute_market_order(cls, account_number: str, symbol: str, side: str,
                              dollar_amount: Optional[str] = None,
                              quantity: Optional[str] = None) -> Dict[str, Any]:
         """Directly places an equity market order on an agentic account."""
         args = {
             'account_number': account_number,
-            'symbol': symbol,
+            'symbol': symbol.upper().strip(),
             'side': side.lower(),
             'type': 'market'
         }
@@ -1330,6 +1521,484 @@ class RobinhoodExecutor:
 
         res = cls.call_mcp_tool('place_equity_order', args)
         return res
+
+
+# ==============================================================================
+# 6.5. Trading Data Offloading & Portfolio Auditor
+# ==============================================================================
+
+class TradingDataManager:
+    """Manages offloading trading, portfolio, quote, and audit data to JSON and CSV files."""
+
+    @classmethod
+    def get_cache_dir(cls) -> str:
+        d = os.path.expanduser("~/.cache/ai/trading")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
+    def export_portfolio(cls, portfolio_data: Dict[str, Any], positions: List[Dict[str, Any]],
+                         quotes: Dict[str, Dict[str, Any]], account_number: str,
+                         output_dir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Saves structured portfolio dataset to JSON and CSV files:
+        - portfolio_<account>.json / portfolio_latest.json
+        - portfolio_<account>.csv / portfolio_latest.csv
+        """
+        out_dir = output_dir or cls.get_cache_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        tot_val = float(portfolio_data.get("total_value", 0.0))
+        eq_val = float(portfolio_data.get("equity_value", 0.0))
+        cash_val = float(portfolio_data.get("cash", 0.0))
+        
+        bp_raw = portfolio_data.get("buying_power", 0.0)
+        if isinstance(bp_raw, dict):
+            bp_val = float(bp_raw.get("buying_power", 0.0))
+        else:
+            try:
+                bp_val = float(bp_raw or 0.0)
+            except Exception:
+                bp_val = 0.0
+
+        processed_positions = []
+        tot_cost = 0.0
+        tot_cur_val = 0.0
+
+        for p in positions:
+            sym = str(p.get("symbol", "")).strip().upper()
+            try:
+                qty = float(p.get("quantity", 0.0))
+            except Exception:
+                qty = 0.0
+            if qty <= 0:
+                continue
+            try:
+                avg_cost = float(p.get("average_buy_price", 0.0))
+            except Exception:
+                avg_cost = 0.0
+
+            q = quotes.get(sym, {})
+            try:
+                cur_price = float(q.get("last_trade_price") or q.get("price") or avg_cost)
+            except Exception:
+                cur_price = avg_cost
+
+            val = qty * cur_price
+            cost = qty * avg_cost
+            tot_cost += cost
+            tot_cur_val += val
+            weight = (val / eq_val * 100.0) if eq_val > 0 else 0.0
+            pnl = val - cost
+            pnl_pct = ((cur_price - avg_cost) / avg_cost * 100.0) if avg_cost > 0 else 0.0
+
+            processed_positions.append({
+                "symbol": sym,
+                "quantity": round(qty, 4),
+                "average_buy_price": round(avg_cost, 4),
+                "current_price": round(cur_price, 4),
+                "current_value": round(val, 2),
+                "cost_basis": round(cost, 2),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+                "weight_pct": round(weight, 2),
+                "type": p.get("type", "equity")
+            })
+
+        processed_positions.sort(key=lambda x: x["current_value"], reverse=True)
+
+        full_payload = {
+            "account_number": str(account_number),
+            "timestamp": datetime.datetime.now(ET_ZONE).isoformat(),
+            "summary": {
+                "total_value": round(tot_val if tot_val > 0 else (tot_cur_val + cash_val), 2),
+                "equity_value": round(eq_val if eq_val > 0 else tot_cur_val, 2),
+                "cash": round(cash_val, 2),
+                "buying_power": round(bp_val, 2),
+                "cash_buffer_pct": round((cash_val / tot_val * 100.0) if tot_val > 0 else 0.0, 2),
+                "total_cost_basis": round(tot_cost, 2),
+                "net_unrealized_pnl": round(tot_cur_val - tot_cost, 2),
+                "net_unrealized_pnl_pct": round(((tot_cur_val - tot_cost) / tot_cost * 100.0) if tot_cost > 0 else 0.0, 2),
+                "active_position_count": len(processed_positions)
+            },
+            "positions": processed_positions
+        }
+
+        # 1. JSON Export
+        json_path = os.path.join(out_dir, f"portfolio_{account_number}.json")
+        latest_json = os.path.join(out_dir, "portfolio_latest.json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(full_payload, f, indent=2)
+            with open(latest_json, "w", encoding="utf-8") as f:
+                json.dump(full_payload, f, indent=2)
+        except Exception:
+            pass
+
+        # 2. CSV Export
+        csv_path = os.path.join(out_dir, f"portfolio_{account_number}.csv")
+        latest_csv = os.path.join(out_dir, "portfolio_latest.csv")
+        csv_headers = [
+            "symbol", "quantity", "average_buy_price", "current_price",
+            "current_value", "cost_basis", "unrealized_pnl", "unrealized_pnl_pct", "weight_pct", "type"
+        ]
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=csv_headers)
+                writer.writeheader()
+                for pos in processed_positions:
+                    writer.writerow(pos)
+            with open(latest_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=csv_headers)
+                writer.writeheader()
+                for pos in processed_positions:
+                    writer.writerow(pos)
+        except Exception:
+            pass
+
+        return {
+            "json": json_path,
+            "csv": csv_path,
+            "latest_json": latest_json,
+            "latest_csv": latest_csv,
+            "processed_positions": processed_positions,
+            "full_payload": full_payload
+        }
+
+    @classmethod
+    def export_audit(cls, audit_data: Dict[str, Any], account_number: str,
+                     output_dir: Optional[str] = None) -> str:
+        """Saves portfolio audit results to JSON."""
+        out_dir = output_dir or cls.get_cache_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"audit_{account_number}.json")
+        latest = os.path.join(out_dir, "audit_latest.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(audit_data, f, indent=2)
+            with open(latest, "w", encoding="utf-8") as f:
+                json.dump(audit_data, f, indent=2)
+        except Exception:
+            pass
+        return path
+
+
+class PortfolioAuditor:
+    """Quantitative risk auditor, concentration checker, and optimizer for Robinhood accounts."""
+
+    SEMI_TICKERS = {
+        "NVDA", "AVGO", "ARM", "SMCI", "AMD", "TSM", "ASML", "AMAT", "MRVL", "QCOM", "INTC", "MCHP", "MLTX", "AEHR", "MXL", "SMH"
+    }
+
+    CORE_ETFS = {
+        "VTI", "VXUS", "SPY", "QQQ", "SMH", "BND", "SCHO", "URA"
+    }
+
+    @classmethod
+    def audit(cls, account_number: Optional[str] = None,
+              port_data: Optional[Dict[str, Any]] = None,
+              positions: Optional[List[Dict[str, Any]]] = None,
+              quotes: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Performs full quantitative risk, concentration, dead-money, dust, and tax-loss harvesting audit."""
+        acc = account_number or RobinhoodExecutor.get_default_account_number()
+        
+        acc_info = {}
+        try:
+            for a in RobinhoodExecutor.get_accounts():
+                if str(a.get("account_number")) == str(acc):
+                    acc_info = a
+                    break
+        except Exception:
+            pass
+
+        port_data = port_data or RobinhoodExecutor.get_live_portfolio(account_number=acc)
+        positions = positions if positions is not None else RobinhoodExecutor.get_equity_positions(account_number=acc)
+        
+        pos_active = [p for p in positions if float(p.get("quantity", 0)) > 0]
+        symbols = [p["symbol"] for p in pos_active]
+        quotes = quotes if quotes is not None else (RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {})
+
+        export_res = TradingDataManager.export_portfolio(port_data, pos_active, quotes, str(acc))
+        proc_pos = export_res["processed_positions"]
+        summary = export_res["full_payload"]["summary"]
+
+        tot_val = summary["total_value"]
+        eq_val = summary["equity_value"]
+        cash_val = summary["cash"]
+
+        # 1. Cash Buffer Analysis (target >= 15%)
+        cash_pct = summary["cash_buffer_pct"]
+        target_cash_pct = 15.0
+        cash_target_val = round(tot_val * 0.15, 2)
+        cash_deficit = max(0.0, round(cash_target_val - cash_val, 2))
+        cash_status = "HEALTHY" if cash_pct >= 15.0 else ("WARNING" if cash_pct >= 10.0 else "CRITICAL_DEFICIT")
+
+        # 2. Concentration Risk (15% single position limit)
+        max_pos_cap_pct = 15.0
+        concentration_alerts = []
+        for p in proc_pos:
+            if p["weight_pct"] >= max_pos_cap_pct:
+                concentration_alerts.append({
+                    "symbol": p["symbol"],
+                    "weight_pct": p["weight_pct"],
+                    "current_value": p["current_value"],
+                    "excess_value": round(p["current_value"] - (tot_val * 0.15), 2),
+                    "status": "OVER_LIMIT"
+                })
+            elif p["weight_pct"] >= 12.0:
+                concentration_alerts.append({
+                    "symbol": p["symbol"],
+                    "weight_pct": p["weight_pct"],
+                    "current_value": p["current_value"],
+                    "excess_value": 0.0,
+                    "status": "APPROACHING_LIMIT"
+                })
+
+        # 3. Sector / Theme Concentration (Semiconductor single-name overlap)
+        semi_positions = [p for p in proc_pos if p["symbol"] in cls.SEMI_TICKERS and p["symbol"] != "SMH"]
+        semi_total_val = sum(p["current_value"] for p in semi_positions)
+        semi_weight_pct = round((semi_total_val / eq_val * 100.0) if eq_val > 0 else 0.0, 2)
+        semi_symbols = [p["symbol"] for p in semi_positions]
+
+        # 4. Dead Money Analysis (down > 40%, value < $50)
+        dead_money = [p for p in proc_pos if p["unrealized_pnl_pct"] <= -40.0 and p["current_value"] <= 50.0]
+        dead_money.sort(key=lambda x: x["unrealized_pnl_pct"])
+        dead_money_val = sum(p["current_value"] for p in dead_money)
+        dead_money_cost = sum(p["cost_basis"] for p in dead_money)
+        dead_money_loss = dead_money_val - dead_money_cost
+
+        # 5. Dust Cleanup (value < $10)
+        dust = [p for p in proc_pos if p["current_value"] < 10.0]
+        dust_val = sum(p["current_value"] for p in dust)
+        dust_cost = sum(p["cost_basis"] for p in dust)
+
+        # 6. Tax-Loss Harvesting Candidates (all negative unrealized P&L)
+        losers = [p for p in proc_pos if p["unrealized_pnl"] < 0]
+        losers.sort(key=lambda x: x["unrealized_pnl"])  # largest dollar loss first
+        total_harvestable_loss = abs(sum(p["unrealized_pnl"] for p in losers))
+
+        # 7. Big Winners / High Gainers
+        winners = [p for p in proc_pos if p["unrealized_pnl_pct"] >= 50.0]
+        winners.sort(key=lambda x: x["unrealized_pnl_pct"], reverse=True)
+
+        # 8. Compute Health Score (0 - 100)
+        score = 100
+        if cash_pct < 5.0:
+            score -= 20
+        elif cash_pct < 10.0:
+            score -= 15
+        elif cash_pct < 15.0:
+            score -= 10
+
+        if any(c["status"] == "OVER_LIMIT" for c in concentration_alerts):
+            score -= 15
+        elif any(c["status"] == "APPROACHING_LIMIT" for c in concentration_alerts):
+            score -= 5
+
+        if semi_weight_pct > 25.0:
+            score -= 15
+        elif semi_weight_pct > 18.0:
+            score -= 10
+
+        if len(dead_money) >= 10:
+            score -= 10
+        elif len(dead_money) >= 5:
+            score -= 5
+
+        if len(dust) >= 15:
+            score -= 10
+        elif len(dust) >= 5:
+            score -= 5
+
+        health_score = max(0, min(100, score))
+
+        # 9. Formulate Clear Action Plan
+        action_plan = []
+        if dead_money:
+            action_plan.append(f"Cut {len(dead_money)} dead-money positions (down >40%, <$50) -> raises ~${dead_money_val:.2f} cash and realizes ${abs(dead_money_loss):.2f} in tax losses.")
+        if dust:
+            action_plan.append(f"Clean up {len(dust)} dust positions (<$10) -> simplifies portfolio and recovers ~${dust_val:.2f} cash.")
+        if winners:
+            top_w_syms = ", ".join([f"{w['symbol']} (+{w['unrealized_pnl_pct']:.0f}%)" for w in winners[:3]])
+            action_plan.append(f"Harvest / trim big winners ({top_w_syms}) or place trailing stops (8-10%) to lock in multi-bagger gains.")
+        if semi_weight_pct > 18.0:
+            action_plan.append(f"Trim semiconductor single-name overlap ({', '.join(semi_symbols[:6])}... = {semi_weight_pct}% of equities) into broader core ETFs (SMH / VTI).")
+        if cash_deficit > 0:
+            action_plan.append(f"Restore cash buffer from {cash_pct:.1f}% to target >= 15.0% (${cash_target_val:.2f} needed; ~${cash_deficit:.2f} deficit covered by dead-money & dust liquidations).")
+
+        audit_dict = {
+            "account_number": str(acc),
+            "account_nickname": acc_info.get("nickname") or "-",
+            "account_type": acc_info.get("brokerage_account_type", "individual"),
+            "trading_type": acc_info.get("type", "margin"),
+            "agentic_allowed": bool(acc_info.get("agentic_allowed", False)),
+            "health_score": health_score,
+            "summary": summary,
+            "positions": proc_pos,
+            "cash_buffer": {
+                "current_pct": cash_pct,
+                "target_pct": target_cash_pct,
+                "status": cash_status,
+                "deficit_dollars": cash_deficit
+            },
+            "concentration_alerts": concentration_alerts,
+            "semi_overlap": {
+                "symbols": semi_symbols,
+                "total_value": round(semi_total_val, 2),
+                "weight_pct": semi_weight_pct
+            },
+            "dead_money": {
+                "count": len(dead_money),
+                "total_value": round(dead_money_val, 2),
+                "total_cost": round(dead_money_cost, 2),
+                "harvestable_loss": round(abs(dead_money_loss), 2),
+                "positions": dead_money
+            },
+            "dust_positions": {
+                "count": len(dust),
+                "total_value": round(dust_val, 2),
+                "total_cost": round(dust_cost, 2),
+                "positions": dust
+            },
+            "tax_loss_harvesting": {
+                "total_harvestable_loss": round(total_harvestable_loss, 2),
+                "loser_count": len(losers),
+                "top_losers": losers[:10]
+            },
+            "big_winners": {
+                "count": len(winners),
+                "positions": winners
+            },
+            "action_plan": action_plan,
+            "saved_files": {
+                "json": export_res["json"],
+                "csv": export_res["csv"]
+            }
+        }
+
+        TradingDataManager.export_audit(audit_dict, str(acc))
+        return audit_dict
+
+    @classmethod
+    def format_executive_summary(cls, audit: Dict[str, Any]) -> str:
+        """Formats a compact, token-efficient executive summary card for agents and humans."""
+        s = audit["summary"]
+        acc = audit["account_number"]
+        agentic = audit.get("agentic_allowed", False)
+        agentic_str = "Agentic (Automated execution enabled)" if agentic else "Non-Agentic (Manual placement required)"
+        pnl_sign = "+" if s["net_unrealized_pnl"] >= 0 else ""
+        
+        proc_pos = audit.get("positions", [])
+        top5 = proc_pos[:5]
+        top5_str = ", ".join([f"{p['symbol']} ${p['current_value']:,.0f} ({p['weight_pct']:.1f}%)" for p in top5]) if top5 else "None"
+        
+        winners = audit.get("big_winners", {}).get("positions", [])[:3]
+        win_str = ", ".join([f"{w['symbol']} +${w['unrealized_pnl']:,.0f} (+{w['unrealized_pnl_pct']:.0f}%)" for w in winners]) if winners else "None"
+
+        losers = audit.get("tax_loss_harvesting", {}).get("top_losers", [])[:3]
+        lose_str = ", ".join([f"{l['symbol']} -${abs(l['unrealized_pnl']):,.0f} ({l['unrealized_pnl_pct']:.0f}%)" for l in losers]) if losers else "None"
+
+        dead = audit.get("dead_money", {})
+        dust = audit.get("dust_positions", {})
+        cb = audit.get("cash_buffer", {})
+        semi = audit.get("semi_overlap", {})
+
+        lines = [
+            "=" * 80,
+            f"  ROBINHOOD PORTFOLIO EXECUTIVE SUMMARY (Account: {acc})",
+            "=" * 80,
+            f"  Total Value: ${s['total_value']:,.2f} | Equities: ${s['equity_value']:,.2f} | Cash: ${s['cash']:,.2f} ({cb.get('current_pct', 0.0):.1f}%)",
+            f"  Cost Basis:  ${s['total_cost_basis']:,.2f} | Unrealized P&L: {pnl_sign}${s['net_unrealized_pnl']:,.2f} ({pnl_sign}{s['net_unrealized_pnl_pct']:.2f}%) | Positions: {s['active_position_count']}",
+            f"  Health Score: {audit.get('health_score', 100)}/100 | Mode: {agentic_str}",
+            "",
+            f"  • Top Holdings : {top5_str}",
+            f"  • Top Winners  : {win_str}",
+            f"  • Top Losers   : {lose_str}",
+        ]
+        if cb.get("status") != "HEALTHY":
+            lines.append(f"  • Risk Alerts  : ⚠️ Cash buffer {cb.get('current_pct', 0.0):.1f}% < 15% minimum (${cb.get('deficit_dollars', 0.0):,.2f} deficit)")
+        else:
+            lines.append("  • Risk Alerts  : ✓ Cash buffer healthy (>=15%)")
+            
+        if semi.get("weight_pct", 0) > 15.0:
+            lines.append(f"                   ⚠️ High Semi Overlap: {semi.get('weight_pct')}% across {len(semi.get('symbols', []))} single stocks")
+        
+        lines.append(f"  • Optimizations: {dead.get('count', 0)} dead-money stocks (<$50, down >40%) -> unlock ~${dead.get('total_value', 0):,.2f}, harvest ${dead.get('harvestable_loss', 0):,.2f} loss")
+        lines.append(f"                   {dust.get('count', 0)} dust stocks (<$10) -> recover ~${dust.get('total_value', 0):,.2f} & clean clutter")
+        lines.append(f"  • Saved Files  : JSON: {audit.get('saved_files', {}).get('json', '')}")
+        lines.append(f"                   CSV:  {audit.get('saved_files', {}).get('csv', '')}")
+        lines.append("=" * 80)
+        return "\n".join(lines)
+
+    @classmethod
+    def format_harvest_losses(cls, audit: Dict[str, Any]) -> str:
+        """Formats detailed tax-loss harvesting candidates table."""
+        tlh = audit.get("tax_loss_harvesting", {})
+        losers = tlh.get("top_losers", [])
+        tot_loss = tlh.get("total_harvestable_loss", 0.0)
+        
+        lines = [
+            "=" * 80,
+            f"  TAX-LOSS HARVESTING CANDIDATES (Account: {audit['account_number']})",
+            "=" * 80,
+            f"  Total Harvestable Losses Available: ${tot_loss:,.2f} across {tlh.get('loser_count', 0)} positions",
+            "  Note: Losses can offset capital gains dollar-for-dollar + up to $3k ordinary income.",
+            "  Warning: Avoid wash sales (do not buy identical security within 30 days).",
+            "",
+            f"{'Symbol':<8} | {'Qty':<8} | {'Avg Cost':<10} | {'Cur Price':<10} | {'Value':<10} | {'Loss ($)':<10} | {'Loss (%)'}",
+            "-" * 80
+        ]
+        for p in losers:
+            lines.append(f"{p['symbol']:<8} | {p['quantity']:<8.3f} | ${p['average_buy_price']:<9.2f} | ${p['current_price']:<9.2f} | ${p['current_value']:<9.2f} | -${abs(p['unrealized_pnl']):<8.2f} | {p['unrealized_pnl_pct']:>6.2f}%")
+        lines.append("=" * 80)
+        return "\n".join(lines)
+
+    @classmethod
+    def format_rebalance_plan(cls, audit: Dict[str, Any]) -> str:
+        """Formats a concrete 4-step rebalancing and cash recovery plan."""
+        dead = audit.get("dead_money", {})
+        dust = audit.get("dust_positions", {})
+        winners = audit.get("big_winners", {}).get("positions", [])
+        cb = audit.get("cash_buffer", {})
+        s = audit["summary"]
+
+        lines = [
+            "=" * 80,
+            f"  PORTFOLIO ACTIONABLE REBALANCING PLAN (Account: {audit['account_number']})",
+            "=" * 80,
+            f"  Current Value: ${s['total_value']:,.2f} | Cash: ${s['cash']:,.2f} ({cb.get('current_pct', 0.0):.1f}%) | Target Buffer: 15% (${s['total_value']*0.15:,.2f})",
+            f"  Account Execution Type: {'Agentic (Autonomous)' if audit.get('agentic_allowed') else 'Non-Agentic (Place in Robinhood App)'}",
+            "",
+            "STEP 1: LIQUIDATE DEAD MONEY (Cut losing trades, harvest tax losses):",
+            f"  Sell all {dead.get('count', 0)} dead-money positions: {', '.join([p['symbol'] for p in dead.get('positions', [])])}",
+            f"  -> Unlocks: ~${dead.get('total_value', 0.0):,.2f} cash | Realizes: ${dead.get('harvestable_loss', 0.0):,.2f} capital loss",
+            "",
+            "STEP 2: CLEAN UP DUST POSITIONS (Eliminate sub-$10 clutter):",
+            f"  Sell {dust.get('count', 0)} dust positions: {', '.join([p['symbol'] for p in dust.get('positions', [])])}",
+            f"  -> Unlocks: ~${dust.get('total_value', 0.0):,.2f} cash",
+            "",
+            "STEP 3: HARVEST / TRIM OVER-EXTENDED WINNERS:",
+        ]
+        if winners:
+            for w in winners[:4]:
+                lines.append(f"  - {w['symbol']}: +{w['unrealized_pnl_pct']:.0f}% (${w['current_value']:,.2f}) -> Sell half (~${w['current_value']/2:,.2f}) or set trailing stop at 8-10%")
+        else:
+            lines.append("  - No extreme winners requiring trimming.")
+        
+        projected_cash = s['cash'] + dead.get('total_value', 0.0) + dust.get('total_value', 0.0)
+        projected_buffer_pct = (projected_cash / s['total_value'] * 100.0) if s['total_value'] > 0 else 0.0
+        lines.extend([
+            "",
+            "STEP 4: CASH BUFFER & DIP-BUYING RESERVE:",
+            f"  Projected Cash after Steps 1 & 2: ~${projected_cash:,.2f} ({projected_buffer_pct:.1f}% buffer)",
+            f"  Status: {'✓ MEETS TARGET (>=15%)' if projected_buffer_pct >= 15.0 else 'Approaching target'}",
+            "",
+            "EXECUTION ADVICE:",
+            "  • Use limit orders at the bid (or midpoint) for lower-liquidity names to prevent slippage.",
+            "  • Keep core high-quality holdings intact (VTI, GOOGL, MSFT, AVGO, AMZN, PANW, CRWD, BND).",
+            "=" * 80
+        ])
+        return "\n".join(lines)
 
 
 # ==============================================================================
@@ -1442,21 +2111,37 @@ Usage:
   robinhood_trader.py <command> [arguments]
 
 Commands:
+  summary [account]          Compact, token-efficient executive summary (<200 tokens) for AI models.
+  portfolio [account]        Query live positions (supports --summary, --filter, --top, --json, --csv).
+  audit [account]            Full quantitative risk audit, concentration checks & health score (0-100).
+  harvest-losses [account]   Tax-loss harvesting candidate breakdown with dollar savings & wash-sale guidance.
+  rebalance-plan [account]   Concrete 4-step rebalance plan (cut dead money, clean dust, trim winners).
+  export [account] [dir]     Export full portfolio & audit datasets to disk (JSON & CSV).
   status                     Display market status, Eastern time, and session.
   analyze <TICKER...>        Deep technical analysis, indicators, news sentiment & risk levels.
   scan [TICKERS...]          Scan watchlist for highest conviction buy/sell opportunities.
   news <TICKER/QUERY>        Fetch latest financial news headlines and calculate sentiment score.
-  portfolio                  Query live positions, total value, and P&L via stored credentials.
   rebalance                  Analyze portfolio allocation and generate optimal profit trades.
   monitor [--auto-trade]     Autonomous trading loop running during US market hours.
   auth                       Verify stored credentials status (cached and active).
 
+Options for 'portfolio':
+  --summary, -s              Output concise executive summary instead of 70+ position table.
+  --filter <type>            Filter positions by: losers, winners, dust, dead-money.
+  --top <N>                  Limit output to top N positions by dollar value.
+  --json                     Output raw structured JSON to stdout.
+  --csv                      Output clean CSV to stdout.
+
 Examples:
-  ./robinhood_trader.py status
+  ./robinhood_trader.py summary
+  ./robinhood_trader.py portfolio --summary
+  ./robinhood_trader.py portfolio --filter losers
+  ./robinhood_trader.py audit
+  ./robinhood_trader.py harvest-losses
+  ./robinhood_trader.py rebalance-plan
+  ./robinhood_trader.py export
   ./robinhood_trader.py analyze AAPL NVDA MSFT
   ./robinhood_trader.py scan
-  ./robinhood_trader.py news TSLA
-  ./robinhood_trader.py monitor --interval 60 --dry-run
 """
     print(help_text.strip())
 
@@ -1487,6 +2172,222 @@ def main():
             print(f"  Next Market Open  : {next_open.strftime('%Y-%m-%d %H:%M %Z')} (in {MarketHours.seconds_until_next_open(now)/3600:.1f}h)")
         print("=" * 65)
 
+    elif cmd in ("summary", "brief", "overview"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        audit_res = PortfolioAuditor.audit(account_number=acc)
+        print(PortfolioAuditor.format_executive_summary(audit_res))
+
+    elif cmd in ("audit", "health", "health-check"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        audit_res = PortfolioAuditor.audit(account_number=acc)
+        s = audit_res["summary"]
+        cb = audit_res["cash_buffer"]
+        semi = audit_res["semi_overlap"]
+        dead = audit_res["dead_money"]
+        dust = audit_res["dust_positions"]
+        tlh = audit_res["tax_loss_harvesting"]
+
+        print("=" * 80)
+        print(f"  QUANTITATIVE PORTFOLIO AUDIT & RISK REPORT (Account: {audit_res['account_number']})")
+        print("=" * 80)
+        print(f"  Health Score      : {audit_res['health_score']}/100")
+        print(f"  Total Value       : ${s['total_value']:,.2f} (Equities: ${s['equity_value']:,.2f}, Cash: ${s['cash']:,.2f})")
+        print(f"  Cash Buffer       : {cb['current_pct']:.1f}% (Target: >={cb['target_pct']}%, Status: {cb['status']})")
+        if cb['deficit_dollars'] > 0:
+            print(f"  Cash Deficit      : ${cb['deficit_dollars']:,.2f} required to restore 15% safety buffer")
+        print(f"  Cost Basis & P&L  : ${s['total_cost_basis']:,.2f} -> Unrealized P&L: {'+' if s['net_unrealized_pnl']>=0 else ''}${s['net_unrealized_pnl']:,.2f} ({s['net_unrealized_pnl_pct']:+.2f}%)")
+        print(f"  Active Positions  : {s['active_position_count']} symbols")
+        print("-" * 80)
+        print("  CONCENTRATION & SECTOR RISKS:")
+        if audit_res.get("concentration_alerts"):
+            for c in audit_res["concentration_alerts"]:
+                print(f"    ⚠️ {c['symbol']}: {c['weight_pct']:.1f}% weight (${c['current_value']:,.2f}) - {c['status']}")
+        else:
+            print("    ✓ No single stock breaches the 15% concentration cap.")
+        print(f"    Semiconductors  : {semi['weight_pct']:.1f}% of equities across {len(semi['symbols'])} single stocks ({', '.join(semi['symbols'][:6])}...)")
+        print("-" * 80)
+        print("  OPPORTUNITIES & OPTIMIZATIONS:")
+        print(f"    Dead Money (<$50, down >40%) : {dead['count']} positions | Value: ${dead['total_value']:,.2f} | Harvestable Loss: ${dead['harvestable_loss']:,.2f}")
+        print(f"    Dust Positions (<$10)        : {dust['count']} positions | Value: ${dust['total_value']:,.2f}")
+        print(f"    Total Harvestable Tax Losses : ${tlh['total_harvestable_loss']:,.2f} across {tlh['loser_count']} losing positions")
+        print("-" * 80)
+        print("  ACTIONABLE RECOMMENDATIONS:")
+        for idx, act in enumerate(audit_res.get("action_plan", []), 1):
+            print(f"    {idx}. {act}")
+        print("=" * 80)
+        print(f"  Full Audit JSON: {TradingDataManager.get_cache_dir()}/audit_{audit_res['account_number']}.json")
+        print("=" * 80)
+
+    elif cmd in ("harvest-losses", "tax-loss", "tax-losses"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        audit_res = PortfolioAuditor.audit(account_number=acc)
+        print(PortfolioAuditor.format_harvest_losses(audit_res))
+
+    elif cmd in ("rebalance-plan", "action-plan", "plan"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        audit_res = PortfolioAuditor.audit(account_number=acc)
+        print(PortfolioAuditor.format_rebalance_plan(audit_res))
+
+    elif cmd in ("export", "dump"):
+        acc = None
+        out_dir = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                if acc is None:
+                    acc = a
+                elif out_dir is None:
+                    out_dir = a
+        acc = acc or RobinhoodExecutor.get_default_account_number()
+        print(f"Exporting full portfolio and audit datasets for account {acc}...")
+        audit_res = PortfolioAuditor.audit(account_number=acc)
+        json_path = audit_res["saved_files"]["json"]
+        csv_path = audit_res["saved_files"]["csv"]
+        audit_path = os.path.join(out_dir or TradingDataManager.get_cache_dir(), f"audit_{acc}.json")
+        
+        print(f"✓ Export complete:")
+        print(f"  • JSON Portfolio : {json_path} ({os.path.getsize(json_path):,} bytes)")
+        print(f"  • CSV Portfolio  : {csv_path} ({os.path.getsize(csv_path):,} bytes, {audit_res['summary']['active_position_count']} rows)")
+        print(f"  • Audit JSON     : {audit_path} ({os.path.getsize(audit_path):,} bytes)")
+
+    elif cmd in ("portfolio", "holdings", "account"):
+        # Check flags
+        is_summary = "--summary" in sys.argv or "-s" in sys.argv
+        is_json = "--json" in sys.argv
+        is_csv = "--csv" in sys.argv
+        
+        filter_type = None
+        if "--filter" in sys.argv:
+            idx = sys.argv.index("--filter")
+            if idx + 1 < len(sys.argv):
+                filter_type = sys.argv[idx + 1].lower()
+
+        top_n = None
+        if "--top" in sys.argv:
+            idx = sys.argv.index("--top")
+            if idx + 1 < len(sys.argv):
+                try:
+                    top_n = int(sys.argv[idx + 1])
+                except Exception:
+                    pass
+
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-") and a != filter_type and str(top_n) != a:
+                acc = a
+                break
+        acc = acc or RobinhoodExecutor.get_default_account_number()
+
+        if is_summary:
+            audit_res = PortfolioAuditor.audit(account_number=acc)
+            print(PortfolioAuditor.format_executive_summary(audit_res))
+            sys.exit(0)
+
+        print(f"Fetching live Robinhood portfolio for account {acc} using stored credentials...\n")
+        port_data = RobinhoodExecutor.get_live_portfolio(account_number=acc)
+        positions = RobinhoodExecutor.get_equity_positions(account_number=acc)
+        
+        pos_active = [p for p in positions if float(p.get("quantity", 0)) > 0]
+        symbols = [p["symbol"] for p in pos_active]
+        quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
+
+        # Automatically export full datasets to disk
+        export_res = TradingDataManager.export_portfolio(port_data, pos_active, quotes, str(acc))
+        proc_pos = export_res["processed_positions"]
+        summary = export_res["full_payload"]["summary"]
+
+        if is_json:
+            print(json.dumps(export_res["full_payload"], indent=2))
+            sys.exit(0)
+
+        if is_csv:
+            with open(export_res["csv"], "r", encoding="utf-8") as f:
+                print(f.read().strip())
+            sys.exit(0)
+
+        # Apply filtering if requested
+        displayed_pos = proc_pos
+        filter_label = ""
+        if filter_type == "losers":
+            displayed_pos = [p for p in proc_pos if p["unrealized_pnl"] < 0]
+            displayed_pos.sort(key=lambda x: x["unrealized_pnl"])
+            filter_label = " [Filter: Losers by $ Loss]"
+        elif filter_type == "winners":
+            displayed_pos = [p for p in proc_pos if p["unrealized_pnl"] > 0]
+            displayed_pos.sort(key=lambda x: x["unrealized_pnl_pct"], reverse=True)
+            filter_label = " [Filter: Winners by % Gain]"
+        elif filter_type == "dust":
+            displayed_pos = [p for p in proc_pos if p["current_value"] < 10.0]
+            filter_label = " [Filter: Dust < $10]"
+        elif filter_type in ("dead-money", "deadmoney"):
+            displayed_pos = [p for p in proc_pos if p["unrealized_pnl_pct"] <= -40.0 and p["current_value"] <= 50.0]
+            displayed_pos.sort(key=lambda x: x["unrealized_pnl_pct"])
+            filter_label = " [Filter: Dead Money (down >40%, <$50)]"
+
+        if top_n and top_n > 0:
+            displayed_pos = displayed_pos[:top_n]
+            filter_label += f" [Top {top_n}]"
+
+        tot_val = summary["total_value"]
+        eq_val = summary["equity_value"]
+        cash_val = summary["cash"]
+        bp_val = summary["buying_power"]
+
+        print("=" * 80)
+        print(f"  ROBINHOOD LIVE PORTFOLIO (Account: {acc}){filter_label}")
+        print("=" * 80)
+        print(f"  Total Portfolio Value : ${tot_val:,.2f}")
+        print(f"  Equity Holdings Value : ${eq_val:,.2f}")
+        print(f"  Cash Balance          : ${cash_val:,.2f}")
+        print(f"  Buying Power          : ${bp_val:,.2f}")
+        print(f"  Showing Positions     : {len(displayed_pos)} of {len(proc_pos)} symbols\n")
+
+        if displayed_pos:
+            print(f"{'Symbol':<8} | {'Qty':<8} | {'Avg Cost':<10} | {'Cur Price':<10} | {'Value':<10} | {'Weight':<7} | {'Unrealized P&L'}")
+            print("-" * 80)
+            tot_cost_disp = 0.0
+            tot_val_disp = 0.0
+            for p in displayed_pos:
+                sym = p["symbol"]
+                qty = p["quantity"]
+                avg_cost = p["average_buy_price"]
+                cur_price = p["current_price"]
+                val = p["current_value"]
+                cost = p["cost_basis"]
+                tot_cost_disp += cost
+                tot_val_disp += val
+                weight = p["weight_pct"]
+                pnl = p["unrealized_pnl"]
+                pnl_pct = p["unrealized_pnl_pct"]
+                pnl_sign = "+" if pnl >= 0 else ""
+                print(f"{sym:<8} | {qty:<8.3f} | ${avg_cost:<9.2f} | ${cur_price:<9.2f} | ${val:<9.2f} | {weight:>5.1f}% | ${pnl_sign}{pnl:<7.2f} ({pnl_sign}{pnl_pct:.2f}%)")
+
+            print("=" * 80)
+            net_pnl = tot_val_disp - tot_cost_disp
+            net_pct = (net_pnl / tot_cost_disp * 100.0) if tot_cost_disp > 0 else 0.0
+            pnl_sign = "+" if net_pnl >= 0 else ""
+            print(f"  Display Total: Cost Basis: ${tot_cost_disp:,.2f} | Value: ${tot_val_disp:,.2f} | Net P&L: ${pnl_sign}{net_pnl:,.2f} ({pnl_sign}{net_pct:.2f}%)")
+            print(f"  Saved Datasets: JSON: {export_res['json']} | CSV: {export_res['csv']}")
+            print("=" * 80)
+        else:
+            print("  No positions match the selected filter.")
+            print("=" * 80)
+
     elif cmd == "analyze":
         tickers = sys.argv[2:] if len(sys.argv) > 2 else ["SPY", "QQQ", "NVDA", "AAPL"]
         print(f"Analyzing tickers: {', '.join(tickers)}...\n")
@@ -1497,7 +2398,7 @@ def main():
             news = res["news_sentiment"]
             
             print("=" * 70)
-            print(f"  {res['ticker']} | Price: ${res['price']:.2f} ({res['change_pct']:>+5.2f}%) | Score: {res['score']}/100 -> {res['recommendation']}")
+            print(f"  {res['ticker']} | Price: ${res['price']:.2f} ({res['change_pct']:>+5.2f}% ) | Score: {res['score']}/100 -> {res['recommendation']}")
             print("=" * 70)
             print(f"  • Technical Indicators : RSI(14)={ind['rsi']:.1f}, SMA20=${ind['sma20']:.2f}, SMA50=${ind['sma50']:.2f}, SMA200=${ind['sma200']:.2f}, MACD_Hist={ind['macd_histogram']:+.3f}")
             print(f"  • News Sentiment       : {news['label']} (Score: {news['score']:+.2f})")
@@ -1530,59 +2431,30 @@ def main():
         for i, h in enumerate(news["headlines"], 1):
             print(f"  {i}. {h}")
 
-    elif cmd in ("portfolio", "holdings", "account"):
-        acc = sys.argv[2] if len(sys.argv) > 2 else "837546068"
-        print(f"Fetching live Robinhood portfolio for account {acc} using stored credentials...\n")
-        port_data = RobinhoodExecutor.get_live_portfolio(account_number=acc)
-        positions = RobinhoodExecutor.get_equity_positions(account_number=acc)
-        
-        pos_active = [p for p in positions if float(p.get("quantity", 0)) > 0]
-        symbols = [p["symbol"] for p in pos_active]
-        quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
-
-        tot_val = float(port_data.get("total_value", 0.0))
-        eq_val = float(port_data.get("equity_value", 0.0))
-        cash_val = float(port_data.get("cash", 0.0))
-        bp_val = float(port_data.get("buying_power", {}).get("buying_power", 0.0))
-
-        print("=" * 80)
-        print(f"  ROBINHOOD LIVE PORTFOLIO (Account: {acc})")
-        print("=" * 80)
-        print(f"  Total Portfolio Value : ${tot_val:,.2f}")
-        print(f"  Equity Holdings Value : ${eq_val:,.2f}")
-        print(f"  Cash Balance          : ${cash_val:,.2f}")
-        print(f"  Buying Power          : ${bp_val:,.2f}")
-        print(f"  Active Positions      : {len(pos_active)} symbols\n")
-
-        print(f"{'Symbol':<8} | {'Qty':<8} | {'Avg Cost':<10} | {'Cur Price':<10} | {'Value':<10} | {'Weight':<7} | {'Unrealized P&L'}")
-        print("-" * 80)
-        tot_cost = 0.0
-        tot_cur_val = 0.0
-        for p in sorted(pos_active, key=lambda x: float(x.get("quantity", 0)) * float(quotes.get(x["symbol"], {}).get("last_trade_price") or quotes.get(x["symbol"], {}).get("price") or x.get("average_buy_price", 0)), reverse=True):
-            sym = p["symbol"]
-            qty = float(p.get("quantity", 0))
-            avg_cost = float(p.get("average_buy_price", 0))
-            q = quotes.get(sym, {})
-            cur_price = float(q.get("last_trade_price") or q.get("price") or avg_cost)
-            val = qty * cur_price
-            cost = qty * avg_cost
-            tot_cost += cost
-            tot_cur_val += val
-            weight = (val / eq_val * 100.0) if eq_val > 0 else 0.0
-            pnl = val - cost
-            pnl_pct = ((cur_price - avg_cost) / avg_cost * 100.0) if avg_cost > 0 else 0.0
-            pnl_sign = "+" if pnl >= 0 else ""
-            print(f"{sym:<8} | {qty:<8.3f} | ${avg_cost:<9.2f} | ${cur_price:<9.2f} | ${val:<9.2f} | {weight:>5.1f}% | ${pnl_sign}{pnl:<7.2f} ({pnl_sign}{pnl_pct:.2f}%)")
-
-        print("=" * 80)
-        net_pnl = tot_cur_val - tot_cost
-        net_pct = (net_pnl / tot_cost * 100.0) if tot_cost > 0 else 0.0
-        pnl_sign = "+" if net_pnl >= 0 else ""
-        print(f"  Total Cost Basis: ${tot_cost:,.2f} | Total Value: ${tot_cur_val:,.2f} | Net P&L: ${pnl_sign}{net_pnl:,.2f} ({pnl_sign}{net_pct:.2f}%)")
-        print("=" * 80)
+    elif cmd in ("accounts", "account-list", "whoami"):
+        print("Querying Robinhood accounts using stored credentials...\n")
+        accounts = RobinhoodExecutor.get_accounts()
+        if not accounts:
+            print("No accounts found or stored credentials not authorized.")
+        else:
+            print("=" * 85)
+            print("  ROBINHOOD AUTHORIZED BROKERAGE ACCOUNTS")
+            print("=" * 85)
+            print(f"{'Account Number':<16} | {'Nickname/Type':<18} | {'Account Type':<16} | {'Trading Type':<14} | {'Agentic Allowed':<15}")
+            print("-" * 85)
+            for acc in accounts:
+                acc_num = acc.get("account_number", "")
+                nick = acc.get("nickname") or "-"
+                b_type = acc.get("brokerage_account_type", "")
+                t_type = acc.get("type", "")
+                agentic = "✓ YES (Active)" if acc.get("agentic_allowed") else "✗ NO"
+                is_def = " [Default]" if acc.get("is_default") else ""
+                disp_name = f"{nick}{is_def}"
+                print(f"{acc_num:<16} | {disp_name:<18} | {b_type:<16} | {t_type:<14} | {agentic:<15}")
+            print("=" * 85)
+            print("  Note: Automated trading orders must target an account with 'Agentic Allowed: ✓ YES'.\n")
 
     elif cmd == "rebalance":
-        # Sample portfolio template
         sample_portfolio = {
             "cash": 2500.0,
             "holdings": {
