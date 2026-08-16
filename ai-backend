@@ -157,38 +157,42 @@ def parse_hf_target(target):
     return t, ""
 
 def fetch_hf_repo_files(repo):
-    api_url = f"https://huggingface.co/api/models/{repo}/tree/main"
     headers = {"User-Agent": "ai-backend/1.0"}
     token = os.environ.get("HF_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
     
-    req = urllib.request.Request(api_url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            files = []
-            for item in data:
-                if isinstance(item, dict):
-                    path = item.get("path", "")
-                    if path.endswith(".gguf") and not os.path.basename(path).startswith("mmproj"):
-                        files.append(path)
-            return files
-    except Exception:
-        api_url = f"https://huggingface.co/api/models/{repo}"
+    candidate_repos = [repo]
+    if not repo.lower().endswith("-gguf"):
+        candidate_repos.extend([f"{repo}-GGUF", f"{repo}-gguf"])
+
+    for cand in candidate_repos:
+        api_url = f"https://huggingface.co/api/models/{cand}/tree/main"
         req = urllib.request.Request(api_url, headers=headers)
+        files = []
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
-                files = []
-                for s in data.get("siblings", []):
-                    rfn = s.get("rfilename", "")
-                    if rfn.endswith(".gguf") and not os.path.basename(rfn).startswith("mmproj"):
-                        files.append(rfn)
-                return files
-        except Exception as e2:
-            print(f"Error fetching repo file list: {e2}", file=sys.stderr)
-            return []
+                for item in data:
+                    if isinstance(item, dict):
+                        path = item.get("path", "")
+                        if path.endswith(".gguf") and not os.path.basename(path).startswith("mmproj"):
+                            files.append(path)
+        except Exception:
+            api_url = f"https://huggingface.co/api/models/{cand}"
+            req = urllib.request.Request(api_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    for s in data.get("siblings", []):
+                        rfn = s.get("rfilename", "")
+                        if rfn.endswith(".gguf") and not os.path.basename(rfn).startswith("mmproj"):
+                            files.append(rfn)
+            except Exception:
+                pass
+        if files:
+            return cand, files
+    return repo, []
 
 def download_file(repo, rel_path):
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -229,8 +233,11 @@ def download_hf_target(target):
     if not repo:
         raise ValueError(f"Invalid HuggingFace target: {target}")
         
+    resolved_repo, files = fetch_hf_repo_files(repo)
+    if files:
+        repo = resolved_repo
+
     if not rel_path:
-        files = fetch_hf_repo_files(repo)
         if not files:
             raise ValueError(f"No .gguf files found in {repo}")
         print(f"Available GGUF files in {repo}:")
@@ -450,7 +457,7 @@ def parse_gpu_sel(sel):
     return idxs or None
 
 def best_single_gpu_idx():
-    """Index of the detected GPU with the most total VRAM, else '1'.
+    """Index of the detected GPU with the most total VRAM, else '0'.
 
     Used to co-locate a speculative draft with the main model on one card
     (the draft can't be tensor-split). The serve-time default is
@@ -459,7 +466,7 @@ def best_single_gpu_idx():
     """
     gpus = list_gpu_info()
     if not gpus:
-        return "1"
+        return "0"
     return str(max(gpus, key=lambda g: g["total_mib"])["index"])
 
 def default_gpu_selection():
@@ -468,7 +475,7 @@ def default_gpu_selection():
     model_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
     gpus = list_gpu_info()
     if not gpus:
-        return "1"
+        return "0"
     best = max(gpus, key=lambda g: g["total_mib"])
     if model_path and os.path.exists(model_path):
         model_gb = split_total_size(model_path)
@@ -552,6 +559,7 @@ def read_gguf_arch(path):
         pass
     if _gg is None:
         for cand in (
+            str(Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py"),
             str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
             "/home/dzyla/Code/llama.cpp/gguf-py",
         ):
@@ -801,7 +809,7 @@ def find_dspark_draft(main_path=None):
 def find_mtp_draft(main_path=None):
     """Locate an MTP draft model for the active main model if separate.
     Check order: explicit LLAMA_MTP_DRAFT_PATH / LLAMA_DRAFT_MODEL_PATH ->
-    sibling MTP GGUF -> any mtp GGUF in models dir."""
+    sibling MTP GGUF (matching model prefix)."""
     env_vars = load_env()
     if not main_path:
         main_path = os.environ.get("LLAMA_MODEL_PATH") or env_vars.get("LLAMA_MODEL_PATH")
@@ -810,18 +818,28 @@ def find_mtp_draft(main_path=None):
     d = os.environ.get("LLAMA_MTP_DRAFT_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH")
     if d and os.path.exists(d) and "mtp" in os.path.basename(d).lower():
         return d
+
+    main_base = os.path.basename(str(main_path)).lower()
+    prefix = main_base.split("-")[0] if "-" in main_base else main_base.split(".")[0]
+
+    candidates = []
     if main_path:
         main_dir = os.path.dirname(os.path.abspath(str(main_path)))
         try:
             for f in sorted(os.listdir(main_dir)):
-                if "mtp" in f.lower() and f.endswith(".gguf") and f != os.path.basename(str(main_path)):
-                    return os.path.join(main_dir, f)
+                if "mtp" in f.lower() and f.endswith(".gguf") and f.lower() != main_base:
+                    candidates.append(os.path.join(main_dir, f))
         except Exception:
             pass
-    if MODEL_DIR.exists():
+    if MODEL_DIR.exists() and (not main_path or str(MODEL_DIR) != os.path.dirname(os.path.abspath(str(main_path)))):
         for p in sorted(MODEL_DIR.iterdir()):
-            if p.suffix == ".gguf" and "mtp" in p.name.lower() and str(p) != str(main_path):
-                return str(p)
+            if p.suffix == ".gguf" and "mtp" in p.name.lower() and p.name.lower() != main_base:
+                candidates.append(str(p))
+
+    for cand in candidates:
+        cand_base = os.path.basename(cand).lower()
+        if prefix and len(prefix) >= 3 and prefix in cand_base:
+            return cand
     return None
 
 
@@ -845,9 +863,23 @@ def compute_main_ngl_for_draft(main_path, draft_path, vram_free_mib):
     return max(1, min(ngl, blk))
 
 
-def persist_env_changes(changes):
+def restart_systemd_service(verbose=True):
+    """Automatically reloads daemon and restarts/resets llama-server when backend settings change."""
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        if is_systemd_service_active():
+            subprocess.run(["systemctl", "--user", "restart", "llama-server.service"], capture_output=True)
+            if verbose:
+                print("[ai-backend] Automatically restarted llama-server.service with updated settings.")
+        else:
+            subprocess.run(["systemctl", "--user", "restart", "llama-server.socket"], capture_output=True)
+    except Exception as e:
+        if verbose:
+            print(f"[ai-backend] Notice syncing systemd: {e}", file=sys.stderr)
+
+def persist_env_changes(changes, auto_restart=True):
     """Apply {key: value} changes to ~/.local/share/ai/env preserving the rest.
-    value None removes the key (auto)."""
+    value None removes the key (auto). Automatically reloads & restarts systemd service."""
     env_vars = load_env()
     for k, v in changes.items():
         if v is None:
@@ -860,6 +892,8 @@ def persist_env_changes(changes):
     # Pass the full merged state (deletions applied) as authoritative so
     # write_env does not re-merge the on-disk copy and resurrect deleted keys.
     write_env(url, model, llama_path, env_vars, authoritative=True)
+    if auto_restart:
+        restart_systemd_service()
 
 def sync_gpu_to_systemd(cuda_dev):
     """Keep the systemd unit's CUDA_VISIBLE_DEVICES in sync with the env file.
@@ -1603,6 +1637,52 @@ def cmd_ctx(size=None):
         sync_ctx_to_systemd(parsed)
         print(f"Context size locked to {parsed} tokens.")
 
+def cmd_cache_quant(quant_type=None):
+    """Configure KV cache quantization (q4_0, q8_0, f16, etc.) to prevent VRAM overflow."""
+    if not quant_type:
+        env_vars = load_env()
+        k = env_vars.get("LLAMA_CACHE_TYPE_K", "q8_0")
+        v = env_vars.get("LLAMA_CACHE_TYPE_V", "q8_0")
+        print(f"Current KV Cache Quantization: K={k}, V={v}")
+        print("Usage: ai-backend cache <q4_0|q8_0|f16|auto>")
+        return
+
+    q = quant_type.strip().lower()
+    mapping = {
+        "4bit": "q4_0",
+        "4-bit": "q4_0",
+        "q4": "q4_0",
+        "q4_0": "q4_0",
+        "q4_1": "q4_1",
+        "8bit": "q8_0",
+        "8-bit": "q8_0",
+        "q8": "q8_0",
+        "q8_0": "q8_0",
+        "q5": "q5_0",
+        "q5_0": "q5_0",
+        "q5_1": "q5_1",
+        "fp16": "f16",
+        "f16": "f16",
+        "full": "f16",
+        "auto": "q4_0",
+    }
+    if q not in mapping:
+        print(f"Invalid cache quantization '{quant_type}'. Supported: q4_0 (4-bit), q8_0 (8-bit), f16 (full FP16), auto.", file=sys.stderr)
+        sys.exit(1)
+
+    target_type = mapping[q]
+    persist_env_changes({
+        "LLAMA_CACHE_TYPE_K": target_type,
+        "LLAMA_CACHE_TYPE_V": target_type
+    })
+    print(f"KV Cache quantization set to {target_type} (K={target_type}, V={target_type}).")
+    if target_type == "q4_0":
+        print("  → KV cache memory usage reduced by ~4x (recommended for 16GB GPUs like RTX 5080/4080).")
+    elif target_type == "q8_0":
+        print("  → KV cache memory usage reduced by ~2x.")
+    elif target_type == "f16":
+        print("  → Full FP16 precision KV cache.")
+
 def cmd_gpu_layers(n=None):
     if not n:
         print("Usage: ai-backend gpu-layers <n|auto>")
@@ -1741,6 +1821,7 @@ Usage:
   ai-backend list                       List all downloaded GGUF models
   ai-backend auto                       Switch to best running backend
   ai-backend ctx <size|auto>            Set or clear explicit context size
+  ai-backend cache <q4_0|q8_0|f16|auto> Configure KV cache quantization (q4_0 saves 4x VRAM)
   ai-backend mode <thinking|normal|low|instruct>   Apply Qwen3.8 recommended sampling settings
   ai-backend yarn <on|off|<scale>>      Enable YaRN RoPE scaling to extend context (on -> ~1M for Qwen3.8)
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
@@ -1753,6 +1834,7 @@ Usage:
 
 Examples:
   ai-backend use qwen3.8                # use Qwen3.8-27B (Unsloth GGUF)
+  ai-backend cache q4_0                 # 4-bit KV cache quantization (prevents VRAM spillover)
   ai-backend use qwen3.8-2.4t           # use Qwen3.8-2.4T-A95B
   ai-backend mode thinking              # recommended Qwen3.8 thinking parameters
   ai-backend mtp on                     # enable MTP speculative decoding
@@ -1798,6 +1880,8 @@ def main():
         cmd_auto()
     elif cmd == "ctx":
         cmd_ctx(args[1] if len(args) > 1 else None)
+    elif cmd in ("cache", "kv-cache", "ctx-quant", "cache-type", "quant"):
+        cmd_cache_quant(args[1] if len(args) > 1 else None)
     elif cmd in ("draft", "dspark"):
         cmd_draft(args[1] if len(args) > 1 else None)
     elif cmd in ("mtp", "spec"):

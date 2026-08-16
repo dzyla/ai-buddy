@@ -25,7 +25,8 @@ GGUF = None
 try:
     import gguf as GGUF
 except Exception:
-    for cand in (str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
+    for cand in (str(Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py"),
+                 str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
                  "/home/dzyla/Code/llama.cpp/gguf-py"):
         if os.path.isdir(cand):
             import sys as _sys

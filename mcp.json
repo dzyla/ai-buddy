@@ -1,9 +1,11 @@
 {
   "mcpServers": {
-    "scientific": {
-      "command": "python3",
-      "args": ["/home/dzyla/Code/ai-buddy/dev/advanced_mcp_server.py"],
-      "env": {}
+    "robinhood": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://agent.robinhood.com/mcp/trading", "--silent"],
+      "env": {
+        "BROWSER": "none"
+      }
     }
   }
 }
