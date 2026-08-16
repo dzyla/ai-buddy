@@ -192,6 +192,7 @@ def serve_stubs(ab, hermetic, monkeypatch):
     monkeypatch.setattr(ab, "find_dspark_draft", lambda *a, **k: None)
     monkeypatch.setattr(ab, "find_mtp_draft", lambda *a, **k: None)
     monkeypatch.setattr(ab, "resolve_serve_gpu", lambda *a, **k: "1")
+    monkeypatch.setattr(ab, "restart_systemd_service", lambda: None)
     monkeypatch.setattr(ab, "list_gpu_info",
                         lambda: [{"index": 1, "name": "RTX PRO 6000",
                                   "total_mib": 97000, "free_mib": 90000}])
