@@ -750,8 +750,9 @@ class ZulipAiBridge:
         else:
             mode_flags = ["--plan"]
 
-        if is_long:
-            mode_flags.append("-c")  # continue until task_complete without bounding at 30/60 steps
+        # The bridge runs non-interactively in background threads, so it must always
+        # run with -c to complete tasks without pausing to ask interactive confirmation on /dev/tty
+        mode_flags.append("-c")
 
         ai_bin = self._resolve_ai_bin()
         ai_cmd = [ai_bin, "-q"] + mode_flags + [prompt]
