@@ -90,3 +90,36 @@ def test_find_mtp_draft(ab, monkeypatch, tmp_path):
     main_model = str(tmp_path / "Qwen3.8-27B-UD-Q4_K_XL.gguf")
     monkeypatch.setenv("LLAMA_MTP_DRAFT_PATH", str(mtp_draft))
     assert ab.find_mtp_draft(main_model) == str(mtp_draft)
+
+
+def test_env_file_model_precedence_over_stale_os_environ(ab, monkeypatch, tmp_path):
+    """When ~/.local/share/ai/env has a newly selected model, it must take precedence
+    over a stale LLAMA_MODEL_PATH left over in the user's terminal environment."""
+    fresh_model = tmp_path / "Qwen3.8-27B-UD-IQ2_XXS.gguf"
+    fresh_model.write_bytes(b"dummy")
+    stale_model = tmp_path / "ornith-9b-mtp-kl-Q4_K_M.gguf"
+    stale_model.write_bytes(b"dummy")
+
+    monkeypatch.setattr(ab, "load_env", lambda: {"LLAMA_MODEL_PATH": str(fresh_model)})
+    monkeypatch.setenv("LLAMA_MODEL_PATH", str(stale_model))
+
+    env_vars = ab.load_env()
+    model_path = env_vars.get("LLAMA_MODEL_PATH") or os.environ.get("LLAMA_MODEL_PATH")
+    assert model_path == str(fresh_model)
+
+
+def test_cmd_serve_accepts_target(ab, monkeypatch, tmp_path):
+    """ai-backend serve <target> should switch to that target before serving."""
+    target_model = tmp_path / "models" / "my_model.gguf"
+    target_model.parent.mkdir(parents=True, exist_ok=True)
+    target_model.write_bytes(b"dummy")
+
+    switched = []
+    monkeypatch.setattr(ab, "cmd_use", lambda t: switched.append(t))
+    monkeypatch.setattr(ab, "load_env", lambda: {"LLAMA_MODEL_PATH": str(target_model)})
+    monkeypatch.setattr(ab, "vram_preflight", lambda *args, **kwargs: False)
+
+    with pytest.raises(SystemExit):
+        ab.cmd_serve("my_model.gguf")
+
+    assert switched == ["my_model.gguf"]
