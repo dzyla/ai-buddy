@@ -563,6 +563,7 @@ Environment=LLAMA_CTX_SIZE=131072"
     cat > "${SYSTEMD_DIR}/llama-server.socket" <<SOCKET_EOF
 [Unit]
 Description=llama-server on-demand socket
+StartLimitIntervalSec=0
 
 [Socket]
 ListenStream=127.0.0.1:${PORT}
@@ -576,6 +577,7 @@ SOCKET_EOF
 [Unit]
 Description=llama-server (on-demand, idle-unload)
 After=llama-server.socket
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
