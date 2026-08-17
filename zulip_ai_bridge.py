@@ -26,6 +26,7 @@ from urllib.parse import unquote, quote
 import csv
 import io
 import time
+import json
 
 # Configure logging for truncation events
 logging.basicConfig(
@@ -470,6 +471,219 @@ def clean_response(text):
     return clean.strip()
 
 
+class ZulipMemoryManager:
+    """
+    Manages a durable audit trail and memory of Zulip conversations.
+    Records every incoming message, context, subprocess execution, stdout/stderr,
+    fallbacks used, delivered reply, duration, and status.
+    Provides querying and diagnostic tools.
+    """
+    def __init__(self, storage_dir=None):
+        if storage_dir is None:
+            self.storage_dir = os.path.expanduser("~/.local/share/ai/zulip_chats")
+        else:
+            self.storage_dir = storage_dir
+        self.jsonl_path = os.path.join(os.path.dirname(self.storage_dir), "zulip_chats.jsonl")
+        self.cache_jsonl_path = os.path.expanduser("~/.cache/ai/zulip_chats.jsonl")
+        os.makedirs(self.storage_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.cache_jsonl_path), exist_ok=True)
+        self._lock = threading.Lock()
+
+    def record_chat(self, chat_data):
+        """Append a chat record atomically to memory files and write full session json."""
+        session_id = chat_data.get("session_id")
+        if not session_id:
+            session_id = f"zulip_{int(time.time())}_{os.getpid()}"
+            chat_data["session_id"] = session_id
+
+        # Write detailed session file
+        try:
+            session_file = os.path.join(self.storage_dir, f"{session_id}.json")
+            with open(session_file, "w", encoding="utf-8") as f:
+                json.dump(chat_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to write detailed zulip chat session file: {e}")
+
+        # Write summary record to JSONL logs
+        summary_record = {
+            "session_id": session_id,
+            "timestamp": chat_data.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S %Z")),
+            "sender_email": chat_data.get("sender_email"),
+            "sender_full_name": chat_data.get("sender_full_name"),
+            "type": chat_data.get("type"),
+            "stream": chat_data.get("stream"),
+            "topic": chat_data.get("topic"),
+            "message_id": chat_data.get("message_id"),
+            "query": chat_data.get("query"),
+            "context_count": chat_data.get("context_count", 0),
+            "ai_mode": chat_data.get("ai_mode", "auto"),
+            "duration_s": chat_data.get("duration_s", 0),
+            "exit_code": chat_data.get("exit_code"),
+            "status": chat_data.get("status", "unknown"),
+            "reply_snippet": (chat_data.get("response_delivered") or "")[:200],
+            "stderr_snippet": (chat_data.get("stderr") or "")[:200],
+            "extracted_reasoning": bool(chat_data.get("extracted_reasoning")),
+            "fallback_used": chat_data.get("fallback_used")
+        }
+
+        line = json.dumps(summary_record, ensure_ascii=False) + "\n"
+        with self._lock:
+            for p in (self.jsonl_path, self.cache_jsonl_path):
+                try:
+                    with open(p, "a", encoding="utf-8") as f:
+                        f.write(line)
+                except Exception as e:
+                    logger.warning(f"Failed to append to {p}: {e}")
+
+        return session_id
+
+    def get_recent(self, limit=10, error_only=False):
+        """Get recent chat records from the JSONL log."""
+        records = []
+        path = self.jsonl_path if os.path.exists(self.jsonl_path) else self.cache_jsonl_path
+        if not os.path.exists(path):
+            return records
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if error_only and data.get("status") in ("success", "stdout", "fallback_reasoning", "fallback_tools"):
+                        continue
+                    records.append(data)
+                    if len(records) >= limit:
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(f"Failed to read zulip chat history: {e}")
+        return records
+
+    def get_chat(self, session_id):
+        """Retrieve the full record for a specific chat."""
+        session_file = os.path.join(self.storage_dir, f"{session_id}.json")
+        if os.path.exists(session_file):
+            try:
+                with open(session_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        for r in self.get_recent(limit=100):
+            if r.get("session_id") == session_id:
+                return r
+        return None
+
+    def get_diagnostics(self):
+        """Compute diagnostic status of the bridge and recent chat health."""
+        recent = self.get_recent(limit=20)
+        total = len(recent)
+        errors = [r for r in recent if r.get("status") in ("error", "empty_output", "timeout")]
+        fallbacks = [r for r in recent if "fallback" in r.get("status", "")]
+        
+        env = load_env_file()
+        base_url = env.get("INFER_BASE_URL", "http://localhost:8080/v1/")
+        server_alive = False
+        active_model = env.get("INFER_MODEL", "unknown")
+        slot_status = "unknown"
+        try:
+            r = requests.get(base_url.rstrip("/") + "/models", timeout=3)
+            if r.status_code == 200:
+                server_alive = True
+                mdata = r.json()
+                if "data" in mdata and mdata["data"]:
+                    active_model = mdata["data"][0].get("id", active_model)
+        except Exception:
+            server_alive = False
+
+        try:
+            sr = requests.get(base_url.rstrip("/") + "/../slots", timeout=2)
+            if sr.status_code == 200:
+                sjson = sr.json()
+                if isinstance(sjson, list) and sjson:
+                    is_busy = sjson[0].get("is_processing", False)
+                    slot_status = "BUSY (processing)" if is_busy else "IDLE"
+        except Exception:
+            pass
+
+        return {
+            "server_alive": server_alive,
+            "base_url": base_url,
+            "active_model": active_model,
+            "slot_status": slot_status,
+            "recent_count": total,
+            "error_count": len(errors),
+            "fallback_count": len(fallbacks),
+            "recent_errors": errors[:3]
+        }
+
+
+def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr=""):
+    """
+    Extract meaningful information from the session file and logs when stdout is empty.
+    Checks:
+    1. Direct assistant content in last session
+    2. Assistant reasoning_content (cleaned up)
+    3. Tool execution results in the session
+    4. Subprocess stderr
+    """
+    if not last_sess_path:
+        last_sess_path = os.path.expanduser("~/.cache/ai/sessions/last.json")
+
+    cleaned_stdout = clean_response(raw_stdout)
+    if cleaned_stdout:
+        return cleaned_stdout, "stdout", None
+
+    if os.path.isfile(last_sess_path):
+        try:
+            with open(last_sess_path, "r", encoding="utf-8") as sf:
+                sdata = json.load(sf)
+            msgs = sdata if isinstance(sdata, list) else sdata.get("messages", [])
+
+            for m in reversed(msgs):
+                if m.get("role") == "assistant":
+                    c = m.get("content")
+                    if c and isinstance(c, str) and c.strip() and c.strip() != "None":
+                        return clean_response(c), "fallback_content", None
+
+                    rc = m.get("reasoning_content")
+                    if rc and isinstance(rc, str) and len(rc.strip()) > 30:
+                        clean_rc = clean_response(rc)
+                        if clean_rc:
+                            return f"*(Response extracted from agent reasoning)*\n\n{clean_rc}", "fallback_reasoning", clean_rc
+
+                    tcs = m.get("tool_calls", [])
+                    if tcs:
+                        tool_names = [t.get("function", {}).get("name", "tool") for t in tcs if isinstance(t, dict)]
+                        tool_outputs = []
+                        for tm in msgs:
+                            if tm.get("role") == "tool":
+                                tc_out = tm.get("content", "")
+                                if tc_out and len(tc_out.strip()) > 0:
+                                    tool_outputs.append(tc_out.strip()[:400])
+                        out_summary = f"✅ Agent completed actions ({', '.join(tool_names)})."
+                        if tool_outputs:
+                            out_summary += f"\n\n**Tool Output Summary:**\n```\n" + "\n---\n".join(tool_outputs[:3]) + "\n```"
+                        return out_summary, "fallback_tools", None
+        except Exception as ex:
+            logger.warning(f"Session fallback extraction failed: {ex}")
+
+    if raw_stderr and raw_stderr.strip():
+        err_clean = clean_response(raw_stderr)
+        return f"⚠️ **Agent encountered an error:**\n```\n{err_clean[:2000]}\n```", "error", None
+
+    return (
+        "⚠️ **Agent returned no text output.**\n\n"
+        "*(The local AI model finished without emitting content or tool calls. "
+        "Use `/debug` or `/history` to inspect the chat memory, or switch reasoning effort with `ai-backend reasoning medium`.)*",
+        "empty_output",
+        None
+    )
+
+
 class ZulipAiBridge:
     def __init__(self, client=None):
         if zulip is None and client is None:
@@ -482,6 +696,9 @@ class ZulipAiBridge:
         # Initialize the file parser for processing uploaded documents
         self._file_parser = FileParser(self.client, self.client.base_url)
         print("File parser initialized — will extract content from uploaded documents.")
+        # Initialize persistent Zulip chat memory
+        self.memory = ZulipMemoryManager()
+        print("Zulip chat memory manager initialized.")
 
     def _is_trusted_url(self, url):
         """Check if a URL is from the trusted Zulip domain."""
@@ -694,7 +911,9 @@ class ZulipAiBridge:
     def _process_message(self, msg, content):
         """Run the ai agent and send the result back. Runs in a background thread."""
         tid = threading.get_ident()
-        print(f"[thread-{tid}] Processing: {content[:80]}")
+        start_time = time.time()
+        chat_id = f"zulip_{int(start_time)}_{msg.get('id', 0)}"
+        print(f"[thread-{tid}] [{chat_id}] Processing: {content[:80]}")
 
         is_long = self._is_long_job(content)
         clean_content = self._strip_long_prefix(content)
@@ -757,6 +976,13 @@ class ZulipAiBridge:
         ai_bin = self._resolve_ai_bin()
         ai_cmd = [ai_bin, "-q"] + mode_flags + [prompt]
 
+        raw_stdout = ""
+        raw_stderr = ""
+        exit_code = 0
+        status = "success"
+        fallback_used = None
+        extracted_reasoning = None
+
         try:
             result = subprocess.run(
                 ai_cmd,
@@ -766,49 +992,72 @@ class ZulipAiBridge:
                 text=True,
                 timeout=task_timeout
             )
-            response_text = result.stdout
-            if result.returncode != 0 and result.stderr:
-                response_text += f"\n\n*Stderr:*\n```\n{result.stderr}\n```"
+            raw_stdout = result.stdout or ""
+            raw_stderr = result.stderr or ""
+            exit_code = result.returncode
+            response_text = raw_stdout
+
+            if exit_code != 0 and raw_stderr:
+                response_text += f"\n\n*Stderr:*\n```\n{raw_stderr}\n```"
 
             response_text = clean_response(response_text)
             if not response_text:
-                # Fallback: inspect the latest session to extract the assistant's work / findings
-                try:
-                    last_sess_path = os.path.expanduser("~/.cache/ai/sessions/last.json")
-                    if os.path.isfile(last_sess_path):
-                        with open(last_sess_path, "r", encoding="utf-8") as sf:
-                            sdata = json.load(sf)
-                        msgs = sdata if isinstance(sdata, list) else sdata.get("messages", [])
-                        # Search backwards for the most recent assistant message with actual content
-                        for m in reversed(msgs):
-                            if m.get("role") == "assistant":
-                                c = m.get("content")
-                                if c and isinstance(c, str) and c.strip() and c.strip() != "None":
-                                    response_text = clean_response(c)
-                                    break
-                                # If tool calls were made, summarize the last tool actions
-                                tcs = m.get("tool_calls", [])
-                                if tcs:
-                                    last_tools = [t.get("function", {}).get("name", "tool") for t in tcs if isinstance(t, dict)]
-                                    response_text = f"✅ Agent completed actions ({', '.join(last_tools)}). See session history for full details."
-                                    break
-                except Exception as ex:
-                    print(f"Session fallback extraction failed: {ex}")
-
-            if not response_text:
-                response_text = "*(agent returned no output)*"
+                fallback_text, fallback_status, reasoning_snip = extract_session_fallback(
+                    raw_stdout=raw_stdout,
+                    raw_stderr=raw_stderr
+                )
+                response_text = fallback_text
+                status = fallback_status
+                fallback_used = fallback_status
+                extracted_reasoning = reasoning_snip
+            else:
+                status = "success"
 
         except subprocess.TimeoutExpired:
+            status = "timeout"
+            exit_code = -1
             response_text = (
                 f"⏱️ The agent timed out after {task_timeout}s. "
                 "For very long-running jobs, use `/long <prompt>` to run in extended execution mode "
                 "or ask me to schedule a background task."
             )
         except Exception as e:
+            status = "error"
+            exit_code = -1
+            raw_stderr = str(e)
             response_text = f"⚠️ Failed to run local `ai` CLI: {str(e)}"
 
+        duration_s = round(time.time() - start_time, 2)
+
+        # Record this interaction to durable memory
+        try:
+            self.memory.record_chat({
+                "session_id": chat_id,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "sender_email": sender_email,
+                "sender_full_name": msg.get("sender_full_name", ""),
+                "type": msg.get("type", "private"),
+                "stream": msg.get("display_recipient") if msg.get("type") != "private" else None,
+                "topic": msg.get("subject") if msg.get("type") != "private" else None,
+                "message_id": msg.get("id"),
+                "query": content,
+                "prompt_sent": prompt,
+                "context_count": len(context_messages),
+                "ai_mode": ai_mode,
+                "duration_s": duration_s,
+                "exit_code": exit_code,
+                "status": status,
+                "stdout": raw_stdout,
+                "stderr": raw_stderr,
+                "response_delivered": response_text,
+                "extracted_reasoning": extracted_reasoning,
+                "fallback_used": fallback_used
+            })
+        except Exception as mex:
+            logger.warning(f"Failed to record Zulip chat memory: {mex}")
+
         self._send_full_reply(msg, response_text)
-        print(f"[thread-{tid}] Done.")
+        print(f"[thread-{tid}] [{chat_id}] Done in {duration_s}s (status: {status}).")
 
     def handle_message(self, msg):
         """Handle a Zulip message."""
@@ -844,10 +1093,73 @@ class ZulipAiBridge:
 
         content = msg['content'].strip()
 
-        # Built-in commands (cheap, no agent round-trip)
-        if content.startswith('/ping'):
-            self._send_reply(msg, "🟢 Zulip AI Bridge is alive.")
+        # Built-in commands (cheap, instant, no agent round-trip)
+        if content.startswith(('/ping', ':ping')):
+            env = load_env_file()
+            model = env.get("INFER_MODEL", "local")
+            mode = self._ai_mode()
+            to = os.environ.get("BRIDGE_TASK_TIMEOUT", os.environ.get("INFER_TASK_TIMEOUT", "1800"))
+            self._send_reply(
+                msg,
+                f"🟢 **Zulip AI Bridge is active**\n"
+                f"- **Permission Mode:** `{mode}`\n"
+                f"- **Configured Model:** `{model}`\n"
+                f"- **Task Timeout:** `{to}s`\n"
+                f"- **Memory Log:** `~/.local/share/ai/zulip_chats.jsonl`\n"
+                f"*(Use `/debug` for server health or `/history` for recent chat logs)*"
+            )
             return
+
+        if content.startswith(('/history', ':history', '/chats', ':chats')):
+            recent = self.memory.get_recent(limit=6)
+            if not recent:
+                self._send_reply(msg, "📋 *No Zulip chat history found in memory yet.*")
+                return
+            lines = [
+                "### 📋 Recent Zulip Chat Memory",
+                "| Time | Status | Dur | User Query |",
+                "|------|--------|-----|------------|"
+            ]
+            for r in recent:
+                raw_ts = r.get("timestamp", "")
+                ts = raw_ts.split()[1] if " " in raw_ts else raw_ts
+                st = r.get("status", "ok")
+                if st in ("success", "stdout"):
+                    st_badge = "🟢 ok"
+                elif "fallback" in st:
+                    st_badge = "🟡 fallback"
+                else:
+                    st_badge = f"🔴 {st}"
+                dur = f"{r.get('duration_s', 0)}s"
+                q = (r.get("query") or "")[:40].replace("|", "\\|").replace("\n", " ")
+                lines.append(f"| {ts} | {st_badge} | {dur} | {q} |")
+            lines.append("\n*Use `/debug` for system health and detailed error traces.*")
+            self._send_reply(msg, "\n".join(lines))
+            return
+
+        if content.startswith(('/debug', ':debug', '/diag', ':diag')):
+            diag = self.memory.get_diagnostics()
+            status_emoji = "🟢" if diag["server_alive"] else "🔴"
+            lines = [
+                "### 🔍 Zulip AI Bridge Diagnostics",
+                f"- **Inference Server:** {status_emoji} `{diag['base_url']}` ({'ONLINE' if diag['server_alive'] else 'OFFLINE'})",
+                f"- **Active Model:** `{diag['active_model']}`",
+                f"- **Server Slot Status:** `{diag['slot_status']}`",
+                f"- **Bridge Permission Mode:** `{self._ai_mode()}`",
+                f"- **Recent Zulip Chats:** {diag['recent_count']} total ({diag['error_count']} errors, {diag['fallback_count']} fallbacks)",
+            ]
+            if diag["recent_errors"]:
+                lines.append("\n**Recent Issues / Errors in Memory:**")
+                for err in diag["recent_errors"]:
+                    lines.append(
+                        f"- **[{err.get('timestamp')}]** `{err.get('query', '')[:45]}`\n"
+                        f"  *Status:* `{err.get('status')}` | *Duration:* `{err.get('duration_s')}s` | *Error:* `{err.get('stderr_snippet', 'None')[:100]}`"
+                    )
+            else:
+                lines.append("\n✅ *No recent errors recorded in Zulip chat memory.*")
+            self._send_reply(msg, "\n".join(lines))
+            return
+
         if content.startswith('/mode'):
             parts = content.split()
             if len(parts) > 1:
