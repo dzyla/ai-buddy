@@ -127,7 +127,7 @@ def test_estimate_vram_mb_hybrid(ab, hermetic):
     big = ab.estimate_vram_mb(hermetic, 262144)
     assert small is not None and big is not None
     base_gib = small["total_mb"] / 1024
-    assert 19.5 < base_gib < 20.5
+    assert 17.0 < base_gib < 20.5
     # 256K ctx: 16 full-attention layers * 4 kv heads * 256 dim * 2 (K+V), q8_0
     # -> ~8 GiB.
     delta_gib = (big["total_mb"] - small["total_mb"]) / 1024
