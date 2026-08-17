@@ -583,7 +583,7 @@ ${SYSTEMD_ENV}
 Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
 ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
-ExecStart=${BIN_DIR}/ai-backend serve
+ExecStart=${BIN_DIR}/ai-backend serve --foreground
 ExecStopPost=/bin/bash -c '/usr/bin/systemd-run --user /bin/bash -c "for i in {1..10}; do systemctl --user is-active -q llama-server.service || { systemctl --user start llama-server.socket; exit 0; }; sleep 0.5; done" || true'
 Restart=no
 StandardOutput=journal
