@@ -2028,6 +2028,54 @@ def get_session(session_id, max_chars=4000):
     return f"Session '{session_id}' not found."
 
 
+def search_zulip_chats(query="", limit=10, error_only=False):
+    """Search or list backed-up Zulip chat interactions from memory."""
+    try:
+        from zulip_ai_bridge import ZulipMemoryManager
+        mem = ZulipMemoryManager()
+        records = mem.get_recent(limit=int(limit) * 3, error_only=bool(error_only))
+        if query and str(query).strip():
+            q_lower = str(query).strip().lower()
+            records = [
+                r for r in records
+                if q_lower in (r.get("query") or "").lower()
+                or q_lower in (r.get("reply_snippet") or "").lower()
+                or q_lower in (r.get("session_id") or "").lower()
+            ]
+        records = records[:int(limit)]
+        if not records:
+            return "No matching Zulip chat records found in memory."
+        lines = [f"Found {len(records)} Zulip chat record(s):", ""]
+        for r in records:
+            st = r.get("status", "ok")
+            dur = f"{r.get('duration_s', 0)}s"
+            lines.append(f"- **ID:** `{r.get('session_id')}` | **Time:** {r.get('timestamp')} | **Status:** `{st}` ({dur})")
+            lines.append(f"  *User query:* {r.get('query')}")
+            if r.get("reply_snippet"):
+                lines.append(f"  *Reply:* {r.get('reply_snippet')[:120]}...")
+            if r.get("stderr_snippet"):
+                lines.append(f"  *Stderr:* {r.get('stderr_snippet')[:100]}...")
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching Zulip chats: {e}"
+
+
+def get_zulip_chat(session_id=""):
+    """Retrieve full details of a specific Zulip chat interaction."""
+    if not session_id:
+        return "Error: session_id is required."
+    try:
+        from zulip_ai_bridge import ZulipMemoryManager
+        mem = ZulipMemoryManager()
+        data = mem.get_chat(session_id.strip())
+        if not data:
+            return f"Error: Zulip chat session '{session_id}' not found."
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"Error getting Zulip chat details: {e}"
+
+
 def _clean_pdf_text(raw):
     # Repair soft-hyphenation at line breaks (word-\nrest -> wordrest)
     raw = re.sub(r'-\n(?=[a-z])', '', raw)
@@ -5431,6 +5479,26 @@ def main():
         print(session_recap(), end="")
         sys.exit(0)
 
+    if action == "zulip-history":
+        lim = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 10
+        print(search_zulip_chats(limit=lim))
+        sys.exit(0)
+
+    if action == "zulip-log":
+        sid = sys.argv[2] if len(sys.argv) > 2 else ""
+        print(get_zulip_chat(session_id=sid))
+        sys.exit(0)
+
+    if action == "zulip-debug":
+        try:
+            from zulip_ai_bridge import ZulipMemoryManager
+            mem = ZulipMemoryManager()
+            diag = mem.get_diagnostics()
+            print(json.dumps(diag, indent=2, ensure_ascii=False))
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
+        sys.exit(0)
+
     if action == "trim-messages":
         if len(sys.argv) < 3:
             sys.exit(1)
@@ -6951,6 +7019,35 @@ def main():
                 }
             }
         })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "search_zulip_chats",
+                "description": "Search and inspect past Zulip chat interactions stored in persistent Zulip memory. Returns timestamp, status, duration, query snippets, and error traces. Use this to investigate Zulip issues, recall recent Zulip discussions, or troubleshoot bridge errors.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Optional keyword or session_id to search in Zulip chat history."},
+                        "limit": {"type": "integer", "description": "Max results to return (default 10)."},
+                        "error_only": {"type": "boolean", "description": "If true, only return chats that ended in error, fallback, or empty output."}
+                    }
+                }
+            }
+        })
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_zulip_chat",
+                "description": "Load the complete, raw JSON log for a specific Zulip interaction by its session_id (including prompt sent to model, stdout, stderr, delivered reply, and timing).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The Zulip session ID, e.g. 'zulip_1786934893_12345'."}
+                    },
+                    "required": ["session_id"]
+                }
+            }
+        })
 
         # 14. Continuous self-improvement: skill_create / skill_update / skill_note
         openai_tools.append({
@@ -7862,6 +7959,20 @@ def main():
                 print(rebuild_history_index())
             except Exception as e:
                 print(f"Error in rebuild_history_index: {e}")
+        elif tool_name == "search_zulip_chats" or server_name == "search_zulip_chats":
+            try:
+                print(search_zulip_chats(
+                    query=arguments.get("query", ""),
+                    limit=arguments.get("limit", 10),
+                    error_only=arguments.get("error_only", False)
+                ))
+            except Exception as e:
+                print(f"Error in search_zulip_chats: {e}")
+        elif tool_name == "get_zulip_chat" or server_name == "get_zulip_chat":
+            try:
+                print(get_zulip_chat(session_id=arguments.get("session_id", "")))
+            except Exception as e:
+                print(f"Error in get_zulip_chat: {e}")
         elif tool_name == "skill_create" or server_name == "skill_create":
             try:
                 print(skill_create(

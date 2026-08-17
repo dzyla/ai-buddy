@@ -165,6 +165,7 @@ class MockZulipClient:
     def __init__(self):
         self.base_url = "https://example.zulipchat.com"
         self.email = "bot@example.zulipchat.com"
+        self.sent_messages = []
 
     def get_me(self):
         class Response:
@@ -173,6 +174,10 @@ class MockZulipClient:
 
     def get_messages(self, payload):
         return {"result": "success", "messages": []}
+
+    def send_message(self, payload):
+        self.sent_messages.append(payload)
+        return {"result": "success", "id": len(self.sent_messages)}
 
 
 def test_manage_context_window_filters_bot_messages():
@@ -423,4 +428,127 @@ def test_send_full_reply_multipart():
     assert len(client.sent) >= 2
     assert "Part 1" in client.sent[0]["content"]
     assert "Part 2" in client.sent[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# ZulipMemoryManager & Fallback Extraction Tests
+# ---------------------------------------------------------------------------
+
+def test_zulip_memory_manager(tmp_path):
+    """Test recording and retrieving Zulip chat records from memory."""
+    from zulip_ai_bridge import ZulipMemoryManager
+
+    storage_dir = str(tmp_path / "zulip_chats")
+    mem = ZulipMemoryManager(storage_dir=storage_dir)
+
+    chat_record = {
+        "session_id": "test_zlp_001",
+        "sender_email": "dawid@example.com",
+        "query": "What's going on with the workstation?",
+        "status": "success",
+        "duration_s": 1.25,
+        "response_delivered": "System load is normal.",
+        "ai_mode": "auto"
+    }
+
+    sid = mem.record_chat(chat_record)
+    assert sid == "test_zlp_001"
+
+    # Verify retrieval from JSONL
+    recent = mem.get_recent(limit=5)
+    assert len(recent) == 1
+    assert recent[0]["session_id"] == "test_zlp_001"
+    assert recent[0]["query"] == "What's going on with the workstation?"
+
+    # Verify retrieval of detailed session
+    detail = mem.get_chat("test_zlp_001")
+    assert detail is not None
+    assert detail["response_delivered"] == "System load is normal."
+
+
+def test_extract_session_fallback_from_reasoning(tmp_path):
+    """Fallback extraction should extract reasoning_content when content is null."""
+    import json
+    from zulip_ai_bridge import extract_session_fallback
+
+    sess_file = tmp_path / "last.json"
+    data = {
+        "messages": [
+            {"role": "user", "content": "Run ai-backend settings"},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "The selected settings are: Qwen3.8-27B model, ctx 80000, MTP enabled."
+            }
+        ]
+    }
+    sess_file.write_text(json.dumps(data), encoding="utf-8")
+
+    text, status, snip = extract_session_fallback(last_sess_path=str(sess_file), raw_stdout="")
+    assert status == "fallback_reasoning"
+    assert "The selected settings are: Qwen3.8-27B" in text
+    assert "Response extracted from agent reasoning" in text
+
+
+def test_extract_session_fallback_from_tools(tmp_path):
+    """Fallback extraction should summarize tool actions when assistant executed tools."""
+    import json
+    from zulip_ai_bridge import extract_session_fallback
+
+    sess_file = tmp_path / "last.json"
+    data = {
+        "messages": [
+            {"role": "user", "content": "check gpu"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"function": {"name": "execute_command", "arguments": '{"command": "nvidia-smi"}'}}]
+            },
+            {
+                "role": "tool",
+                "name": "execute_command",
+                "content": "NVIDIA RTX 5080, 54C, 227W"
+            }
+        ]
+    }
+    sess_file.write_text(json.dumps(data), encoding="utf-8")
+
+    text, status, _ = extract_session_fallback(last_sess_path=str(sess_file), raw_stdout="")
+    assert status == "fallback_tools"
+    assert "execute_command" in text
+    assert "RTX 5080" in text
+
+
+def test_slash_commands_in_bridge(tmp_path):
+    """Test /ping, /history, and /debug commands."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge, ZulipMemoryManager
+
+    client = MockZulipClient()
+    bridge = ZulipAiBridge(client=client)
+    bridge.detected_owner = "dawid@example.com"
+    bridge.memory = ZulipMemoryManager(storage_dir=str(tmp_path / "zulip_chats"))
+
+    # Seed one record
+    bridge.memory.record_chat({
+        "session_id": "seed_01",
+        "sender_email": "dawid@example.com",
+        "query": "hello world",
+        "status": "success",
+        "duration_s": 0.5,
+        "response_delivered": "Hello!"
+    })
+
+    # Test /ping
+    bridge.handle_message({"type": "private", "sender_email": "dawid@example.com", "content": "/ping"})
+    assert any("Zulip AI Bridge is active" in m["content"] for m in client.sent_messages)
+
+    # Test /history
+    bridge.handle_message({"type": "private", "sender_email": "dawid@example.com", "content": "/history"})
+    assert any("Recent Zulip Chat Memory" in m["content"] for m in client.sent_messages)
+
+    # Test /debug
+    bridge.handle_message({"type": "private", "sender_email": "dawid@example.com", "content": "/debug"})
+    assert any("Zulip AI Bridge Diagnostics" in m["content"] for m in client.sent_messages)
+
 

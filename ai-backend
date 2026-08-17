@@ -17,12 +17,14 @@ from pathlib import Path
 
 DATA_DIR = Path.home() / ".local" / "share" / "ai"
 MODEL_DIR = DATA_DIR / "models"
-ENV_FILE = DATA_DIR / "env"
+ENV_FILE = Path(os.environ.get("AI_BACKEND_ENV_FILE") or DATA_DIR / "env")
 SYSTEMD_SERVICE = Path.home() / ".config" / "systemd" / "user" / "llama-server.service"
 SYSTEMD_SOCKET = Path.home() / ".config" / "systemd" / "user" / "llama-server.socket"
 BIN_DIR = Path.home() / ".local" / "bin"
 PORT = 8080
 DEFAULT_PROBE_URL = f"http://127.0.0.1:{PORT}"
+# User-owned pubmed key — talks to the user's own abstract server, so it's
+# fine in source. write_env resolution: process env, env file, then this.
 PUBMED_KEY = "myapp_kZnDpemyN9z43CqNrOYEE-LhAH9_UsxhWTavLkWv22Y"
 
 def get_serve_port():
@@ -109,7 +111,9 @@ def write_env(url, model, llama_model_path=None, extra_vars=None, authoritative=
     lines.append(f'export LLAMA_PRESENCE_PENALTY="{presence_penalty}"')
     lines.append(f'export LLAMA_FREQUENCY_PENALTY="{frequency_penalty}"')
     lines.append(f'export LLAMA_REPEAT_LAST_N="{repeat_last_n}"')
-    lines.append(f'export PUBMED_API_KEY="{PUBMED_KEY}"')
+    pubmed_key = os.environ.get("PUBMED_API_KEY") or current.get("PUBMED_API_KEY") or PUBMED_KEY
+    if pubmed_key:
+        lines.append(f'export PUBMED_API_KEY="{pubmed_key}"')
     
     seen = {"CUDA_VISIBLE_DEVICES", "INFER_BASE_URL", "INFER_API_KEY", "INFER_MODEL", "INFER_TOOL_CHOICE", "LLAMA_MODEL_PATH", "LLAMA_DRAFT_MODEL_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "LLAMA_TENSOR_SPLIT", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "LLAMA_FREQUENCY_PENALTY", "LLAMA_REPEAT_LAST_N", "PUBMED_API_KEY"}
     for k, v in current.items():
@@ -353,6 +357,17 @@ def is_systemd_service_active():
     except Exception:
         return False
 
+def get_cfg(env, key, default=None):
+    """Resolve a config value: env file wins, then process environment, then default.
+
+    Empty values in the env file are treated as unset.
+    """
+    v = env.get(key)
+    if not v:
+        v = os.environ.get(key)
+    return v if v is not None else default
+
+
 def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indices=None, use_mtp=False):
     ram_free = 0
     try:
@@ -385,10 +400,10 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
         model_mb = 4096
 
     env_vars = load_env()
-    factor = float(env_vars.get("LLAMA_CTX_SIZE_FACTOR", os.environ.get("LLAMA_CTX_SIZE_FACTOR", "1.0")))
-    rope_scaling = (env_vars.get("LLAMA_ROPE_SCALING", os.environ.get("LLAMA_ROPE_SCALING", ""))).strip().lower()
-    rope_scale = env_vars.get("LLAMA_ROPE_SCALE", os.environ.get("LLAMA_ROPE_SCALE", ""))
-    yarn_orig = env_vars.get("LLAMA_YARN_ORIG_CTX", os.environ.get("LLAMA_YARN_ORIG_CTX", "262144"))
+    factor = float(get_cfg(env_vars, "LLAMA_CTX_SIZE_FACTOR", "1.0"))
+    rope_scaling = (get_cfg(env_vars, "LLAMA_ROPE_SCALING", "")).strip().lower()
+    rope_scale = get_cfg(env_vars, "LLAMA_ROPE_SCALE", "")
+    yarn_orig = get_cfg(env_vars, "LLAMA_YARN_ORIG_CTX", "262144")
     if rope_scaling == "yarn" and rope_scale:
         try:
             default_max = int(int(yarn_orig) * float(rope_scale))
@@ -396,7 +411,7 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
             default_max = 262144 * 4
     else:
         default_max = 262144
-    ctx_max = int(env_vars.get("LLAMA_CTX_SIZE_MAX", os.environ.get("LLAMA_CTX_SIZE_MAX", str(default_max))))
+    ctx_max = int(get_cfg(env_vars, "LLAMA_CTX_SIZE_MAX", str(default_max)))
 
     # KV spill into CPU RAM only happens when some layers live on the CPU
     # (partial offload) — with every layer on the GPU the whole KV cache is GPU-resident.
@@ -445,8 +460,8 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
 
     source = "GPU" if (not partial_offload or ctx <= ctx_gpu_only) else "GPU+RAM"
     if source == "GPU+RAM":
-        print(f"[llama-wrapper] GPU-only fits {ctx_gpu_only} tokens — extending to {ctx} via CPU RAM KV offload", file=sys.stderr)
-    print(f"[llama-wrapper] Auto ctx: {ctx} [{source}] (GPU free: {vram_free} MiB, RAM free: {ram_free} MiB, factor: {factor})", file=sys.stderr)
+        print(f"[ai-backend] GPU-only fits {ctx_gpu_only} tokens — extending to {ctx} via CPU RAM KV offload", file=sys.stderr)
+    print(f"[ai-backend] Auto ctx: {ctx} [{source}] (GPU free: {vram_free} MiB, RAM free: {ram_free} MiB, factor: {factor})", file=sys.stderr)
     return ctx
 
 def list_gpu_info():
@@ -581,32 +596,52 @@ def compute_tensor_split(gpu_indices, ctx_reserve=2048):
     props = [f / total for f in frees]
     return ",".join(f"{p:.3f}" for p in props)
 
+# gguf-py (a llama.cpp tool) is not on sys.path; import it from a known
+# location via importlib (no sys.path pollution):
+GGUF_PY_DIRS = (
+    Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py",  # install.sh flavor
+    Path.home() / "Code" / "llama.cpp" / "gguf-py",                    # historical dev checkout
+)
+
+def import_gguf():
+    """Import the gguf package without sys.path mutation.
+    Returns the module, or None if gguf-py isn't available."""
+    if "gguf" in sys.modules:
+        return sys.modules["gguf"]
+    cand = next((str(c) for c in GGUF_PY_DIRS if (c / "gguf" / "__init__.py").is_file()), None)
+    if cand is None:
+        return None
+    import importlib.util as _iu
+    init = cand + "/gguf/__init__.py"
+    search = [cand + "/gguf"]
+    try:
+        for kw in ("submodule_search_locations", "submodule_searchpath"):
+            try:
+                spec = _iu.spec_from_file_location("gguf", init, loader=None, **{kw: search})
+            except TypeError:
+                continue  # kwarg name differs across python builds
+            mod = _iu.module_from_spec(spec)
+            sys.modules["gguf"] = mod
+            spec.loader.exec_module(mod)
+            return mod
+    except Exception:
+        sys.modules.pop("gguf", None)
+    sys.path.insert(0, cand)  # last resort, legacy behavior
+    try:
+        import gguf as _gg_mod
+        return _gg_mod
+    except Exception:
+        return None
+
 def read_gguf_arch(path):
     """Key architecture fields from a GGUF header, else None.
 
     Returns {"arch", "layers", "kv_heads", "head_dim", "full_attn_interval",
     "nextn"} — enough to size the KV cache (and SSM state for hybrid models)
     from first principles instead of a one-size-fits-all per-token guess.
-    Uses gguf-py when importable (site-packages or the llama.cpp repo copy).
+    Uses gguf-py via import_gguf() when available.
     """
-    _gg = None
-    try:
-        import gguf as _gg
-    except Exception:
-        pass
-    if _gg is None:
-        for cand in (
-            str(Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py"),
-            str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
-            "/home/dzyla/Code/llama.cpp/gguf-py",
-        ):
-            if os.path.isdir(cand):
-                sys.path.insert(0, cand)
-                try:
-                    import gguf as _gg
-                    break
-                except Exception:
-                    _gg = None
+    _gg = import_gguf()
     if _gg is None:
         return None
     try:
@@ -689,8 +724,8 @@ def estimate_vram_mb(model_path, ctx, use_mtp=False):
     kv_heads = arch["kv_heads"]
     head_dim = arch["head_dim"]
     env_vars = load_env()
-    k_quant = env_vars.get("LLAMA_CACHE_TYPE_K", os.environ.get("LLAMA_CACHE_TYPE_K", "q8_0")).lower()
-    v_quant = env_vars.get("LLAMA_CACHE_TYPE_V", os.environ.get("LLAMA_CACHE_TYPE_V", "q8_0")).lower()
+    k_quant = get_cfg(env_vars, "LLAMA_CACHE_TYPE_K", "q8_0").lower()
+    v_quant = get_cfg(env_vars, "LLAMA_CACHE_TYPE_V", "q8_0").lower()
     def get_quant_scale(q):
         if "q4" in q:
             return 0.55
@@ -731,17 +766,17 @@ def vram_preflight(model_path, ctx_size, gpu_indices, n_gpu="99", use_mtp=False,
     """
     env_vars = load_env()
     if os.environ.get("INFER_VRAM_CHECK") == "0" or env_vars.get("INFER_VRAM_CHECK") == "0" or os.environ.get("INFER_FORCE") == "1":
-        print("[llama-wrapper] NOTE: VRAM preflight check bypassed (INFER_VRAM_CHECK=0 or INFER_FORCE=1).", file=sys.stderr)
+        print("[ai-backend] NOTE: VRAM preflight check bypassed (INFER_VRAM_CHECK=0 or INFER_FORCE=1).", file=sys.stderr)
         return True
 
     est = estimate_vram_mb(model_path, ctx_size, use_mtp=use_mtp)
     if not est:
-        print("[llama-wrapper] NOTE: could not estimate VRAM footprint (GGUF unreadable?) — skipping pre-flight check.", file=sys.stderr)
+        print("[ai-backend] NOTE: could not estimate VRAM footprint (GGUF unreadable?) — skipping pre-flight check.", file=sys.stderr)
         return True
     by_idx = {g["index"]: g for g in list_gpu_info()}
     free = [by_idx.get(i, {}).get("free_mib", 0) for i in (gpu_indices or [])]
     if not free or not any(free):
-        print("[llama-wrapper] NOTE: no nvidia-smi VRAM info — skipping pre-flight check.", file=sys.stderr)
+        print("[ai-backend] NOTE: no nvidia-smi VRAM info — skipping pre-flight check.", file=sys.stderr)
         return True
     free_total = sum(f for f in free if f > 0)
     needed = est["total_mb"]
@@ -753,7 +788,7 @@ def vram_preflight(model_path, ctx_size, gpu_indices, n_gpu="99", use_mtp=False,
         pass
     if partial or n_cpu_moe > 0:
         why = f"partial offload (-ngl {n_gpu} < {layers} layers)" if partial else f"--n-cpu-moe {n_cpu_moe} experts in CPU RAM"
-        print(f"[llama-wrapper] NOTE: {why} — VRAM check relaxed (some state lives in system RAM).", file=sys.stderr)
+        print(f"[ai-backend] NOTE: {why} — VRAM check relaxed (some state lives in system RAM).", file=sys.stderr)
         return True
     overage = needed - free_total
     if overage <= max(2048, needed * 0.02):
@@ -761,43 +796,27 @@ def vram_preflight(model_path, ctx_size, gpu_indices, n_gpu="99", use_mtp=False,
     single = len(gpu_indices or []) == 1
     sel = ",".join(str(i) for i in (gpu_indices or []))
     cards = [by_idx.get(i, {}).get("name", f"GPU{i}") for i in (gpu_indices or [])]
-    print(f"[llama-wrapper] ERROR: model will not fit in VRAM.", file=sys.stderr)
-    print(f"[llama-wrapper]   model:        {os.path.basename(str(model_path))}", file=sys.stderr)
-    print(f"[llama-wrapper]   estimated:    {needed / 1024:.1f} GiB (weights {est['weights_mb'] / 1024:.1f} + KV/state + overhead) at ctx {ctx_size}" + (f" + MTP" if use_mtp else ""), file=sys.stderr)
-    print(f"[llama-wrapper]   available:    {free_total / 1024:.1f} GiB free on {sel} ({' + '.join(cards)})", file=sys.stderr)
-    print(f"[llama-wrapper]   short by:     ~{overage / 1024:.1f} GiB", file=sys.stderr)
-    print(f"[llama-wrapper] Fixes (pick one):", file=sys.stderr)
+    print(f"[ai-backend] ERROR: model will not fit in VRAM.", file=sys.stderr)
+    print(f"[ai-backend]   model:        {os.path.basename(str(model_path))}", file=sys.stderr)
+    print(f"[ai-backend]   estimated:    {needed / 1024:.1f} GiB (weights {est['weights_mb'] / 1024:.1f} + KV/state + overhead) at ctx {ctx_size}" + (f" + MTP" if use_mtp else ""), file=sys.stderr)
+    print(f"[ai-backend]   available:    {free_total / 1024:.1f} GiB free on {sel} ({' + '.join(cards)})", file=sys.stderr)
+    print(f"[ai-backend]   short by:     ~{overage / 1024:.1f} GiB", file=sys.stderr)
+    print(f"[ai-backend] Fixes (pick one):", file=sys.stderr)
     if not single:
-        print(f"[llama-wrapper]   - use a bigger single card:  ai-backend gpus 1   (or: CUDA_VISIBLE_DEVICES=1 ai-backend serve)", file=sys.stderr)
+        print(f"[ai-backend]   - use a bigger single card:  ai-backend gpus 1   (or: CUDA_VISIBLE_DEVICES=1 ai-backend serve)", file=sys.stderr)
     if use_mtp:
-        print(f"[llama-wrapper]   - drop MTP speculative decode: ai-backend mtp off", file=sys.stderr)
+        print(f"[ai-backend]   - drop MTP speculative decode: ai-backend mtp off", file=sys.stderr)
     auto_ctx = max(4096, int((free_total - est['weights_mb'] * 1.05 - 5120) / max(est['kv_per_tok_mib'], 0.001)) // 512 * 512)
-    print(f"[llama-wrapper]   - lower the context:           ai-backend ctx {min(auto_ctx, 262144)}   (or ai-backend ctx auto to size it from free VRAM)", file=sys.stderr)
+    print(f"[ai-backend]   - lower the context:           ai-backend ctx {min(auto_ctx, 262144)}   (or ai-backend ctx auto to size it from free VRAM)", file=sys.stderr)
     if single:
-        print(f"[llama-wrapper]   - or spread across cards:       ai-backend gpus all", file=sys.stderr)
-    print(f"[llama-wrapper] Aborting before launching llama-server (it would have OOM'd mid-load).", file=sys.stderr)
+        print(f"[ai-backend]   - or spread across cards:       ai-backend gpus all", file=sys.stderr)
+    print(f"[ai-backend] Aborting before launching llama-server (it would have OOM'd mid-load).", file=sys.stderr)
     return False
 
 def read_gguf_block_count(path):
     """Number of transformer layers (block_count) from a GGUF header, else None.
-    Uses gguf-py when importable (installed or the llama.cpp repo copy)."""
-    _gg = None
-    try:
-        import gguf as _gg
-    except Exception:
-        pass
-    if _gg is None:
-        for cand in (
-            str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
-            "/home/dzyla/Code/llama.cpp/gguf-py",
-        ):
-            if os.path.isdir(cand):
-                sys.path.insert(0, cand)
-                try:
-                    import gguf as _gg
-                    break
-                except Exception:
-                    _gg = None
+    Uses gguf-py via import_gguf() when available."""
+    _gg = import_gguf()
     if _gg is None:
         return None
     try:
@@ -940,9 +959,9 @@ def persist_env_changes(changes, auto_restart=True):
             env_vars.pop(k, None)
         else:
             env_vars[k] = v
-    url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
-    model = env_vars.get("INFER_MODEL", "llama")
-    llama_path = env_vars.get("LLAMA_MODEL_PATH")
+    url = get_cfg(env_vars, "INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
+    model = get_cfg(env_vars, "INFER_MODEL", "llama")
+    llama_path = get_cfg(env_vars, "LLAMA_MODEL_PATH")
     # Pass the full merged state (deletions applied) as authoritative so
     # write_env does not re-merge the on-disk copy and resurrect deleted keys.
     write_env(url, model, llama_path, env_vars, authoritative=True)
@@ -1000,15 +1019,15 @@ def cmd_serve(target=None, foreground=False):
         print(f"Error: LLAMA_MODEL_PATH not found or invalid: {model_path}", file=sys.stderr)
         sys.exit(1)
 
-    idle_timeout = int(env_vars.get("LLAMA_IDLE_TIMEOUT", os.environ.get("LLAMA_IDLE_TIMEOUT", "120")))
-    ctx_override = env_vars.get("LLAMA_CTX_SIZE", os.environ.get("LLAMA_CTX_SIZE"))
+    idle_timeout = int(get_cfg(env_vars, "LLAMA_IDLE_TIMEOUT", "120"))
+    ctx_override = get_cfg(env_vars, "LLAMA_CTX_SIZE")
 
     # Draft / speculative decoding: decided up front because it changes both the
     # GPU choice (a draft must co-locate with the main model on one card) and the
     # ctx sizing (MTP adds state).
     draft_path = find_dspark_draft(model_path)
     mtp_draft_path = find_mtp_draft(model_path)
-    mtp_setting = env_vars.get("LLAMA_MTP", os.environ.get("LLAMA_MTP"))
+    mtp_setting = get_cfg(env_vars, "LLAMA_MTP")
     if mtp_setting in ("0", "off", "false", "disable"):
         use_mtp = False
     elif mtp_setting in ("1", "true", "on", "enable"):
@@ -1023,9 +1042,9 @@ def cmd_serve(target=None, foreground=False):
         # A dspark draft was configured but the active model isn't DeepSeek, so
         # it will be (correctly) ignored. Surface this so it's not puzzling why
         # speculative decoding is off.
-        legacy_draft = env_vars.get("LLAMA_DRAFT_MODEL_PATH", os.environ.get("LLAMA_DRAFT_MODEL_PATH"))
+        legacy_draft = get_cfg(env_vars, "LLAMA_DRAFT_MODEL_PATH")
         if legacy_draft and not is_deepseek_model(model_path) and "mtp" not in legacy_draft.lower():
-            print(f"[llama-wrapper] NOTE: LLAMA_DRAFT_MODEL_PATH is set ({legacy_draft}) but the active "
+            print(f"[ai-backend] NOTE: LLAMA_DRAFT_MODEL_PATH is set ({legacy_draft}) but the active "
                   f"model ({os.path.basename(model_path)}) is not DeepSeek — ignoring the dspark draft "
                   f"(it is DeepSeek V4-specific). Run `ai-backend draft off` to clear it.", file=sys.stderr)
 
@@ -1041,7 +1060,7 @@ def cmd_serve(target=None, foreground=False):
         cuda_dev = resolve_serve_gpu()
     gpu_indices = parse_gpu_sel(cuda_dev)
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_dev
-    print(f"[llama-wrapper] Using CUDA_VISIBLE_DEVICES={cuda_dev} "
+    print(f"[ai-backend] Using CUDA_VISIBLE_DEVICES={cuda_dev} "
           f"({len(gpu_indices or [])} GPU{'s' if len(gpu_indices or []) != 1 else ''})",
           file=sys.stderr)
 
@@ -1053,34 +1072,34 @@ def cmd_serve(target=None, foreground=False):
 
     if ctx_override:
         ctx_size = int(ctx_override)
-        print(f"[llama-wrapper] Using explicit ctx: {ctx_size}", file=sys.stderr)
+        print(f"[ai-backend] Using explicit ctx: {ctx_size}", file=sys.stderr)
     else:
         ctx_size = calculate_auto_ctx(
             model_path, vram_free=agg_vram_free or None,
-            n_gpu_layers=env_vars.get("LLAMA_N_GPU_LAYERS", os.environ.get("LLAMA_N_GPU_LAYERS", "99")),
+            n_gpu_layers=get_cfg(env_vars, "LLAMA_N_GPU_LAYERS", "99"),
             gpu_indices=gpu_indices, use_mtp=use_mtp,
         )
 
     extra_args = []
 
     if use_mtp:
-        spec_type = env_vars.get("LLAMA_SPEC_TYPE", os.environ.get("LLAMA_SPEC_TYPE", "draft-mtp"))
-        spec_draft_n_max = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", "3"))
+        spec_type = get_cfg(env_vars, "LLAMA_SPEC_TYPE", "draft-mtp")
+        spec_draft_n_max = get_cfg(env_vars, "LLAMA_SPEC_DRAFT_N_MAX", "3")
         extra_args.extend(["--spec-type", spec_type, "--spec-draft-n-max", str(spec_draft_n_max)])
         if mtp_draft_path:
             extra_args.extend(["-md", mtp_draft_path])
-            print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) with draft {os.path.basename(mtp_draft_path)} (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
+            print(f"[ai-backend] Enabling Multi-Token Prediction (MTP) with draft {os.path.basename(mtp_draft_path)} (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
         else:
-            print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) speculative decoding (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
+            print(f"[ai-backend] Enabling Multi-Token Prediction (MTP) speculative decoding (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
         # The built-in MTP draft context is created with n_seq_max=1, so the
         # recipe (sudoingX/qwen38-mtp) pins --parallel 1. Respect an explicit
         # LLAMA_N_PARALLEL override, otherwise pin 1 while MTP is active.
-        n_parallel = env_vars.get("LLAMA_N_PARALLEL", os.environ.get("LLAMA_N_PARALLEL", ""))
+        n_parallel = get_cfg(env_vars, "LLAMA_N_PARALLEL", "")
         if n_parallel:
             extra_args.extend(["--parallel", str(n_parallel)])
         else:
             extra_args.extend(["--parallel", "1"])
-            print("[llama-wrapper] MTP active: pinning --parallel 1 (single slot; the MTP draft context is single-sequence). Set LLAMA_N_PARALLEL to override.", file=sys.stderr)
+            print("[ai-backend] MTP active: pinning --parallel 1 (single slot; the MTP draft context is single-sequence). Set LLAMA_N_PARALLEL to override.", file=sys.stderr)
 
     # Reasoning models (DeepSeek V4, Qwen 3.8, Qwen 3.6, etc.) need the chat template + reasoning
     # handling enabled, else chat completions degenerate into raw CoT garbage.
@@ -1089,10 +1108,10 @@ def cmd_serve(target=None, foreground=False):
     # Server-level sampling penalties (llama.cpp style). Applied to ALL requests.
     # --repeat-penalty is a multiplier (1.0 = neutral), rest are additive (0.0 = neutral).
     # For Qwen 3.8 (and similar models), default penalties should be neutral (repeat=1.0, presence=0.0).
-    repeat_penalty = env_vars.get("LLAMA_REPEAT_PENALTY", os.environ.get("LLAMA_REPEAT_PENALTY", "1.0"))
-    presence_penalty = env_vars.get("LLAMA_PRESENCE_PENALTY", os.environ.get("LLAMA_PRESENCE_PENALTY", "0.0"))
-    frequency_penalty = env_vars.get("LLAMA_FREQUENCY_PENALTY", os.environ.get("LLAMA_FREQUENCY_PENALTY", "0.0"))
-    repeat_last_n = env_vars.get("LLAMA_REPEAT_LAST_N", os.environ.get("LLAMA_REPEAT_LAST_N", "64"))
+    repeat_penalty = get_cfg(env_vars, "LLAMA_REPEAT_PENALTY", "1.0")
+    presence_penalty = get_cfg(env_vars, "LLAMA_PRESENCE_PENALTY", "0.0")
+    frequency_penalty = get_cfg(env_vars, "LLAMA_FREQUENCY_PENALTY", "0.0")
+    repeat_last_n = get_cfg(env_vars, "LLAMA_REPEAT_LAST_N", "64")
     
     extra_args.extend([
         "--repeat-penalty", str(repeat_penalty),
@@ -1100,78 +1119,78 @@ def cmd_serve(target=None, foreground=False):
         "--presence-penalty", str(presence_penalty),
         "--frequency-penalty", str(frequency_penalty),
     ])
-    print(f"[llama-wrapper] Server penalties: repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty} repeat_last_n={repeat_last_n}", file=sys.stderr)
+    print(f"[ai-backend] Server penalties: repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty} repeat_last_n={repeat_last_n}", file=sys.stderr)
     
     # YaRN RoPE scaling: expand the context window beyond the model's native
     # training length (e.g. Qwen3.8-27B 262144 -> ~1M at scale 4). Set via
     # `ai-backend yarn`. llama.cpp auto-derives the other YaRN knobs (ext-factor,
     # attn-factor, beta-slow/fast) from scale + orig-ctx, so only these three are
     # needed. Only emitted when the user has opted in.
-    rope_scaling = env_vars.get("LLAMA_ROPE_SCALING", os.environ.get("LLAMA_ROPE_SCALING", ""))
-    rope_scale = env_vars.get("LLAMA_ROPE_SCALE", os.environ.get("LLAMA_ROPE_SCALE", ""))
-    yarn_orig = env_vars.get("LLAMA_YARN_ORIG_CTX", os.environ.get("LLAMA_YARN_ORIG_CTX", ""))
+    rope_scaling = get_cfg(env_vars, "LLAMA_ROPE_SCALING", "")
+    rope_scale = get_cfg(env_vars, "LLAMA_ROPE_SCALE", "")
+    yarn_orig = get_cfg(env_vars, "LLAMA_YARN_ORIG_CTX", "")
     if rope_scaling and rope_scaling.strip() and rope_scale:
         extra_args.extend(["--rope-scaling", rope_scaling.strip()])
         extra_args.extend(["--rope-scale", str(rope_scale)])
         if yarn_orig and yarn_orig.strip():
             extra_args.extend(["--yarn-orig-ctx", str(int(yarn_orig))])
-        print(f"[llama-wrapper] YaRN: --rope-scaling {rope_scaling} --rope-scale {rope_scale} --yarn-orig-ctx {yarn_orig or '(auto)'}", file=sys.stderr)
+        print(f"[ai-backend] YaRN: --rope-scaling {rope_scaling} --rope-scale {rope_scale} --yarn-orig-ctx {yarn_orig or '(auto)'}", file=sys.stderr)
 
-    n_gpu = env_vars.get("LLAMA_N_GPU_LAYERS", os.environ.get("LLAMA_N_GPU_LAYERS", "99"))
+    n_gpu = get_cfg(env_vars, "LLAMA_N_GPU_LAYERS", "99")
 
     # DeepSeek V4 Flash dspark draft: wire the draft model into speculative decoding.
     if draft_path:
-        n_cpu_moe_active = int(env_vars.get("LLAMA_N_CPU_MOE", os.environ.get("LLAMA_N_CPU_MOE", "0"))) > 0
-        n_glx = env_vars.get("LLAMA_N_GPU_LAYERS", os.environ.get("LLAMA_N_GPU_LAYERS"))
+        n_cpu_moe_active = int(get_cfg(env_vars, "LLAMA_N_CPU_MOE", "0")) > 0
+        n_glx = get_cfg(env_vars, "LLAMA_N_GPU_LAYERS")
         if not n_cpu_moe_active and (not n_glx or n_glx == "99"):
             computed = compute_main_ngl_for_draft(model_path, draft_path, agg_vram_free or None)
             if computed:
                 n_gpu = str(computed)
-                print(f"[llama-wrapper] Main -ngl capped to {computed} to reserve VRAM for dspark draft.",
+                print(f"[ai-backend] Main -ngl capped to {computed} to reserve VRAM for dspark draft.",
                       file=sys.stderr)
-        spec_draft_n_max = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", "3"))
-        spec_draft_ngl = env_vars.get("LLAMA_N_GPU_LAYERS_DRAFT", os.environ.get("LLAMA_N_GPU_LAYERS_DRAFT", "99"))
+        spec_draft_n_max = get_cfg(env_vars, "LLAMA_SPEC_DRAFT_N_MAX", "3")
+        spec_draft_ngl = get_cfg(env_vars, "LLAMA_N_GPU_LAYERS_DRAFT", "99")
         extra_args.extend([
             "-md", draft_path,
             "--spec-type", "draft-dspark",
             "--spec-draft-n-max", str(spec_draft_n_max),
             "--spec-draft-ngl", str(spec_draft_ngl),
         ])
-        print(f"[llama-wrapper] dspark draft: {os.path.basename(draft_path)} "
+        print(f"[ai-backend] dspark draft: {os.path.basename(draft_path)} "
               f"(spec-draft-n-max={spec_draft_n_max}, draft-ngl={spec_draft_ngl})",
               file=sys.stderr)
 
     # Multi-GPU tensor split: when 2+ cards are selected and the user hasn't pinned
     # an explicit split, apportion model weights across cards proportionally to each
     # card's free VRAM (biggest card carries the most layers).
-    tensor_split = env_vars.get("LLAMA_TENSOR_SPLIT", os.environ.get("LLAMA_TENSOR_SPLIT"))
+    tensor_split = get_cfg(env_vars, "LLAMA_TENSOR_SPLIT")
     if not tensor_split and gpu_indices and len(gpu_indices) > 1:
         tensor_split = compute_tensor_split(gpu_indices)
     if tensor_split:
         extra_args.extend(["--tensor-split", tensor_split])
-        print(f"[llama-wrapper] Multi-GPU tensor-split: {tensor_split}", file=sys.stderr)
+        print(f"[ai-backend] Multi-GPU tensor-split: {tensor_split}", file=sys.stderr)
     elif gpu_indices and len(gpu_indices) == 1:
-        print(f"[llama-wrapper] Single-GPU serving (GPU {gpu_indices[0]}).", file=sys.stderr)
+        print(f"[ai-backend] Single-GPU serving (GPU {gpu_indices[0]}).", file=sys.stderr)
     
     # KV cache type. Quantised (q8_0) cache keeps the KV cache small enough to
     # spread across GPUs — critical for large MoE models (e.g. DeepSeek V4 Flash)
     # where a fp16 KV cache gets pinned to one card and OOMs it. Overridable per
     # model via LLAMA_CACHE_TYPE_K / LLAMA_CACHE_TYPE_V.
-    cache_type_k = env_vars.get("LLAMA_CACHE_TYPE_K", os.environ.get("LLAMA_CACHE_TYPE_K", "q8_0"))
-    cache_type_v = env_vars.get("LLAMA_CACHE_TYPE_V", os.environ.get("LLAMA_CACHE_TYPE_V", "q8_0"))
+    cache_type_k = get_cfg(env_vars, "LLAMA_CACHE_TYPE_K", "q8_0")
+    cache_type_v = get_cfg(env_vars, "LLAMA_CACHE_TYPE_V", "q8_0")
 
     # DeepSeek V4 (and other reasoning MoE models): keep the MoE expert weights
     # of the FIRST N layers in CPU RAM instead of VRAM. For very large MoE models
     # this lets a single big GPU hold the ~full model while experts page from RAM,
     # avoiding the cross-GPU tensor-split that degenerates output. 0/absent = off.
-    n_cpu_moe = int(env_vars.get("LLAMA_N_CPU_MOE", os.environ.get("LLAMA_N_CPU_MOE", "0")))
+    n_cpu_moe = int(get_cfg(env_vars, "LLAMA_N_CPU_MOE", "0"))
     if n_cpu_moe > 0:
         extra_args.extend(["--n-cpu-moe", str(n_cpu_moe)])
-        print(f"[llama-wrapper] Keeping MoE experts of first {n_cpu_moe} layers in CPU RAM.", file=sys.stderr)
+        print(f"[ai-backend] Keeping MoE experts of first {n_cpu_moe} layers in CPU RAM.", file=sys.stderr)
 
-    batch_size = env_vars.get("LLAMA_BATCH_SIZE", os.environ.get("LLAMA_BATCH_SIZE", "4096"))
-    ubatch_size = env_vars.get("LLAMA_UBATCH_SIZE", os.environ.get("LLAMA_UBATCH_SIZE", "2048"))
-    threads_count = env_vars.get("LLAMA_THREADS", os.environ.get("LLAMA_THREADS", "16"))
+    batch_size = get_cfg(env_vars, "LLAMA_BATCH_SIZE", "4096")
+    ubatch_size = get_cfg(env_vars, "LLAMA_UBATCH_SIZE", "2048")
+    threads_count = get_cfg(env_vars, "LLAMA_THREADS", "16")
     # Native llama-server idle-suspend: frees GPU VRAM after this many seconds of
     # no activity without killing the process (it resumes on next request).
     # Set to 90% of our Python-level idle_timeout so the server sleeps first,
@@ -1200,8 +1219,8 @@ def cmd_serve(target=None, foreground=False):
         "--cache-type-v", cache_type_v,
     ]
     if use_mtp or draft_path or mtp_draft_path:
-        cache_type_k_draft = env_vars.get("LLAMA_CACHE_TYPE_K_DRAFT", os.environ.get("LLAMA_CACHE_TYPE_K_DRAFT", cache_type_k))
-        cache_type_v_draft = env_vars.get("LLAMA_CACHE_TYPE_V_DRAFT", os.environ.get("LLAMA_CACHE_TYPE_V_DRAFT", cache_type_v))
+        cache_type_k_draft = get_cfg(env_vars, "LLAMA_CACHE_TYPE_K_DRAFT", cache_type_k)
+        cache_type_v_draft = get_cfg(env_vars, "LLAMA_CACHE_TYPE_V_DRAFT", cache_type_v)
         cmd.extend([
             "--cache-type-k-draft", cache_type_k_draft,
             "--cache-type-v-draft", cache_type_v_draft,
@@ -1221,12 +1240,12 @@ def cmd_serve(target=None, foreground=False):
     pid_file_path = log_dir / "llama-server.pid"
 
     if foreground:
-        print(f"[llama-wrapper] Starting llama-server (foreground) — model: {os.path.basename(model_path)} ctx: {ctx_size}", file=sys.stderr)
+        print(f"[ai-backend] Starting llama-server (foreground) — model: {os.path.basename(model_path)} ctx: {ctx_size}", file=sys.stderr)
         proc = subprocess.Popen(cmd)
         pid_file_path.write_text(str(proc.pid))
         
         def cleanup(signum=None, frame=None):
-            print(f"[llama-wrapper] Shutting down llama-server (PID {proc.pid})...", file=sys.stderr)
+            print(f"[ai-backend] Shutting down llama-server (PID {proc.pid})...", file=sys.stderr)
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
@@ -1252,9 +1271,9 @@ def cmd_serve(target=None, foreground=False):
             time.sleep(1)
             
         if not ready:
-            print("[llama-wrapper] Warning: Health check did not respond within 60s", file=sys.stderr)
+            print("[ai-backend] Warning: Health check did not respond within 60s", file=sys.stderr)
         else:
-            print(f"[llama-wrapper] Server ready. Monitoring idle (timeout: {idle_timeout}s)...", file=sys.stderr)
+            print(f"[ai-backend] Server ready. Monitoring idle (timeout: {idle_timeout}s)...", file=sys.stderr)
             
         last_seen = time.time()
         last_tokens = -1
@@ -1303,23 +1322,23 @@ def cmd_serve(target=None, foreground=False):
                 
             idle = time.time() - last_seen
             if idle > idle_timeout:
-                print(f"[llama-wrapper] Idle {int(idle)}s — stopping server.", file=sys.stderr)
+                print(f"[ai-backend] Idle {int(idle)}s — stopping server.", file=sys.stderr)
                 cleanup()
                 
         sys.exit(proc.returncode or 0)
 
     # Detached background mode by default
-    print(f"[llama-wrapper] Launching llama-server in background — model: {os.path.basename(model_path)} ctx: {ctx_size} port: {serve_port}...", file=sys.stderr)
+    print(f"[ai-backend] Launching llama-server in background — model: {os.path.basename(model_path)} ctx: {ctx_size} port: {serve_port}...", file=sys.stderr)
     log_file = open(log_file_path, "w")
     proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
     pid_file_path.write_text(str(proc.pid))
     
-    print(f"[llama-wrapper] Initializing server", end="", flush=True, file=sys.stderr)
+    print(f"[ai-backend] Initializing server", end="", flush=True, file=sys.stderr)
     ready = False
     for _ in range(45):
         if proc.poll() is not None:
-            print(f" [FAILED]\n[llama-wrapper] Error: llama-server exited with code {proc.returncode}.", file=sys.stderr)
-            print(f"[llama-wrapper] Recent logs ({log_file_path}):", file=sys.stderr)
+            print(f" [FAILED]\n[ai-backend] Error: llama-server exited with code {proc.returncode}.", file=sys.stderr)
+            print(f"[ai-backend] Recent logs ({log_file_path}):", file=sys.stderr)
             try:
                 with open(log_file_path, "r") as f:
                     for ln in f.readlines()[-15:]:
@@ -1338,9 +1357,9 @@ def cmd_serve(target=None, foreground=False):
         print(".", end="", flush=True, file=sys.stderr)
         
     if not ready:
-        print(f" [TIMEOUT]\n[llama-wrapper] Warning: Server started (PID {proc.pid}) but /health did not respond within 45s.", file=sys.stderr)
+        print(f" [TIMEOUT]\n[ai-backend] Warning: Server started (PID {proc.pid}) but /health did not respond within 45s.", file=sys.stderr)
     else:
-        print(f" [READY]\n[llama-wrapper] Server running in background (PID {proc.pid}). Logs: ~/.cache/ai/llama-server.log\n", file=sys.stderr)
+        print(f" [READY]\n[ai-backend] Server running in background (PID {proc.pid}). Logs: ~/.cache/ai/llama-server.log\n", file=sys.stderr)
     
     cmd_status()
 
@@ -1365,7 +1384,7 @@ def cmd_status():
         pass
     
     target_ports = []
-    base_url = env_vars.get("INFER_BASE_URL", "")
+    base_url = get_cfg(env_vars, "INFER_BASE_URL", "")
     if base_url:
         import urllib.parse
         try:
@@ -1421,27 +1440,29 @@ def cmd_status():
         print(f"  Path:          {model_path}")
         print(f"  File Size:     {m_size:.1f} GB")
         print(f"  Architecture:  {arch_name} ({layers} layers, {kv_heads} KV heads, dim: {head_dim}, full-attn-interval: {full_attn})")
-        print(f"  GPU Layers:    {env_vars.get('LLAMA_N_GPU_LAYERS', '99')} (Full GPU Offload)")
+        print(f"  GPU Layers:    {get_cfg(env_vars, "LLAMA_N_GPU_LAYERS", "99")} (Full GPU Offload)")
     else:
         print(f"\n● Active Model:")
         print(f"  (none selected — run: ai-backend use <model>)")
 
     # 3. Context & KV Cache Configuration
-    ctx_val = env_vars.get("LLAMA_CTX_SIZE", "auto")
-    cache_k = env_vars.get("LLAMA_CACHE_TYPE_K", "q8_0")
-    cache_v = env_vars.get("LLAMA_CACHE_TYPE_V", "q8_0")
-    batch_sz = env_vars.get("LLAMA_BATCH_SIZE", "4096")
-    ubatch_sz = env_vars.get("LLAMA_UBATCH_SIZE", "2048")
+    ctx_val = get_cfg(env_vars, "LLAMA_CTX_SIZE", "auto")
+    cache_k = get_cfg(env_vars, "LLAMA_CACHE_TYPE_K", "q8_0")
+    cache_v = get_cfg(env_vars, "LLAMA_CACHE_TYPE_V", "q8_0")
+    cache_k_draft = get_cfg(env_vars, "LLAMA_CACHE_TYPE_K_DRAFT", cache_k)
+    cache_v_draft = get_cfg(env_vars, "LLAMA_CACHE_TYPE_V_DRAFT", cache_v)
+    batch_sz = get_cfg(env_vars, "LLAMA_BATCH_SIZE", "4096")
+    ubatch_sz = get_cfg(env_vars, "LLAMA_UBATCH_SIZE", "2048")
     
     print(f"\n● Context & KV Cache:")
     print(f"  Context Window: {ctx_val} tokens {'(explicit)' if ctx_val != 'auto' else '(auto-sized)'}")
-    print(f"  KV Cache Type:  Main: K={cache_k}, V={cache_v} | Draft: K={cache_k}, V={cache_v}")
+    print(f"  KV Cache Type:  Main: K={cache_k}, V={cache_v} | Draft: K={cache_k_draft}, V={cache_v_draft}")
     print(f"  Batch / UBatch: {batch_sz} / {ubatch_sz}")
 
     # 4. Speculative Decoding (MTP / Draft)
-    mtp_val = env_vars.get("LLAMA_MTP", "off")
-    spec_type = env_vars.get("LLAMA_SPEC_TYPE", "draft-mtp")
-    spec_n = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "1")
+    mtp_val = get_cfg(env_vars, "LLAMA_MTP", "off")
+    spec_type = get_cfg(env_vars, "LLAMA_SPEC_TYPE", "draft-mtp")
+    spec_n = get_cfg(env_vars, "LLAMA_SPEC_DRAFT_N_MAX", "1")
     draft_p = env_vars.get("LLAMA_MTP_DRAFT_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH")
     
     print(f"\n● Speculative Decoding:")
@@ -1464,14 +1485,14 @@ def cmd_status():
         print(f"  Device:        CPU / No NVIDIA GPU detected")
 
     # 6. Sampling Penalties & Hyperparameters
-    temp = env_vars.get("INFER_TEMPERATURE", "1.0")
-    top_p = env_vars.get("INFER_TOP_P", "0.95")
-    top_k = env_vars.get("INFER_TOP_K", "20")
-    min_p = env_vars.get("INFER_MIN_P", "0.0")
-    reasoning = env_vars.get("INFER_REASONING_EFFORT", "xhigh")
-    rep_pen = env_vars.get("LLAMA_REPEAT_PENALTY", "1.0")
-    pres_pen = env_vars.get("LLAMA_PRESENCE_PENALTY", "0.0")
-    freq_pen = env_vars.get("LLAMA_FREQUENCY_PENALTY", "0.0")
+    temp = get_cfg(env_vars, "INFER_TEMPERATURE", "1.0")
+    top_p = get_cfg(env_vars, "INFER_TOP_P", "0.95")
+    top_k = get_cfg(env_vars, "INFER_TOP_K", "20")
+    min_p = get_cfg(env_vars, "INFER_MIN_P", "0.0")
+    reasoning = get_cfg(env_vars, "INFER_REASONING_EFFORT", "xhigh")
+    rep_pen = get_cfg(env_vars, "LLAMA_REPEAT_PENALTY", "1.0")
+    pres_pen = get_cfg(env_vars, "LLAMA_PRESENCE_PENALTY", "0.0")
+    freq_pen = get_cfg(env_vars, "LLAMA_FREQUENCY_PENALTY", "0.0")
     
     print(f"\n● Sampling & Hyperparameters:")
     print(f"  Temperature:   {temp} | Top-P: {top_p} | Top-K: {top_k} | Min-P: {min_p}")
@@ -1479,10 +1500,10 @@ def cmd_status():
     print(f"  Penalties:     repeat={rep_pen}, presence={pres_pen}, frequency={freq_pen}")
 
     # 7. YaRN RoPE Scaling
-    yarn_scale = env_vars.get("LLAMA_ROPE_SCALE")
+    yarn_scale = get_cfg(env_vars, "LLAMA_ROPE_SCALE")
     if yarn_scale:
-        yarn_mode = env_vars.get("LLAMA_ROPE_SCALING", "yarn")
-        orig_ctx = env_vars.get("LLAMA_YARN_ORIG_CTX", "262144")
+        yarn_mode = get_cfg(env_vars, "LLAMA_ROPE_SCALING", "yarn")
+        orig_ctx = get_cfg(env_vars, "LLAMA_YARN_ORIG_CTX", "262144")
         print(f"\n● YaRN RoPE Scaling:")
         print(f"  Scaling:       {yarn_mode} (scale: {yarn_scale}x, orig_ctx: {orig_ctx})")
 
@@ -1996,6 +2017,24 @@ def cmd_tune(target=None):
     print(f"\n  Settings applied. Run `ai-backend serve` to start the server.")
 
 
+def cmd_probe(url=None, extra=None):
+    """Streaming decode-speed A/B probe (dev/probe_mtp.py): baseline vs MTP.
+
+    Passes [url] and any additional probe arguments (e.g. --runs 3 --thinking)
+    through to dev/probe_mtp.py; without args it probes the default endpoint.
+    """
+    script = Path(__file__).resolve().parent / "dev" / "probe_mtp.py"
+    if not script.exists():
+        print(f"Probe script not found: {script}", file=sys.stderr)
+        sys.exit(1)
+    cmd = [sys.executable, str(script)]
+    if url:
+        cmd.append(url)
+    cmd.extend(extra or [])
+    res = subprocess.run(cmd)
+    sys.exit(res.returncode)
+
+
 def cmd_mode(mode_name=None):
     """Configure recommended settings for thinking vs instruct mode (e.g. for Qwen3.8)."""
     if not mode_name:
@@ -2177,8 +2216,8 @@ def cmd_cache_quant(quant_type=None, auto_restart=True):
     """Configure KV cache quantization (q4_0, q8_0, f16, etc.) to prevent VRAM overflow."""
     if not quant_type:
         env_vars = load_env()
-        k = env_vars.get("LLAMA_CACHE_TYPE_K", "q8_0")
-        v = env_vars.get("LLAMA_CACHE_TYPE_V", "q8_0")
+        k = get_cfg(env_vars, "LLAMA_CACHE_TYPE_K", "q8_0")
+        v = get_cfg(env_vars, "LLAMA_CACHE_TYPE_V", "q8_0")
         print(f"Current KV Cache Quantization: K={k}, V={v}")
         print("Usage: ai-backend cache <q4_0|q8_0|f16|auto>")
         return
@@ -2242,8 +2281,8 @@ def cmd_gpus(sel=None):
     change can't strand serve on a small card."""
     gpus = list_gpu_info()
     env_vars = load_env()
-    current = env_vars.get("CUDA_VISIBLE_DEVICES")
-    ts = env_vars.get("LLAMA_TENSOR_SPLIT")
+    current = get_cfg(env_vars, "CUDA_VISIBLE_DEVICES")
+    ts = get_cfg(env_vars, "LLAMA_TENSOR_SPLIT")
 
     def _is_auto(v):
         return not v or v == "auto"
@@ -2318,9 +2357,9 @@ def patch_env_key(key, value):
         env_vars.pop(key, None)
     else:
         env_vars[key] = value
-    url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
-    model = env_vars.get("INFER_MODEL", "llama")
-    llama_path = env_vars.get("LLAMA_MODEL_PATH")
+    url = get_cfg(env_vars, "INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
+    model = get_cfg(env_vars, "INFER_MODEL", "llama")
+    llama_path = get_cfg(env_vars, "LLAMA_MODEL_PATH")
     write_env(url, model, llama_path, env_vars, authoritative=True)
 
 
@@ -2339,9 +2378,9 @@ def sync_ctx_to_systemd(ctx_size):
         if new_content != content:
             SYSTEMD_SERVICE.write_text(new_content)
             subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-            print(f"[llama-wrapper] Synced systemd LLAMA_CTX_SIZE={ctx_size}")
+            print(f"[ai-backend] Synced systemd LLAMA_CTX_SIZE={ctx_size}")
         else:
-            print(f"[llama-wrapper] systemd LLAMA_CTX_SIZE already {ctx_size}")
+            print(f"[ai-backend] systemd LLAMA_CTX_SIZE already {ctx_size}")
     except Exception as e:
         print(f"Warning syncing systemd service: {e}", file=sys.stderr)
 
@@ -2437,7 +2476,7 @@ def main():
     elif cmd in ("tune", "auto-tune", "tune-mtp", "optimize"):
         cmd_tune(args[1] if len(args) > 1 else None)
     elif cmd in ("probe", "speed", "benchmark"):
-        cmd_probe(args[1] if len(args) > 1 else None)
+        cmd_probe(args[1] if len(args) > 1 else None, args[2:] if len(args) > 2 else None)
     elif cmd in ("mode", "preset"):
         cmd_mode(args[1] if len(args) > 1 else None)
     elif cmd in ("yarn", "rope"):

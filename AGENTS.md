@@ -269,7 +269,18 @@ globally to every request while the process is running:
 
 ### Zulip Bridge
 - `zulip_ai_bridge.py` — Zulip bot bridge that pipes messages to the `ai` CLI.
-- **Permission mode:** defaults to `auto` (full autonomy) over Zulip — the bot investigates AND executes. Override with `BRIDGE_AI_MODE=plan|manual` for restricted access. The bridge is already gated to the owner via `ZULIP_USER` / detected owner, so auto is safe here and actually useful (plan mode over Zulip just posts plans and halts — no interactive approve flow). Built-in `/ping` command for liveness checks.
+- **Permission mode:** defaults to `auto` (full autonomy) over Zulip — the bot investigates AND executes. Override with `BRIDGE_AI_MODE=plan|manual` for restricted access. The bridge is already gated to the owner via `ZULIP_USER` / detected owner, so auto is safe here and actually useful (plan mode over Zulip just posts plans and halts — no interactive approve flow).
+- **Zulip Chat Memory & Audit Log:** every interaction is persistently recorded in `~/.local/share/ai/zulip_chats.jsonl` (and `~/.cache/ai/zulip_chats.jsonl`) with full session JSON in `~/.local/share/ai/zulip_chats/<session_id>.json`. Captures query, context, duration, returncode, stdout/stderr, and fallbacks.
+- **Built-in slash commands:**
+  - `/ping` — liveness check + active model + server URL
+  - `/history` or `/chats` — returns table of recent Zulip interactions, duration, and status
+  - `/debug` or `/diag` — returns live inference server status, slot state, and detailed error traces
+  - `/mode <auto|plan|manual>` — switch or view bridge permission mode
+  - `/timeout <seconds>` — set standard task timeout
+- **Robust fallback extraction:** if a local thinking model finishes inside `<think>` without emitting standard text content, `extract_session_fallback` extracts findings from `reasoning_content` and tool action results, preventing `(agent returned no output)`.
+- **CLI & MCP tools for Zulip memory:**
+  - CLI: `./ai_mcp.py zulip-history [limit]`, `./ai_mcp.py zulip-log <id>`, `./ai_mcp.py zulip-debug`
+  - MCP tools: `search_zulip_chats`, `get_zulip_chat`
 - **File parsing:** automatically downloads uploaded files (PDFs, images, spreadsheets, code, etc.) and extracts their text content before passing to the agent. Supports text, PDF (pdfplumber/pypdfium2), image OCR (tesseract), CSV/Excel (openpyxl), and archives.
 - **ContextWindowManager:** manages conversation context to stay within the AI model's context window, truncating messages as needed.
 - **Automatic reconnection:** the bridge uses exponential backoff to reconnect on connection errors.
