@@ -17,6 +17,8 @@ Document and manage llama.cpp server sampling options, Unsloth dynamic quants, M
 - `LLAMA_MTP` (1/0, enable Multi-Token Prediction speculative decoding with `--spec-type draft-mtp`)
 - `LLAMA_SPEC_DRAFT_N_MAX` (speculative tokens count, default 3 for MTP/dspark)
 - `LLAMA_MTP_DRAFT_PATH` (optional companion MTP draft model path)
+- `LLAMA_REASONING_BUDGET` (token budget limit on thinking CoT, e.g. 4096)
+- `LLAMA_FIT` (off/on, defaults to `off` to prevent silent context downsizing)
 
 ## Qwen3.8 Recommended Settings (Unsloth)
 

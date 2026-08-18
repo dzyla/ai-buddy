@@ -563,6 +563,7 @@ Environment=LLAMA_CTX_SIZE=131072"
     cat > "${SYSTEMD_DIR}/llama-server.socket" <<SOCKET_EOF
 [Unit]
 Description=llama-server on-demand socket
+StartLimitIntervalSec=0
 
 [Socket]
 ListenStream=127.0.0.1:${PORT}
@@ -576,6 +577,7 @@ SOCKET_EOF
 [Unit]
 Description=llama-server (on-demand, idle-unload)
 After=llama-server.socket
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -583,7 +585,7 @@ ${SYSTEMD_ENV}
 Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
 ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
-ExecStart=${BIN_DIR}/ai-backend serve
+ExecStart=${BIN_DIR}/ai-backend serve --foreground
 ExecStopPost=/bin/bash -c '/usr/bin/systemd-run --user /bin/bash -c "for i in {1..10}; do systemctl --user is-active -q llama-server.service || { systemctl --user start llama-server.socket; exit 0; }; sleep 0.5; done" || true'
 Restart=no
 StandardOutput=journal

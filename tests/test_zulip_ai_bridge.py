@@ -552,3 +552,91 @@ def test_slash_commands_in_bridge(tmp_path):
     assert any("Zulip AI Bridge Diagnostics" in m["content"] for m in client.sent_messages)
 
 
+def test_session_fallback_on_empty_stdout(tmp_path):
+    """When subprocess stdout is empty, fallback should extract response from last.json session."""
+    import json
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    class _CaptureClient(MockZulipClient):
+        def __init__(self):
+            super().__init__()
+            self.sent_messages = []
+
+        def send_message(self, payload):
+            self.sent_messages.append(payload)
+            return {"result": "success", "id": len(self.sent_messages)}
+
+    client = _CaptureClient()
+    bridge = ZulipAiBridge(client=client)
+
+    sess_dir = tmp_path / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    last_json = sess_dir / "last.json"
+    last_json.write_text(json.dumps({
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "Hello from cached session!"}
+        ]
+    }))
+
+    msg = {
+        "id": 55,
+        "type": "private",
+        "sender_email": "owner@example.com",
+        "content": "hello",
+    }
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run), \
+         patch("os.path.expanduser", side_effect=lambda p: str(last_json) if "last.json" in p else p):
+        bridge._process_message(msg, msg["content"])
+
+    assert any("Hello from cached session!" in m["content"] for m in client.sent_messages)
+
+
+def test_error_reporting_on_failed_agent():
+    """When subprocess exits with non-zero error, the error should be surfaced clearly."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    class _CaptureClient(MockZulipClient):
+        def __init__(self):
+            super().__init__()
+            self.sent_messages = []
+
+        def send_message(self, payload):
+            self.sent_messages.append(payload)
+            return {"result": "success", "id": len(self.sent_messages)}
+
+    client = _CaptureClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {
+        "id": 56,
+        "type": "private",
+        "sender_email": "owner@example.com",
+        "content": "test error",
+    }
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 2
+            stdout = ""
+            stderr = "CUDA out of memory"
+        return R()
+
+    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run), \
+         patch("os.path.isfile", return_value=False):
+        bridge._process_message(msg, msg["content"])
+
+    assert any("CUDA out of memory" in m["content"] or "exit code 2" in m["content"] for m in client.sent_messages)
+
+
+

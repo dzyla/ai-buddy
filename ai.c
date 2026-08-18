@@ -808,6 +808,7 @@ static float top_p_val              = -1.0f;
 static int   top_k_val              = -1;
 static float min_p_val              = -1.0f;
 static char  *reasoning_effort_val  = NULL;
+static int   thinking_budget_val   = -1;   /* set via :budget, --budget, or INFER_REASONING_BUDGET */
 static int   preserve_thinking_val  = 0;
 static char  *mode_preset_val       = NULL; /* --mode <xhigh|normal|low|instruct> */
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
@@ -4306,6 +4307,9 @@ int main(int argc, char **argv) {
         } else if ((strcmp(argv[i], "--reasoning") == 0 || strcmp(argv[i], "--reasoning-effort") == 0) && i + 1 < argc) {
             reasoning_effort_val = strdup(argv[i+1]);
             i++;
+        } else if ((strcmp(argv[i], "--budget") == 0 || strcmp(argv[i], "--reasoning-budget") == 0) && i + 1 < argc) {
+            thinking_budget_val = atoi(argv[i+1]);
+            i++;
         } else if (strcmp(argv[i], "--preserve-thinking") == 0) {
             preserve_thinking_val = 1;
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -4379,6 +4383,9 @@ int main(int argc, char **argv) {
     if (env_minp && *env_minp) min_p_val = (float)atof(env_minp);
     char *env_reasoning = getenv("INFER_REASONING_EFFORT");
     if (env_reasoning && *env_reasoning && !reasoning_effort_val) reasoning_effort_val = strdup(env_reasoning);
+
+    char *env_budget = getenv("INFER_REASONING_BUDGET");
+    if (env_budget && *env_budget && thinking_budget_val < 0) thinking_budget_val = atoi(env_budget);
     char *env_preserve_think = getenv("INFER_PRESERVE_THINKING");
     if (env_preserve_think && (strcmp(env_preserve_think, "1") == 0 || strcasecmp(env_preserve_think, "true") == 0)) {
         preserve_thinking_val = 1;
@@ -5001,6 +5008,36 @@ int main(int argc, char **argv) {
                     run_query_this_turn = 0;
                     continue;
                 }
+                if (strcmp(user_input, ":budget") == 0) {
+                    char msg[128];
+                    if (thinking_budget_val > 0) {
+                        snprintf(msg, sizeof(msg), "Current reasoning thinking budget: %d tokens.", thinking_budget_val);
+                    } else if (thinking_budget_val == 0) {
+                        snprintf(msg, sizeof(msg), "Reasoning thinking budget: 0 tokens (thinking disabled / instant answer).");
+                    } else {
+                        snprintf(msg, sizeof(msg), "Reasoning thinking budget: unrestricted (no token cap).");
+                    }
+                    print_info_box("Thinking Budget", msg);
+                    run_query_this_turn = 0;
+                    continue;
+                }
+                if (strncmp(user_input, ":budget ", 8) == 0) {
+                    const char *src = user_input + 8;
+                    while (*src == ' ') src++;
+                    if (strcasecmp(src, "off") == 0 || strcasecmp(src, "unlimited") == 0 || strcasecmp(src, "none") == 0 || strcmp(src, "-1") == 0) {
+                        thinking_budget_val = -1;
+                        print_info_box("Thinking Budget Cleared", "Reasoning thinking budget set to unrestricted.");
+                    } else if (isdigit(*src)) {
+                        thinking_budget_val = atoi(src);
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "Reasoning thinking budget set to %d tokens for this session.", thinking_budget_val);
+                        print_info_box("Thinking Budget Updated", msg);
+                    } else {
+                        print_info_box("Invalid Budget", "Usage: :budget <tokens|off> (e.g. :budget 4096, :budget 8192, :budget off)");
+                    }
+                    run_query_this_turn = 0;
+                    continue;
+                }
                 if (strcmp(user_input, ":jobs") == 0 || strcmp(user_input, ":tasks") == 0) {
                     print_jobs_and_tasks_status();
                     run_query_this_turn = 0;
@@ -5019,6 +5056,7 @@ int main(int argc, char **argv) {
                     print_info_box("Interactive Commands",
                         "  :details       Toggle details (tools & thinking output on/off)\n"
                         "  :mode [preset] Live sampling preset: xhigh/normal/low/instruct (no arg = show)\n"
+                        "  :budget [tok]  Set thinking reasoning token budget (e.g. 4096, 8192, off)\n"
                         "  :compact       Summarise + reset context (keeps semantic history)\n"
                         "  :clear         Wipe conversation history entirely\n"
                         "  :status        Show context size and model info\n"
@@ -5287,6 +5325,10 @@ step_limit_check:
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"reasoning_effort\":\"%s\"", esc_effort);
                     free(esc_effort);
+                }
+                if (thinking_budget_val >= 0) {
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"reasoning_budget\":%d", thinking_budget_val);
                 }
                 if (preserve_thinking_val) {
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,

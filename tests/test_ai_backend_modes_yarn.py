@@ -46,6 +46,8 @@ def hermetic(ab, monkeypatch, tmp_path):
         'export INFER_REASONING_EFFORT="xhigh"\n'
     )
     monkeypatch.setattr(ab, "ENV_FILE", env_file)
+    monkeypatch.setattr(ab, "SYSTEMD_SERVICE", tmp_path / "dummy.service")
+    monkeypatch.setattr(ab, "SYSTEMD_SOCKET", tmp_path / "dummy.socket")
     for var in ("LLAMA_MODEL_PATH", "CUDA_VISIBLE_DEVICES", "LLAMA_MTP", "LLAMA_CTX_SIZE",
                 "LLAMA_CTX_SIZE_FACTOR", "LLAMA_CTX_SIZE_MAX", "LLAMA_N_GPU_LAYERS",
                 "LLAMA_DRAFT_MODEL_PATH", "LLAMA_MTP_DRAFT_PATH",
