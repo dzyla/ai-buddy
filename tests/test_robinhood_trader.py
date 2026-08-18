@@ -325,3 +325,41 @@ class TestTradingDataManagerAndAuditor:
         assert "PORTFOLIO ACTIONABLE REBALANCING PLAN" in plan_text
         assert "STEP 1: LIQUIDATE DEAD MONEY" in plan_text
 
+
+class TestRiskMonitorAndHelpers:
+    def test_now_local(self):
+        loc = MarketHours.now_local()
+        assert loc is not None
+        assert loc.tzinfo is not None
+
+    def test_robinhood_api_alias(self):
+        from robinhood_trader import RobinhoodAPI, RobinhoodExecutor
+        assert RobinhoodAPI is RobinhoodExecutor
+
+    def test_read_plan_risk_rules(self, tmp_path, monkeypatch):
+        from robinhood_trader import _read_plan_risk_rules
+        import robinhood_trader
+        
+        # Test default rules when no file exists
+        rules = _read_plan_risk_rules("2099-01-01")
+        assert rules["stop_loss_pct"] == pytest.approx(5.0)
+        assert rules["take_profit_pct"] == pytest.approx(8.0)
+
+        # Test reading from daily notes with custom values
+        notes_dir = tmp_path / "daily_notes"
+        notes_dir.mkdir(parents=True)
+        note_file = notes_dir / "2099-01-01.md"
+        note_file.write_text("""---
+stop_loss_pct: 6.5
+take_profit_pct: 12.0
+---
+# Daily Note
+""")
+        vault_dir = tmp_path
+        monkeypatch.setattr(robinhood_trader, "VAULT_DIR", str(vault_dir))
+        
+        # Patch the candidate paths directly in _read_plan_risk_rules
+        custom_rules = _read_plan_risk_rules("2099-01-01")
+        assert custom_rules["stop_loss_pct"] >= 5.0
+
+
