@@ -32,10 +32,14 @@ A production-grade, autonomous financial analysis, risk management, and trading 
 ```
 
 ### Core Design Principles
-1. **Zero-LLM Daemon**: The background monitoring loop runs purely in deterministic Python. It uses **0 GPU VRAM** and consumes no LLM tokens during its 24/7 lifecycle.
-2. **Context-Optimized Token Offloading**: Full portfolio datasets (60+ positions, balances, cost bases) are offloaded to disk (`~/.cache/ai/trading/`). CLI commands like `./robinhood_trader.py summary` output compact digests (<200 tokens) so LLMs maintain situational awareness without context overflow.
-3. **Multi-Factor Quantitative Scoring**: Tickers are evaluated on a 0–100 scale combining trend (SMA 20/50/200), momentum (RSI-14), MACD histogram, and real-time news sentiment.
-4. **Obsidian Knowledge Vault**: Trade logs, pre-market briefings, and ticker theses persist in standard Markdown notes (`~/.config/ai/trading_vault/`).
+1. **Intelligent Market-Hours Agent Involvement**: During active trading hours, the system invokes the AI Agent (`AgentAdvisor`) at high-value decision points:
+   - **Pre-Market Validation**: Validates macro outlook, assesses overnight catalysts, and suggests strategic adjustments.
+   - **Trade Confirmation Gating**: Before executing any Stop-Loss or Take-Profit order, the AI Agent validates whether to `EXECUTE` or `WAIT` (to avoid selling on temporary flash dips).
+   - **Market Close Retrospective**: Summarizes daily execution lessons in Obsidian notes.
+2. **Zero-LLM Quiet Hours**: Outside market hours (nights, weekends, holidays), the daemon strictly sleeps in power-saving mode without invoking the AI model or using GPU VRAM.
+3. **Context-Optimized Token Offloading**: Full portfolio datasets (60+ positions, balances, cost bases) are offloaded to disk (`~/.cache/ai/trading/`). CLI commands like `./robinhood_trader.py summary` output compact digests (<200 tokens) so LLMs maintain situational awareness without context overflow.
+4. **Multi-Factor Quantitative Scoring**: Tickers are evaluated on a 0–100 scale combining trend (SMA 20/50/200), momentum (RSI-14), MACD histogram, and real-time news sentiment.
+5. **Obsidian Knowledge Vault**: Trade logs, pre-market briefings, and ticker theses persist in standard Markdown notes (`~/.config/ai/trading_vault/`).
 
 ---
 
