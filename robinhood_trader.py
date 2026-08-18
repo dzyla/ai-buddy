@@ -2100,6 +2100,167 @@ def run_market_monitor(interval_seconds: int = 300, auto_trade: bool = False, dr
 
 
 # ==============================================================================
+# 7.6. Deterministic Risk Monitor (no-LLM loop)
+# ==============================================================================
+#
+# The risk-management half of the daily trading cycle, deliberately NOT an AI
+# loop: a plain Python loop that enforces the deterministic rules from today's
+# plan file (written by the AI pre-market unit at 08:30 ET) against live
+# positions during regular trading hours:
+#   stop-loss   : price <= avg cost * (1 - stop_loss_pct/100)  -> sell full (market)
+#   take-profit : price >= avg cost * (1 + take_profit_pct/100) -> sell 50%, then full
+# Flag files in ~/.config/ai/.monitor_flags/ guard against repeat triggers per day.
+# Log: ~/.cache/ai/risk_monitor.log
+#
+# Invoked by the rh-risk systemd unit (rh-risk.timer, Mon..Fri 09:25 ET) which
+# loops until 16:00 ET; the loop is bounded (session gate + 16:05 ET backstop).
+
+RISK_MONITOR_LOG = os.path.join(os.path.expanduser("~/.cache/ai"), "risk_monitor.log")
+RISK_MONITOR_FLAGS = os.path.join(os.path.expanduser("~/.config/ai"), ".monitor_flags")
+
+
+def _risk_log(msg: str) -> None:
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        os.makedirs(os.path.dirname(RISK_MONITOR_LOG), exist_ok=True)
+        with open(RISK_MONITOR_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _read_plan_risk_rules(today: str) -> Dict[str, float]:
+    """Read stop_loss_pct / take_profit_pct from today's AI plan file (defaults 5.0 / 8.0)."""
+    rules = {"stop_loss_pct": 5.0, "take_profit_pct": 8.0}
+    path = os.path.join(os.path.expanduser("~/.config/ai/trading_vault/plan"), f"{today}.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return rules
+    for key in rules:
+        m = re.search(rf"^{key}\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$", text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            try:
+                rules[key] = float(m.group(1))
+            except ValueError:
+                pass
+    return rules
+
+
+def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float, take_profit_pct: float) -> None:
+    """One risk-management pass over all open equity positions."""
+    today = MarketHours.now_et().strftime("%Y-%m-%d")
+    positions = RobinhoodAPI.get_equity_positions(account_number)
+    symbols = [str(p.get("symbol", "")).upper() for p in positions if float(p.get("quantity", 0) or 0) > 0]
+    quotes = RobinhoodAPI.get_equity_quotes(symbols) if symbols else {}
+    os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
+
+    for pos in positions:
+        sym = str(pos.get("symbol", "")).upper()
+        qty = float(pos.get("quantity", 0) or 0)
+        avg_cost = float(pos.get("average_buy_price", 0) or 0)
+        if not sym or qty <= 0 or avg_cost <= 0:
+            continue
+        quote = quotes.get(sym, {})
+        price = float(quote.get("last_trade_price") or quote.get("price") or avg_cost)
+        if price <= 0:
+            _risk_log(f"RISK {sym}: no live quote (price={price}); skipping")
+            continue
+        pnl_pct = (price - avg_cost) / avg_cost * 100.0
+
+        stop_flag = os.path.join(RISK_MONITOR_FLAGS, f"stop_loss_{today}_{sym}.flag")
+        tp_flag = os.path.join(RISK_MONITOR_FLAGS, f"take_profit_{today}_{sym}.flag")
+
+        if pnl_pct <= -stop_loss_pct and not os.path.exists(stop_flag):
+            action = f"STOP-LOSS {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
+            _risk_log(f"RISK {sym}: {action}")
+            if not dry_run:
+                try:
+                    res = RobinhoodAPI.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                    _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                    with open(stop_flag, "w", encoding="utf-8") as fh:
+                        json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                    "price": price, "qty": qty, "pnl_pct": pnl_pct}, fh)
+                except Exception as exc:  # noqa: BLE001
+                    _risk_log(f"RISK {sym}: order FAILED: {exc}")
+        elif pnl_pct >= take_profit_pct:
+            stage = "none"
+            if os.path.exists(tp_flag):
+                try:
+                    with open(tp_flag, encoding="utf-8") as fh:
+                        stage = json.load(fh).get("stage", "none")
+                except (OSError, ValueError):
+                    stage = "none"
+            if stage == "none":
+                sell_qty = round(qty / 2.0, 4)  # market orders allow fractional shares
+                action = f"TAKE-PROFIT (50%) {sym} {sell_qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
+                _risk_log(f"RISK {sym}: {action}")
+                if not dry_run:
+                    try:
+                        res = RobinhoodAPI.execute_market_order(account_number, sym, "sell", quantity=str(sell_qty))
+                        _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                        with open(tp_flag, "w", encoding="utf-8") as fh:
+                            json.dump({"stage": "half",
+                                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                        "price": price, "qty_sold": sell_qty}, fh)
+                    except Exception as exc:  # noqa: BLE001
+                        _risk_log(f"RISK {sym}: order FAILED: {exc}")
+            elif stage == "half":
+                action = f"TAKE-PROFIT (full) {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
+                _risk_log(f"RISK {sym}: {action}")
+                if not dry_run:
+                    try:
+                        res = RobinhoodAPI.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                        _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                        with open(tp_flag, "w", encoding="utf-8") as fh:
+                            json.dump({"stage": "full",
+                                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                        "price": price, "qty_sold": qty}, fh)
+                    except Exception as exc:  # noqa: BLE001
+                        _risk_log(f"RISK {sym}: order FAILED: {exc}")
+        else:
+            _risk_log(f"RISK {sym}: {pnl_pct:+.2f}% vs avg ${avg_cost:.2f} (price ${price:.2f}) - no action")
+
+
+def run_risk_monitor(interval_seconds: int = 900, dry_run: bool = False,
+                     once: bool = False, force_session: bool = False) -> None:
+    """Deterministic risk-management loop (no LLM). Bounded: REGULAR session + 16:05 ET backstop."""
+    _risk_log(f"RISK-MONITOR start mode={'DRY-RUN (no orders)' if dry_run else 'LIVE (real market orders)'} "
+              f"interval={interval_seconds}s once={once}")
+    while True:
+        now = MarketHours.now_et()
+        session = "REGULAR" if force_session else MarketHours.get_market_session(now)
+        if session != "REGULAR":
+            if once:
+                _risk_log(f"RISK-MONITOR {session} - outside RTH, exiting")
+                return
+            secs_open = MarketHours.seconds_until_next_open(now)
+            if secs_open and secs_open < 6 * 3600:  # pre-market: wait for the open
+                time.sleep(min(interval_seconds, max(10, int(secs_open))))
+                continue
+            _risk_log(f"RISK-MONITOR {session} - exiting")
+            return
+        account_number = RobinhoodAPI.get_agentic_account_number()
+        today = MarketHours.now_et().strftime("%Y-%m-%d")
+        rules = _read_plan_risk_rules(today)
+        _risk_log(f"RISK-MONITOR pulse REGULAR account={account_number} "
+                  f"stop_loss={rules['stop_loss_pct']}% take_profit={rules['take_profit_pct']}% dry_run={dry_run}")
+        try:
+            _risk_monitor_pulse(account_number, dry_run, rules["stop_loss_pct"], rules["take_profit_pct"])
+        except Exception as exc:  # noqa: BLE001
+            _risk_log(f"RISK-MONITOR pulse error: {exc}")
+        if once:
+            return
+        if MarketHours.now_et().strftime("%H%M") >= "1605":  # backstop past market close
+            _risk_log("RISK-MONITOR past-close backstop reached - exiting")
+            return
+        time.sleep(interval_seconds)
+
+
+# ==============================================================================
 # 8. Command Line Interface (CLI) Dispatch
 # ==============================================================================
 
