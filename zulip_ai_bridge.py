@@ -12,6 +12,7 @@ import subprocess
 import threading
 import sys
 import os
+import json
 import logging
 try:
     import zulip
@@ -26,7 +27,6 @@ from urllib.parse import unquote, quote
 import csv
 import io
 import time
-import json
 
 # Configure logging for truncation events
 logging.basicConfig(
@@ -630,46 +630,52 @@ def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr=""):
     3. Tool execution results in the session
     4. Subprocess stderr
     """
-    if not last_sess_path:
-        last_sess_path = os.path.expanduser("~/.cache/ai/sessions/last.json")
+    if last_sess_path:
+        candidates = [last_sess_path]
+    else:
+        candidates = [
+            os.path.expanduser("~/.cache/ai/sessions/last.json"),
+            os.path.expanduser("~/.local/share/ai/sessions/last.json")
+        ]
 
     cleaned_stdout = clean_response(raw_stdout)
     if cleaned_stdout:
         return cleaned_stdout, "stdout", None
 
-    if os.path.isfile(last_sess_path):
-        try:
-            with open(last_sess_path, "r", encoding="utf-8") as sf:
-                sdata = json.load(sf)
-            msgs = sdata if isinstance(sdata, list) else sdata.get("messages", [])
+    for cand_path in candidates:
+        if os.path.isfile(cand_path):
+            try:
+                with open(cand_path, "r", encoding="utf-8") as sf:
+                    sdata = json.load(sf)
+                msgs = sdata if isinstance(sdata, list) else sdata.get("messages", [])
 
-            for m in reversed(msgs):
-                if m.get("role") == "assistant":
-                    c = m.get("content")
-                    if c and isinstance(c, str) and c.strip() and c.strip() != "None":
-                        return clean_response(c), "fallback_content", None
+                for m in reversed(msgs):
+                    if m.get("role") == "assistant":
+                        c = m.get("content")
+                        if c and isinstance(c, str) and c.strip() and c.strip() != "None":
+                            return clean_response(c), "fallback_content", None
 
-                    rc = m.get("reasoning_content")
-                    if rc and isinstance(rc, str) and len(rc.strip()) > 30:
-                        clean_rc = clean_response(rc)
-                        if clean_rc:
-                            return f"*(Response extracted from agent reasoning)*\n\n{clean_rc}", "fallback_reasoning", clean_rc
+                        rc = m.get("reasoning_content")
+                        if rc and isinstance(rc, str) and len(rc.strip()) > 30:
+                            clean_rc = clean_response(rc)
+                            if clean_rc:
+                                return f"*(Response extracted from agent reasoning)*\n\n{clean_rc}", "fallback_reasoning", clean_rc
 
-                    tcs = m.get("tool_calls", [])
-                    if tcs:
-                        tool_names = [t.get("function", {}).get("name", "tool") for t in tcs if isinstance(t, dict)]
-                        tool_outputs = []
-                        for tm in msgs:
-                            if tm.get("role") == "tool":
-                                tc_out = tm.get("content", "")
-                                if tc_out and len(tc_out.strip()) > 0:
-                                    tool_outputs.append(tc_out.strip()[:400])
-                        out_summary = f"✅ Agent completed actions ({', '.join(tool_names)})."
-                        if tool_outputs:
-                            out_summary += f"\n\n**Tool Output Summary:**\n```\n" + "\n---\n".join(tool_outputs[:3]) + "\n```"
-                        return out_summary, "fallback_tools", None
-        except Exception as ex:
-            logger.warning(f"Session fallback extraction failed: {ex}")
+                        tcs = m.get("tool_calls", [])
+                        if tcs:
+                            tool_names = [t.get("function", {}).get("name", "tool") for t in tcs if isinstance(t, dict)]
+                            tool_outputs = []
+                            for tm in msgs:
+                                if tm.get("role") == "tool":
+                                    tc_out = tm.get("content", "")
+                                    if tc_out and len(tc_out.strip()) > 0:
+                                        tool_outputs.append(tc_out.strip()[:400])
+                            out_summary = f"✅ Agent completed actions ({', '.join(tool_names)})."
+                            if tool_outputs:
+                                out_summary += f"\n\n**Tool Output Summary:**\n```\n" + "\n---\n".join(tool_outputs[:3]) + "\n```"
+                            return out_summary, "fallback_tools", None
+            except Exception as ex:
+                logger.warning(f"Session fallback extraction failed on {cand_path}: {ex}")
 
     if raw_stderr and raw_stderr.strip():
         err_clean = clean_response(raw_stderr)
@@ -948,9 +954,7 @@ class ZulipAiBridge:
         # Build environment for the subprocess, incorporating ~/.local/share/ai/env
         ai_mode = self._ai_mode()
         run_env = os.environ.copy()
-        for k, v in load_env_file().items():
-            if k not in run_env or not run_env[k]:
-                run_env[k] = v
+        run_env.update(load_env_file())
 
         if ai_mode == "auto":
             run_env["INFER_AUTO_APPROVE"] = "1"
@@ -995,12 +999,17 @@ class ZulipAiBridge:
             raw_stdout = result.stdout or ""
             raw_stderr = result.stderr or ""
             exit_code = result.returncode
-            response_text = raw_stdout
 
-            if exit_code != 0 and raw_stderr:
-                response_text += f"\n\n*Stderr:*\n```\n{raw_stderr}\n```"
+            if exit_code == 0:
+                response_text = clean_response(raw_stdout)
+            else:
+                if raw_stdout.strip():
+                    response_text = clean_response(raw_stdout)
+                    if raw_stderr.strip():
+                        response_text += f"\n\n*Stderr:*\n```\n{raw_stderr.strip()}\n```"
+                else:
+                    response_text = f"⚠️ Agent returned error (exit code {exit_code}):\n```\n{raw_stderr.strip()}\n```" if raw_stderr.strip() else ""
 
-            response_text = clean_response(response_text)
             if not response_text:
                 fallback_text, fallback_status, reasoning_snip = extract_session_fallback(
                     raw_stdout=raw_stdout,
@@ -1011,7 +1020,7 @@ class ZulipAiBridge:
                 fallback_used = fallback_status
                 extracted_reasoning = reasoning_snip
             else:
-                status = "success"
+                status = "success" if exit_code == 0 else "error"
 
         except subprocess.TimeoutExpired:
             status = "timeout"

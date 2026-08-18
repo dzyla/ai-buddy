@@ -35,6 +35,8 @@ def empty_env_file(monkeypatch, ab, tmp_path):
     # Hermetic: load_env() reads ~/.local/share/ai/env in the real environment;
     # point it at an empty file so no test depends on the developer's config.
     monkeypatch.setattr(ab, "ENV_FILE", Path(tmp_path / "env"))
+    monkeypatch.setattr(ab, "SYSTEMD_SERVICE", tmp_path / "dummy.service")
+    monkeypatch.setattr(ab, "SYSTEMD_SOCKET", tmp_path / "dummy.socket")
 
 
 def test_is_deepseek_model(ab):
