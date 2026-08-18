@@ -628,7 +628,7 @@ def structured_query(target, filter_expr=None, transform=None, aggregate=None):
 
 AGENT_STORE_DIR = os.path.expanduser("~/.config/ai/agents")
 
-def spawn_agent(name, prompt, tools=None, persistent=True):
+def spawn_agent(name, prompt, tools=None, persistent=True, budget=None):
     os.makedirs(AGENT_STORE_DIR, exist_ok=True)
     agent_id = f"agent_{name}_{int(time.time())}"
     data = {
@@ -636,6 +636,7 @@ def spawn_agent(name, prompt, tools=None, persistent=True):
         "name": name,
         "prompt": prompt,
         "tools": tools or ["execute_command", "read_file"],
+        "budget": budget,
         "history": [],
         "created_at": time.time(),
         "status": "idle"
@@ -644,7 +645,7 @@ def spawn_agent(name, prompt, tools=None, persistent=True):
         json.dump(data, f, indent=2)
     return f"Spawned agent {name} (ID: {agent_id})"
 
-def resume_agent(agent_id, user_message):
+def resume_agent(agent_id, user_message, budget=None):
     path = os.path.join(AGENT_STORE_DIR, f"{agent_id}.json")
     if not os.path.exists(path):
         return f"Error: Agent '{agent_id}' not found."
@@ -654,7 +655,14 @@ def resume_agent(agent_id, user_message):
     ai_bin = _resolve_ai_bin()
     agent_prompt = data.get("prompt", "")
     full_prompt = f"[Agent Persona / Goal: {agent_prompt}]\n\n{user_message}" if agent_prompt else user_message
-    res = subprocess.run([ai_bin, "-y", "-q", full_prompt], capture_output=True, text=True, timeout=180)
+    
+    cmd_args = [ai_bin, "-y", "-q"]
+    effective_budget = budget if budget is not None else data.get("budget")
+    if effective_budget is not None and str(effective_budget).strip():
+        cmd_args.extend(["--budget", str(effective_budget).strip()])
+    cmd_args.append(full_prompt)
+
+    res = subprocess.run(cmd_args, capture_output=True, text=True, timeout=180)
     out = (res.stdout or res.stderr or "").strip()
     data["history"].append({"role": "assistant", "content": out})
     data["last_activity"] = time.time()
@@ -5748,7 +5756,8 @@ def main():
                     "properties": {
                         "name": {"type": "string", "description": "Short name for the agent (e.g. 'researcher')."},
                         "prompt": {"type": "string", "description": "What the agent is for (stored as its mission)."},
-                        "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed tool list."}
+                        "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed tool list."},
+                        "budget": {"type": "integer", "description": "Optional thinking token budget for reasoning (e.g. 2048, 4096, 8192)."}
                     },
                     "required": ["name", "prompt"]
                 }
@@ -5763,7 +5772,8 @@ def main():
                     "type": "object",
                     "properties": {
                         "agent_id": {"type": "string"},
-                        "message": {"type": "string", "description": "The user message for this turn."}
+                        "message": {"type": "string", "description": "The user message for this turn."},
+                        "budget": {"type": "integer", "description": "Optional reasoning thinking token budget override for this turn."}
                     },
                     "required": ["agent_id", "message"]
                 }
@@ -6366,6 +6376,10 @@ def main():
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Array of self-contained task instructions. Each runs in its own agent concurrently."
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Optional thinking token budget per helper agent (e.g. 2048, 4096)."
                         }
                     },
                     "required": ["tasks"]
@@ -7509,12 +7523,14 @@ def main():
             prompt = arguments.get("prompt", "")
             tools = arguments.get("tools")
             persistent = arguments.get("persistent", True)
-            result = spawn_agent(name, prompt, tools=tools, persistent=persistent)
+            budget = arguments.get("budget")
+            result = spawn_agent(name, prompt, tools=tools, persistent=persistent, budget=budget)
             print(result)
         elif tool_name == "resume_agent" or server_name == "resume_agent":
             agent_id = arguments.get("agent_id", "")
             msg = arguments.get("message", "")
-            result = resume_agent(agent_id, msg)
+            budget = arguments.get("budget")
+            result = resume_agent(agent_id, msg, budget=budget)
             print(result)
         elif tool_name == "list_agents" or server_name == "list_agents":
             result = list_agents()
@@ -7575,6 +7591,7 @@ def main():
             print(result)
         elif tool_name == "delegate_task" or server_name == "delegate_task":
             tasks = arguments.get("tasks")
+            budget = arguments.get("budget")
             if not isinstance(tasks, list):
                 # Accept legacy single-task call gracefully
                 single_task = arguments.get("task", "")
@@ -7599,7 +7616,10 @@ def main():
                     print(f"[delegate_task] Starting {n} parallel agent(s)...", file=sys.stderr, flush=True)
 
                     def run_single_agent(t_desc, idx):
-                        cmd_args = [ai_bin, "-y", "-q", t_desc]
+                        cmd_args = [ai_bin, "-y", "-q"]
+                        if budget is not None and str(budget).strip():
+                            cmd_args.extend(["--budget", str(budget).strip()])
+                        cmd_args.append(t_desc)
                         try:
                             proc = subprocess.run(
                                 cmd_args,

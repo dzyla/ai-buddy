@@ -1086,6 +1086,29 @@ def cmd_serve(target=None, foreground=False):
     # handling enabled, else chat completions degenerate into raw CoT garbage.
     extra_args.extend(["--jinja", "--reasoning", "on"])
 
+    # Prevent llama-server from silently altering/downsizing context behind our back
+    # since ai-backend performs exact VRAM preflight.
+    fit_setting = env_vars.get("LLAMA_FIT", os.environ.get("LLAMA_FIT", "off")).strip().lower()
+    if fit_setting in ("off", "0", "false", "no"):
+        extra_args.extend(["--fit", "off"])
+    elif fit_setting in ("on", "1", "true", "yes"):
+        extra_args.extend(["--fit", "on"])
+
+    # Reasoning preservation across multi-turn sessions
+    preserve_setting = env_vars.get("LLAMA_REASONING_PRESERVE", os.environ.get("LLAMA_REASONING_PRESERVE"))
+    if preserve_setting in ("1", "true", "on", "yes"):
+        extra_args.append("--reasoning-preserve")
+    elif preserve_setting in ("0", "false", "off", "no"):
+        extra_args.append("--no-reasoning-preserve")
+
+    # Reasoning budget (token cap on CoT thinking)
+    reasoning_budget = env_vars.get("LLAMA_REASONING_BUDGET", os.environ.get("LLAMA_REASONING_BUDGET"))
+    if reasoning_budget and str(reasoning_budget).strip() and str(reasoning_budget).strip() != "-1":
+        extra_args.extend(["--reasoning-budget", str(reasoning_budget).strip()])
+        budget_msg = env_vars.get("LLAMA_REASONING_BUDGET_MESSAGE", os.environ.get("LLAMA_REASONING_BUDGET_MESSAGE"))
+        if budget_msg and budget_msg.strip():
+            extra_args.extend(["--reasoning-budget-message", budget_msg.strip()])
+
     # Server-level sampling penalties (llama.cpp style). Applied to ALL requests.
     # --repeat-penalty is a multiplier (1.0 = neutral), rest are additive (0.0 = neutral).
     # For Qwen 3.8 (and similar models), default penalties should be neutral (repeat=1.0, presence=0.0).
@@ -1476,6 +1499,10 @@ def cmd_status():
     print(f"\n● Sampling & Hyperparameters:")
     print(f"  Temperature:   {temp} | Top-P: {top_p} | Top-K: {top_k} | Min-P: {min_p}")
     print(f"  Reasoning:     {reasoning}")
+    budget_val = env_vars.get("LLAMA_REASONING_BUDGET")
+    if budget_val:
+        budget_msg = env_vars.get("LLAMA_REASONING_BUDGET_MESSAGE", "(none)")
+        print(f"  Think Budget:  {budget_val} tokens (message: {budget_msg})")
     print(f"  Penalties:     repeat={rep_pen}, presence={pres_pen}, frequency={freq_pen}")
 
     # 7. YaRN RoPE Scaling
@@ -2143,6 +2170,32 @@ def cmd_reasoning(effort=None):
         sys.exit(1)
 
 
+def cmd_budget(budget=None, message=None):
+    """Set, clear, or report the server-side reasoning token budget and fallback message."""
+    env_vars = load_env()
+    if budget is None:
+        curr_b = env_vars.get("LLAMA_REASONING_BUDGET", "unrestricted (-1)")
+        curr_m = env_vars.get("LLAMA_REASONING_BUDGET_MESSAGE", "(none)")
+        print(f"Reasoning token budget: {curr_b} | Budget message: {curr_m}")
+        print("\nUsage: ai-backend budget <tokens|off> [message]")
+        return
+    b = budget.strip().lower()
+    if b in ("off", "none", "unlimited", "-1", "disable", "clear"):
+        persist_env_changes({"LLAMA_REASONING_BUDGET": None, "LLAMA_REASONING_BUDGET_MESSAGE": None})
+        print("Reasoning budget cleared (unrestricted thinking tokens).")
+    elif b.isdigit() or b == "0":
+        changes = {"LLAMA_REASONING_BUDGET": b}
+        if message:
+            changes["LLAMA_REASONING_BUDGET_MESSAGE"] = message
+        else:
+            changes["LLAMA_REASONING_BUDGET_MESSAGE"] = None
+        persist_env_changes(changes)
+        print(f"Reasoning token budget set to {b} tokens" + (f" (message: '{message}')" if message else "") + ".")
+    else:
+        print(f"Invalid budget '{budget}'. Use a token number (e.g. 4096) or 'off'.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_ctx(size=None, auto_restart=True):
     if not size:
         print("Usage: ai-backend ctx <size|auto>")
@@ -2375,6 +2428,7 @@ Usage:
   ai-backend mode <thinking|normal|low|instruct>   Apply Qwen3.8 recommended sampling settings
   ai-backend yarn <on|off|<scale>>      Enable YaRN RoPE scaling to extend context (on -> ~1M for Qwen3.8)
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
+  ai-backend budget <tokens|off> [msg]  Set server-side reasoning token budget (e.g. 4096)
   ai-backend mtp <on|off|tokens|draft>  Configure Multi-Token Prediction speculative decoding
   ai-backend probe [url]                 Streaming decode-speed A/B probe (dev/probe_mtp.py); baseline vs MTP
   ai-backend tune [model]                Auto-tune context, KV cache, and MTP draft tokens for max throughput
@@ -2387,6 +2441,7 @@ Examples:
   ai-backend tune                       # auto-tune active model for hardware & max speed
   ai-backend use qwen3.8                # use Qwen3.8-27B (Unsloth GGUF)
   ai-backend cache q4_0                 # 4-bit KV cache quantization (prevents VRAM spillover)
+  ai-backend budget 4096                # clamp thinking tokens to 4096
   ai-backend use qwen3.8-2.4t           # use Qwen3.8-2.4T-A95B
   ai-backend mode thinking              # recommended Qwen3.8 thinking parameters
   ai-backend mtp on                     # enable MTP speculative decoding
@@ -2458,6 +2513,9 @@ def main():
         cmd_yarn(args[1] if len(args) > 1 else None)
     elif cmd in ("reasoning", "reasoning-effort"):
         cmd_reasoning(args[1] if len(args) > 1 else None)
+    elif cmd in ("budget", "reasoning-budget", "think-budget"):
+        msg = " ".join(args[2:]) if len(args) > 2 else None
+        cmd_budget(args[1] if len(args) > 1 else None, msg)
     elif cmd in ("gpu-layers", "gpulayers"):
         cmd_gpu_layers(args[1] if len(args) > 1 else None)
     elif cmd in ("gpus", "gpu", "tensor-split"):
