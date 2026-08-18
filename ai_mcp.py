@@ -4453,10 +4453,25 @@ def _deliver_reminder(task_data):
 
 def unschedule_task(task_id):
     import os
+    import signal
     safe_task_id = "".join(c for c in task_id if c.isalnum() or c in ("_", "-"))
     task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
     task_file = os.path.join(task_dir, f"{safe_task_id}.json")
+    pid_file = os.path.join(task_dir, f"{safe_task_id}.pid")
     
+    # Kill the scheduler loop process immediately if alive
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.remove(pid_file)
+        except Exception:
+            pass
+
     if os.path.exists(task_file):
         try:
             os.remove(task_file)
