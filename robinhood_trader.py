@@ -200,6 +200,11 @@ class MarketHours:
         """Returns the current datetime in US Eastern Time."""
         return datetime.datetime.now(ET_ZONE)
 
+    @staticmethod
+    def now_local() -> datetime.datetime:
+        """Returns the current datetime in the system local timezone (e.g. Mountain Time)."""
+        return datetime.datetime.now().astimezone()
+
     @classmethod
     def is_weekend(cls, dt: Optional[datetime.datetime] = None) -> bool:
         dt = dt or cls.now_et()
@@ -1328,7 +1333,7 @@ class RobinhoodExecutor:
         return res
 
     @classmethod
-    def call_mcp_tool(cls, tool_name: str, arguments: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
+    def call_mcp_tool(cls, tool_name: str, arguments: Dict[str, Any], timeout: int = 15, max_retries: int = 2) -> Dict[str, Any]:
         """Calls any Robinhood MCP tool in sub-second time without browser prompts."""
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
             return {}
@@ -1340,58 +1345,71 @@ class RobinhoodExecutor:
         env['DISPLAY'] = ''
         env.pop('WSL_DISTRO_NAME', None)
 
-        proc = subprocess.Popen(
-            ['npx', '-y', 'mcp-remote', 'https://agent.robinhood.com/mcp/trading', '--silent'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-            env=env,
-            start_new_session=True
-        )
-        try:
-            req_init = {
-                'jsonrpc': '2.0',
-                'id': 1,
-                'method': 'initialize',
-                'params': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'ai-buddy', 'version': '1.0'}}
-            }
-            proc.stdin.write(json.dumps(req_init) + '\n')
-            proc.stdin.flush()
-            proc.stdout.readline()
-            proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
-            proc.stdin.flush()
-
-            req_tool = {
-                'jsonrpc': '2.0',
-                'id': 2,
-                'method': 'tools/call',
-                'params': {'name': tool_name, 'arguments': arguments}
-            }
-            proc.stdin.write(json.dumps(req_tool) + '\n')
-            proc.stdin.flush()
-            
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                try:
-                    data = json.loads(line)
-                    if data.get('id') == 2:
-                        return data.get('result', {})
-                except Exception:
-                    pass
-        finally:
+        for attempt in range(max_retries + 1):
+            proc = None
             try:
-                import signal
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                proc.wait(timeout=0.5)
+                proc = subprocess.Popen(
+                    ['npx', '-y', 'mcp-remote', 'https://agent.robinhood.com/mcp/trading', '--silent'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                    env=env,
+                    start_new_session=True
+                )
+                req_init = {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'method': 'initialize',
+                    'params': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'ai-buddy', 'version': '1.0'}}
+                }
+                proc.stdin.write(json.dumps(req_init) + '\n')
+                proc.stdin.flush()
+                init_resp = proc.stdout.readline()
+                if not init_resp:
+                    if attempt < max_retries:
+                        time.sleep(0.5)
+                        continue
+                    return {}
+
+                proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+                proc.stdin.flush()
+
+                req_tool = {
+                    'jsonrpc': '2.0',
+                    'id': 2,
+                    'method': 'tools/call',
+                    'params': {'name': tool_name, 'arguments': arguments}
+                }
+                proc.stdin.write(json.dumps(req_tool) + '\n')
+                proc.stdin.flush()
+                
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    try:
+                        data = json.loads(line)
+                        if data.get('id') == 2:
+                            return data.get('result', {})
+                    except Exception:
+                        pass
             except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                if attempt < max_retries:
+                    time.sleep(0.5)
+                    continue
+            finally:
+                if proc:
+                    try:
+                        import signal
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
         return {}
 
     @classmethod
@@ -1521,6 +1539,10 @@ class RobinhoodExecutor:
 
         res = cls.call_mcp_tool('place_equity_order', args)
         return res
+
+
+# Alias for backward compatibility and uniform API reference
+RobinhoodAPI = RobinhoodExecutor
 
 
 # ==============================================================================
@@ -2132,30 +2154,53 @@ def _risk_log(msg: str) -> None:
 
 
 def _read_plan_risk_rules(today: str) -> Dict[str, float]:
-    """Read stop_loss_pct / take_profit_pct from today's AI plan file (defaults 5.0 / 8.0)."""
+    """Read stop_loss_pct / take_profit_pct from today's AI plan or daily notes (defaults 5.0 / 8.0)."""
     rules = {"stop_loss_pct": 5.0, "take_profit_pct": 8.0}
-    path = os.path.join(os.path.expanduser("~/.config/ai/trading_vault/plan"), f"{today}.md")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        return rules
-    for key in rules:
-        m = re.search(rf"^{key}\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$", text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            try:
-                rules[key] = float(m.group(1))
-            except ValueError:
-                pass
+    candidates = [
+        os.path.join(os.path.expanduser("~/.config/ai/trading_vault/daily_notes"), f"{today}.md"),
+        os.path.join(os.path.expanduser("~/.config/ai/trading_vault/plan"), f"{today}.md"),
+        os.path.join(os.path.expanduser("~/.config/ai"), "robinhood_trading_state.json"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            if path.endswith(".json"):
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    if "stop_loss_pct" in data:
+                        rules["stop_loss_pct"] = float(data["stop_loss_pct"])
+                    if "take_profit_pct" in data:
+                        rules["take_profit_pct"] = float(data["take_profit_pct"])
+                continue
+            # Check YAML frontmatter or key = value / key: value
+            for key in ("stop_loss_pct", "take_profit_pct"):
+                m = re.search(rf"^{key}\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*$", text, re.IGNORECASE | re.MULTILINE)
+                if m:
+                    rules[key] = float(m.group(1))
+            # Also check shorthand stop_loss: X% or stop_loss: X
+            m_sl = re.search(r"stop_loss(?:_pct)?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)%?", text, re.IGNORECASE)
+            if m_sl:
+                try:
+                    val = float(m_sl.group(1))
+                    if 0.5 <= val <= 50.0:
+                        rules["stop_loss_pct"] = val
+                except ValueError:
+                    pass
+            break
+        except Exception:
+            continue
     return rules
 
 
 def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float, take_profit_pct: float) -> None:
     """One risk-management pass over all open equity positions."""
     today = MarketHours.now_et().strftime("%Y-%m-%d")
-    positions = RobinhoodAPI.get_equity_positions(account_number)
+    positions = RobinhoodExecutor.get_equity_positions(account_number)
     symbols = [str(p.get("symbol", "")).upper() for p in positions if float(p.get("quantity", 0) or 0) > 0]
-    quotes = RobinhoodAPI.get_equity_quotes(symbols) if symbols else {}
+    quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
     os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
 
     for pos in positions:
@@ -2179,7 +2224,7 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
             _risk_log(f"RISK {sym}: {action}")
             if not dry_run:
                 try:
-                    res = RobinhoodAPI.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                    res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
                     _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
                     with open(stop_flag, "w", encoding="utf-8") as fh:
                         json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -2200,7 +2245,7 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
                 _risk_log(f"RISK {sym}: {action}")
                 if not dry_run:
                     try:
-                        res = RobinhoodAPI.execute_market_order(account_number, sym, "sell", quantity=str(sell_qty))
+                        res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(sell_qty))
                         _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
                         with open(tp_flag, "w", encoding="utf-8") as fh:
                             json.dump({"stage": "half",
@@ -2213,7 +2258,7 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
                 _risk_log(f"RISK {sym}: {action}")
                 if not dry_run:
                     try:
-                        res = RobinhoodAPI.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                        res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
                         _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
                         with open(tp_flag, "w", encoding="utf-8") as fh:
                             json.dump({"stage": "full",
@@ -2243,7 +2288,7 @@ def run_risk_monitor(interval_seconds: int = 900, dry_run: bool = False,
                 continue
             _risk_log(f"RISK-MONITOR {session} - exiting")
             return
-        account_number = RobinhoodAPI.get_agentic_account_number()
+        account_number = RobinhoodExecutor.get_agentic_account_number()
         today = MarketHours.now_et().strftime("%Y-%m-%d")
         rules = _read_plan_risk_rules(today)
         _risk_log(f"RISK-MONITOR pulse REGULAR account={account_number} "
@@ -2278,12 +2323,14 @@ Commands:
   harvest-losses [account]   Tax-loss harvesting candidate breakdown with dollar savings & wash-sale guidance.
   rebalance-plan [account]   Concrete 4-step rebalance plan (cut dead money, clean dust, trim winners).
   export [account] [dir]     Export full portfolio & audit datasets to disk (JSON & CSV).
-  status                     Display market status, Eastern time, and session.
+  status                     Display market status, Eastern time, Mountain / local time, and session.
   analyze <TICKER...>        Deep technical analysis, indicators, news sentiment & risk levels.
   scan [TICKERS...]          Scan watchlist for highest conviction buy/sell opportunities.
   news <TICKER/QUERY>        Fetch latest financial news headlines and calculate sentiment score.
   rebalance                  Analyze portfolio allocation and generate optimal profit trades.
   monitor [--auto-trade]     Autonomous trading loop running during US market hours.
+  risk-monitor [--live]      Deterministic risk manager (enforces stop-loss & take-profit rules).
+  service <start|stop|...>   Manage background systemd service.
   auth                       Verify stored credentials status (cached and active).
 
 Options for 'portfolio':
@@ -2301,8 +2348,10 @@ Examples:
   ./robinhood_trader.py harvest-losses
   ./robinhood_trader.py rebalance-plan
   ./robinhood_trader.py export
+  ./robinhood_trader.py status
   ./robinhood_trader.py analyze AAPL NVDA MSFT
   ./robinhood_trader.py scan
+  ./robinhood_trader.py service status
 """
     print(help_text.strip())
 
@@ -2315,23 +2364,27 @@ def main():
     cmd = sys.argv[1].lower()
 
     if cmd == "status":
-        now = MarketHours.now_et()
-        session = MarketHours.get_market_session(now)
-        is_open = MarketHours.is_market_open(now)
-        next_open = MarketHours.next_market_open(now)
+        now_et = MarketHours.now_et()
+        now_loc = MarketHours.now_local()
+        session = MarketHours.get_market_session(now_et)
+        is_open = MarketHours.is_market_open(now_et)
+        next_open = MarketHours.next_market_open(now_et)
         
-        print("=" * 65)
+        print("=" * 70)
         print("  US STOCK MARKET & ROBINHOOD STATUS")
-        print("=" * 65)
-        print(f"  Current Time (ET) : {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        print("=" * 70)
+        print(f"  Eastern Time (ET) : {now_et.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+        print(f"  Local Time (MT)   : {now_loc.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
         print(f"  Market Session    : {session}")
-        print(f"  Regular Hours     : {'OPEN (09:30 - 16:00 ET)' if is_open else 'CLOSED'}")
+        print(f"  Regular Hours     : {'OPEN (09:30 - 16:00 ET / 07:30 - 14:00 MT)' if is_open else 'CLOSED'}")
         if is_open:
-            rem = MarketHours.seconds_until_close(now)
+            rem = MarketHours.seconds_until_close(now_et)
             print(f"  Time to Close     : {int(rem // 60)} minutes")
         else:
-            print(f"  Next Market Open  : {next_open.strftime('%Y-%m-%d %H:%M %Z')} (in {MarketHours.seconds_until_next_open(now)/3600:.1f}h)")
-        print("=" * 65)
+            next_open_loc = next_open.astimezone()
+            print(f"  Next Market Open  : {next_open.strftime('%Y-%m-%d %I:%M %p %Z')} ({next_open_loc.strftime('%I:%M %p %Z')})")
+            print(f"  Countdown         : in {MarketHours.seconds_until_next_open(now_et)/3600:.1f} hours")
+        print("=" * 70)
 
     elif cmd in ("summary", "brief", "overview"):
         acc = None
@@ -2636,6 +2689,20 @@ def main():
             if idx + 1 < len(sys.argv):
                 interval = int(sys.argv[idx + 1])
         run_market_monitor(interval_seconds=interval, auto_trade=auto_trade, dry_run=dry_run)
+
+    elif cmd in ("risk-monitor", "risk", "rh-risk"):
+        interval = 900
+        dry_run = "--live" not in sys.argv
+        once = "--once" in sys.argv
+        force_session = "--force" in sys.argv
+        if "--interval" in sys.argv:
+            idx = sys.argv.index("--interval")
+            if idx + 1 < len(sys.argv):
+                try:
+                    interval = int(sys.argv[idx + 1])
+                except ValueError:
+                    pass
+        run_risk_monitor(interval_seconds=interval, dry_run=dry_run, once=once, force_session=force_session)
 
     elif cmd in ("pre-market", "premarket", "briefing"):
         tickers = sys.argv[2:] if len(sys.argv) > 2 else DEFAULT_WATCHLIST
