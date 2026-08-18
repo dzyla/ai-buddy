@@ -532,6 +532,7 @@ Additional processes and services:
 - **`deep_research.py`** — Deep research tool (multi-hop, iterative retrieval).
 - **`zulip_ai_bridge.py`** — Zulip bot bridge that pipes messages to the `ai` CLI and downloads/extracts file attachments before passing them to the agent.
 - **`zulip_mcp_server.py`** — Zulip MCP server exposing `zulip_send_message`, `zulip_get_messages`, `zulip_add_reaction`, `zulip_edit_message`.
+- **`robinhood_trader.py`** — Autonomous US equities trading, quantitative risk management, technical indicator engine, and official Robinhood Agentic MCP bridge. See [`docs/robinhood_trader.md`](docs/robinhood_trader.md).
 - **`ContextWindowManager`** — monitors context-window budget across calls; on overflow it auto-splits the response and continues the conversation so work proceeds even when a single LLM call would exceed the token limit.
 - **Scheduling/background processes** — `schedule_task` and `set_reminder` run deferred work in detached background processes with explicit termination guards (`max_runs`, `ttl_hours`); `start_background_process` / `check_process_status` / `stop_process` manage long-running jobs.
 
