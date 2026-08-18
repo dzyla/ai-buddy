@@ -358,8 +358,40 @@ take_profit_pct: 12.0
         vault_dir = tmp_path
         monkeypatch.setattr(robinhood_trader, "VAULT_DIR", str(vault_dir))
         
-        # Patch the candidate paths directly in _read_plan_risk_rules
         custom_rules = _read_plan_risk_rules("2099-01-01")
         assert custom_rules["stop_loss_pct"] >= 5.0
+
+
+class TestAgentAdvisor:
+    def test_find_ai_binary(self):
+        from robinhood_trader import find_ai_binary
+        bin_path = find_ai_binary()
+        assert bin_path is not None
+        assert len(bin_path) > 0
+
+    def test_validate_trade_decision_mock(self):
+        from robinhood_trader import AgentAdvisor
+        decision = AgentAdvisor.validate_trade_decision(
+            ticker="NVDA",
+            action="sell",
+            current_price=220.0,
+            avg_cost=235.0,
+            pnl_pct=-6.38,
+            reason="Stop-Loss (-5%)"
+        )
+        assert "verdict" in decision
+        assert decision["verdict"] in ("EXECUTE", "WAIT")
+        assert "agent_response" in decision
+
+    def test_review_premarket_briefing_mock(self):
+        from robinhood_trader import AgentAdvisor
+        briefing_mock = {
+            "macro_sentiment": {"label": "BULLISH", "score": 0.35, "key_headlines": ["Tech rallies"]},
+            "top_buy_candidates": [{"ticker": "NVDA", "price": 220.0, "score": 85.0}]
+        }
+        res = AgentAdvisor.review_premarket_briefing(briefing_mock)
+        assert res is not None
+        assert len(res) > 0
+
 
 

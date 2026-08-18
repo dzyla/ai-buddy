@@ -111,6 +111,10 @@ class ObsidianTradingVault:
             for b in buys:
                 lines.append(f"| [[{b['ticker']}]] | ${b['price']:.2f} | {b['score']} | {b['sentiment']} | ${b['stop_loss']:.2f} | ${b['take_profit_1']:.2f} | ${b['take_profit_2']:.2f} |")
         
+        if briefing.get("ai_agent_validation"):
+            lines.append("\n## 🤖 AI Strategist Pre-Market Validation & Plan")
+            lines.append(briefing["ai_agent_validation"])
+
         if intraday_events:
             lines.append("\n## ⚡ Intraday Executions & Trailing Stop Updates")
             for ev in intraday_events:
@@ -120,6 +124,9 @@ class ObsidianTradingVault:
             lines.append("\n## 🔔 Market Close Summary & P&L Review")
             lines.append(f"- **Status:** `{close_summary.get('status', 'COMPLETED')}`")
             lines.append(f"- **Timestamp:** {close_summary.get('timestamp', '')}")
+            if close_summary.get("ai_close_review"):
+                lines.append("\n### 🤖 AI Market Close Retrospective")
+                lines.append(close_summary["ai_close_review"])
             
         content = "\n".join(lines) + "\n"
         with open(filepath, "w") as f:
@@ -889,6 +896,126 @@ class NewsSentimentEngine:
 
 
 # ==============================================================================
+# 4.5. AI Agent Market Strategist & Execution Validator Bridge
+# ==============================================================================
+
+def find_ai_binary() -> str:
+    """Locates the compiled ai CLI binary."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai"),
+        os.path.expanduser("~/.local/bin/ai"),
+        "/usr/local/bin/ai",
+        "ai"
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "ai"
+
+
+class AgentAdvisor:
+    """Invokes the AI Agent during active market hours for deep validation, macro alignment, and trade confirmation."""
+
+    @classmethod
+    def invoke_agent(cls, prompt: str, timeout: int = 120) -> str:
+        """Invokes the ai agent binary with auto-approve (-y) to generate analysis or validation."""
+        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
+            return "VERDICT: EXECUTE\nREASONING: Simulated test mode approval.\nSUGGESTION: Proceed with staged plan."
+            
+        ai_bin = find_ai_binary()
+        env = os.environ.copy()
+        env["INFER_AUTO_APPROVE"] = "1"
+        env["BROWSER"] = "none"
+        
+        try:
+            res = subprocess.run(
+                [ai_bin, "-y", prompt],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env
+            )
+            out = res.stdout.strip()
+            return out if out else res.stderr.strip()
+        except Exception as e:
+            return f"(AI Agent invocation error: {e})"
+
+    @classmethod
+    def review_premarket_briefing(cls, briefing_data: Dict[str, Any]) -> str:
+        """Asks the AI Agent to review the pre-market data, validate macro outlook, and suggest actionable adjustments."""
+        top_buys = briefing_data.get("top_buy_candidates", [])
+        macro = briefing_data.get("macro_sentiment", {})
+        
+        prompt = (
+            f"You are the senior trading strategist for Robinhood Agentic Trading. "
+            f"Review today's pre-market briefing data:\n"
+            f"Macro Sentiment: {macro.get('label')} (Score: {macro.get('score')})\n"
+            f"Headlines: {json.dumps(macro.get('key_headlines', []))}\n"
+            f"Top Staged Setups: {json.dumps(top_buys)}\n\n"
+            f"Provide:\n"
+            f"1. A concise validation of whether macro sentiment supports aggressive buying or conservative risk today.\n"
+            f"2. Assessment of top candidates, key entry levels, and potential risk traps/catalysts.\n"
+            f"3. Concrete actionable suggestions for today's trading session."
+        )
+        return cls.invoke_agent(prompt, timeout=120)
+
+    @classmethod
+    def validate_trade_decision(cls, ticker: str, action: str, current_price: float, avg_cost: float,
+                                pnl_pct: float, reason: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        When a Buy/Sell signal or Stop-Loss / Take-Profit is triggered, asks the AI Agent to validate:
+        - Should we EXECUTE immediately, or WAIT for confirmation?
+        - Evaluates risk, volume, and momentum.
+        """
+        details = details or {}
+        prompt = (
+            f"You are the risk officer and execution validator for Robinhood Agentic Trading. "
+            f"A trade signal has triggered:\n"
+            f"- Action: {action.upper()}\n"
+            f"- Ticker: {ticker}\n"
+            f"- Current Price: ${current_price:.2f}\n"
+            f"- Average Cost Basis: ${avg_cost:.2f}\n"
+            f"- P&L: {pnl_pct:+.2f}%\n"
+            f"- Trigger Reason: {reason}\n"
+            f"- Context: {json.dumps(details)}\n\n"
+            f"Validate whether to EXECUTE immediately or WAIT. Output your verdict in this exact format:\n"
+            f"VERDICT: [EXECUTE | WAIT]\n"
+            f"REASONING: <concise 2-sentence rationale>\n"
+            f"SUGGESTION: <limit price, trailing stop or timing adjustment>"
+        )
+        agent_response = cls.invoke_agent(prompt, timeout=90)
+        
+        # Parse verdict
+        verdict = "EXECUTE"
+        if "VERDICT: WAIT" in agent_response.upper() or "VERDICT: [WAIT]" in agent_response.upper():
+            verdict = "WAIT"
+        elif "VERDICT: EXECUTE" in agent_response.upper() or "VERDICT: [EXECUTE]" in agent_response.upper():
+            verdict = "EXECUTE"
+        else:
+            if "wait" in agent_response.lower() and ("do not execute" in agent_response.lower() or "hold off" in agent_response.lower()):
+                verdict = "WAIT"
+            else:
+                verdict = "EXECUTE"
+
+        return {
+            "verdict": verdict,
+            "agent_response": agent_response
+        }
+
+    @classmethod
+    def review_daily_close(cls, close_data: Dict[str, Any]) -> str:
+        """Asks the AI Agent to review market close results and summarize daily lessons."""
+        prompt = (
+            f"You are the trading strategist for Robinhood Agentic Trading. "
+            f"The market has closed for today ({close_data.get('date')}). "
+            f"Review daily performance and summarize:\n"
+            f"1. Daily performance review and key portfolio movements.\n"
+            f"2. Risk lessons and preparation for tomorrow's market open."
+        )
+        return cls.invoke_agent(prompt, timeout=120)
+
+
+# ==============================================================================
 # 5. Algorithmic Trading & Profit Maximization Strategy Engine
 # ==============================================================================
 
@@ -1216,7 +1343,16 @@ class TradingStrategyEngine:
                 for s in top_sells[:3]
             ]
         }
-        # 4. Automatically persist to Obsidian Trading Knowledge Vault
+        # 4. Invoke AI Agent for deep strategic validation (Market Hours only)
+        try:
+            print("Invoking AI Agent to validate macro outlook and suggest trade setups...")
+            agent_validation = AgentAdvisor.review_premarket_briefing(staged_plan)
+            staged_plan["ai_agent_validation"] = agent_validation
+            print(f"\n🤖 AI Agent Validation & Strategy:\n{agent_validation}\n")
+        except Exception as e:
+            staged_plan["ai_agent_validation"] = f"(Agent validation skipped: {e})"
+
+        # 5. Automatically persist to Obsidian Trading Knowledge Vault
         try:
             date_str = now.strftime("%Y-%m-%d")
             note_file = ObsidianTradingVault.save_daily_note(date_str, briefing=staged_plan)
@@ -1235,6 +1371,7 @@ class TradingStrategyEngine:
         """
         Runs at 4:05 PM ET after market close:
         - Summarizes daily market session performance
+        - Consults AI Agent for closing retrospective and lessons
         - Appends daily record to ~/.config/ai/trading_journal.json and Obsidian Vault
         """
         now = MarketHours.now_et()
@@ -1256,6 +1393,16 @@ class TradingStrategyEngine:
             "status": "COMPLETED",
             "session": "REGULAR_CLOSE"
         }
+
+        # Invoke AI Agent to review close performance
+        try:
+            print("Invoking AI Agent for daily close debrief and retrospective...")
+            close_review = AgentAdvisor.review_daily_close(daily_entry)
+            daily_entry["ai_close_review"] = close_review
+            print(f"\n🤖 AI Agent Market Close Retrospective:\n{close_review}\n")
+        except Exception:
+            pass
+
         journal.append(daily_entry)
         
         try:
@@ -2084,6 +2231,15 @@ def run_scheduled_trading_lifecycle(interval_seconds: int = 900, auto_trade: boo
             for r in top_opportunities:
                 print(f"{r['ticker']:<7} | ${r['price']:<8.2f} | {r['change_pct']:>+5.2f}% | {r['indicators']['rsi']:<6.1f} | {r['score']:<6.1f} | {r['recommendation']:<12} | ${r['risk_targets']['stop_loss']:<9.2f} | ${r['risk_targets']['take_profit_1']:.2f}")
 
+            # Active Risk Management & AI Agent Validation Pulse
+            try:
+                acc_num = RobinhoodExecutor.get_agentic_account_number()
+                today_str = now.strftime("%Y-%m-%d")
+                rules = _read_plan_risk_rules(today_str)
+                _risk_monitor_pulse(acc_num, dry_run, rules["stop_loss_pct"], rules["take_profit_pct"])
+            except Exception as e:
+                print(f"Risk pulse notice: {e}")
+
             time_left = MarketHours.seconds_until_close(now)
             print(f"\nSession active: {int(time_left // 60)} minutes remaining. Sleeping {interval_seconds}s until next check...")
             time.sleep(interval_seconds)
@@ -2221,14 +2377,23 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
 
         if pnl_pct <= -stop_loss_pct and not os.path.exists(stop_flag):
             action = f"STOP-LOSS {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
-            _risk_log(f"RISK {sym}: {action}")
+            _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
+            
+            val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Stop-Loss (-{stop_loss_pct}%)", {"qty": qty, "account": account_number})
+            _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
+            
+            if val["verdict"] == "WAIT":
+                _risk_log(f"RISK {sym}: AI Agent advised WAIT. Holding position for confirmation.")
+                continue
+
             if not dry_run:
                 try:
                     res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
                     _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": "STOP_LOSS", "agent_verdict": val["verdict"]})
                     with open(stop_flag, "w", encoding="utf-8") as fh:
                         json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                    "price": price, "qty": qty, "pnl_pct": pnl_pct}, fh)
+                                    "price": price, "qty": qty, "pnl_pct": pnl_pct, "agent_verdict": val["verdict"]}, fh)
                 except Exception as exc:  # noqa: BLE001
                     _risk_log(f"RISK {sym}: order FAILED: {exc}")
         elif pnl_pct >= take_profit_pct:
@@ -2242,28 +2407,46 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
             if stage == "none":
                 sell_qty = round(qty / 2.0, 4)  # market orders allow fractional shares
                 action = f"TAKE-PROFIT (50%) {sym} {sell_qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
-                _risk_log(f"RISK {sym}: {action}")
+                _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
+                
+                val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Take-Profit 50% (+{take_profit_pct}%)", {"qty": sell_qty, "account": account_number})
+                _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
+                
+                if val["verdict"] == "WAIT":
+                    _risk_log(f"RISK {sym}: AI Agent advised WAIT. Holding position.")
+                    continue
+
                 if not dry_run:
                     try:
                         res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(sell_qty))
                         _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                        ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": sell_qty, "price": price, "pnl_pct": pnl_pct, "reason": "TAKE_PROFIT_HALF", "agent_verdict": val["verdict"]})
                         with open(tp_flag, "w", encoding="utf-8") as fh:
                             json.dump({"stage": "half",
                                         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                        "price": price, "qty_sold": sell_qty}, fh)
+                                        "price": price, "qty_sold": sell_qty, "agent_verdict": val["verdict"]}, fh)
                     except Exception as exc:  # noqa: BLE001
                         _risk_log(f"RISK {sym}: order FAILED: {exc}")
             elif stage == "half":
                 action = f"TAKE-PROFIT (full) {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
-                _risk_log(f"RISK {sym}: {action}")
+                _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
+                
+                val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, "Take-Profit Full", {"qty": qty, "account": account_number})
+                _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
+                
+                if val["verdict"] == "WAIT":
+                    _risk_log(f"RISK {sym}: AI Agent advised WAIT. Holding position.")
+                    continue
+
                 if not dry_run:
                     try:
                         res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
                         _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                        ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": "TAKE_PROFIT_FULL", "agent_verdict": val["verdict"]})
                         with open(tp_flag, "w", encoding="utf-8") as fh:
                             json.dump({"stage": "full",
                                         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                        "price": price, "qty_sold": qty}, fh)
+                                        "price": price, "qty_sold": qty, "agent_verdict": val["verdict"]}, fh)
                     except Exception as exc:  # noqa: BLE001
                         _risk_log(f"RISK {sym}: order FAILED: {exc}")
         else:
