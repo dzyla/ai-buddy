@@ -4743,7 +4743,7 @@ int main(int argc, char **argv) {
 
     /* Build the content string: SYSTEM_PROMPT + ctx + optional triggers + optional memory */
     size_t mlen = strlen(active_system_prompt) + strlen(sys_ctx)
-                  + (triggers ? strlen(triggers) + 64 : 0)
+                  + (g_agents_enabled && triggers ? strlen(triggers) + 64 : 0)
                   + (memory ? strlen(memory) + 64 : 0)
                   + (rag_memories ? strlen(rag_memories) + 64 : 0)
                   + (si_recap ? strlen(si_recap) + 128 : 0)
@@ -4756,7 +4756,7 @@ int main(int argc, char **argv) {
     if (g_goal_text && strlen(g_goal_text) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nMISSION BOARD:\n- Top Goal: %s\n- Status: In Progress\n- Instruction: Decompose into subtasks, execute step-by-step, verify work before finishing.", g_goal_text);
-    if (triggers && strlen(triggers) > 0)
+    if (g_agents_enabled && triggers && strlen(triggers) > 0)
         clen += snprintf(content + clen, mlen - clen,
                          "\n\nCRITICAL SKILL TRIGGERS (obey BEFORE any other tool):\n%s", triggers);
     if (memory && strlen(memory) > 0)
