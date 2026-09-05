@@ -10,7 +10,7 @@ env = os.environ.copy()
 env['BROWSER'] = 'none'
 
 proc = subprocess.Popen(
-    ['npx', '-y', 'mcp-remote', 'https://agent.robinhood.com/mcp/trading', '--silent'],
+    ['npx', '-y', 'mcp-remote', 'https://agent.robinhood.com/mcp/trading'],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.DEVNULL,

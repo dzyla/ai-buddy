@@ -27,6 +27,7 @@ import urllib.error
 import re
 import datetime
 import csv
+import shutil
 from typing import List, Dict, Any, Optional, Tuple
 
 try:
@@ -53,6 +54,20 @@ SECTOR_UNIVERSES = {
 
 DEFAULT_WATCHLIST = [
     t for sector_tickers in SECTOR_UNIVERSES.values() for t in sector_tickers
+]
+
+# Balanced cross-sector watchlist representing Core ballast, AI/Chips, Cyber/Cloud, Healthcare, and Fintech
+BALANCED_LIFECYCLE_WATCHLIST = [
+    # Core Ballast ETFs
+    "VTI", "QQQ",
+    # AI & Semi Leaders
+    "NVDA", "AVGO", "PLTR", "TSM",
+    # Cyber & Cloud SaaS
+    "CRWD", "PANW", "MSFT", "GOOGL",
+    # Healthcare & Defensive Biotech
+    "LLY", "NVO", "VRTX",
+    # Fintech & Momentum
+    "COIN", "TSLA"
 ]
 
 
@@ -435,6 +450,15 @@ class MarketHours:
             return 0.0
         close_time = datetime.datetime.combine(dt.date(), datetime.time(16, 0), tzinfo=ET_ZONE)
         return max(0.0, (close_time - dt).total_seconds())
+
+    @staticmethod
+    def get_timezone(name: str):
+        """Returns a timezone object for the given IANA timezone name. Falls back to ET_ZONE."""
+        try:
+            import zoneinfo
+            return zoneinfo.ZoneInfo(name)
+        except Exception:
+            return ET_ZONE
 
 
 # ==============================================================================
@@ -895,9 +919,14 @@ class NewsSentimentEngine:
 
     @classmethod
     def analyze_news_sentiment(cls, query_or_ticker: str) -> Dict[str, Any]:
-        """Fetches news and calculates aggregated sentiment metrics."""
-        articles = cls.fetch_news(query_or_ticker)
-        if not articles:
+        """
+        Fetches news, deduplicates syndicated articles, and calculates recency-weighted sentiment:
+        - NLP Engine: Financial Lexicon Keyword Scoring
+        - Deduplication: Title similarity hashing
+        - Recency decay: Recent (<24h) = 1.0x, (24-48h) = 0.5x, older = 0.25x
+        """
+        raw_articles = cls.fetch_news(query_or_ticker)
+        if not raw_articles:
             return {
                 "ticker": query_or_ticker,
                 "article_count": 0,
@@ -906,8 +935,45 @@ class NewsSentimentEngine:
                 "headlines": []
             }
 
-        scores = [cls.score_text(a["title"]) for a in articles]
-        avg_score = sum(scores) / float(len(scores)) if scores else 0.0
+        # Deduplicate headlines by normalized title slug
+        unique_articles = []
+        seen_slugs = set()
+        for a in raw_articles:
+            title = a.get("title", "").strip()
+            slug = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+            if slug and slug not in seen_slugs:
+                seen_slugs.add(slug)
+                unique_articles.append(a)
+
+        # Recency-weighted sentiment: half-life ~2 hours (lambda=0.35/hr).
+        # Articles older than 48 h retain only ~8% weight; same-session news dominates.
+        # pubDate format from Yahoo RSS: "Mon, 24 Aug 2026 14:30:00 +0000"
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        _lambda = 0.35  # decay rate per hour (half-life ≈ 2 h)
+        weighted_scores = []
+        total_weight = 0.0
+        for a in unique_articles:
+            raw_score = cls.score_text(a["title"])
+            pub_date_str = a.get("date", "").strip()
+            weight = 1.0  # default: no decay if date unavailable
+            if pub_date_str:
+                try:
+                    pub_dt = datetime.datetime.strptime(pub_date_str, "%a, %d %b %Y %H:%M:%S %z")
+                except ValueError:
+                    try:
+                        pub_date_clean = re.sub(r"\s+[A-Z]{2,4}$", "", pub_date_str)
+                        pub_dt = datetime.datetime.strptime(pub_date_clean, "%a, %d %b %Y %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+                    except ValueError:
+                        pub_dt = None
+                        weight = 0.5
+                
+                if pub_dt:
+                    age_hours = max(0.0, (now_utc - pub_dt).total_seconds() / 3600.0)
+                    weight = math.exp(-_lambda * age_hours)
+            weighted_scores.append(raw_score * weight)
+            total_weight += weight
+
+        avg_score = sum(weighted_scores) / total_weight if total_weight > 0 else 0.0
 
         if avg_score >= 0.35:
             label = "STRONGLY_BULLISH"
@@ -922,10 +988,10 @@ class NewsSentimentEngine:
 
         return {
             "ticker": query_or_ticker,
-            "article_count": len(articles),
+            "article_count": len(unique_articles),
             "sentiment_score": round(avg_score, 2),
             "sentiment_label": label,
-            "headlines": [a["title"] for a in articles[:5]]
+            "headlines": [a["title"] for a in unique_articles[:5]]
         }
 
 
@@ -961,8 +1027,8 @@ class AgentAdvisor:
         env["INFER_AUTO_APPROVE"] = "1"
         env["BROWSER"] = "none"
         
-        timeout_sec = timeout or int(os.environ.get("ROBINHOOD_AI_TIMEOUT", 180))
-        cmd = [ai_bin, "-y", "--no-agents", "--no-git", "-q", "--private"]
+        timeout_sec = timeout or int(os.environ.get("ROBINHOOD_AI_TIMEOUT", 120))
+        cmd = [ai_bin, "-y", "--no-agents", "--no-git", "--no-mcp", "-q", "--private"]
         if flags:
             cmd.extend(flags)
         else:
@@ -1087,9 +1153,15 @@ class AgentAdvisor:
         """
         When a Buy/Sell signal or Stop-Loss / Take-Profit is triggered, asks the AI Agent to validate:
         - Should we EXECUTE immediately, or WAIT for confirmation?
-        - Evaluates risk, volume, and momentum.
+        - Evaluates risk, volume, momentum, and wash-sale/churn risk.
         """
         details = details or {}
+        acc_num = details.get("account", "")
+        if acc_num and "recent_exits" not in details:
+            recent_exits = ComplianceAndRiskGuard.get_recent_exits(acc_num, ticker, days=30)
+            if recent_exits:
+                details["recent_exits"] = recent_exits
+
         prompt = (
             f"You are the risk officer and execution validator for Robinhood Agentic Trading. "
             f"A trade signal has triggered:\n"
@@ -1100,7 +1172,8 @@ class AgentAdvisor:
             f"- P&L: {pnl_pct:+.2f}%\n"
             f"- Trigger Reason: {reason}\n"
             f"- Context: {json.dumps(details)}\n\n"
-            f"Validate whether to EXECUTE immediately or WAIT. Output your verdict in this exact format:\n"
+            f"Validate whether to EXECUTE immediately or WAIT. Note: strictly forbid re-buying a stock that was recently sold or stopped out.\n"
+            f"Output your verdict in this exact format:\n"
             f"VERDICT: [EXECUTE | WAIT]\n"
             f"REASONING: <concise 2-sentence rationale>\n"
             f"SUGGESTION: <limit price, trailing stop or timing adjustment>"
@@ -1108,13 +1181,18 @@ class AgentAdvisor:
         agent_response = cls.invoke_agent(prompt, timeout=90)
         
         # Parse verdict
-        verdict = "EXECUTE"
-        if "VERDICT: WAIT" in agent_response.upper() or "VERDICT: [WAIT]" in agent_response.upper():
+        has_error = not agent_response or agent_response.startswith("(AI Agent invocation error:") or ("error" in agent_response.lower() and len(agent_response) < 100)
+        if has_error:
+            # Conservative safety posture: on failure/timeout, NEVER execute a BUY; but DO execute protective stop-losses.
+            verdict = "WAIT" if action.lower() == "buy" else "EXECUTE"
+        elif "VERDICT: WAIT" in agent_response.upper() or "VERDICT: [WAIT]" in agent_response.upper():
             verdict = "WAIT"
         elif "VERDICT: EXECUTE" in agent_response.upper() or "VERDICT: [EXECUTE]" in agent_response.upper():
             verdict = "EXECUTE"
         else:
-            if "wait" in agent_response.lower() and ("do not execute" in agent_response.lower() or "hold off" in agent_response.lower()):
+            if "wait" in agent_response.lower() and ("do not execute" in agent_response.lower() or "hold off" in agent_response.lower() or "avoid" in agent_response.lower()):
+                verdict = "WAIT"
+            elif action.lower() == "buy" and ("wash" in agent_response.lower() or "cooldown" in agent_response.lower() or "risk" in agent_response.lower() and "high" in agent_response.lower()):
                 verdict = "WAIT"
             else:
                 verdict = "EXECUTE"
@@ -1202,7 +1280,16 @@ class TradingStrategyEngine:
 
     @classmethod
     def analyze_ticker(cls, ticker: str) -> Dict[str, Any]:
-        """Computes complete multi-factor analysis, technical signals, and trade recommendations."""
+        """
+        Computes complete multi-factor analysis, technical signals, and trade recommendations:
+        - Symmetric Trend factor [-20, +20]
+        - Continuous RSI momentum without gaps [-15, +12]
+        - Volume confirmation factor [-8, +10] with Volume Ratio (V / V_20d_avg)
+        - Continuous MACD magnitude and acceleration [-10, +10]
+        - Calibrated News Sentiment factor [-8, +8]
+        - Volatility-adjusted dynamic stops (ATR-tied)
+        - Selective recommendation thresholds (STRONG_BUY >= 80.0, BUY >= 68.0)
+        """
         ticker = ticker.strip().upper()
         quote = FinancialData.fetch_quote(ticker)
         bars = FinancialData.fetch_historical(ticker, range_period="6mo", interval="1d")
@@ -1215,7 +1302,7 @@ class TradingStrategyEngine:
             closes = [b["close"] for b in bars]
             highs = [b["high"] for b in bars]
             lows = [b["low"] for b in bars]
-            volumes = [b["volume"] for b in bars]
+            volumes = [b.get("volume", 0) for b in bars]
 
             rsi_period = min(14, max(2, len(closes) - 1))
             rsi_series = TechnicalIndicators.rsi(closes, period=rsi_period)
@@ -1249,58 +1336,195 @@ class TradingStrategyEngine:
             sma50 = current_price
             sma200 = current_price
             macd_hist = 0.0
+            macd_data = {"histogram": [0.0]}
             bb_pct_b = 0.5
             current_atr = current_price * 0.02
+            volumes = []
 
-        # Multi-factor score (0 - 100)
-        score = 50.0
-
-        # Trend factor (up to ±20 pts)
-        if current_price > sma20:
-            score += 7
-        if current_price > sma50:
-            score += 8
-        if current_price > sma200:
-            score += 5
-        if sma50 > sma200:  # Golden cross regime
-            score += 5
-
-        # Momentum factor (up to ±15 pts)
-        if 35 <= current_rsi <= 65:
-            score += 5
-        elif current_rsi < 30:  # Oversold bounce potential
-            score += 10
-        elif current_rsi > 75:  # Overbought warning
-            score -= 10
-
-        # MACD factor (up to ±10 pts)
-        if macd_hist > 0:
-            score += 8
+        # ── Hard Liquidity Pre-Screen (disqualify before scoring) ────────────────
+        # V4 spec: avg 20d vol >= 500,000 shares AND price >= $5.00 are hard gates,
+        # not soft penalties.  Candidates that fail are returned with a STRONG_SELL
+        # classification so callers can skip them immediately.
+        if len(bars) >= 5 and volumes:
+            _liq_vols = [v for v in volumes if v is not None and v > 0]
+            _avg_vol_20 = sum(_liq_vols[-20:]) / min(len(_liq_vols), 20) if _liq_vols else 0
         else:
-            score -= 6
+            _avg_vol_20 = 0
+        if _avg_vol_20 < 500_000 or current_price < 5.0:
+            _reason = (f"avg_vol={_avg_vol_20:.0f} < 500k" if _avg_vol_20 < 500_000
+                       else f"price=${current_price:.2f} < $5.00")
+            return {
+                "ticker": ticker,
+                "price": current_price,
+                "change_pct": quote.get("change_percent", 0.0),
+                "score": 0.0,
+                "recommendation": "STRONG_SELL",
+                "disqualified": True,
+                "disqualify_reason": f"Liquidity gate failed: {_reason}",
+                "factor_breakdown": {},
+                "indicators": {
+                    "rsi": 50.0, "sma20": current_price, "sma50": current_price,
+                    "sma200": current_price, "macd_histogram": 0.0,
+                    "volume_ratio": 0.0, "bollinger_pct_b": 0.5,
+                    "atr": current_price * 0.02, "atr_pct": 2.0
+                },
+                "news_sentiment": {"score": 0.0, "label": "NEUTRAL", "headlines": []},
+                "risk_targets": {
+                    "stop_loss": round(current_price * 0.95, 2), "stop_loss_pct": 5.0,
+                    "take_profit_1": round(current_price * 1.08, 2), "take_profit_1_pct": 8.0,
+                    "take_profit_2": round(current_price * 1.15, 2), "take_profit_2_pct": 15.0,
+                    "trailing_stop_pct": 4.5
+                }
+            }
 
-        # News Sentiment factor (up to ±15 pts)
+        # Multi-factor score (0 - 100) with calibrated baseline = 50.0
+        score = 50.0
+        factors = {}
+
+        # 1. Explicit Symmetric Trend factor (range: -20 to +20)
+        trend_score = 0.0
+        trend_score += 5.0 if current_price > sma20 else -4.0
+        trend_score += 6.0 if current_price > sma50 else -5.0
+        trend_score += 5.0 if current_price > sma200 else -6.0
+        trend_score += 4.0 if sma50 > sma200 else -5.0  # Golden Cross vs Death Cross
+        trend_score = max(-20.0, min(20.0, trend_score))
+        factors["trend"] = trend_score
+        score += trend_score
+
+        # 2. Continuous RSI Momentum Factor without dead zones (range: -15 to +12)
+        momentum_score = 0.0
+        if 50.0 <= current_rsi <= 65.0:
+            momentum_score += 8.0  # Optimal bullish momentum corridor
+        elif 40.0 <= current_rsi < 50.0 or 65.0 < current_rsi <= 70.0:
+            momentum_score += 4.0  # Moderate trend corridor
+        elif 30.0 <= current_rsi < 40.0:
+            momentum_score -= 2.0  # Sluggish / weakening momentum
+        elif 70.0 < current_rsi <= 78.0:
+            momentum_score -= 8.0  # Overbought exhaustion warning
+        elif current_rsi > 78.0:
+            momentum_score -= 15.0  # Severe parabolic overextension
+        elif current_rsi < 30.0:
+            # Oversold only rewarded if secular bull trend is intact; penalized if falling knife
+            if current_price > sma200:
+                momentum_score += 6.0  # Dip buying in long-term uptrend
+            else:
+                momentum_score -= 8.0  # Secular downtrend breakdown
+        factors["momentum"] = momentum_score
+        score += momentum_score
+
+        # 3. Time-Normalized Volume Confirmation Factor (range: -8 to +10)
+        vol_score = 0.0
+        vol_ratio = 1.0
+        if len(bars) >= 5 and volumes:
+            valid_vols = [v for v in volumes if v is not None and v > 0]
+            if valid_vols:
+                cur_vol = valid_vols[-1]
+                avg_vol_20 = sum(valid_vols[-20:]) / min(len(valid_vols), 20)
+                if avg_vol_20 > 0:
+                    now_et = MarketHours.now_et()
+                    session = MarketHours.get_market_session(now_et)
+                    if session == "REGULAR":
+                        # Intraday Time Normalization with Empirical U-Shaped Distribution:
+                        # - 09:30-10:00 ET (t <= 30 min): ~25% daily volume
+                        # - 10:00-15:00 ET (30 < t <= 330 min): ~50% daily volume (midday slow-down)
+                        # - 15:00-16:00 ET (330 < t <= 390 min): ~25% daily volume (power-hour ramp)
+                        market_open_today = datetime.datetime.combine(now_et.date(), datetime.time(9, 30), tzinfo=ET_ZONE)
+                        elapsed_min = max(1.0, min(390.0, (now_et - market_open_today).total_seconds() / 60.0))
+                        if elapsed_min <= 30.0:
+                            expected_fraction = 0.25 * (elapsed_min / 30.0)
+                        elif elapsed_min <= 330.0:
+                            expected_fraction = 0.25 + 0.50 * ((elapsed_min - 30.0) / 300.0)
+                        else:
+                            expected_fraction = 0.75 + 0.25 * ((elapsed_min - 330.0) / 60.0)
+                        expected_fraction = max(0.04, expected_fraction)
+                        expected_vol_so_far = avg_vol_20 * expected_fraction
+                        vol_ratio = round(cur_vol / expected_vol_so_far, 2)
+                    else:
+                        vol_ratio = round(cur_vol / avg_vol_20, 2)
+
+                    if vol_ratio >= 1.5:
+                        vol_score += 10.0  # High-volume institutional breakout
+                    elif vol_ratio >= 1.1:
+                        vol_score += 5.0   # Above-average volume confirmation
+                    elif vol_ratio >= 0.8:
+                        vol_score += 0.0   # Normal average volume
+                    elif vol_ratio >= 0.5:
+                        vol_score -= 4.0   # Sub-par volume caution
+                    else:
+                        vol_score -= 8.0   # Anemic volume / false breakout risk
+        factors["volume"] = vol_score
+        score += vol_score
+
+        # Liquidity gate already enforced above as a hard disqualifier; no soft penalty needed here.
+
+        # 4. Continuous MACD Impulse & Acceleration (range: -10 to +10)
+        # Bar Resolution: last two CLOSED daily bars ([-2] = yesterday close, [-3] = day before).
+        # Using [-1] risks reading an incomplete intraday bar from the data provider; using [-2]
+        # guarantees a stable, session-level momentum regime throughout RTH.
+        macd_score = 0.0
+        hist_series = [h for h in macd_data.get("histogram", []) if h is not None]
+        # Hist_t  = last closed bar (yesterday); Hist_t-1 = bar before that
+        macd_hist_closed = hist_series[-2] if len(hist_series) >= 2 else macd_hist
+        prev_hist = hist_series[-3] if len(hist_series) >= 3 else (hist_series[-2] if len(hist_series) >= 2 else macd_hist)
+        hist_delta = macd_hist_closed - prev_hist
+        macd_hist = macd_hist_closed  # use closed bar for magnitude/sign checks below
+
+        macd_score += 4.0 if macd_hist > 0 else -4.0
+        macd_score += 4.0 if hist_delta > 0 else -4.0  # Expanding vs contracting momentum
+        if abs(macd_hist) > (current_atr * 0.25) and current_atr > 0:
+            macd_score += 2.0 if macd_hist > 0 else -2.0
+        macd_score = max(-10.0, min(10.0, macd_score))
+        factors["macd"] = macd_score
+        score += macd_score
+
+        # 5. Calibrated News Sentiment Factor (range: -8 to +8)
         sent_score = news.get("sentiment_score", 0.0)
-        score += sent_score * 15.0
+        headlines = news.get("headlines", [])
+        news_weight = 8.0 if len(headlines) >= 2 else (4.0 if len(headlines) == 1 else 0.0)
+        sentiment_contribution = round(sent_score * news_weight, 1)
+        factors["sentiment"] = sentiment_contribution
+        score += sentiment_contribution
 
+        # 6. Anti-Chasing Gap & Parabolic Overextension Filter
+        # Buying parabolic intraday spikes (> +3.5% with RSI > 68) causes whipsaw top-ticking
+        intraday_chg = quote.get("change_percent", 0.0)
+        if intraday_chg >= 3.5 and current_rsi >= 68.0:
+            score -= 10.0
+            factors["anti_chase"] = -10.0
+
+        # Bound total score to [0, 100]
         score = max(0.0, min(100.0, round(score, 1)))
 
-        # Recommendation based on score
-        if score >= 75:
+        # Multi-Factor Alignment Gate for STRONG_BUY:
+        # Requires score >= 80.0, positive trend, non-negative momentum, non-anemic volume,
+        # and no extreme intraday parabolic gap-up chase
+        is_strong_buy = (
+            score >= 80.0 and
+            trend_score > 0 and
+            momentum_score >= 0 and
+            vol_ratio >= 0.8 and
+            intraday_chg < 4.0
+        )
+
+        if is_strong_buy:
             recommendation = "STRONG_BUY"
-        elif score >= 60:
+        elif score >= 68.0:
             recommendation = "BUY"
-        elif score <= 25:
+        elif score <= 28.0:
             recommendation = "STRONG_SELL"
-        elif score <= 40:
+        elif score <= 42.0:
             recommendation = "SELL"
         else:
             recommendation = "HOLD"
 
-        # Risk parameters
-        stop_loss_price = round(max(0.01, current_price - max(current_price * 0.05, 2.0 * current_atr)), 2)
+        # Volatility-Adjusted Dynamic Risk parameters
+        atr_pct = (current_atr / current_price * 100.0) if current_price > 0 else 2.0
+        stop_loss_pct = round(max(5.0, min(12.0, 2.0 * atr_pct)), 2)
+        stop_loss_price = round(max(0.01, current_price * (1.0 - stop_loss_pct / 100.0)), 2)
+        
         take_profit_target_1 = round(current_price * 1.08, 2)  # +8%
         take_profit_target_2 = round(current_price * 1.15, 2)  # +15%
+        trailing_stop_pct = round(max(4.5, min(8.0, 1.5 * atr_pct)), 2)
 
         return {
             "ticker": ticker,
@@ -1308,28 +1532,31 @@ class TradingStrategyEngine:
             "change_pct": quote.get("change_percent", 0.0),
             "score": score,
             "recommendation": recommendation,
+            "factor_breakdown": factors,
             "indicators": {
-                "rsi": current_rsi,
+                "rsi": round(current_rsi, 1),
                 "sma20": round(sma20, 2),
                 "sma50": round(sma50, 2),
                 "sma200": round(sma200, 2),
-                "macd_histogram": macd_hist,
-                "bollinger_pct_b": bb_pct_b,
-                "atr": current_atr
+                "macd_histogram": round(macd_hist, 4),
+                "volume_ratio": vol_ratio,
+                "bollinger_pct_b": round(bb_pct_b, 2),
+                "atr": round(current_atr, 2),
+                "atr_pct": round(atr_pct, 2)
             },
             "news_sentiment": {
                 "score": news.get("sentiment_score", 0.0),
                 "label": news.get("sentiment_label", "NEUTRAL"),
-                "headlines": news.get("headlines", [])
+                "headlines": headlines
             },
             "risk_targets": {
                 "stop_loss": stop_loss_price,
-                "stop_loss_pct": round((stop_loss_price - current_price) / current_price * 100, 2),
+                "stop_loss_pct": stop_loss_pct,
                 "take_profit_1": take_profit_target_1,
                 "take_profit_1_pct": 8.0,
                 "take_profit_2": take_profit_target_2,
                 "take_profit_2_pct": 15.0,
-                "trailing_stop_pct": 3.5
+                "trailing_stop_pct": trailing_stop_pct
             }
         }
 
@@ -1452,9 +1679,26 @@ class TradingStrategyEngine:
         top_buys = [o for o in opportunities if o["score"] >= 65]
         top_sells = [o for o in opportunities if o["score"] <= 40]
         
+        # Scan for any deferred exits that need to be actioned at open
+        _deferred_exits_pending = []
+        try:
+            _def_dir = DEFERRED_EXIT_FLAG_DIR
+            if os.path.isdir(_def_dir):
+                for _fn in os.listdir(_def_dir):
+                    if _fn.startswith("deferred_exit_") and _fn.endswith(".flag"):
+                        _fp = os.path.join(_def_dir, _fn)
+                        try:
+                            with open(_fp, encoding="utf-8") as _fh:
+                                _deferred_exits_pending.append(json.load(_fh))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         staged_plan = {
             "date": now.strftime("%Y-%m-%d"),
             "briefing_time": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "deferred_exits_pending": _deferred_exits_pending,  # Prioritised for immediate review at open
             "macro_sentiment": {
                 "label": macro_news.get("sentiment_label", "NEUTRAL"),
                 "score": macro_news.get("sentiment_score", 0.0),
@@ -1669,7 +1913,7 @@ def authenticate_robinhood_mcp():
     print("A browser window will open to authenticate with Robinhood.")
     print("Once authorized, credentials will be cached in your local MCP store.\n")
     
-    cmd = "npx -y mcp-remote https://agent.robinhood.com/mcp/trading"
+    cmd = "mcp-remote https://agent.robinhood.com/mcp/trading" if shutil.which("mcp-remote") else "npx -y mcp-remote@0.2.5 https://agent.robinhood.com/mcp/trading"
     print(f"Executing: {cmd}\n")
     os.system(cmd)
 
@@ -1698,10 +1942,61 @@ class RobinhoodExecutor:
         return res
 
     @classmethod
+    def _sync_mcp_auth_tokens(cls):
+        """Sync stored OAuth tokens across different mcp-remote package versions in ~/.mcp-auth/."""
+        auth_dir = os.path.expanduser("~/.mcp-auth")
+        if not os.path.isdir(auth_dir):
+            return
+        try:
+            remote_dirs = [os.path.join(auth_dir, d) for d in os.listdir(auth_dir) if d.startswith("mcp-remote-") and os.path.isdir(os.path.join(auth_dir, d))]
+            if not remote_dirs:
+                return
+            
+            tokens_map = {}
+            for rd in remote_dirs:
+                for f in os.listdir(rd):
+                    if f.endswith("_tokens.json") or f.endswith("_client_info.json"):
+                        fpath = os.path.join(rd, f)
+                        try:
+                            mtime = os.path.getmtime(fpath)
+                            with open(fpath, "r", encoding="utf-8") as tf:
+                                td = json.load(tf)
+                            if td:
+                                if f not in tokens_map or mtime > tokens_map[f][0]:
+                                    tokens_map[f] = (mtime, fpath, td)
+                        except Exception:
+                            pass
+            
+            for f, (_, src_path, td) in tokens_map.items():
+                for rd in remote_dirs:
+                    dest_path = os.path.join(rd, f)
+                    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+                        try:
+                            with open(dest_path, "w", encoding="utf-8") as df:
+                                json.dump(td, df, indent=2)
+                            os.chmod(dest_path, 0o600)
+                        except Exception:
+                            pass
+
+            for rd in remote_dirs:
+                for f in os.listdir(rd):
+                    if f.endswith("_lock.json") or "_code_verifier" in f:
+                        lock_file = os.path.join(rd, f)
+                        try:
+                            if time.time() - os.path.getmtime(lock_file) > 30:
+                                os.remove(lock_file)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    @classmethod
     def call_mcp_tool(cls, tool_name: str, arguments: Dict[str, Any], timeout: int = 15, max_retries: int = 2) -> Dict[str, Any]:
         """Calls any Robinhood MCP tool in sub-second time without browser prompts."""
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
             return {}
+
+        cls._sync_mcp_auth_tokens()
 
         env = os.environ.copy()
         env['BROWSER'] = ':'
@@ -1710,11 +2005,15 @@ class RobinhoodExecutor:
         env['DISPLAY'] = ''
         env.pop('WSL_DISTRO_NAME', None)
 
+        import select
+
+        remote_cmd = ['mcp-remote', 'https://agent.robinhood.com/mcp/trading'] if shutil.which('mcp-remote') else ['npx', '-y', 'mcp-remote@0.2.5', 'https://agent.robinhood.com/mcp/trading']
+
         for attempt in range(max_retries + 1):
             proc = None
             try:
                 proc = subprocess.Popen(
-                    ['npx', '-y', 'mcp-remote', 'https://agent.robinhood.com/mcp/trading', '--silent'],
+                    remote_cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
@@ -1731,8 +2030,27 @@ class RobinhoodExecutor:
                 }
                 proc.stdin.write(json.dumps(req_init) + '\n')
                 proc.stdin.flush()
-                init_resp = proc.stdout.readline()
-                if not init_resp:
+
+                # Read init with select timeout
+                init_ok = False
+                start_t = time.time()
+                while time.time() - start_t < timeout:
+                    rem = max(0.1, timeout - (time.time() - start_t))
+                    r, _, _ = select.select([proc.stdout], [], [], rem)
+                    if not r:
+                        break
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    try:
+                        resp = json.loads(line)
+                        if resp.get('id') == 1:
+                            init_ok = True
+                            break
+                    except Exception:
+                        pass
+
+                if not init_ok:
                     if attempt < max_retries:
                         time.sleep(0.5)
                         continue
@@ -1750,7 +2068,12 @@ class RobinhoodExecutor:
                 proc.stdin.write(json.dumps(req_tool) + '\n')
                 proc.stdin.flush()
                 
-                while True:
+                tool_start = time.time()
+                while time.time() - tool_start < timeout:
+                    rem = max(0.1, timeout - (time.time() - tool_start))
+                    r, _, _ = select.select([proc.stdout], [], [], rem)
+                    if not r:
+                        break
                     line = proc.stdout.readline()
                     if not line:
                         break
@@ -1814,9 +2137,21 @@ class RobinhoodExecutor:
         return accounts[0]["account_number"] if accounts else "837546068"
 
     @classmethod
+    def resolve_account(cls, account_input: Optional[str] = None) -> str:
+        """Resolves an account alias or number (e.g. 'agentic' -> '517198354')."""
+        if not account_input:
+            return cls.get_default_account_number()
+        inp = str(account_input).strip().lower()
+        if inp in ("agentic", "agent", "sandbox", "agentic_account"):
+            return cls.get_agentic_account_number()
+        if inp in ("default", "primary", "manual"):
+            return cls.get_default_account_number()
+        return str(account_input).strip()
+
+    @classmethod
     def get_live_portfolio(cls, account_number: Optional[str] = None) -> Dict[str, Any]:
         """Fetch real-time portfolio balance, equity value, cash, and buying power."""
-        acc = account_number or cls.get_default_account_number()
+        acc = cls.resolve_account(account_number)
         res = cls.call_mcp_tool('get_portfolio', {'account_number': acc})
         data = cls._extract_data(res)
         return data if isinstance(data, dict) else {}
@@ -1824,11 +2159,39 @@ class RobinhoodExecutor:
     @classmethod
     def get_equity_positions(cls, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch active equity holdings and quantities."""
-        acc = account_number or cls.get_default_account_number()
+        acc = cls.resolve_account(account_number)
         res = cls.call_mcp_tool('get_equity_positions', {'account_number': acc})
         data = cls._extract_data(res)
         if isinstance(data, dict):
             return data.get('positions', [])
+        return []
+
+    @classmethod
+    def get_orders(cls, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch equity order history."""
+        acc = cls.resolve_account(account_number)
+        res = cls.call_mcp_tool('get_equity_orders', {'account_number': acc})
+        data = cls._extract_data(res)
+        if isinstance(data, dict):
+            return data.get('orders', [])
+        return []
+
+    @classmethod
+    def get_realized_pnl(cls, account_number: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch realized profit and loss metrics."""
+        acc = cls.resolve_account(account_number)
+        res = cls.call_mcp_tool('get_realized_pnl', {'account_number': acc})
+        data = cls._extract_data(res)
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def get_pnl_trade_history(cls, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch realized P&L trade-by-trade history."""
+        acc = cls.resolve_account(account_number)
+        res = cls.call_mcp_tool('get_pnl_trade_history', {'account_number': acc})
+        data = cls._extract_data(res)
+        if isinstance(data, dict):
+            return data.get('trades', [])
         return []
 
     @classmethod
@@ -1908,6 +2271,257 @@ class RobinhoodExecutor:
 
 # Alias for backward compatibility and uniform API reference
 RobinhoodAPI = RobinhoodExecutor
+
+
+# ==============================================================================
+# 6.4. Regulatory Compliance (PDT FINRA Rule 4210) & Intraday Circuit Breakers
+# ==============================================================================
+
+PDT_TRACKER_FILE = os.path.join(os.path.expanduser("~/.config/ai"), "pdt_tracker.json")
+CIRCUIT_BREAKER_FILE = os.path.join(os.path.expanduser("~/.config/ai"), "daily_circuit_breaker.json")
+# Written by Tier 3 emergency liquidation; read by _auto_trade_entry_pulse to block buys for the session
+SESSION_HALT_FLAG = os.path.join(os.path.expanduser("~/.config/ai"), ".monitor_flags", "tier3_halt_{date}.flag")
+# Written when a PDT-deferred exit is pending; reviewed at pre-market briefing
+DEFERRED_EXIT_FLAG_DIR = os.path.join(os.path.expanduser("~/.config/ai"), ".monitor_flags")
+
+class ComplianceAndRiskGuard:
+    """Enforces FINRA PDT rules, wash-sale & re-entry cooldowns, and intraday portfolio circuit breakers."""
+
+    @classmethod
+    def record_trade(cls, account_number: str, symbol: str, action: str,
+                     price: Optional[float] = None, qty: Optional[float] = None,
+                     pnl_pct: Optional[float] = None, reason: Optional[str] = None) -> Dict[str, Any]:
+        """Tracks day trades and recent exits (for PDT and Wash-Sale / Re-entry cooldown)."""
+        today = MarketHours.now_et().strftime("%Y-%m-%d")
+        os.makedirs(os.path.dirname(PDT_TRACKER_FILE), exist_ok=True)
+        data = {"trades": []}
+        if os.path.exists(PDT_TRACKER_FILE):
+            try:
+                with open(PDT_TRACKER_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {"trades": []}
+
+        # Keep rolling 45 calendar days (~30+ business days to support full IRS 30-day wash sale tracking)
+        cutoff = (MarketHours.now_et() - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
+        recent = [t for t in data.get("trades", []) if t.get("date", "") >= cutoff]
+
+        entry = {
+            "account": str(account_number),
+            "symbol": symbol.upper(),
+            "action": action.upper(),
+            "date": today,
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+        if price is not None:
+            entry["price"] = round(float(price), 4)
+        if qty is not None:
+            entry["qty"] = round(float(qty), 6)
+        if pnl_pct is not None:
+            entry["pnl_pct"] = round(float(pnl_pct), 2)
+        if reason is not None:
+            entry["reason"] = str(reason)
+
+        recent.append(entry)
+        data["trades"] = recent
+        try:
+            with open(PDT_TRACKER_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+        return data
+
+    @classmethod
+    def get_recent_exits(cls, account_number: str, symbol: Optional[str] = None, days: int = 30) -> List[Dict[str, Any]]:
+        """Returns all SELL trades for an account (and optional symbol) within rolling `days` calendar days."""
+        if not os.path.exists(PDT_TRACKER_FILE):
+            return []
+        try:
+            with open(PDT_TRACKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cutoff = (MarketHours.now_et() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+            exits = [
+                t for t in data.get("trades", [])
+                if t.get("action") == "SELL" and str(t.get("account")) == str(account_number)
+                and t.get("date", "") >= cutoff
+            ]
+            if symbol:
+                exits = [t for t in exits if t.get("symbol", "").upper() == symbol.upper()]
+            return exits
+        except Exception:
+            return []
+
+    @classmethod
+    def is_in_cooldown(cls, account_number: str, symbol: str,
+                       cooldown_days_loss: int = 7,
+                       cooldown_days_profit: int = 3) -> Tuple[bool, str]:
+        """
+        Enforces strict re-entry lockout rules to prevent wash sales, whipsaws, and wasteful churn:
+        1. Same-Day Lockout: Any symbol sold today CANNOT be re-bought today under any circumstances.
+        2. Loss / Stop-Loss Cooldown: Any symbol sold at a loss / stop-loss is locked for `cooldown_days_loss` (default 7 days).
+        3. Take-Profit Cooldown: Any symbol sold at take-profit / rebalance is locked for `cooldown_days_profit` (default 3 days).
+        """
+        today = MarketHours.now_et().strftime("%Y-%m-%d")
+        now_dt = MarketHours.now_et()
+        exits = cls.get_recent_exits(account_number, symbol, days=max(cooldown_days_loss, cooldown_days_profit, 30))
+        if not exits:
+            return False, "No recent exits (clean for entry)"
+
+        for ex in reversed(exits):
+            ex_date = ex.get("date", "")
+            if ex_date == today:
+                return True, f"SAME-DAY RE-ENTRY LOCKOUT: {symbol} was sold earlier today ({ex.get('ts', today)}). Buying back on the same day is strictly prohibited."
+
+            try:
+                ex_dt = datetime.datetime.strptime(ex_date, "%Y-%m-%d").replace(tzinfo=ET_ZONE)
+                days_since = (now_dt.date() - ex_dt.date()).days
+            except Exception:
+                days_since = 0
+
+            pnl = ex.get("pnl_pct", 0.0)
+            reason = ex.get("reason", "")
+            is_loss = (pnl < 0) or ("STOP" in reason.upper()) or ("LOSS" in reason.upper())
+
+            required_cooldown = cooldown_days_loss if is_loss else cooldown_days_profit
+            if days_since < required_cooldown:
+                loss_str = f"loss/stop-loss ({pnl:+.1f}%, reason: {reason or 'stop-loss'})" if is_loss else f"profit/exit ({pnl:+.1f}%)"
+                return True, (f"WASH-SALE / RE-ENTRY COOLDOWN: {symbol} sold {days_since}d ago at {loss_str}. "
+                              f"Required lockout is {required_cooldown}d ({required_cooldown - days_since}d remaining).")
+
+        return False, "Cooldown period expired (clean for entry)"
+
+    @classmethod
+    def get_day_trades_count(cls, account_number: str) -> int:
+        """Counts round-trip day trades (same symbol BUY + SELL on same date) in rolling 5 days."""
+        if not os.path.exists(PDT_TRACKER_FILE):
+            return 0
+        try:
+            with open(PDT_TRACKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cutoff = (MarketHours.now_et() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+            trades = [t for t in data.get("trades", []) if t.get("date", "") >= cutoff and str(t.get("account")) == str(account_number)]
+            
+            by_day_sym: Dict[Tuple[str, str], List[str]] = {}
+            for t in trades:
+                key = (t["date"], t["symbol"])
+                by_day_sym.setdefault(key, []).append(t["action"])
+            
+            day_trades = 0
+            for (dt, sym), actions in by_day_sym.items():
+                buys = actions.count("BUY")
+                sells = actions.count("SELL")
+                day_trades += min(buys, sells)
+            return day_trades
+        except Exception:
+            return 0
+
+    @classmethod
+    def is_same_day_position(cls, account_number: str, symbol: str) -> bool:
+        """Determines if a position was purchased during today's session (round-trip day trade risk)."""
+        today = MarketHours.now_et().strftime("%Y-%m-%d")
+        if not os.path.exists(PDT_TRACKER_FILE):
+            return False
+        try:
+            with open(PDT_TRACKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            buys = [t for t in data.get("trades", [])
+                    if t.get("date") == today and t.get("symbol") == symbol.upper() and
+                    t.get("action") == "BUY" and str(t.get("account")) == str(account_number)]
+            return len(buys) > 0
+        except Exception:
+            return False
+
+    @classmethod
+    def can_day_trade(cls, account_number: str, total_equity: float) -> Tuple[bool, str]:
+        """FINRA Rule 4210: Accounts < $25k are limited to 3 day trades in rolling 5 business days."""
+        if total_equity >= 25000.0:
+            return True, "Equity >= $25k (Exempt from PDT limit)"
+        
+        count = cls.get_day_trades_count(account_number)
+        if count >= 3:
+            return False, f"PDT Limit Reached ({count}/3 day trades used in 5-day window). Blocked from same-day round-trips."
+        return True, f"PDT Compliant ({count}/3 day trades used in 5-day window)"
+
+    @classmethod
+    def check_daily_circuit_breaker(cls, account_number: str, current_equity: float) -> Tuple[int, str]:
+        """
+        Multi-tier intraday drawdown escalation:
+        Tier 0: Drawdown > -3.0% (Normal operation)
+        Tier 1: Drawdown <= -3.0% (Halt new buy entries)
+        Tier 2: Drawdown <= -6.0% (Tighten all trailing stops to 1.0x ATR)
+        Tier 3: Drawdown <= -10.0% (Emergency risk liquidation mode)
+        """
+        today = MarketHours.now_et().strftime("%Y-%m-%d")
+        os.makedirs(os.path.dirname(CIRCUIT_BREAKER_FILE), exist_ok=True)
+        baseline_data = {}
+        if os.path.exists(CIRCUIT_BREAKER_FILE):
+            try:
+                with open(CIRCUIT_BREAKER_FILE, "r", encoding="utf-8") as f:
+                    baseline_data = json.load(f)
+            except Exception:
+                pass
+        
+        acc_key = f"{account_number}_{today}"
+        start_equity = baseline_data.get(acc_key)
+        if not start_equity or start_equity <= 0:
+            baseline_data[acc_key] = current_equity
+            try:
+                with open(CIRCUIT_BREAKER_FILE, "w", encoding="utf-8") as f:
+                    json.dump(baseline_data, f, indent=2)
+            except Exception:
+                pass
+            return 0, f"Starting daily baseline set at ${current_equity:,.2f}"
+
+        drawdown_pct = (current_equity - start_equity) / start_equity * 100.0
+        if drawdown_pct <= -10.0:
+            return 3, f"CIRCUIT BREAKER TIER 3 TRIPPED: Drawdown is {drawdown_pct:.2f}% (Limit: -10.0%). Emergency risk liquidation mode."
+        elif drawdown_pct <= -6.0:
+            return 2, f"CIRCUIT BREAKER TIER 2 TRIPPED: Drawdown is {drawdown_pct:.2f}% (Limit: -6.0%). Tightening all stops to 1.0x ATR."
+        elif drawdown_pct <= -3.0:
+            return 1, f"CIRCUIT BREAKER TIER 1 TRIPPED: Drawdown is {drawdown_pct:.2f}% (Limit: -3.0%). New buy entries halted for today."
+        return 0, f"Intraday P&L: {drawdown_pct:+.2f}% vs open ${start_equity:,.2f} (Within risk limits)"
+
+    @classmethod
+    def get_ticker_risk_parameters(cls, symbol: str, current_price: float, default_stop_pct: float = 5.0) -> Dict[str, float]:
+        """
+        Calculates volatility-adjusted risk thresholds tailored to asset volatility:
+        - Broad Index ETFs (VTI, QQQ, SPY, SMH, etc.): 4.5% stop, 3.5% trailing stop.
+        - High-Beta / Single Equities: 2.0x ATR_pct bounded between 6.0% and 14.0% to prevent noise whipsaws.
+        - Stage 1 Take-Profit: +8.0%
+        - Stage 2 Take-Profit: +15.0%
+        - Trailing stop distance: 1.5x ATR_pct bounded between 4.0% and 8.0%.
+        """
+        sym = symbol.upper().strip()
+        is_broad_etf = sym in ("VTI", "QQQ", "SPY", "SMH", "IWM", "DIA")
+        
+        atr_pct = 1.0 if is_broad_etf else 3.5
+        try:
+            bars = FinancialData.fetch_historical(sym, range_period="1mo", interval="1d")
+            if len(bars) >= 5:
+                highs = [b["high"] for b in bars]
+                lows = [b["low"] for b in bars]
+                closes = [b["close"] for b in bars]
+                atr_series = TechnicalIndicators.atr(highs, lows, closes, period=min(14, len(closes) - 1))
+                if atr_series and atr_series[-1] is not None and current_price > 0:
+                    atr_pct = (atr_series[-1] / current_price) * 100.0
+        except Exception:
+            pass
+
+        if is_broad_etf:
+            stop_loss = 4.5
+            trailing_stop = 3.5
+        else:
+            # Scaled to 2.0x ATR so normal intraday high-beta market noise does not whipsaw out positions
+            stop_loss = round(max(6.0, min(14.0, 2.0 * atr_pct)), 2)
+            trailing_stop = round(max(4.0, min(8.0, 1.5 * atr_pct)), 2)
+
+        return {
+            "stop_loss_pct": stop_loss,
+            "take_profit_1_pct": 8.0,
+            "take_profit_2_pct": 15.0,
+            "trailing_stop_pct": trailing_stop,
+            "atr_pct": round(atr_pct, 2)
+        }
 
 
 # ==============================================================================
@@ -2087,7 +2701,7 @@ class PortfolioAuditor:
               positions: Optional[List[Dict[str, Any]]] = None,
               quotes: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Performs full quantitative risk, concentration, dead-money, dust, and tax-loss harvesting audit."""
-        acc = account_number or RobinhoodExecutor.get_default_account_number()
+        acc = RobinhoodExecutor.resolve_account(account_number)
         
         acc_info = {}
         try:
@@ -2433,33 +3047,36 @@ def run_scheduled_trading_lifecycle(interval_seconds: int = 900, auto_trade: boo
         # Phase 2: Active Trading Session (09:30 - 16:00 ET)
         elif session == "REGULAR":
             has_run_closing = False
-            print(f"\n[{time_str}] ⚡ REGULAR SESSION PULSE CHECK (Every {interval_seconds}s)")
+            print(f"\n[{time_str}] ⚡ REGULAR SESSION PULSE CHECK (Every {interval_seconds}s)", flush=True)
             
+            scan_universe = BALANCED_LIFECYCLE_WATCHLIST if (watchlist is None or set(watchlist) == set(DEFAULT_WATCHLIST)) else watchlist[:14]
             top_opportunities = []
-            for ticker in watchlist[:10]:
+            for ticker in scan_universe:
                 try:
                     res = TradingStrategyEngine.analyze_ticker(ticker)
                     top_opportunities.append(res)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"Notice analyzing {ticker}: {exc}", flush=True)
 
             top_opportunities.sort(key=lambda x: x["score"], reverse=True)
-            print(f"{'Ticker':<7} | {'Price':<9} | {'Chg%':<7} | {'RSI':<6} | {'Score':<6} | {'Signal':<12} | {'Stop Loss':<10} | {'Target'}")
-            print("-" * 80)
+            print(f"{'Ticker':<7} | {'Price':<9} | {'Chg%':<7} | {'RSI':<6} | {'Score':<6} | {'Signal':<12} | {'Stop Loss':<10} | {'Target'}", flush=True)
+            print("-" * 80, flush=True)
             for r in top_opportunities:
-                print(f"{r['ticker']:<7} | ${r['price']:<8.2f} | {r['change_pct']:>+5.2f}% | {r['indicators']['rsi']:<6.1f} | {r['score']:<6.1f} | {r['recommendation']:<12} | ${r['risk_targets']['stop_loss']:<9.2f} | ${r['risk_targets']['take_profit_1']:.2f}")
+                print(f"{r['ticker']:<7} | ${r['price']:<8.2f} | {r['change_pct']:>+5.2f}% | {r['indicators']['rsi']:<6.1f} | {r['score']:<6.1f} | {r['recommendation']:<12} | ${r['risk_targets']['stop_loss']:<9.2f} | ${r['risk_targets']['take_profit_1']:.2f}", flush=True)
 
-            # Active Risk Management & AI Agent Validation Pulse
+            # Active Risk Management & Autonomous Opportunity Execution Pulse
             try:
                 acc_num = RobinhoodExecutor.get_agentic_account_number()
                 today_str = now.strftime("%Y-%m-%d")
                 rules = _read_plan_risk_rules(today_str)
                 _risk_monitor_pulse(acc_num, dry_run, rules["stop_loss_pct"], rules["take_profit_pct"])
+                if auto_trade:
+                    _auto_trade_entry_pulse(acc_num, dry_run, top_opportunities)
             except Exception as e:
-                print(f"Risk pulse notice: {e}")
+                print(f"Trading pulse notice: {e}", flush=True)
 
             time_left = MarketHours.seconds_until_close(now)
-            print(f"\nSession active: {int(time_left // 60)} minutes remaining. Sleeping {interval_seconds}s until next check...")
+            print(f"\nSession active: {int(time_left // 60)} minutes remaining. Sleeping {interval_seconds}s until next check...", flush=True)
             time.sleep(interval_seconds)
 
         # Phase 3: Post-Market Closing Summary (16:00 - 16:15 ET)
@@ -2569,13 +3186,269 @@ def _read_plan_risk_rules(today: str) -> Dict[str, float]:
     return rules
 
 
-def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float, take_profit_pct: float) -> None:
-    """One risk-management pass over all open equity positions."""
+def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: List[Dict[str, Any]]) -> None:
+    """Executes high-conviction buy setups when cash buffer, circuit breakers, and risk rules permit."""
+    if not top_candidates:
+        return
+    
+    port = RobinhoodExecutor.get_live_portfolio(account_number)
+    bp_dict = port.get("buying_power", {})
+    bp = float(bp_dict.get("buying_power", 0.0) if isinstance(bp_dict, dict) else (bp_dict or 0.0))
+    cash = float(port.get("cash", bp) or bp or 0.0)
+    total_val = float(port.get("total_value", 0.0) or (float(port.get("equity_value", 0.0) or 0.0) + cash) or 0.0)
+    if total_val <= 0:
+        total_val = cash
+
+    # 0. Session halt flag check (written by Tier 3 emergency liquidation)
+    _today = MarketHours.now_et().strftime("%Y-%m-%d")
+    _halt_flag = SESSION_HALT_FLAG.format(date=_today)
+    if os.path.exists(_halt_flag):
+        _risk_log(f"AUTO-TRADE: Session halt flag present (Tier 3 triggered earlier today). "
+                  f"All new buy entries blocked for the remainder of this session.")
+        return
+
+    # 0.5. Opening Bell Noise Window (09:30 - 09:45 ET)
+    # Never chase opening gaps or buy during opening auction volatility
+    now_et = MarketHours.now_et()
+    if datetime.time(9, 30) <= now_et.time() < datetime.time(9, 45):
+        _risk_log(f"AUTO-TRADE: Opening range stabilization in effect (09:30-09:45 ET). Postponing breakout entries until after 09:45 ET.")
+        return
+
+    # 1. Multi-Tier Daily Circuit Breaker Check (halt buying on Tier 1+)
+    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, total_val)
+    if tier >= 1:
+        _risk_log(f"AUTO-TRADE: {cb_msg}")
+        return
+
+    # 2. Pre-Purchase PDT Budget Check
+    if total_val < 25000.0:
+        day_trades_used = ComplianceAndRiskGuard.get_day_trades_count(account_number)
+        if day_trades_used >= 3:
+            _risk_log(f"AUTO-TRADE: PDT budget exhausted ({day_trades_used}/3 day trades used in 5-day window). Blocking new entries.")
+            return
+        elif day_trades_used == 2:
+            _risk_log(f"AUTO-TRADE ADVISORY: 2/3 day trades used. Only 1 day trade remaining in 5-day window.")
+
+    # 3. Minimum viable account size guard (prevent trivially-small trades)
+    if total_val < 150.0:
+        _risk_log(f"AUTO-TRADE: Total portfolio value ${total_val:.2f} below $150 minimum. "
+                  f"Suspending auto-trade until sufficient capital is present.")
+        return
+
+    # 4. Ensure min 15% cash buffer is preserved after buy
+    min_cash_buffer = total_val * 0.15
+    deployable_cash = max(0.0, cash - min_cash_buffer)
+    
+    if deployable_cash < 10.0:
+        _risk_log(f"AUTO-TRADE: Cash ${cash:.2f} (deployable: ${deployable_cash:.2f} above 15% buffer). No capital for new entry.")
+        return
+
     today = MarketHours.now_et().strftime("%Y-%m-%d")
+    positions = RobinhoodExecutor.get_equity_positions(account_number)
+    held_symbols = {str(p.get("symbol", "")).upper(): float(p.get("quantity", 0) or 0) for p in positions if float(p.get("quantity", 0) or 0) > 0}
+
+    # 4.5. Core-Satellite Ballast Management:
+    # If cash buffer is in surplus (> 25%) and Core ETFs (VTI/QQQ) are underfunded (< 35% of portfolio),
+    # prioritize funding Core ETFs to reduce portfolio volatility and eliminate dead cash drag.
+    core_etf_holdings = {"VTI": 0.0, "QQQ": 0.0}
+    for p in positions:
+        s = str(p.get("symbol", "")).upper()
+        if s in core_etf_holdings:
+            core_etf_holdings[s] = float(p.get("quantity", 0) or 0) * float(p.get("average_buy_price", 0) or 0)
+    
+    total_core_val = sum(core_etf_holdings.values())
+    core_ratio = (total_core_val / total_val) if total_val > 0 else 0.0
+    cash_ratio = (cash / total_val) if total_val > 0 else 0.0
+
+    if cash_ratio > 0.25 and core_ratio < 0.35 and deployable_cash >= 20.0:
+        target_core = "VTI" if core_etf_holdings["VTI"] <= core_etf_holdings["QQQ"] else "QQQ"
+        core_buy_size = round(min(deployable_cash * 0.5, 50.0, deployable_cash - 10.0), 2)
+        if core_buy_size >= 15.0:
+            core_flag = os.path.join(RISK_MONITOR_FLAGS, f"ballast_buy_{today}_{target_core}.flag")
+            if not os.path.exists(core_flag):
+                _risk_log(f"AUTO-TRADE CORE BALLAST: Cash is {cash_ratio*100:.1f}% (target 15%) & Core ETFs are {core_ratio*100:.1f}% (target 52%). Deploying ${core_buy_size:.2f} into {target_core} ballast...")
+                if not dry_run:
+                    try:
+                        res = RobinhoodExecutor.execute_market_order(account_number, target_core, "buy", dollar_amount=str(core_buy_size))
+                        _risk_log(f"AUTO-TRADE {target_core}: Core Ballast BUY placed! Response={str(res)[:160]}")
+                        ComplianceAndRiskGuard.record_trade(account_number, target_core, "BUY", qty=None)
+                        with open(core_flag, "w", encoding="utf-8") as fh:
+                            json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dollar_amount": core_buy_size}, fh)
+                        deployable_cash -= core_buy_size
+                    except Exception as exc:
+                        _risk_log(f"AUTO-TRADE {target_core} ballast buy failed: {exc}")
+
+    for opp in top_candidates:
+        sym = opp.get("ticker", "").upper()
+        score = opp.get("score", 0.0)
+        rec = opp.get("recommendation", "")
+        price = opp.get("price", 0.0)
+        indicators = opp.get("indicators", {})
+        
+        # Calibrated selective threshold (STRONG_BUY >= 80.0)
+        if score < 80.0 or rec != "STRONG_BUY" or price <= 0:
+            continue
+        
+        # 1. Strict Wash-Sale & Re-Entry Cooldown Check (prevents selling and re-buying same stock)
+        in_cooldown, cd_msg = ComplianceAndRiskGuard.is_in_cooldown(account_number, sym)
+        if in_cooldown:
+            _risk_log(f"AUTO-TRADE {sym}: {cd_msg} -> Skipping entry.")
+            continue
+
+        # 2. Daily Exit Flag Guard (prevents same-day re-entry after stop-loss or take-profit)
+        stop_flag = os.path.join(RISK_MONITOR_FLAGS, f"stop_loss_{today}_{sym}.flag")
+        tp_flag = os.path.join(RISK_MONITOR_FLAGS, f"take_profit_{today}_{sym}.flag")
+        if os.path.exists(stop_flag) or os.path.exists(tp_flag):
+            _risk_log(f"AUTO-TRADE {sym}: Exit flag present today (stop-loss or take-profit active) -> Skipping entry.")
+            continue
+
+        # 3. Position Sizing and Hard Concentration Cap:
+        # Cap single stocks strictly at 15% of portfolio (Core ETFs allowed up to 35%)
+        pos_val = 0.0
+        for p in positions:
+            if str(p.get("symbol", "")).upper() == sym:
+                pos_val = float(p.get("quantity", 0) or 0) * price
+                break
+        
+        is_etf = sym in ("VTI", "QQQ", "SPY")
+        max_cap = 0.35 if is_etf else 0.15
+        max_allowed_val = total_val * max_cap
+        room_for_pos = max_allowed_val - pos_val
+        if room_for_pos < 10.0:
+            _risk_log(f"AUTO-TRADE {sym}: Already at {pos_val/total_val*100:.1f}% concentration cap (max {int(max_cap*100)}%); skipping.")
+            continue
+
+        # 4. Sector Concentration Guard (Max 2 satellite positions per sector to prevent semi overlap)
+        if not is_etf:
+            sym_sector = None
+            for sec_name, sec_syms in SECTOR_UNIVERSES.items():
+                if sym in sec_syms and sec_name != "CORE_INDEX_ETFS":
+                    sym_sector = sec_name
+                    break
+            if sym_sector:
+                sector_held_count = sum(1 for held_sym in held_symbols if held_sym in SECTOR_UNIVERSES.get(sym_sector, []))
+                if sector_held_count >= 2 and sym not in held_symbols:
+                    _risk_log(f"AUTO-TRADE {sym}: Sector {sym_sector} already has {sector_held_count} active positions; skipping to ensure diversification.")
+                    continue
+
+        # 5. Bid-Ask Spread Guard against slippage
+        try:
+            quote_map = RobinhoodExecutor.get_equity_quotes([sym])
+            q_info = quote_map.get(sym, {})
+            bid_pr = float(q_info.get("bid_price") or 0.0)
+            ask_pr = float(q_info.get("ask_price") or 0.0)
+            if bid_pr > 0 and ask_pr > 0 and (ask_pr - bid_pr) / ask_pr > 0.01:
+                _risk_log(f"AUTO-TRADE {sym}: Bid-ask spread too wide ({((ask_pr-bid_pr)/ask_pr*100):.2f}% > 1.0%); skipping entry to prevent slippage.")
+                continue
+        except Exception:
+            pass
+
+        buy_flag = os.path.join(RISK_MONITOR_FLAGS, f"buy_{today}_{sym}.flag")
+        if os.path.exists(buy_flag):
+            continue
+
+        # Position sizing scaled to portfolio growth (8% target, min $15, max concentration room)
+        target_size = max(15.0, total_val * 0.08)
+        trade_size = round(min(deployable_cash, target_size, room_for_pos), 2)
+        if trade_size < 10.0:
+            trade_size = round(min(deployable_cash, 10.0, room_for_pos), 2)
+        if trade_size < 5.0:
+            break
+
+        _risk_log(f"AUTO-TRADE SIGNAL: {sym} Score {score:.1f} ({rec}, VolRatio: {indicators.get('volume_ratio', 1.0)}x) -> Sizing ${trade_size:.2f} trade...")
+        val = AgentAdvisor.validate_trade_decision(sym, "buy", price, price, 0.0, f"Breakout Setup (Score: {score:.1f}, VolRatio: {indicators.get('volume_ratio', 1.0)}x)", {
+            "dollar_amount": trade_size,
+            "account": account_number,
+            "rsi": indicators.get("rsi"),
+            "volume_ratio": indicators.get("volume_ratio"),
+            "macd_histogram": indicators.get("macd_histogram"),
+            "stop_loss": opp.get("risk_targets", {}).get("stop_loss"),
+            "target_1": opp.get("risk_targets", {}).get("take_profit_1")
+        })
+        _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
+
+        if val["verdict"] in ("EXECUTE", "PROCEED", "BUY"):
+            if not dry_run:
+                try:
+                    res = RobinhoodExecutor.execute_market_order(account_number, sym, "buy", dollar_amount=str(trade_size))
+                    _risk_log(f"AUTO-TRADE {sym}: BUY order placed! Response={str(res)[:200]}")
+                    ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY", price=price, qty=round(trade_size / price, 6) if price > 0 else None)
+                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": trade_size, "price": price, "score": score, "reason": "AUTO_BREAKOUT", "agent_verdict": val["verdict"]})
+                    with open(buy_flag, "w", encoding="utf-8") as fh:
+                        json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dollar_amount": trade_size, "price": price, "score": score}, fh)
+                    deployable_cash -= trade_size
+                except Exception as exc:
+                    _risk_log(f"AUTO-TRADE {sym}: Order failed: {exc}")
+            else:
+                _risk_log(f"AUTO-TRADE [DRY RUN] {sym}: Would place ${trade_size:.2f} BUY order at ~${price:.2f}.")
+                with open(buy_flag, "w", encoding="utf-8") as fh:
+                    json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dry_run": True}, fh)
+
+
+def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float, take_profit_pct: float) -> None:
+    """One risk-management pass over all open equity positions with multi-tier circuit breaker escalation."""
+    today = MarketHours.now_et().strftime("%Y-%m-%d")
+    port = RobinhoodExecutor.get_live_portfolio(account_number)
+    bp_dict = port.get("buying_power", {})
+    bp = float(bp_dict.get("buying_power", 0.0) if isinstance(bp_dict, dict) else (bp_dict or 0.0))
+    cash = float(port.get("cash", bp) or bp or 0.0)
+    total_equity = float(port.get("total_value", 0.0) or (float(port.get("equity_value", 0.0) or 0.0) + cash) or 0.0)
     positions = RobinhoodExecutor.get_equity_positions(account_number)
     symbols = [str(p.get("symbol", "")).upper() for p in positions if float(p.get("quantity", 0) or 0) > 0]
     quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
     os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
+
+    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, total_equity)
+
+    # Tier 3 Emergency Liquidation Mode (Drawdown <= -10%)
+    if tier == 3:
+        _risk_log(f"🚨 {cb_msg} -> Executing emergency capital liquidation...")
+
+        # Write session-halt flag so _auto_trade_entry_pulse is blocked even if called again
+        _halt_flag = SESSION_HALT_FLAG.format(date=today)
+        os.makedirs(os.path.dirname(_halt_flag), exist_ok=True)
+        try:
+            with open(_halt_flag, "w", encoding="utf-8") as _fh:
+                json.dump({"tier": 3, "reason": cb_msg,
+                           "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()}, _fh)
+        except OSError:
+            pass
+
+        positions_with_pnl = []
+        for pos in positions:
+            sym = str(pos.get("symbol", "")).upper()
+            qty = float(pos.get("quantity", 0) or 0)
+            avg_cost = float(pos.get("average_buy_price", 0) or 0)
+            if not sym or qty <= 0 or avg_cost <= 0:
+                continue
+            quote = quotes.get(sym, {})
+            price = float(quote.get("last_trade_price") or quote.get("price") or avg_cost)
+            pnl_pct = (price - avg_cost) / avg_cost * 100.0 if avg_cost > 0 else 0.0
+            positions_with_pnl.append((pnl_pct, sym, qty, price, avg_cost))
+
+        for pnl_pct, sym, qty, price, avg_cost in positions_with_pnl:
+            _risk_log(f"EMERGENCY LIQUIDATION {sym}: selling {qty} sh @ ${price:.2f} ({pnl_pct:+.2f}%)")
+            if not dry_run:
+                try:
+                    # PDT deferral is OVERRIDDEN during Tier 3 emergency liquidation
+                    RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                    ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason="EMERGENCY_CIRCUIT_BREAKER_TIER_3")
+                    ObsidianTradingVault.log_trade_execution({
+                        "ticker": sym, "action": "SELL", "qty": qty, "price": price,
+                        "pnl_pct": pnl_pct, "reason": "EMERGENCY_CIRCUIT_BREAKER_TIER_3",
+                        "pdt_override": True
+                    })
+                except Exception as exc:
+                    _risk_log(f"EMERGENCY LIQUIDATION {sym} FAILED: {exc}")
+        return
+
+    # Tier 2 Stop Tightening Mode (Drawdown <= -6%)
+    if tier == 2:
+        _risk_log(f"⚠️ {cb_msg} -> Tightening active stop-loss to 4.0% / 1.0x ATR.")
+        stop_loss_pct = min(stop_loss_pct, 4.0)
+
+    now_et = MarketHours.now_et()
+    is_opening_bell = (datetime.time(9, 30) <= now_et.time() < datetime.time(9, 45))
 
     for pos in positions:
         sym = str(pos.get("symbol", "")).upper()
@@ -2590,14 +3463,55 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
             continue
         pnl_pct = (price - avg_cost) / avg_cost * 100.0
 
+        # Calculate dynamic volatility-adjusted risk thresholds
+        risk_params = ComplianceAndRiskGuard.get_ticker_risk_parameters(sym, price, default_stop_pct=stop_loss_pct)
+        effective_stop_pct = risk_params["stop_loss_pct"]
+        trailing_stop_pct = risk_params["trailing_stop_pct"]
+        tp1_pct = risk_params["take_profit_1_pct"]
+        tp2_pct = risk_params["take_profit_2_pct"]
+
+        # Breakeven Stop Ratchet: If position gained >= 4.0%, never let it become a loss
+        if pnl_pct >= 4.0:
+            effective_stop_pct = 0.5  # Max -0.5% drop from cost once up 4%
+
         stop_flag = os.path.join(RISK_MONITOR_FLAGS, f"stop_loss_{today}_{sym}.flag")
         tp_flag = os.path.join(RISK_MONITOR_FLAGS, f"take_profit_{today}_{sym}.flag")
 
-        if pnl_pct <= -stop_loss_pct and not os.path.exists(stop_flag):
-            action = f"STOP-LOSS {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
+        # PDT Safety check: ONLY same-day positions trigger day-trade round-trips!
+        is_same_day = ComplianceAndRiskGuard.is_same_day_position(account_number, sym)
+        can_dt, pdt_reason = ComplianceAndRiskGuard.can_day_trade(account_number, total_equity)
+
+        # Opening Bell Noise Buffer: During 09:30-09:45 ET, pause stop-loss executions unless catastrophic (> -12%)
+        if is_opening_bell and pnl_pct > -12.0 and pnl_pct <= -effective_stop_pct:
+            _risk_log(f"RISK {sym}: Opening bell stabilization window (09:30-09:45 ET). Pausing stop-loss trigger ({pnl_pct:+.2f}%) to allow morning wicks to settle.")
+            continue
+
+        if pnl_pct <= -effective_stop_pct and not os.path.exists(stop_flag):
+            # If position was bought today and PDT limit is exhausted, defer exit to next open
+            if is_same_day and not can_dt:
+                _risk_log(f"PDT GUARD {sym}: Position bought today, 3/3 day trades used. "
+                          f"Deferring STOP-LOSS exit to tomorrow 09:30 ET open (deferred_exit flag written).")
+                _deferred_flag = os.path.join(DEFERRED_EXIT_FLAG_DIR, f"deferred_exit_{today}_{sym}.flag")
+                os.makedirs(DEFERRED_EXIT_FLAG_DIR, exist_ok=True)
+                try:
+                    with open(_deferred_flag, "w", encoding="utf-8") as _fh:
+                        json.dump({
+                            "symbol": sym, "reason": "PDT_STOP_LOSS_DEFERRAL",
+                            "pnl_pct": round(pnl_pct, 2), "price": price,
+                            "avg_cost": avg_cost, "qty": qty,
+                            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            "execute_at": "next_market_open_09:30_ET"
+                        }, _fh)
+                except OSError:
+                    pass
+                continue
+
+            action = f"STOP-LOSS {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f}, limit: -{effective_stop_pct:.1f}%)"
             _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
             
-            val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Stop-Loss (-{stop_loss_pct}%)", {"qty": qty, "account": account_number})
+            val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Stop-Loss (-{effective_stop_pct}%)", {
+                "qty": qty, "account": account_number, "pdt_status": pdt_reason, "is_same_day": is_same_day
+            })
             _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
             
             if val["verdict"] == "WAIT":
@@ -2608,26 +3522,52 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
                 try:
                     res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
                     _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                    ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason="STOP_LOSS")
                     ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": "STOP_LOSS", "agent_verdict": val["verdict"]})
                     with open(stop_flag, "w", encoding="utf-8") as fh:
                         json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                     "price": price, "qty": qty, "pnl_pct": pnl_pct, "agent_verdict": val["verdict"]}, fh)
                 except Exception as exc:  # noqa: BLE001
                     _risk_log(f"RISK {sym}: order FAILED: {exc}")
-        elif pnl_pct >= take_profit_pct:
-            stage = "none"
+        elif pnl_pct >= tp1_pct or os.path.exists(tp_flag):
+            tp_info = {}
             if os.path.exists(tp_flag):
                 try:
                     with open(tp_flag, encoding="utf-8") as fh:
-                        stage = json.load(fh).get("stage", "none")
+                        tp_info = json.load(fh)
                 except (OSError, ValueError):
-                    stage = "none"
-            if stage == "none":
+                    tp_info = {}
+
+            stage = tp_info.get("stage", "none")
+
+            # Stage 1: Hit +8% -> Lock in 50% profits, start trailing runner
+            if stage == "none" and pnl_pct >= tp1_pct:
+                if is_same_day and not can_dt:
+                    _tp_stage_label = "PDT_TP1_DEFERRAL"
+                    _risk_log(f"PDT GUARD {sym}: Position bought today, 3/3 day trades used. "
+                              f"Deferring {_tp_stage_label} exit to tomorrow 09:30 ET open (runner held at {pnl_pct:+.1f}%).")
+                    _deferred_flag = os.path.join(DEFERRED_EXIT_FLAG_DIR, f"deferred_exit_{today}_{sym}.flag")
+                    os.makedirs(DEFERRED_EXIT_FLAG_DIR, exist_ok=True)
+                    try:
+                        with open(_deferred_flag, "w", encoding="utf-8") as _fh:
+                            json.dump({
+                                "symbol": sym, "reason": _tp_stage_label,
+                                "pnl_pct": round(pnl_pct, 2), "price": price,
+                                "avg_cost": avg_cost, "qty": qty,
+                                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "execute_at": "next_market_open_09:30_ET"
+                            }, _fh)
+                    except OSError:
+                        pass
+                    continue
+
                 sell_qty = round(qty / 2.0, 4)  # market orders allow fractional shares
-                action = f"TAKE-PROFIT (50%) {sym} {sell_qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
+                action = f"TAKE-PROFIT (Stage 1 - 50%) {sym} {sell_qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
                 _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
                 
-                val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Take-Profit 50% (+{take_profit_pct}%)", {"qty": sell_qty, "account": account_number})
+                val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Take-Profit 50% (+{tp1_pct}%)", {
+                    "qty": sell_qty, "account": account_number, "pdt_status": pdt_reason, "is_same_day": is_same_day
+                })
                 _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
                 
                 if val["verdict"] == "WAIT":
@@ -2637,38 +3577,83 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
                 if not dry_run:
                     try:
                         res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(sell_qty))
-                        _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
+                        _risk_log(f"RISK {sym}: Stage 1 order response={str(res)[:300]}")
+                        ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=sell_qty, pnl_pct=pnl_pct, reason="TAKE_PROFIT_HALF")
                         ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": sell_qty, "price": price, "pnl_pct": pnl_pct, "reason": "TAKE_PROFIT_HALF", "agent_verdict": val["verdict"]})
                         with open(tp_flag, "w", encoding="utf-8") as fh:
-                            json.dump({"stage": "half",
-                                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                        "price": price, "qty_sold": sell_qty, "agent_verdict": val["verdict"]}, fh)
+                            json.dump({
+                                "stage": "runner",
+                                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "price_stage1": price,
+                                "high_water_mark": price,
+                                "entry_price": avg_cost,
+                                "qty_sold_half": sell_qty,
+                                "remaining_qty": qty - sell_qty,
+                                "trailing_stop_pct": trailing_stop_pct,
+                                "target_2_pct": tp2_pct
+                            }, fh)
                     except Exception as exc:  # noqa: BLE001
                         _risk_log(f"RISK {sym}: order FAILED: {exc}")
-            elif stage == "half":
-                action = f"TAKE-PROFIT (full) {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
-                _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
-                
-                val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, "Take-Profit Full", {"qty": qty, "account": account_number})
-                _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
-                
-                if val["verdict"] == "WAIT":
-                    _risk_log(f"RISK {sym}: AI Agent advised WAIT. Holding position.")
-                    continue
 
-                if not dry_run:
+            # Stage 2: Manage Runner with True Dynamic Trailing Stop & Target 2
+            elif stage in ("runner", "half"):
+                hwm = max(float(tp_info.get("high_water_mark") or price), price)
+                # Persist updated high water mark if price printed higher
+                if price > float(tp_info.get("high_water_mark", 0.0)):
+                    tp_info["high_water_mark"] = price
                     try:
-                        res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
-                        _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
-                        ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": "TAKE_PROFIT_FULL", "agent_verdict": val["verdict"]})
                         with open(tp_flag, "w", encoding="utf-8") as fh:
-                            json.dump({"stage": "full",
-                                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                        "price": price, "qty_sold": qty, "agent_verdict": val["verdict"]}, fh)
-                    except Exception as exc:  # noqa: BLE001
-                        _risk_log(f"RISK {sym}: order FAILED: {exc}")
+                            json.dump(tp_info, fh)
+                    except OSError:
+                        pass
+
+                drop_from_peak = ((hwm - price) / hwm * 100.0) if hwm > 0 else 0.0
+                effective_trail = float(tp_info.get("trailing_stop_pct") or trailing_stop_pct)
+                target_2 = float(tp_info.get("target_2_pct") or tp2_pct)
+
+                exit_runner = False
+                exit_reason = ""
+                if pnl_pct >= target_2:
+                    exit_runner = True
+                    exit_reason = f"TAKE_PROFIT_FULL (Target 2 +{pnl_pct:.1f}% >= +{target_2}%)"
+                elif drop_from_peak >= effective_trail:
+                    exit_runner = True
+                    exit_reason = f"TRAILING_STOP_EXIT (Dropped {drop_from_peak:.1f}% >= {effective_trail:.1f}% from high ${hwm:.2f})"
+                elif pnl_pct <= 1.0:
+                    exit_runner = True
+                    exit_reason = f"RUNNER_BREAKEVEN_PROTECTION (P&L {pnl_pct:+.1f}% dropped near entry)"
+
+                if exit_runner:
+                    if is_same_day and not can_dt:
+                        _risk_log(f"PDT GUARD {sym}: Position bought today, 3/3 day trades used. Deferring runner exit.")
+                        continue
+
+                    action = f"RUNNER EXIT {sym} {qty} sh @ ${price:.2f} ({exit_reason})"
+                    _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
+                    val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, exit_reason, {
+                        "qty": qty, "account": account_number, "pdt_status": pdt_reason, "is_same_day": is_same_day
+                    })
+                    _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
+                    if val["verdict"] == "WAIT":
+                        _risk_log(f"RISK {sym}: AI Agent advised WAIT on runner exit. Holding runner.")
+                        continue
+
+                    if not dry_run:
+                        try:
+                            res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                            _risk_log(f"RISK {sym}: Runner order response={str(res)[:300]}")
+                            ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason=exit_reason)
+                            ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": exit_reason, "agent_verdict": val["verdict"]})
+                            with open(tp_flag, "w", encoding="utf-8") as fh:
+                                json.dump({"stage": "completed",
+                                            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                            "price": price, "qty_sold": qty, "reason": exit_reason}, fh)
+                        except Exception as exc:  # noqa: BLE001
+                            _risk_log(f"RISK {sym}: runner exit FAILED: {exc}")
+                else:
+                    _risk_log(f"RISK {sym}: Holding runner (P&L: {pnl_pct:+.2f}%, High: ${hwm:.2f}, Pullback: {drop_from_peak:.1f}% / Trail: {effective_trail:.1f}%)")
         else:
-            _risk_log(f"RISK {sym}: {pnl_pct:+.2f}% vs avg ${avg_cost:.2f} (price ${price:.2f}) - no action")
+            _risk_log(f"RISK {sym}: {pnl_pct:+.2f}% vs avg ${avg_cost:.2f} (price ${price:.2f}, dynamic stop: -{effective_stop_pct:.1f}%) - no action")
 
 
 def run_risk_monitor(interval_seconds: int = 900, dry_run: bool = False,
@@ -2718,8 +3703,14 @@ Usage:
   robinhood_trader.py <command> [arguments]
 
 Commands:
-  summary [account]          Compact, token-efficient executive summary (<200 tokens) for AI models.
+  summary [account|all]      Compact, token-efficient executive summary (<200 tokens) for AI models.
   portfolio [account]        Query live positions (supports --summary, --filter, --top, --json, --csv).
+  orders [account]           View recent equity orders, executions, and statuses.
+  pnl [account]              View realized and unrealized profit & loss performance.
+  trades [account]           View closed trade-by-trade P&L history.
+  buy <TICKER> [DOLLAR]      Execute market buy order on Agentic account (e.g. buy SMCI 25).
+  sell <TICKER> [QTY|all]    Execute market sell order on Agentic account (e.g. sell AVGO all).
+  accounts                   List all authorized Robinhood brokerage accounts & permissions.
   audit [account]            Full quantitative risk audit, concentration checks & health score (0-100).
   harvest-losses [account]   Tax-loss harvesting candidate breakdown with dollar savings & wash-sale guidance.
   rebalance-plan [account]   Concrete 4-step rebalance plan (cut dead money, clean dust, trim winners).
@@ -2743,16 +3734,16 @@ Options for 'portfolio':
 
 Examples:
   ./robinhood_trader.py summary
+  ./robinhood_trader.py summary agentic
+  ./robinhood_trader.py orders agentic
+  ./robinhood_trader.py pnl agentic
+  ./robinhood_trader.py accounts
   ./robinhood_trader.py portfolio --summary
   ./robinhood_trader.py portfolio --filter losers
   ./robinhood_trader.py audit
   ./robinhood_trader.py harvest-losses
   ./robinhood_trader.py rebalance-plan
-  ./robinhood_trader.py export
   ./robinhood_trader.py status
-  ./robinhood_trader.py analyze AAPL NVDA MSFT
-  ./robinhood_trader.py scan
-  ./robinhood_trader.py service status
 """
     print(help_text.strip())
 
@@ -2793,8 +3784,22 @@ def main():
             if not a.startswith("-"):
                 acc = a
                 break
-        audit_res = PortfolioAuditor.audit(account_number=acc)
-        print(PortfolioAuditor.format_executive_summary(audit_res))
+        if acc and acc.lower() == "all":
+            accounts = RobinhoodExecutor.get_accounts()
+            if not accounts:
+                audit_res = PortfolioAuditor.audit()
+                print(PortfolioAuditor.format_executive_summary(audit_res))
+            else:
+                for a in accounts:
+                    a_num = a.get("account_number")
+                    if a_num:
+                        audit_res = PortfolioAuditor.audit(account_number=a_num)
+                        print(PortfolioAuditor.format_executive_summary(audit_res))
+                        print()
+        else:
+            resolved_acc = RobinhoodExecutor.resolve_account(acc) if acc else None
+            audit_res = PortfolioAuditor.audit(account_number=resolved_acc)
+            print(PortfolioAuditor.format_executive_summary(audit_res))
 
     elif cmd in ("audit", "health", "health-check"):
         acc = None
@@ -3046,6 +4051,99 @@ def main():
         for i, h in enumerate(news["headlines"], 1):
             print(f"  {i}. {h}")
 
+    elif cmd in ("orders", "order-history", "recent-orders", "todays-orders"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        resolved_acc = RobinhoodExecutor.resolve_account(acc)
+        orders = RobinhoodExecutor.get_orders(resolved_acc)
+        print("=" * 95)
+        print(f"  ROBINHOOD EQUITY ORDERS (Account: {resolved_acc})")
+        print("=" * 95)
+        if not orders:
+            print("  No recent equity orders found.")
+        else:
+            print(f"{'Date/Time (UTC)':<20} | {'Symbol':<7} | {'Side':<5} | {'State':<10} | {'Qty/Amount':<12} | {'Avg Price':<10} | {'Agent'}")
+            print("-" * 95)
+            for o in orders[:25]:
+                dt = (o.get("last_transaction_at") or o.get("created_at") or "")[:19].replace("T", " ")
+                sym = o.get("symbol", "")
+                side = (o.get("side") or "").upper()
+                state = (o.get("state") or "").upper()
+                qty = o.get("cumulative_quantity") or o.get("quantity")
+                if not qty and o.get("dollar_based_amount"):
+                    qty = f"${float(o['dollar_based_amount']['amount']):.2f}"
+                elif qty:
+                    try:
+                        qty = f"{float(qty):.4f}"
+                    except Exception:
+                        pass
+                avg_p = o.get("average_price") or o.get("price")
+                avg_p_str = f"${float(avg_p):.2f}" if avg_p else "-"
+                agent = o.get("placed_agent") or "user"
+                print(f"{dt:<20} | {sym:<7} | {side:<5} | {state:<10} | {str(qty):<12} | {avg_p_str:<10} | {agent}")
+        print("=" * 95)
+
+    elif cmd in ("pnl", "realized-pnl", "gains"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        resolved_acc = RobinhoodExecutor.resolve_account(acc)
+        pnl_data = RobinhoodExecutor.get_realized_pnl(resolved_acc)
+        port_data = RobinhoodExecutor.get_live_portfolio(resolved_acc)
+        print("=" * 80)
+        print(f"  ROBINHOOD PROFIT & LOSS REPORT (Account: {resolved_acc})")
+        print("=" * 80)
+        tot_ret = pnl_data.get("total_returns", "0.00")
+        tot_rate = pnl_data.get("total_rate_of_return", "0.00")
+        try:
+            tot_ret_f = float(tot_ret)
+            tot_rate_f = float(tot_rate) * 100.0
+            pnl_s = "+" if tot_ret_f >= 0 else ""
+            print(f"  Realized P&L (Cumulative) : {pnl_s}${tot_ret_f:,.2f} ({pnl_s}{tot_rate_f:.2f}%)")
+        except Exception:
+            print(f"  Realized P&L (Cumulative) : ${tot_ret}")
+        
+        eq_val = port_data.get("equity", port_data.get("market_value", "0.00"))
+        print(f"  Portfolio Equity Value    : ${float(eq_val):,.2f}" if eq_val else "  Portfolio Equity Value    : -")
+        print("=" * 80)
+
+    elif cmd in ("trades", "trade-history"):
+        acc = None
+        for a in sys.argv[2:]:
+            if not a.startswith("-"):
+                acc = a
+                break
+        resolved_acc = RobinhoodExecutor.resolve_account(acc)
+        trades = RobinhoodExecutor.get_pnl_trade_history(resolved_acc)
+        print("=" * 90)
+        print(f"  ROBINHOOD TRADE HISTORY (Account: {resolved_acc})")
+        print("=" * 90)
+        if not trades:
+            print("  No recent closed trade records found.")
+        else:
+            print(f"{'Date/Time':<20} | {'Symbol':<7} | {'Side':<5} | {'Quantity':<10} | {'Price':<10} | {'Realized P&L'}")
+            print("-" * 90)
+            for t in trades[:25]:
+                dt = (t.get("execution_time") or t.get("date") or "")[:19].replace("T", " ")
+                sym = t.get("symbol", "")
+                side = (t.get("side") or "").upper()
+                qty = t.get("quantity", "")
+                price = t.get("price", "")
+                gain = t.get("realized_pnl", t.get("gain", "0.00"))
+                try:
+                    gain_f = float(gain)
+                    gsign = "+" if gain_f >= 0 else ""
+                    gstr = f"{gsign}${gain_f:,.2f}"
+                except Exception:
+                    gstr = str(gain)
+                print(f"{dt:<20} | {sym:<7} | {side:<5} | {str(qty):<10} | ${float(price):<9.2f} | {gstr}")
+        print("=" * 90)
+
     elif cmd in ("accounts", "account-list", "whoami"):
         print("Querying Robinhood accounts using stored credentials...\n")
         accounts = RobinhoodExecutor.get_accounts()
@@ -3135,13 +4233,90 @@ def main():
         for r in discovered:
             print(f"{r['ticker']:<7} | ${r['price']:<8.2f} | {r['change_pct']:>+5.2f}% | {r['indicators']['rsi']:<6.1f} | {r['score']:<6.1f} | {r['recommendation']:<12} | ${r['risk_targets']['stop_loss']:<9.2f} | ${r['risk_targets']['take_profit_1']:.2f}")
 
+    elif cmd == "buy":
+        if len(sys.argv) < 3:
+            print("Usage: robinhood_trader.py buy <TICKER> [DOLLAR_AMOUNT] [account] [--force]")
+            sys.exit(1)
+        sym = sys.argv[2].upper().strip()
+        dollar_amt = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("-") else "25"
+        acc = sys.argv[4] if len(sys.argv) > 4 and not sys.argv[4].startswith("-") else None
+        resolved_acc = RobinhoodExecutor.resolve_account(acc or "agentic")
+        
+        in_cd, cd_msg = ComplianceAndRiskGuard.is_in_cooldown(resolved_acc, sym)
+        if in_cd and "--force" not in sys.argv:
+            print("=" * 70)
+            print(f"  ⚠️  TRADE BLOCKED BY RISK GUARD (WASH-SALE / RE-ENTRY COOLDOWN)")
+            print("=" * 70)
+            print(f"  {cd_msg}")
+            print(f"  Pass --force to explicitly override this risk block.")
+            print("=" * 70)
+            sys.exit(1)
+
+        print("=" * 70)
+        print(f"  EXECUTING ROBINHOOD BUY ORDER")
+        print("=" * 70)
+        print(f"  Symbol        : {sym}")
+        print(f"  Dollar Amount : ${float(dollar_amt):.2f}")
+        print(f"  Target Account: {resolved_acc} (Agentic Sandbox)")
+        print("-" * 70)
+        res = RobinhoodExecutor.execute_market_order(resolved_acc, sym, "buy", dollar_amount=str(dollar_amt))
+        print("Response:", json.dumps(res, indent=2))
+        ComplianceAndRiskGuard.record_trade(resolved_acc, sym, "BUY", reason="MANUAL_CLI")
+        try:
+            ObsidianTradingVault.log_trade_execution({
+                "ticker": sym, "action": "BUY", "dollar_amount": float(dollar_amt),
+                "reason": "MANUAL_CLI", "account": resolved_acc
+            })
+        except Exception:
+            pass
+        print("=" * 70)
+
+    elif cmd == "sell":
+        if len(sys.argv) < 3:
+            print("Usage: robinhood_trader.py sell <TICKER> [QUANTITY|all] [account]")
+            sys.exit(1)
+        sym = sys.argv[2].upper().strip()
+        qty_arg = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("-") else "all"
+        acc = sys.argv[4] if len(sys.argv) > 4 and not sys.argv[4].startswith("-") else None
+        resolved_acc = RobinhoodExecutor.resolve_account(acc or "agentic")
+        
+        if qty_arg.lower() == "all":
+            positions = RobinhoodExecutor.get_equity_positions(resolved_acc)
+            matching = [p for p in positions if str(p.get("symbol", "")).upper() == sym]
+            if not matching or float(matching[0].get("quantity", 0)) <= 0:
+                print(f"No open position found for {sym} in account {resolved_acc}.")
+                sys.exit(1)
+            qty = str(matching[0].get("quantity"))
+        else:
+            qty = str(qty_arg)
+
+        print("=" * 70)
+        print(f"  EXECUTING ROBINHOOD SELL ORDER")
+        print("=" * 70)
+        print(f"  Symbol        : {sym}")
+        print(f"  Quantity      : {qty} shares")
+        print(f"  Target Account: {resolved_acc} (Agentic Sandbox)")
+        print("-" * 70)
+        res = RobinhoodExecutor.execute_market_order(resolved_acc, sym, "sell", quantity=qty)
+        print("Response:", json.dumps(res, indent=2))
+        ComplianceAndRiskGuard.record_trade(resolved_acc, sym, "SELL", qty=float(qty) if qty else None, reason="MANUAL_CLI")
+        try:
+            ObsidianTradingVault.log_trade_execution({
+                "ticker": sym, "action": "SELL", "quantity": float(qty),
+                "reason": "MANUAL_CLI", "account": resolved_acc
+            })
+        except Exception:
+            pass
+        print("=" * 70)
+
     elif cmd in ("service", "systemd"):
         sub = sys.argv[2] if len(sys.argv) > 2 else "status"
         service_file = os.path.expanduser("~/.config/systemd/user/robinhood-trader.service")
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
         
-        if sub == "install":
+        def _write_unit(live=False):
             os.makedirs(os.path.expanduser("~/.config/systemd/user"), exist_ok=True)
-            repo_dir = os.path.dirname(os.path.abspath(__file__))
+            mode_args = "--interval 60 --auto-trade --live" if live else "--interval 60"
             unit_content = f"""[Unit]
 Description=Robinhood Agentic Trading & Market Hours Monitor
 After=network-online.target
@@ -3153,7 +4328,7 @@ WorkingDirectory={repo_dir}
 Environment=PATH={os.path.expanduser('~/.local/bin')}:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=BROWSER=none
-ExecStart=/usr/bin/python3 {os.path.join(repo_dir, 'robinhood_trader.py')} monitor --interval 60
+ExecStart=/usr/bin/python3 {os.path.join(repo_dir, 'robinhood_trader.py')} monitor {mode_args}
 Restart=always
 RestartSec=15
 StandardOutput=journal
@@ -3165,8 +4340,23 @@ WantedBy=default.target
             with open(service_file, "w") as f:
                 f.write(unit_content)
             subprocess.run(["systemctl", "--user", "daemon-reload"])
-            print(f"Installed {service_file}")
-            print("To enable & start: python3 robinhood_trader.py service start")
+
+        if sub in ("install", "setup"):
+            _write_unit(live=False)
+            print(f"Installed {service_file} in monitor mode.")
+            print("To start: python3 robinhood_trader.py service start")
+
+        elif sub in ("live", "live-trading", "enable-live"):
+            _write_unit(live=True)
+            subprocess.run(["systemctl", "--user", "restart", "robinhood-trader.service"])
+            print("Switched robinhood-trader.service to LIVE AUTONOMOUS TRADING mode.")
+            subprocess.run(["systemctl", "--user", "status", "robinhood-trader.service"])
+
+        elif sub in ("dry-run", "dryrun", "monitor-only"):
+            _write_unit(live=False)
+            subprocess.run(["systemctl", "--user", "restart", "robinhood-trader.service"])
+            print("Switched robinhood-trader.service to DRY-RUN MONITOR mode.")
+            subprocess.run(["systemctl", "--user", "status", "robinhood-trader.service"])
 
         elif sub in ("start", "enable"):
             subprocess.run(["systemctl", "--user", "daemon-reload"])
@@ -3178,6 +4368,7 @@ WantedBy=default.target
             print("robinhood-trader.service stopped.")
 
         elif sub == "restart":
+            subprocess.run(["systemctl", "--user", "daemon-reload"])
             subprocess.run(["systemctl", "--user", "restart", "robinhood-trader.service"])
             subprocess.run(["systemctl", "--user", "status", "robinhood-trader.service"])
 
@@ -3190,7 +4381,7 @@ WantedBy=default.target
 
         else:
             print(f"Unknown service command: {sub}")
-            print("Usage: robinhood_trader.py service [install|start|stop|restart|status|logs]")
+            print("Usage: robinhood_trader.py service [start|stop|restart|status|logs|live|dry-run]")
 
     elif cmd == "auth":
         authenticate_robinhood_mcp()

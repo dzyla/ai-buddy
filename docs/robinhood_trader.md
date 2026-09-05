@@ -96,10 +96,11 @@ The automated trader runs as a systemd user daemon (`robinhood-trader.service`):
 ### CLI Service Controls
 ```bash
 ./robinhood_trader.py service status     # Check live service status & uptime
-./robinhood_trader.py service logs 50     # View the last 50 log lines
-./robinhood_trader.py service stop        # Stop the background daemon
-./robinhood_trader.py service start       # Enable and start the background daemon
-./robinhood_trader.py service restart     # Restart the daemon process
+./robinhood_trader.py service logs 50    # View the last 50 log lines
+./robinhood_trader.py service live       # Switch to LIVE autonomous trading mode
+./robinhood_trader.py service dry-run    # Switch back to monitor-only (dry-run) mode
+./robinhood_trader.py service restart    # Restart daemon process
+./robinhood_trader.py service stop       # Stop the background daemon
 ```
 
 ### Direct Systemd Commands
@@ -117,18 +118,24 @@ All commands are accessible directly via [`./robinhood_trader.py`](file:///home/
 
 | Command | Arguments | Description | Example |
 | :--- | :--- | :--- | :--- |
-| `summary` | `[account]` | Compact executive summary (<200 tokens) with top holdings, winners/losers, and health score | `./robinhood_trader.py summary` |
-| `portfolio` | `[account] [--flags]` | Full holdings table. Flags: `--summary`, `--filter <losers\|winners\|dust\|dead-money>`, `--top <N>`, `--json`, `--csv` | `./robinhood_trader.py portfolio --filter losers` |
-| `audit` | `[account]` | Quantitative health score (0–100), concentration cap breaches, semi overlap, dead-money and dust audit | `./robinhood_trader.py audit` |
+| `summary` | `[account\|all]` | Compact executive summary (<200 tokens) with top holdings, winners/losers, and health score | `./robinhood_trader.py summary agentic` |
+| `portfolio` | `[account] [--flags]` | Full holdings table. Flags: `--summary`, `--filter <losers\|winners\|dust\|dead-money>`, `--top <N>`, `--json`, `--csv` | `./robinhood_trader.py portfolio agentic --filter losers` |
+| `orders` | `[account]` | View recent equity orders, fill prices, execution timestamps, and placing agent | `./robinhood_trader.py orders agentic` |
+| `pnl` | `[account]` | Realized gains, total return rate, and unrealized equity performance | `./robinhood_trader.py pnl agentic` |
+| `trades` | `[account]` | Closed trade-by-trade P&L retrospective history | `./robinhood_trader.py trades agentic` |
+| `buy` | `<ticker> [dollar] [acc]`| Execute instant market buy order on Agentic Sandbox (`517198354`) | `./robinhood_trader.py buy SMCI 25 agentic` |
+| `sell` | `<ticker> [qty\|all] [acc]`| Execute market sell order on Agentic Sandbox | `./robinhood_trader.py sell AVGO all agentic` |
+| `audit` | `[account]` | Quantitative health score (0–100), concentration cap breaches, semi overlap, dead-money and dust audit | `./robinhood_trader.py audit agentic` |
 | `harvest-losses`| `[account]` | Tax-loss harvesting candidates with dollar savings and wash-sale guidance | `./robinhood_trader.py harvest-losses` |
-| `rebalance-plan`| `[account]` | Concrete 4-step rebalance plan (dead-money liquidation, dust cleanup, winner trims, cash buffer) | `./robinhood_trader.py rebalance-plan` |
-| `export` | `[account] [dir]` | Exports full JSON and CSV datasets to `~/.cache/ai/trading/` | `./robinhood_trader.py export` |
+| `rebalance-plan`| `[account]` | Concrete 4-step rebalance plan (dead-money liquidation, dust cleanup, winner trims, cash buffer) | `./robinhood_trader.py rebalance-plan agentic` |
+| `export` | `[account] [dir]` | Exports full JSON and CSV datasets to `~/.cache/ai/trading/` | `./robinhood_trader.py export agentic` |
 | `analyze` | `<tickers...>` | Multi-factor analysis: live price, RSI, SMA 20/50/200, MACD, sentiment & risk levels | `./robinhood_trader.py analyze NVDA AAPL MSFT` |
 | `scan` | `[tickers...]` | Scans watchlist and ranks highest-conviction buy/sell opportunities | `./robinhood_trader.py scan` |
 | `news` | `<ticker/query>` | Searches latest financial news and calculates sentiment score (-1.0 to +1.0) | `./robinhood_trader.py news TSLA` |
 | `discover` | — | Searches market for high-momentum breakout candidates | `./robinhood_trader.py discover` |
 | `risk-monitor` | `[--live] [--once]`| Runs deterministic risk monitor enforcing stop-loss and take-profit rules | `./robinhood_trader.py risk-monitor --live` |
-| `monitor` | `[--auto-trade]`| Starts the autonomous lifecycle loop in the foreground | `./robinhood_trader.py monitor --interval 60` |
+| `monitor` | `[--auto-trade] [--live]`| Starts the autonomous lifecycle loop in foreground | `./robinhood_trader.py monitor --interval 60 --auto-trade --live` |
+| `service` | `<start\|stop\|live\|...>`| Manage background systemd user service | `./robinhood_trader.py service live` |
 | `accounts` | — | Lists authorized brokerage accounts and agentic permissions | `./robinhood_trader.py accounts` |
 | `auth` | — | Verifies stored MCP OAuth credentials | `./robinhood_trader.py auth` |
 

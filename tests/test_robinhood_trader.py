@@ -394,4 +394,100 @@ class TestAgentAdvisor:
         assert len(res) > 0
 
 
+class TestWashSaleAndCooldown:
+    def test_cooldown_same_day_lockout(self, tmp_path, monkeypatch):
+        import robinhood_trader
+        from robinhood_trader import ComplianceAndRiskGuard, MarketHours
+        
+        pdt_file = str(tmp_path / "pdt_tracker.json")
+        monkeypatch.setattr(robinhood_trader, "PDT_TRACKER_FILE", pdt_file)
+
+        # Record a SELL today
+        ComplianceAndRiskGuard.record_trade("TEST_ACC", "SMCI", "SELL", price=35.0, qty=1.0, pnl_pct=-5.0, reason="STOP_LOSS")
+        
+        # Verify same-day re-entry is strictly blocked
+        in_cd, msg = ComplianceAndRiskGuard.is_in_cooldown("TEST_ACC", "SMCI")
+        assert in_cd is True
+        assert "SAME-DAY RE-ENTRY LOCKOUT" in msg
+
+        # Another ticker that was not sold should NOT be in cooldown
+        in_cd_other, _ = ComplianceAndRiskGuard.is_in_cooldown("TEST_ACC", "NVDA")
+        assert in_cd_other is False
+
+    def test_cooldown_past_loss_and_profit(self, tmp_path, monkeypatch):
+        import json
+        import robinhood_trader
+        from robinhood_trader import ComplianceAndRiskGuard, MarketHours
+        
+        pdt_file = tmp_path / "pdt_tracker.json"
+        monkeypatch.setattr(robinhood_trader, "PDT_TRACKER_FILE", str(pdt_file))
+
+        today_dt = MarketHours.now_et()
+        two_days_ago = (today_dt - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+        four_days_ago = (today_dt - datetime.timedelta(days=4)).strftime("%Y-%m-%d")
+        ten_days_ago = (today_dt - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+
+        pdt_file.write_text(json.dumps({
+            "trades": [
+                {"account": "ACC1", "symbol": "LOSS_TICKER", "action": "SELL", "date": two_days_ago, "pnl_pct": -6.0, "reason": "STOP_LOSS"},
+                {"account": "ACC1", "symbol": "PROFIT_TICKER", "action": "SELL", "date": four_days_ago, "pnl_pct": 10.0, "reason": "TAKE_PROFIT"},
+                {"account": "ACC1", "symbol": "OLD_LOSS_TICKER", "action": "SELL", "date": ten_days_ago, "pnl_pct": -5.0, "reason": "STOP_LOSS"}
+            ]
+        }))
+
+        # LOSS_TICKER sold 2 days ago (< 7 day loss cooldown) -> BLOCKED
+        in_cd, msg = ComplianceAndRiskGuard.is_in_cooldown("ACC1", "LOSS_TICKER", cooldown_days_loss=7, cooldown_days_profit=3)
+        assert in_cd is True
+        assert "WASH-SALE / RE-ENTRY COOLDOWN" in msg
+
+        # PROFIT_TICKER sold 4 days ago (> 3 day profit cooldown) -> ALLOWED
+        in_cd, _ = ComplianceAndRiskGuard.is_in_cooldown("ACC1", "PROFIT_TICKER", cooldown_days_loss=7, cooldown_days_profit=3)
+        assert in_cd is False
+
+        # OLD_LOSS_TICKER sold 10 days ago (> 7 day loss cooldown) -> ALLOWED
+        in_cd, _ = ComplianceAndRiskGuard.is_in_cooldown("ACC1", "OLD_LOSS_TICKER", cooldown_days_loss=7, cooldown_days_profit=3)
+        assert in_cd is False
+
+
+class TestDynamicVolatilityAndRunnerRisk:
+    def test_etf_vs_high_beta_risk_parameters(self):
+        from robinhood_trader import ComplianceAndRiskGuard
+        # Test ETF risk parameters (tight stop, conservative trailing stop)
+        vti_params = ComplianceAndRiskGuard.get_ticker_risk_parameters("VTI", 380.0)
+        assert vti_params["stop_loss_pct"] <= 5.0
+        assert vti_params["trailing_stop_pct"] <= 4.0
+        assert vti_params["take_profit_1_pct"] == 8.0
+        assert vti_params["take_profit_2_pct"] == 15.0
+
+        # Test single stock dynamic scaling
+        stock_params = ComplianceAndRiskGuard.get_ticker_risk_parameters("NVDA", 220.0)
+        assert stock_params["stop_loss_pct"] >= 5.0
+        assert stock_params["take_profit_1_pct"] == 8.0
+
+    def test_balanced_lifecycle_watchlist(self):
+        from robinhood_trader import BALANCED_LIFECYCLE_WATCHLIST
+        # Verify Core Ballast ETFs are included
+        assert "VTI" in BALANCED_LIFECYCLE_WATCHLIST
+        assert "QQQ" in BALANCED_LIFECYCLE_WATCHLIST
+        # Verify cross-sector diversity
+        assert any(t in BALANCED_LIFECYCLE_WATCHLIST for t in ("NVDA", "AVGO", "PLTR"))
+        assert any(t in BALANCED_LIFECYCLE_WATCHLIST for t in ("MSFT", "GOOGL", "CRWD"))
+        assert any(t in BALANCED_LIFECYCLE_WATCHLIST for t in ("LLY", "NVO"))
+
+    def test_anti_chasing_filter(self, monkeypatch):
+        from robinhood_trader import TradingStrategyEngine, FinancialData
+        # Mock quote with big intraday spike (+5%) and high RSI
+        monkeypatch.setattr(FinancialData, "fetch_quote", lambda t: {"price": 100.0, "change_percent": 5.0})
+        # Mock historical with upward run
+        prices = [float(100 + i * 2) for i in range(30)]
+        mock_bars = [{"close": p, "high": p + 1, "low": p - 1, "volume": 1_000_000} for p in prices]
+        monkeypatch.setattr(FinancialData, "fetch_historical", lambda *args, **kwargs: mock_bars)
+        
+        analysis = TradingStrategyEngine.analyze_ticker("TEST")
+        # Anti-chasing filter should have applied penalty and NOT be STRONG_BUY
+        assert "anti_chase" in analysis.get("factor_breakdown", {})
+        assert analysis["recommendation"] != "STRONG_BUY"
+
+
+
 

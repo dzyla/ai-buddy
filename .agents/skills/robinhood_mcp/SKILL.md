@@ -13,12 +13,12 @@ Use this skill when the user requests to trade equities, query portfolio holding
 
 Robinhood provides official Model Context Protocol (MCP) integrations:
 *   **MCP Server Endpoint**: `https://agent.robinhood.com/mcp/trading`
-*   **Config (`mcp.json`)**: Configured via `npx -y mcp-remote https://agent.robinhood.com/mcp/trading --silent` with `BROWSER=none`.
+*   **Config (`mcp.json`)**: Configured via `npx -y mcp-remote https://agent.robinhood.com/mcp/trading` with `BROWSER=none`.
 *   **Stored Credentials**: OAuth credentials are authenticated and cached locally. The agent executes silently without browser popups.
 
 ### User Account Layout & Financial Safety:
 When prompting or querying the user's account, call `robinhood__get_accounts` (or `./robinhood_trader.py accounts`) to inspect the user's brokerage accounts:
-1.  **Agentic Sandbox Account**: `517198354` (nickname: `Agentic`, type: `limited_margin`, `agentic_allowed: true`). **ALL automated orders (`place_equity_order`, `review_equity_order`) MUST target this account.**
+1.  **Agentic Sandbox Account**: `517198354` (nickname: `Agentic`, type: `limited_margin`, `agentic_allowed: true`). **ALL automated orders (`place_equity_order`, `review_equity_order`) MUST target this account.** You can specify `agentic` or `517198354` in CLI commands (e.g. `./robinhood_trader.py summary agentic`, `./robinhood_trader.py orders agentic`).
 2.  **Primary Individual Margin Account**: `837546068` (type: `margin`, default account, `agentic_allowed: false`). Protected against automated mutation; read-only inspection (`get_portfolio`, `get_equity_positions`).
 3.  **Roth IRA Account**: `422982744` (type: `cash`, `brokerage_account_type: ira_roth`, `agentic_allowed: false`). Read-only inspection.
 
@@ -78,7 +78,9 @@ To prevent context bloat while giving the agent full visibility into past trades
 - Stores a 60-day rolling log of daily market closing summaries and performance.
 
 ### How the Agent Reads Past History:
-- **Fast Status Check**: Run `./robinhood_trader.py summary` (<200 tokens) to inspect current portfolio health and top positions.
+- **Fast Status Check**: Run `./robinhood_trader.py summary [agentic|all]` (<200 tokens) to inspect portfolio health and top positions.
+- **Check Recent Orders**: Run `./robinhood_trader.py orders [agentic]`.
+- **Check Profit & Loss**: Run `./robinhood_trader.py pnl [agentic]`.
 - **Inspect Past Day**: Read `~/.config/ai/trading_vault/daily_notes/<YYYY-MM-DD>.md`.
 - **Inspect Ticker History**: Read `~/.config/ai/trading_vault/tickers/<TICKER>.md`.
 
@@ -97,19 +99,24 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 | `robinhood__get_equity_quotes` | Live real-time market quotes, bid/ask, previous close | `{"symbols": ["AAPL", "NVDA"]}` |
 | `robinhood__get_equity_historicals` | Fetch historical OHLCV daily/intraday bars | `{"symbols": ["AAPL"], "interval": "day", "start_time": "2026-05-01T00:00:00Z"}` |
 | `robinhood__get_equity_technical_indicators` | Server-side calculated RSI, MACD, SMA, Bollinger Bands | `{"symbol": "AAPL", "type": "rsi", "interval": "day", "start_time": "..."}` |
+| `robinhood__get_equity_orders` | Fetch recent stock orders & statuses | `{"account_number": "517198354"}` |
+| `robinhood__get_realized_pnl` | Fetch realized gains/losses performance metrics | `{"account_number": "517198354"}` |
 | `robinhood__review_equity_order` | Simulate a stock order without placing | `{"account_number": "517198354", "symbol": "AAPL", "side": "buy", "type": "market", "dollar_amount": "50"}` |
 | `robinhood__place_equity_order` | Execute real equity order on agentic account | `{"account_number": "517198354", "symbol": "AAPL", "side": "buy", "type": "market", "dollar_amount": "50"}` |
 
 ### Built-in Analysis CLI (`robinhood_trader.py`):
 | Command | Description | Example |
 | :--- | :--- | :--- |
-| `summary [account]` | Compact executive summary (<200 tokens), top holdings, winners/losers, risk score & file links | `./robinhood_trader.py summary` |
-| `audit [account]` | Quantitative health score (0-100), concentration cap checks, semi overlap, dead-money & dust audit | `./robinhood_trader.py audit` |
+| `summary [account\|all]` | Compact executive summary (<200 tokens), top holdings, winners/losers, risk score | `./robinhood_trader.py summary agentic` |
+| `orders [account]` | View recent equity orders, fill status, and executing agent | `./robinhood_trader.py orders agentic` |
+| `pnl [account]` | Realized and unrealized P&L report | `./robinhood_trader.py pnl agentic` |
+| `trades [account]` | Closed trade-by-trade P&L history | `./robinhood_trader.py trades agentic` |
+| `accounts` | Queries all authorized brokerage accounts & agentic permissions | `./robinhood_trader.py accounts` |
+| `portfolio [account]` | Live positions table (supports `--summary`, `--filter <losers\|winners\|dust\|dead-money>`, `--top <N>`, `--json`, `--csv`) | `./robinhood_trader.py portfolio agentic --filter losers` |
+| `audit [account]` | Quantitative health score (0-100), concentration cap checks, semi overlap, dead-money & dust audit | `./robinhood_trader.py audit agentic` |
 | `harvest-losses [account]` | Step-by-step tax-loss harvesting candidates, harvestable dollar savings, wash-sale guidance | `./robinhood_trader.py harvest-losses` |
 | `rebalance-plan [account]` | Concrete 4-step rebalance plan: dead money liquidation, dust cleanup, winner trims, cash buffer | `./robinhood_trader.py rebalance-plan` |
 | `export [account]` | Explicitly exports portfolio JSON, CSV, and audit datasets to `~/.cache/ai/trading/` | `./robinhood_trader.py export` |
-| `portfolio [account]` | Live positions table (supports `--summary`, `--filter <losers\|winners\|dust\|dead-money>`, `--top <N>`, `--json`, `--csv`) | `./robinhood_trader.py portfolio --filter losers` |
-| `accounts` | Queries all authorized brokerage accounts & agentic permissions | `./robinhood_trader.py accounts` |
 | `analyze <tickers...>` | Multi-factor analysis: live price, RSI, SMA (20/50/200), MACD, sentiment & risk targets | `./robinhood_trader.py analyze NVDA AAPL MSFT` |
 | `status` | Checks US market open/closed status, session, Eastern & Mountain times | `./robinhood_trader.py status` |
 | `scan [watchlist]` | Scans ticker universe and ranks highest-conviction opportunities | `./robinhood_trader.py scan` |
@@ -125,17 +132,25 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 > [!CAUTION]
 > Trading involves real financial risk. Adhere strictly to the following rules:
 
-1. **Stop-Loss Enforcement**:
-   - Every purchase MUST have a defined stop loss (default: -5.0% from entry, or 2x ATR).
-   - If an asset hits its stop-loss level, exit immediately.
-2. **Tiered Take-Profit & Trailing Stop**:
-   - Take 50% profit when position reaches +8% to +10%.
-   - Trail remaining 50% with a 3.5% trailing stop above entry to ride prolonged momentum waves.
-3. **Portfolio Diversification & Cash Buffer**:
+1. **Multi-Tier Intraday Circuit Breakers**:
+   - **Tier 1 ($\le -3.0\%$ Drawdown from Open):** Halts all automated buy orders for the rest of the day.
+   - **Tier 2 ($\le -6.0\%$ Drawdown from Open):** Tightens active stop-losses to $\min(4.0\%, 1.0\times\text{ATR})$.
+   - **Tier 3 ($\le -10.0\%$ Drawdown from Open):** Triggers Emergency Capital Liquidation (cancels open orders, exits positions in loss-ranked order overriding PDT deferral, disables auto-trade).
+2. **FINRA PDT Rule 4210 Compliance**:
+   - Small sandbox accounts ($<\$25,000$) are limited to 3 day trades in rolling 5 business days (`pdt_tracker.json`).
+   - If day trades used reaches $3/3$, same-day round-trip buys/sells are blocked; stop-losses on same-day buys defer to the next 09:30 ET market open (`deferred_exit.flag`).
+   - Positions opened on prior days (overnight/swing) are NOT day trades and can always be exited freely.
+3. **Dynamic Volatility Trailing Stop & Take-Profit**:
+   - Stop-loss: $\max(5.0\%, 2.0\times\text{ATR}_{\text{pct}})$.
+   - Stage 1 Take-Profit: Exit 50% shares at $+8.0\%$.
+   - Stage 2 Runner: Trail remaining 50% shares with dynamic trailing stop $\max(4.5\%, 1.5\times\text{ATR}_{\text{pct}})$ up to $+15.0\%$.
+4. **Portfolio Diversification, Sizing & Cash Buffer**:
+   - Dynamic Growth-Scaled Position Sizing: $\text{Size} = \text{round}\big(\min(\text{Cash}, \max(\$15.00, 0.08\times\text{Equity}), 0.15\times\text{Equity}), 2\big)$.
    - Max single-stock allocation: 15% of total portfolio value.
-   - Maintain at least 15% cash reserve buffer for market drawdowns and dip buying.
-4. **Account Permission Boundary**:
+   - Maintain at least 15% cash reserve buffer for market pullbacks.
+5. **Account Permission Boundary**:
    - Automated orders MUST target `517198354` (`agentic_allowed: true`).
-   - Non-agentic accounts are protected against automated mutation.
-5. **Human Verification in Plan / Manual Modes**:
+   - Non-agentic accounts (`837546068`, `422982744`) are protected against automated mutation.
+6. **Human Verification in Plan / Manual Modes**:
    - When running under `--plan` or `--manual`, present the proposed trades (Ticker, Action, Shares/Dollar, Limit Price, Estimated Total, Risk Target) to the user and obtain confirmation before placing orders.
+
