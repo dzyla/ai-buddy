@@ -104,12 +104,65 @@ def send_notification(proc, method, params=None):
     except (BrokenPipeError, OSError):
         pass
 
+def _sync_mcp_auth_tokens():
+    """Sync stored OAuth tokens across different mcp-remote package versions in ~/.mcp-auth/."""
+    auth_dir = os.path.expanduser("~/.mcp-auth")
+    if not os.path.isdir(auth_dir):
+        return
+    try:
+        remote_dirs = [os.path.join(auth_dir, d) for d in os.listdir(auth_dir) if d.startswith("mcp-remote-") and os.path.isdir(os.path.join(auth_dir, d))]
+        if not remote_dirs:
+            return
+        
+        tokens_map = {}
+        for rd in remote_dirs:
+            for f in os.listdir(rd):
+                if f.endswith("_tokens.json") or f.endswith("_client_info.json"):
+                    fpath = os.path.join(rd, f)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                        with open(fpath, "r", encoding="utf-8") as tf:
+                            td = json.load(tf)
+                        if td:
+                            if f not in tokens_map or mtime > tokens_map[f][0]:
+                                tokens_map[f] = (mtime, fpath, td)
+                    except Exception:
+                        pass
+        
+        for f, (_, src_path, td) in tokens_map.items():
+            for rd in remote_dirs:
+                dest_path = os.path.join(rd, f)
+                if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+                    try:
+                        with open(dest_path, "w", encoding="utf-8") as df:
+                            json.dump(td, df, indent=2)
+                        os.chmod(dest_path, 0o600)
+                    except Exception:
+                        pass
+
+        for rd in remote_dirs:
+            for f in os.listdir(rd):
+                if f.endswith("_lock.json") or "_code_verifier" in f:
+                    lock_file = os.path.join(rd, f)
+                    try:
+                        if time.time() - os.path.getmtime(lock_file) > 30:
+                            os.remove(lock_file)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
 def start_server(cfg):
+    _sync_mcp_auth_tokens()
     cmd = []
     if "command" in cfg:
         cmd.append(cfg["command"])
     if "args" in cfg:
-        cmd.extend(os.path.expandvars(os.path.expanduser(a)) for a in cfg["args"])
+        for a in cfg["args"]:
+            expanded = os.path.expandvars(os.path.expanduser(a))
+            if expanded == "--silent" and ("mcp-remote" in str(cmd) or any("mcp-remote" in str(x) for x in cfg.get("args", []))):
+                continue
+            cmd.append(expanded)
     
     if not cmd:
         return None
@@ -141,7 +194,7 @@ def start_server(cfg):
     )
     return proc
 
-def init_server(proc, timeout=5.0):
+def init_server(proc, timeout=15.0):
     init_params = {
         "protocolVersion": "2024-11-05",
         "capabilities": {},
@@ -282,22 +335,23 @@ def list_tools(server_name, cfg):
     import hashlib
     cfg_hash = hashlib.md5(json.dumps(cfg, sort_keys=True).encode("utf-8")).hexdigest()
     cached = _get_cached_mcp_tools(server_name, cfg_hash)
-    if cached is not None:
+    if cached is not None and len(cached) > 0:
         return cached
 
     proc = start_server(cfg)
     if not proc:
         return []
     try:
-        init_server(proc, timeout=5.0)
-        resp = run_jsonrpc(proc, "tools/list", {}, req_id=2, timeout=5.0)
+        init_server(proc, timeout=15.0)
+        resp = run_jsonrpc(proc, "tools/list", {}, req_id=2, timeout=15.0)
         tools = resp.get("result", {}).get("tools", [])
         namespaced_tools = []
         for t in tools:
             clean_server = "".join(c if c.isalnum() or c == "_" else "_" for c in server_name)
             t["name"] = f"{clean_server}__{t['name']}"
             namespaced_tools.append(t)
-        _save_cached_mcp_tools(server_name, cfg_hash, namespaced_tools)
+        if namespaced_tools:
+            _save_cached_mcp_tools(server_name, cfg_hash, namespaced_tools)
         return namespaced_tools
     except Exception as e:
         print(f"Warning: listing tools from {server_name} failed: {e}", file=sys.stderr)
@@ -351,7 +405,7 @@ def call_tool(server_name, cfg, tool_name, arguments):
     if not proc:
         return {"error": "Failed to start server"}
     try:
-        init_server(proc, timeout=5.0)
+        init_server(proc, timeout=15.0)
         resp = run_jsonrpc(proc, "tools/call", {"name": tool_name, "arguments": arguments}, req_id=3, timeout=60.0)
         if "error" in resp:
             return {"error": str(resp["error"])}
