@@ -488,6 +488,109 @@ class TestDynamicVolatilityAndRunnerRisk:
         assert "anti_chase" in analysis.get("factor_breakdown", {})
         assert analysis["recommendation"] != "STRONG_BUY"
 
+    def test_secular_uptrend_pullback_dip_buying(self, monkeypatch):
+        import math
+        from robinhood_trader import TradingStrategyEngine, FinancialData
+        # Mock oscillating upward trend over 80 days then 7-day pullback to SMA20
+        prices = [100.0 + i * 1.0 + 3.0 * math.sin(i * 0.5) for i in range(80)]
+        prices += [178.0, 176.5, 175.0, 173.5, 172.0, 171.0, 169.0]
+        mock_bars = [{"close": p, "high": p + 1.5, "low": p - 1.5, "volume": 1_000_000} for p in prices]
+        monkeypatch.setattr(FinancialData, "fetch_quote", lambda t: {"price": 169.0, "change_percent": -1.1})
+        monkeypatch.setattr(FinancialData, "fetch_historical", lambda *args, **kwargs: mock_bars)
+        
+        analysis = TradingStrategyEngine.analyze_ticker("PULLBACK_TEST")
+        factors = analysis.get("factor_breakdown", {})
+        # Pullback factor should be active because price > SMA200 and testing SMA20
+        assert "pullback_support" in factors
+        assert factors["pullback_support"] >= 8.0
+
+    def test_profit_lock_ladder_tracking(self, tmp_path, monkeypatch):
+        import json
+        import robinhood_trader
+        from robinhood_trader import _risk_monitor_pulse, RobinhoodExecutor, AgentAdvisor
+        
+        flags_dir = str(tmp_path / "flags")
+        os.makedirs(flags_dir, exist_ok=True)
+        monkeypatch.setattr(robinhood_trader, "RISK_MONITOR_FLAGS", flags_dir)
+        monkeypatch.setattr(AgentAdvisor, "validate_trade_decision", lambda *args, **kwargs: {"verdict": "EXECUTE", "agent_response": "ok"})
+        
+        # Mock portfolio and positions
+        monkeypatch.setattr(RobinhoodExecutor, "get_live_portfolio", lambda acc: {"total_value": 1000.0, "cash": 500.0})
+        # Position bought at 100, current price 106.5 (+6.5%)
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_positions", lambda acc: [
+            {"symbol": "WINNER", "quantity": "1.0", "average_buy_price": "100.0"}
+        ])
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_quotes", lambda syms: {
+            "WINNER": {"last_trade_price": "106.50", "price": "106.50"}
+        })
+        
+        executed_orders = []
+        monkeypatch.setattr(RobinhoodExecutor, "execute_market_order", lambda acc, sym, side, **kwargs: executed_orders.append((sym, side, kwargs)))
+
+        # First pulse: price is at peak 106.50 (+6.5%) -> should record peak_pnl_pct = 6.5 in guard file
+        _risk_monitor_pulse("TEST_ACC", dry_run=False, stop_loss_pct=5.0, take_profit_pct=8.0)
+        
+        guard_file = os.path.join(flags_dir, "pos_guard_WINNER.json")
+        assert os.path.exists(guard_file)
+        with open(guard_file) as f:
+            data = json.load(f)
+        assert data["peak_pnl_pct"] == pytest.approx(6.5)
+
+        # Second pulse: price drops to 102.0 (+2.0%, below Tier 2 ratchet floor of +2.5%)
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_quotes", lambda syms: {
+            "WINNER": {"last_trade_price": "102.00", "price": "102.00"}
+        })
+        _risk_monitor_pulse("TEST_ACC", dry_run=False, stop_loss_pct=5.0, take_profit_pct=8.0)
+
+        # Should have executed PROFIT-LOCK sell order because it broke the +2.5% ratchet floor!
+        assert len(executed_orders) == 1
+        assert executed_orders[0][0] == "WINNER"
+        assert executed_orders[0][1] == "sell"
+
+    def test_auto_trade_entry_market_regime_and_midday_lockout(self, tmp_path, monkeypatch):
+        import robinhood_trader
+        from robinhood_trader import _auto_trade_entry_pulse, RobinhoodExecutor, MarketHours, ET_ZONE
+        
+        flags_dir = str(tmp_path / "flags")
+        os.makedirs(flags_dir, exist_ok=True)
+        monkeypatch.setattr(robinhood_trader, "RISK_MONITOR_FLAGS", flags_dir)
+        
+        # Mock portfolio with plenty of cash
+        monkeypatch.setattr(RobinhoodExecutor, "get_live_portfolio", lambda acc: {
+            "total_value": 1000.0, "cash": 400.0, "buying_power": {"buying_power": 400.0}
+        })
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_positions", lambda acc: [])
+        
+        executed_orders = []
+        monkeypatch.setattr(RobinhoodExecutor, "execute_market_order", lambda acc, sym, side, **kwargs: executed_orders.append((sym, side, kwargs)))
+
+        top_candidates = [{
+            "ticker": "PLTR", "score": 85.0, "recommendation": "STRONG_BUY", "price": 30.0,
+            "indicators": {"volume_ratio": 1.5, "rsi": 55.0},
+            "risk_targets": {"stop_loss": 27.5, "take_profit_1": 32.4}
+        }]
+
+        # Scenario A: Midday Chop Lockout (12:15 ET)
+        midday_dt = datetime.datetime(2026, 9, 8, 12, 15, 0, tzinfo=ET_ZONE)
+        monkeypatch.setattr(MarketHours, "now_et", lambda: midday_dt)
+        
+        _auto_trade_entry_pulse("TEST_ACC", dry_run=False, top_candidates=top_candidates)
+        assert len(executed_orders) == 0  # Midday lockout blocked entry!
+
+        # Scenario B: Afternoon (14:15 ET), but Broad Market SPY is down -1.5% (distribution day)
+        afternoon_dt = datetime.datetime(2026, 9, 8, 14, 15, 0, tzinfo=ET_ZONE)
+        monkeypatch.setattr(MarketHours, "now_et", lambda: afternoon_dt)
+        
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_quotes", lambda syms: {
+            "SPY": {"last_trade_price": "540.00", "adjusted_previous_close": "550.00"},  # -1.8%
+            "QQQ": {"last_trade_price": "470.00", "adjusted_previous_close": "480.00"},  # -2.0%
+            "PLTR": {"bid_price": "29.98", "ask_price": "30.02"}
+        })
+        
+        # Satellite PLTR should be suppressed by defensive market regime!
+        _auto_trade_entry_pulse("TEST_ACC", dry_run=False, top_candidates=top_candidates)
+        assert not any(ord[0] == "PLTR" for ord in executed_orders)
+
 
 
 
