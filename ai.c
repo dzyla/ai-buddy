@@ -2976,6 +2976,15 @@ static void free_stream_context(struct stream_context *ctx) {
     if (ctx->line_buf) free(ctx->line_buf);
 }
 
+static void stream_retry_reset(void *userdata) {
+    struct stream_context *s_ctx = (struct stream_context *)userdata;
+    if (!s_ctx) return;
+    int q = s_ctx->quiet_mode;
+    struct response *orig = s_ctx->original_chunk;
+    free_stream_context(s_ctx);
+    init_stream_context(s_ctx, orig, q);
+}
+
 static void buf_append_str(char **buf, size_t *len, size_t *cap, const char *str, size_t str_len) {
     if (!str || str_len == 0) return;
     if (*len + str_len >= *cap) {
@@ -3010,9 +3019,9 @@ static int get_tool_call_idx(struct stream_context *ctx, int index) {
 
 static void process_sse_json(struct stream_context *ctx, const char *json_str, size_t len) {
     jsmn_parser parser;
-    jsmntok_t tokens[256];
+    jsmntok_t tokens[512];
     jsmn_init(&parser);
-    int r = jsmn_parse(&parser, json_str, len, tokens, 256);
+    int r = jsmn_parse(&parser, json_str, len, tokens, 512);
     if (r < 0) return;
     
     int choices_tok = -1;
@@ -3192,45 +3201,71 @@ static void process_sse_json(struct stream_context *ctx, const char *json_str, s
                             j = json_skip_token(tokens, r, j + 2);
                         }
 
+                        int tc_index = tc;
                         if (idx_tok != -1 && tokens[idx_tok].type == JSMN_PRIMITIVE) {
-                            int tc_index = atoi(json_str + tokens[idx_tok].start);
-                            int internal_idx = get_tool_call_idx(ctx, tc_index);
-                            if (internal_idx != -1) {
-                                if (id_tok2 != -1 && tokens[id_tok2].type == JSMN_STRING) {
-                                    if (ctx->tool_calls[internal_idx].id) free(ctx->tool_calls[internal_idx].id);
-                                    ctx->tool_calls[internal_idx].id = unescape_json_string(json_str + tokens[id_tok2].start, tokens[id_tok2].end - tokens[id_tok2].start);
+                            tc_index = atoi(json_str + tokens[idx_tok].start);
+                        }
+                        int internal_idx = get_tool_call_idx(ctx, tc_index);
+                        if (internal_idx != -1) {
+                            if (id_tok2 != -1 && tokens[id_tok2].type == JSMN_STRING) {
+                                char *id_chunk = unescape_json_string(json_str + tokens[id_tok2].start, tokens[id_tok2].end - tokens[id_tok2].start);
+                                if (id_chunk) {
+                                    if (*id_chunk && !ctx->tool_calls[internal_idx].id) {
+                                        ctx->tool_calls[internal_idx].id = id_chunk;
+                                        id_chunk = NULL;
+                                    }
+                                    if (id_chunk) free(id_chunk);
                                 }
-                                if (func_tok != -1 && tokens[func_tok].type == JSMN_OBJECT) {
-                                    int f_end = tokens[func_tok].end;
-                                    int name_tok = -1;
-                                    int args_tok = -1;
-                                    
-                                    int k_f = func_tok + 1;
-                                    while (k_f < r && tokens[k_f].start < f_end) {
-                                        if (tokens[k_f].type == JSMN_STRING) {
-                                            int len = tokens[k_f].end - tokens[k_f].start;
-                                            if (len == 4 && strncmp(json_str + tokens[k_f].start, "name", 4) == 0) {
-                                                name_tok = k_f + 1;
-                                            } else if (len == 9 && strncmp(json_str + tokens[k_f].start, "arguments", 9) == 0) {
-                                                args_tok = k_f + 1;
+                            }
+                            if (func_tok != -1 && tokens[func_tok].type == JSMN_OBJECT) {
+                                int f_end = tokens[func_tok].end;
+                                int name_tok = -1;
+                                int args_tok = -1;
+                                
+                                int k_f = func_tok + 1;
+                                while (k_f < r && tokens[k_f].start < f_end) {
+                                    if (tokens[k_f].type == JSMN_STRING) {
+                                        int len = tokens[k_f].end - tokens[k_f].start;
+                                        if (len == 4 && strncmp(json_str + tokens[k_f].start, "name", 4) == 0) {
+                                            name_tok = k_f + 1;
+                                        } else if (len == 9 && strncmp(json_str + tokens[k_f].start, "arguments", 9) == 0) {
+                                            args_tok = k_f + 1;
+                                        }
+                                    }
+                                    k_f = json_skip_token(tokens, r, k_f + 2);
+                                }
+
+                                if (name_tok != -1 && tokens[name_tok].type == JSMN_STRING) {
+                                    char *name_chunk = unescape_json_string(json_str + tokens[name_tok].start, tokens[name_tok].end - tokens[name_tok].start);
+                                    if (name_chunk) {
+                                        if (*name_chunk) {
+                                            if (!ctx->tool_calls[internal_idx].name) {
+                                                ctx->tool_calls[internal_idx].name = name_chunk;
+                                                name_chunk = NULL;
+                                            } else if (strcmp(ctx->tool_calls[internal_idx].name, name_chunk) != 0) {
+                                                size_t old_len = strlen(ctx->tool_calls[internal_idx].name);
+                                                size_t chunk_len = strlen(name_chunk);
+                                                char *new_name = malloc(old_len + chunk_len + 1);
+                                                if (new_name) {
+                                                    memcpy(new_name, ctx->tool_calls[internal_idx].name, old_len);
+                                                    memcpy(new_name + old_len, name_chunk, chunk_len);
+                                                    new_name[old_len + chunk_len] = '\0';
+                                                    free(ctx->tool_calls[internal_idx].name);
+                                                    ctx->tool_calls[internal_idx].name = new_name;
+                                                }
                                             }
                                         }
-                                        k_f = json_skip_token(tokens, r, k_f + 2);
+                                        if (name_chunk) free(name_chunk);
                                     }
-
-                                    if (name_tok != -1 && tokens[name_tok].type == JSMN_STRING) {
-                                        if (ctx->tool_calls[internal_idx].name) free(ctx->tool_calls[internal_idx].name);
-                                        ctx->tool_calls[internal_idx].name = unescape_json_string(json_str + tokens[name_tok].start, tokens[name_tok].end - tokens[name_tok].start);
-                                    }
-                                    if (args_tok != -1 && tokens[args_tok].type == JSMN_STRING) {
-                                        char *args_chunk = unescape_json_string(json_str + tokens[args_tok].start, tokens[args_tok].end - tokens[args_tok].start);
-                                        if (args_chunk) {
-                                            buf_append_str(&ctx->tool_calls[internal_idx].arguments,
-                                                           &ctx->tool_calls[internal_idx].arguments_len,
-                                                           &ctx->tool_calls[internal_idx].arguments_cap,
-                                                           args_chunk, strlen(args_chunk));
-                                            free(args_chunk);
-                                        }
+                                }
+                                if (args_tok != -1 && tokens[args_tok].type == JSMN_STRING) {
+                                    char *args_chunk = unescape_json_string(json_str + tokens[args_tok].start, tokens[args_tok].end - tokens[args_tok].start);
+                                    if (args_chunk) {
+                                        buf_append_str(&ctx->tool_calls[internal_idx].arguments,
+                                                       &ctx->tool_calls[internal_idx].arguments_len,
+                                                       &ctx->tool_calls[internal_idx].arguments_cap,
+                                                       args_chunk, strlen(args_chunk));
+                                        free(args_chunk);
                                     }
                                 }
                             }
@@ -3272,13 +3307,6 @@ static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *userda
     size_t realsize = size * nmemb;
     struct stream_context *ctx = (struct stream_context *)userdata;
 
-    if (ctx->original_chunk && ctx->original_chunk->data == NULL && ctx->line_len > 0) {
-        int q = ctx->quiet_mode;
-        struct response *orig = ctx->original_chunk;
-        free_stream_context(ctx);
-        init_stream_context(ctx, orig, q);
-    }
-
     buf_append_str(&ctx->line_buf, &ctx->line_len, &ctx->line_cap, (const char *)ptr, realsize);
 
     if (strstr(ctx->line_buf, "Loading model")) {
@@ -3315,14 +3343,30 @@ static void reconstruct_final_json(struct stream_context *ctx) {
     size_t tc_len = 0;
     size_t tc_cap = 0;
     
-    if (ctx->num_tool_calls > 0) {
+    int valid_tool_calls = 0;
+    for (int i = 0; i < ctx->num_tool_calls; i++) {
+        if (ctx->tool_calls[i].name && ctx->tool_calls[i].name[0]) {
+            size_t nlen = strlen(ctx->tool_calls[i].name);
+            if (strspn(ctx->tool_calls[i].name, " \t\r\n") != nlen) {
+                valid_tool_calls++;
+            }
+        }
+    }
+
+    if (valid_tool_calls > 0) {
         buf_append_str(&tool_calls_json, &tc_len, &tc_cap, "[", 1);
+        int emitted = 0;
         for (int i = 0; i < ctx->num_tool_calls; i++) {
-            if (i > 0) {
+            if (!ctx->tool_calls[i].name || !ctx->tool_calls[i].name[0]) continue;
+            size_t nlen = strlen(ctx->tool_calls[i].name);
+            if (strspn(ctx->tool_calls[i].name, " \t\r\n") == nlen) continue;
+
+            if (emitted > 0) {
                 buf_append_str(&tool_calls_json, &tc_len, &tc_cap, ",", 1);
             }
+            emitted++;
             char *safe_id = ctx->tool_calls[i].id ? json_escape(ctx->tool_calls[i].id) : strdup("");
-            char *safe_name = ctx->tool_calls[i].name ? json_escape(ctx->tool_calls[i].name) : strdup("");
+            char *safe_name = json_escape(ctx->tool_calls[i].name);
             char *safe_args = ctx->tool_calls[i].arguments ? json_escape(ctx->tool_calls[i].arguments) : strdup("");
             
             size_t item_cap = strlen(safe_id) + strlen(safe_name) + strlen(safe_args) + 128;
@@ -3344,13 +3388,18 @@ static void reconstruct_final_json(struct stream_context *ctx) {
     char *safe_reasoning = ctx->accumulated_reasoning ? json_escape(ctx->accumulated_reasoning) : strdup("");
     char *safe_content = ctx->accumulated_content ? json_escape(ctx->accumulated_content) : strdup("");
     
+    const char *fin_reason = ctx->finish_reason;
+    if (valid_tool_calls == 0 && fin_reason && strcmp(fin_reason, "tool_calls") == 0) {
+        fin_reason = "stop";
+    }
+
     size_t final_cap = (ctx->id ? strlen(ctx->id) : 0) +
                        (ctx->object ? strlen(ctx->object) : 0) +
                        (ctx->model_name ? strlen(ctx->model_name) : 0) +
                        strlen(safe_reasoning) +
                        strlen(safe_content) +
                        (tool_calls_json ? strlen(tool_calls_json) : 0) +
-                       (ctx->finish_reason ? strlen(ctx->finish_reason) : 0) +
+                       (fin_reason ? strlen(fin_reason) : 0) +
                        1024;
     char *final_json = malloc(final_cap);
     
@@ -3378,9 +3427,9 @@ static void reconstruct_final_json(struct stream_context *ctx) {
         ctx->created,
         ctx->model_name ? ctx->model_name : "unknown",
         message_fields,
-        ctx->finish_reason ? "\"" : "",
-        ctx->finish_reason ? ctx->finish_reason : "null",
-        ctx->finish_reason ? "\"" : "",
+        fin_reason ? "\"" : "",
+        fin_reason ? fin_reason : "null",
+        fin_reason ? "\"" : "",
         ctx->prompt_tokens,
         ctx->completion_tokens,
         ctx->total_tokens);
@@ -3710,7 +3759,7 @@ static void load_from_profiles(char **url, char **key, char **model) {
     if (model && (!*model || !**model) && strlen(f_model) > 0) *model = f_model;
 }
 
-static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk) {
+static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk, void (*retry_cb)(void *), void *retry_userdata) {
     char *url = NULL;
     curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &url);
     
@@ -3736,6 +3785,7 @@ static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk) {
                     free(chunk->data);
                     chunk->data = NULL;
                     chunk->size = 0;
+                    if (retry_cb) retry_cb(retry_userdata);
                     usleep(500000); // 500ms
                     continue;
                 }
@@ -3760,6 +3810,7 @@ static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk) {
                 chunk->data = NULL;
                 chunk->size = 0;
             }
+            if (retry_cb) retry_cb(retry_userdata);
             usleep(500000); // 500ms
             continue;
         }
@@ -3810,7 +3861,7 @@ static int detect_context_window(CURL *c, const char *cur_api_url) {
         curl_easy_setopt(c, CURLOPT_URL, props_url);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&p_chunk);
         curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
-        CURLcode p_res = perform_curl_with_retry(c, &p_chunk);
+        CURLcode p_res = perform_curl_with_retry(c, &p_chunk, NULL, NULL);
         if (p_res == CURLE_OK && p_chunk.data) {
             detected_win = extract_json_int_field(p_chunk.data, "n_ctx");
         }
@@ -3833,7 +3884,7 @@ static int detect_context_window(CURL *c, const char *cur_api_url) {
             curl_easy_setopt(c, CURLOPT_URL, models_url);
             curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&m_chunk);
             curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
-            CURLcode m_res = perform_curl_with_retry(c, &m_chunk);
+            CURLcode m_res = perform_curl_with_retry(c, &m_chunk, NULL, NULL);
             if (m_res == CURLE_OK && m_chunk.data) {
                 detected_win = extract_json_int_field(m_chunk.data, "max_model_len");
                 if (detected_win <= 0) detected_win = extract_json_int_field(m_chunk.data, "context_length");
@@ -5370,7 +5421,7 @@ step_limit_check:
                 if (interactive_mode) enable_raw_mode();
                 struct timespec t_req_start, t_req_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_req_start);
-                CURLcode res = perform_curl_with_retry(c, &chunk);
+                CURLcode res = perform_curl_with_retry(c, &chunk, stream_retry_reset, &s_ctx);
                 clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                 if (interactive_mode) disable_raw_mode();
                 double elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
@@ -5449,7 +5500,7 @@ step_limit_check:
                             g_esc_requested = 0;
                             if (interactive_mode) enable_raw_mode();
                             clock_gettime(CLOCK_MONOTONIC, &t_req_start);
-                            res = perform_curl_with_retry(c, &chunk);
+                            res = perform_curl_with_retry(c, &chunk, stream_retry_reset, &s_ctx);
                             clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                             if (interactive_mode) disable_raw_mode();
                             elapsed_sec = (t_req_end.tv_sec  - t_req_start.tv_sec) +
@@ -5719,6 +5770,21 @@ step_limit_check:
                               }
 
                               char *tool_output = NULL;
+
+                              if (!unescaped_name || !*unescaped_name || strspn(unescaped_name, " \t\r\n") == strlen(unescaped_name)) {
+                                  if (debug_mode) {
+                                      fprintf(stderr, "[debug] Skipping empty or whitespace tool name\n");
+                                  }
+                                  char *empty_err = strdup("Error: Model returned an empty tool name.");
+                                  char tool_resp[strlen(unescaped_id ? unescaped_id : "") + strlen(empty_err) + 128];
+                                  snprintf(tool_resp, sizeof(tool_resp), "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"%s\"}", unescaped_id ? unescaped_id : "", empty_err);
+                                  messages_json = append_message(messages_json, tool_resp);
+                                  free(empty_err);
+                                  if (unescaped_id) free(unescaped_id);
+                                  if (unescaped_name) free(unescaped_name);
+                                  if (unescaped_args) free(unescaped_args);
+                                  goto end_tool_iter;
+                              }
 
                               if (last_tool_name && last_tool_args &&
                                   strcmp(last_tool_name, unescaped_name) == 0 &&
