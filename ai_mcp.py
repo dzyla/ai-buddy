@@ -7259,6 +7259,10 @@ def main():
         tool_name = sys.argv[3]
         args_json = sys.argv[4]
 
+        if not tool_name or not tool_name.strip():
+            print("Error: empty tool name provided")
+            sys.exit(0)
+
         try:
             arguments = json.loads(args_json)
         except Exception:
