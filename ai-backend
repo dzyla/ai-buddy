@@ -10,10 +10,21 @@ import json
 import time
 import signal
 import shutil
+import platform
+import functools
 import subprocess
 import urllib.request
 import urllib.parse
 from pathlib import Path
+
+# Ensure WSL2 NVIDIA drivers and tools (/usr/lib/wsl/lib) are visible in PATH and LD_LIBRARY_PATH
+if os.path.isdir("/usr/lib/wsl/lib"):
+    _cur_path = os.environ.get("PATH", "")
+    if "/usr/lib/wsl/lib" not in _cur_path.split(":"):
+        os.environ["PATH"] = f"/usr/lib/wsl/lib:{_cur_path}"
+    _cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    if "/usr/lib/wsl/lib" not in _cur_ld.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"/usr/lib/wsl/lib:{_cur_ld}" if _cur_ld else "/usr/lib/wsl/lib"
 
 DATA_DIR = Path.home() / ".local" / "share" / "ai"
 MODEL_DIR = DATA_DIR / "models"
@@ -40,7 +51,37 @@ def get_serve_port():
             return port
         except Exception:
             s.close()
-    return 8080
+
+def is_proxy_running(proxy_port=PORT):
+    """Check if on-demand smart proxy (e.g. llama-proxy.py) is listening on proxy_port."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"http://127.0.0.1:{proxy_port}/", headers={"User-Agent": "ai-backend"})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+            return "llama-proxy-ready" in data or "proxy" in data
+    except Exception:
+        return False
+
+def is_windows_or_wsl():
+    """Detect if running under native Windows or Windows Subsystem for Linux (WSL)."""
+    if sys.platform in ("win32", "cygwin"):
+        return True
+    try:
+        if "microsoft" in platform.uname().release.lower():
+            return True
+    except Exception:
+        pass
+    if os.path.exists("/proc/version"):
+        try:
+            with open("/proc/version", "r") as f:
+                if "microsoft" in f.read().lower():
+                    return True
+        except Exception:
+            pass
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    return False
 
 def load_env():
     env_vars = {}
@@ -344,7 +385,7 @@ def kill_llama_server():
                 pass
     except Exception:
         pass
-    time.sleep(0.1)
+    time.sleep(0.5)
 
 def is_systemd_service_active():
     try:
@@ -364,20 +405,36 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
     except Exception:
         pass
 
+    gpus = list_gpu_info()
+    if gpu_indices and gpus:
+        by_idx = {g["index"]: g for g in gpus}
+        actual_free = sum(by_idx.get(i, {}).get("free_mib", 0) for i in gpu_indices)
+        total_cap = sum(by_idx.get(i, {}).get("total_mib", 0) for i in gpu_indices)
+    elif gpus:
+        actual_free = sum(g.get("free_mib", 0) for g in gpus)
+        total_cap = sum(g.get("total_mib", 0) for g in gpus)
+    else:
+        actual_free = 0
+        total_cap = 0
+
     if vram_free is None:
-        vram_free = 0
-        if gpu_indices:
-            by_idx = {g["index"]: g for g in list_gpu_info()}
-            vram_free = sum(by_idx.get(i, {}).get("free_mib", 0) for i in gpu_indices)
-        elif shutil.which("nvidia-smi"):
-            try:
-                res = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                vram_free = int(res.stdout.splitlines()[0].strip())
-            except Exception:
-                pass
+        vram_free = actual_free
+    elif actual_free > 0 and vram_free > actual_free + 512:
+        # Caller passed total VRAM instead of actual free VRAM (e.g. from total_mib).
+        # Clamp to actual free VRAM so we do not over-commit.
+        vram_free = actual_free
+
+    if is_windows_or_wsl():
+        # On Windows / WSL, the Windows host OS, DWM, and desktop apps permanently
+        # occupy VRAM. Reserve at least 2048 MiB of headroom below physical capacity
+        # to ensure allocations never trigger WDDM Shared GPU Memory paging.
+        if total_cap > 0:
+            if vram_free <= 0 or vram_free < 2048:
+                # GPU was temporarily occupied (e.g. during server restart/stop).
+                # Assume full capacity minus OS reservation rather than 0 MiB.
+                vram_free = max(1024, total_cap - 2048)
+            else:
+                vram_free = min(vram_free, max(1024, total_cap - 2048))
 
     try:
         model_mb = split_total_size(model_path) * 1024
@@ -397,6 +454,11 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
     else:
         default_max = 262144
     ctx_max = int(env_vars.get("LLAMA_CTX_SIZE_MAX", os.environ.get("LLAMA_CTX_SIZE_MAX", str(default_max))))
+    if is_windows_or_wsl() and (total_cap == 0 or total_cap <= 17000) and not (rope_scaling == "yarn" and rope_scale):
+        # On 16GB GPUs under Windows/WSL, a ~10GB model with KV cache and compute buffers
+        # must stay capped at 65536 tokens (or 32768 tokens with MTP) to guarantee zero
+        # spillover into WDDM Shared GPU Memory.
+        ctx_max = min(ctx_max, 32768 if use_mtp else 65536)
 
     # KV spill into CPU RAM only happens when some layers live on the CPU
     # (partial offload) — with every layer on the GPU the whole KV cache is GPU-resident.
@@ -405,8 +467,8 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
         partial_offload = int(str(n_gpu_layers)) < (layers or 10**9)
     except (TypeError, ValueError):
         partial_offload = False
-    if vram_free <= 0:
-        partial_offload = True  # no GPU info at all → CPU-only, KV lives in RAM
+    if vram_free <= 0 and total_cap <= 0:
+        partial_offload = True  # truly no GPU at all → CPU-only, KV lives in RAM
 
     est = estimate_vram_mb(model_path, 0, use_mtp=use_mtp)  # base: weights + SSM state + overhead, no KV
     if est:
@@ -418,16 +480,26 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
         kv_gpu = 0.01518
         kv_ram = 0.00400
 
-    # Base estimate already includes 3072 MiB of runtime buffer overhead;
-    # safety margin is only a small buffer (256 MiB) to avoid double-counting.
-    safety_gpu = 256
+    if is_windows_or_wsl():
+        # Windows WDDM / WSL2 driver transparently spills any VRAM overflow to System RAM
+        # ("Shared GPU Memory") over PCIe, causing a severe 10x-30x slowdown.
+        # Reserve generous headroom for Windows DWM, display compositor spikes,
+        # CUDA driver runtime context (~500MB), and flash-attn / compute graph buffers.
+        safety_gpu = max(1024, int((vram_free or 16384) * 0.08))
+        # NEVER extend context into CPU RAM on Windows / WSL2!
+        ctx_ram_extend = 0
+        partial_offload = False
+    else:
+        # Base estimate already includes 3072 MiB of runtime buffer overhead;
+        # safety margin is only a small buffer (256 MiB) to avoid double-counting.
+        safety_gpu = 256
+        ram_budget = max(0, ram_free - safety_ram) if partial_offload else 0
+        ctx_ram_extend = int(ram_budget / kv_ram) if partial_offload else 0
+
     safety_ram = 4096
 
     gpu_budget = max(0, vram_free - base_mb - safety_gpu)
     ctx_gpu_only = int(gpu_budget / kv_gpu) if kv_gpu > 0 else 0
-
-    ram_budget = max(0, ram_free - safety_ram) if partial_offload else 0
-    ctx_ram_extend = int(ram_budget / kv_ram) if partial_offload else 0
 
     if partial_offload:
         ctx_base = min(ctx_max, ctx_gpu_only + ctx_ram_extend)
@@ -437,11 +509,13 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
             ctx_base = min(ctx_max, ctx_gpu_only)
         else:
             # When VRAM is tight, use whatever margin exists above raw weights
-            tight_margin = max(0, vram_free - (est.get("weights_mb", model_mb) if est else model_mb) - 512)
+            tight_margin = max(0, vram_free - (est.get("weights_mb", model_mb) if est else model_mb) - (1024 if is_windows_or_wsl() else 512))
             ctx_base = max(4096, min(ctx_max, int(tight_margin / kv_gpu))) if tight_margin > 0 else 4096
 
     ctx = int(ctx_base * factor)
     ctx = min(ctx_max, max(4096, (ctx // 512) * 512))
+    if is_windows_or_wsl() and (total_cap == 0 or total_cap <= 17000) and not (rope_scaling == "yarn" and rope_scale):
+        ctx = min(ctx, 32768 if use_mtp else 65536)
 
     source = "GPU" if (not partial_offload or ctx <= ctx_gpu_only) else "GPU+RAM"
     if source == "GPU+RAM":
@@ -452,11 +526,14 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
 def list_gpu_info():
     """Return [{index, name, total_mib, free_mib}, ...] from nvidia-smi (empty if unavailable)."""
     gpus = []
-    if not shutil.which("nvidia-smi"):
+    smi_bin = shutil.which("nvidia-smi") or (
+        "/usr/lib/wsl/lib/nvidia-smi" if os.path.exists("/usr/lib/wsl/lib/nvidia-smi") else None
+    )
+    if not smi_bin:
         return gpus
     try:
         res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
+            [smi_bin, "--query-gpu=index,name,memory.total,memory.free",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
@@ -581,7 +658,8 @@ def compute_tensor_split(gpu_indices, ctx_reserve=2048):
     props = [f / total for f in frees]
     return ",".join(f"{p:.3f}" for p in props)
 
-def read_gguf_arch(path):
+@functools.lru_cache(maxsize=32)
+def _read_gguf_arch_cached(path):
     """Key architecture fields from a GGUF header, else None.
 
     Returns {"arch", "layers", "kv_heads", "head_dim", "full_attn_interval",
@@ -589,24 +667,24 @@ def read_gguf_arch(path):
     from first principles instead of a one-size-fits-all per-token guess.
     Uses gguf-py when importable (site-packages or the llama.cpp repo copy).
     """
+    import glob
+    for cand in (
+        "/home/dzyla/miniconda3/lib/python3.12/site-packages",
+        str(Path.home() / "miniconda3" / "lib" / "python3.12" / "site-packages"),
+        *glob.glob(str(Path.home() / "miniconda3" / "lib" / "python3.*" / "site-packages")),
+        *glob.glob(str(Path.home() / ".local" / "lib" / "python3.*" / "site-packages")),
+        str(Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py"),
+        str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
+        "/home/dzyla/Code/llama.cpp/gguf-py",
+    ):
+        if os.path.isdir(cand) and cand not in sys.path:
+            sys.path.insert(0, cand)
+
     _gg = None
     try:
         import gguf as _gg
     except Exception:
         pass
-    if _gg is None:
-        for cand in (
-            str(Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py"),
-            str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
-            "/home/dzyla/Code/llama.cpp/gguf-py",
-        ):
-            if os.path.isdir(cand):
-                sys.path.insert(0, cand)
-                try:
-                    import gguf as _gg
-                    break
-                except Exception:
-                    _gg = None
     if _gg is None:
         return None
     try:
@@ -663,6 +741,15 @@ def read_gguf_arch(path):
             "nextn": int(a.get("nextn_predict_layers") or 0),
             "ssm": ssm,
         }
+    except Exception:
+        return None
+
+def read_gguf_arch(path):
+    if not path:
+        return None
+    try:
+        resolved = str(Path(path).resolve())
+        return _read_gguf_arch_cached(resolved)
     except Exception:
         return None
 
@@ -756,7 +843,14 @@ def vram_preflight(model_path, ctx_size, gpu_indices, n_gpu="99", use_mtp=False,
         print(f"[llama-wrapper] NOTE: {why} — VRAM check relaxed (some state lives in system RAM).", file=sys.stderr)
         return True
     overage = needed - free_total
-    if overage <= max(2048, needed * 0.02):
+    if is_windows_or_wsl():
+        # On Windows / WSL, any VRAM overage causes the NVIDIA driver to transparently
+        # page tensors into System RAM (Shared GPU Memory), dropping inference speed by 90%+.
+        # Enforce a strict threshold (allow at most 256 MiB or 1% estimation variance).
+        max_overage = max(256, int(needed * 0.01))
+    else:
+        max_overage = max(2048, needed * 0.02)
+    if overage <= max_overage:
         return True
     single = len(gpu_indices or []) == 1
     sel = ",".join(str(i) for i in (gpu_indices or []))
@@ -941,6 +1035,8 @@ def persist_env_changes(changes, auto_restart=True):
         else:
             env_vars[k] = v
     url = env_vars.get("INFER_BASE_URL", f"http://localhost:{PORT}/v1/")
+    if is_proxy_running() and f":8081" in url:
+        url = f"http://localhost:{PORT}/v1/"
     model = env_vars.get("INFER_MODEL", "llama")
     llama_path = env_vars.get("LLAMA_MODEL_PATH")
     # Pass the full merged state (deletions applied) as authoritative so
@@ -1001,7 +1097,7 @@ def cmd_serve(target=None, foreground=False):
         sys.exit(1)
 
     idle_timeout = int(env_vars.get("LLAMA_IDLE_TIMEOUT", os.environ.get("LLAMA_IDLE_TIMEOUT", "120")))
-    ctx_override = env_vars.get("LLAMA_CTX_SIZE", os.environ.get("LLAMA_CTX_SIZE"))
+    ctx_override = os.environ.get("LLAMA_CTX_SIZE") or env_vars.get("LLAMA_CTX_SIZE")
 
     # Draft / speculative decoding: decided up front because it changes both the
     # GPU choice (a draft must co-locate with the main model on one card) and the
@@ -1081,6 +1177,10 @@ def cmd_serve(target=None, foreground=False):
         else:
             extra_args.extend(["--parallel", "1"])
             print("[llama-wrapper] MTP active: pinning --parallel 1 (single slot; the MTP draft context is single-sequence). Set LLAMA_N_PARALLEL to override.", file=sys.stderr)
+    else:
+        n_parallel = env_vars.get("LLAMA_N_PARALLEL", os.environ.get("LLAMA_N_PARALLEL", ""))
+        if n_parallel:
+            extra_args.extend(["--parallel", str(n_parallel)])
 
     # Reasoning models (DeepSeek V4, Qwen 3.8, Qwen 3.6, etc.) need the chat template + reasoning
     # handling enabled, else chat completions degenerate into raw CoT garbage.
@@ -1209,7 +1309,8 @@ def cmd_serve(target=None, foreground=False):
 
     kill_llama_server()
     serve_port = get_serve_port()
-    write_env(f"http://localhost:{serve_port}/v1/", "llama", str(model_path))
+    client_port = PORT if is_proxy_running() else serve_port
+    write_env(f"http://localhost:{client_port}/v1/", "llama", str(model_path))
 
     cmd = [
         "llama-server",
@@ -1720,11 +1821,13 @@ def cmd_tune(target=None):
     # 1. Inspect GPU & VRAM capacity
     was_systemd_active = is_systemd_service_active()
     kill_llama_server()
+    time.sleep(1.5)  # ensure CUDA runtime releases VRAM
 
     gpus = list_gpu_info()
     total_vram_mib = sum(g["total_mib"] for g in gpus) if gpus else 0
+    agg_free_mib = sum(g.get("free_mib", 0) for g in gpus) if gpus else 0
     gpu_names = ", ".join(g["name"] for g in gpus) if gpus else "CPU / Unknown"
-    print(f"Detected GPU(s): {gpu_names} ({total_vram_mib} MiB VRAM total)")
+    print(f"Detected GPU(s): {gpu_names} ({agg_free_mib} MiB free / {total_vram_mib} MiB total)")
 
     # 2. Determine safe context & KV cache quantization
     arch = read_gguf_arch(model_path) or {}
@@ -1755,7 +1858,7 @@ def cmd_tune(target=None):
     # This is what will be pinned after benchmarking — use best-case (no MTP) for ctx ceiling.
     recommended_ctx = calculate_auto_ctx(
         model_path,
-        vram_free=total_vram_mib or None,
+        vram_free=agg_free_mib or None,
         use_mtp=False,
     )
     # Snap to a clean multiple of 4096 and cap at 262144
@@ -1767,6 +1870,7 @@ def cmd_tune(target=None):
     print(f"  → Clearing explicit ctx (will lock to {recommended_ctx} tokens after benchmark)")
     cmd_ctx("auto", auto_restart=False)
 
+    TUNE_PORT = 8089
 
     # Helper: Wait for server ready, also watching for early server death
     def wait_ready(proc, timeout=180):
@@ -1787,7 +1891,7 @@ def cmd_tune(target=None):
                     print(f"    {ln}")
                 return False
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=1) as resp:
+                with urllib.request.urlopen(f"http://127.0.0.1:{TUNE_PORT}/health", timeout=1) as resp:
                     if resp.status == 200:
                         return True
             except Exception:
@@ -1797,7 +1901,7 @@ def cmd_tune(target=None):
 
     # Helper: Stream generation
     def generate_eval(prompt, max_tokens=220, thinking=False):
-        endpoint = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+        endpoint = f"http://127.0.0.1:{TUNE_PORT}/v1/chat/completions"
         body = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
@@ -1832,7 +1936,7 @@ def cmd_tune(target=None):
 
     # Helper: Server metrics query
     def get_metrics():
-        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/metrics")
+        req = urllib.request.Request(f"http://127.0.0.1:{TUNE_PORT}/metrics")
         m = {}
         try:
             with urllib.request.urlopen(req, timeout=3) as resp:
@@ -1879,14 +1983,16 @@ def cmd_tune(target=None):
         agg_free = sum(g.get("free_mib", 0) for g in gpus)
         safe_ctx = calculate_auto_ctx(
             model_path,
-            vram_free=agg_free or total_vram_mib or None,
+            vram_free=agg_free or None,
             use_mtp=use_mtp_flag,
         )
         safe_ctx = min(safe_ctx, recommended_ctx)
+        serve_env["LLAMA_PORT"] = str(TUNE_PORT)
         serve_env["LLAMA_CTX_SIZE"] = str(safe_ctx)
+        serve_env["LLAMA_N_PARALLEL"] = "1"
         print(f"    (using ctx={safe_ctx} for this run)", flush=True)
         proc = subprocess.Popen(
-            [sys.argv[0], "serve", "--foreground"],
+            [sys.executable, str(Path(__file__).resolve()), "serve", "--foreground"],
             env=serve_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -1994,9 +2100,12 @@ def cmd_tune(target=None):
         final_use_mtp = True
 
     # Re-calculate safe resident context size with the winning MTP choice to fit VRAM accurately
+    stop_server(None)
+    gpus = list_gpu_info()
+    agg_free_mib = sum(g.get("free_mib", 0) for g in gpus) if gpus else 0
     final_safe_ctx = calculate_auto_ctx(
         model_path,
-        vram_free=total_vram_mib or None,
+        vram_free=agg_free_mib or None,
         use_mtp=final_use_mtp,
     )
     final_safe_ctx = min(262144, (final_safe_ctx // 4096) * 4096)
@@ -2007,6 +2116,7 @@ def cmd_tune(target=None):
     recommended_ctx = final_safe_ctx
 
     if was_systemd_active:
+        subprocess.run(["systemctl", "--user", "start", "llama-server.service"], capture_output=True)
         restart_systemd_service()
 
     # Final summary table

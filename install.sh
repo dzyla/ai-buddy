@@ -546,17 +546,28 @@ print(lines[idx].split(') ', 1)[1])
 
     # Prepare environment lines for systemd
     SYSTEMD_ENV=""
+    WSL_LIB=""
+    if [ -d "/usr/lib/wsl/lib" ]; then
+        WSL_LIB=":/usr/lib/wsl/lib"
+    fi
     if [ -n "${CUDA_BIN_DIR:-}" ]; then
-        SYSTEMD_ENV="Environment=PATH=${BIN_DIR}:${CUDA_BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        SYSTEMD_ENV="Environment=PATH=${BIN_DIR}:${CUDA_BIN_DIR}${WSL_LIB}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=CUDA_PATH=${CUDA_ROOT}
 Environment=LLAMA_CTX_SIZE=131072"
         if [ -n "${CUDA_LIB_DIR:-}" ]; then
             SYSTEMD_ENV="${SYSTEMD_ENV}
-Environment=LD_LIBRARY_PATH=${CUDA_LIB_DIR}"
+Environment=LD_LIBRARY_PATH=${CUDA_LIB_DIR}${WSL_LIB}"
+        elif [ -n "${WSL_LIB}" ]; then
+            SYSTEMD_ENV="${SYSTEMD_ENV}
+Environment=LD_LIBRARY_PATH=/usr/lib/wsl/lib"
         fi
     else
-        SYSTEMD_ENV="Environment=PATH=${BIN_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        SYSTEMD_ENV="Environment=PATH=${BIN_DIR}${WSL_LIB}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=LLAMA_CTX_SIZE=131072"
+        if [ -n "${WSL_LIB}" ]; then
+            SYSTEMD_ENV="${SYSTEMD_ENV}
+Environment=LD_LIBRARY_PATH=/usr/lib/wsl/lib"
+        fi
     fi
 
     # Write systemd units

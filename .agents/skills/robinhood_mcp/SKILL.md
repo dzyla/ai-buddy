@@ -132,25 +132,33 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 > [!CAUTION]
 > Trading involves real financial risk. Adhere strictly to the following rules:
 
-1. **Multi-Tier Intraday Circuit Breakers**:
+1. **Local LLM Investment Committee & Strict BUY Gating**:
+   - Every buy setup is evaluated directly by the local LLM (`AgentAdvisor`) for risk/reward ratio (>= 2.0x required), anti-chasing filters, and cash reserves.
+   - For any BUY signal to execute, the LLM must explicitly return `verdict: EXECUTE`, `action: BUY`, and `confidence >= 0.65`.
+   - Any ambiguity, low confidence (< 0.65), `PASS`, or timeout strictly defaults to `WAIT` (no-buy safety gate).
+2. **Core-Satellite Wealth Compounding Engine**:
+   - Bedrock Core ETFs (`VTI`, `QQQ` target 55-65% allocation) are dollar-cost-averaged on pullbacks to build sustainable compounding equity.
+   - Core Ballast Immunity: Core broad-market ETFs (`VTI`, `QQQ`) are protected from routine -4% to -5% stops; they hold through normal pullbacks and only exit on catastrophic bear breaks (<= -15.0%).
+   - Speculative Satellites: Restricted to max 3 active single-stock positions and max 1 new satellite entry per calendar day to eliminate rapid-fire churn.
+3. **Multi-Tier Intraday Circuit Breakers**:
    - **Tier 1 ($\le -3.0\%$ Drawdown from Open):** Halts all automated buy orders for the rest of the day.
    - **Tier 2 ($\le -6.0\%$ Drawdown from Open):** Tightens active stop-losses to $\min(4.0\%, 1.0\times\text{ATR})$.
    - **Tier 3 ($\le -10.0\%$ Drawdown from Open):** Triggers Emergency Capital Liquidation (cancels open orders, exits positions in loss-ranked order overriding PDT deferral, disables auto-trade).
-2. **FINRA PDT Rule 4210 Compliance**:
+4. **FINRA PDT Rule 4210 Compliance & Anti-Churn Cooldown**:
    - Small sandbox accounts ($<\$25,000$) are limited to 3 day trades in rolling 5 business days (`pdt_tracker.json`).
    - If day trades used reaches $3/3$, same-day round-trip buys/sells are blocked; stop-losses on same-day buys defer to the next 09:30 ET market open (`deferred_exit.flag`).
-   - Positions opened on prior days (overnight/swing) are NOT day trades and can always be exited freely.
-3. **Dynamic Volatility Trailing Stop & Take-Profit**:
-   - Stop-loss: $\max(5.0\%, 2.0\times\text{ATR}_{\text{pct}})$.
+   - Strict 14-day cooldown on any ticker stopped out at a loss; same-day re-entry after selling is 100% blocked.
+5. **Dynamic Volatility Trailing Stop & Take-Profit**:
+   - Single-Stock Stop-loss: $\max(6.0\%, 2.0\times\text{ATR}_{\text{pct}})$.
    - Stage 1 Take-Profit: Exit 50% shares at $+8.0\%$.
-   - Stage 2 Runner: Trail remaining 50% shares with dynamic trailing stop $\max(4.5\%, 1.5\times\text{ATR}_{\text{pct}})$ up to $+15.0\%$.
-4. **Portfolio Diversification, Sizing & Cash Buffer**:
+   - Stage 2 Runner: Trail remaining 50% shares with dynamic trailing stop $\max(4.5\%, 1.5\times\text{ATR}_{\text{pct}})$ up to $+15.0\%+$.
+6. **Portfolio Diversification, Sizing & Cash Buffer**:
    - Dynamic Growth-Scaled Position Sizing: $\text{Size} = \text{round}\big(\min(\text{Cash}, \max(\$15.00, 0.08\times\text{Equity}), 0.15\times\text{Equity}), 2\big)$.
    - Max single-stock allocation: 15% of total portfolio value.
    - Maintain at least 15% cash reserve buffer for market pullbacks.
-5. **Account Permission Boundary**:
+7. **Account Permission Boundary**:
    - Automated orders MUST target `517198354` (`agentic_allowed: true`).
    - Non-agentic accounts (`837546068`, `422982744`) are protected against automated mutation.
-6. **Human Verification in Plan / Manual Modes**:
+8. **Human Verification in Plan / Manual Modes**:
    - When running under `--plan` or `--manual`, present the proposed trades (Ticker, Action, Shares/Dollar, Limit Price, Estimated Total, Risk Target) to the user and obtain confirmation before placing orders.
 

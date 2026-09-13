@@ -1014,20 +1014,100 @@ def find_ai_binary() -> str:
 
 
 class AgentAdvisor:
-    """Invokes the AI Agent during active market hours for deep validation, macro alignment, and trade confirmation."""
+    """Invokes the local LLM during active market hours for deep validation, macro alignment, and trade confirmation."""
 
     @classmethod
-    def invoke_agent(cls, prompt: str, timeout: Optional[int] = None, flags: Optional[List[str]] = None) -> str:
-        """Invokes the ai agent binary with auto-approve to generate analysis or validation."""
+    def invoke_local_llm(cls, messages: List[Dict[str, str]], temperature: float = 0.15,
+                         max_tokens: int = 1024, timeout: int = 25) -> Optional[Dict[str, Any]]:
+        """
+        Directly queries the local OpenAI-compatible llama-server endpoint at INFER_BASE_URL.
+        Returns dict with keys: 'content', 'reasoning' or None on failure.
+        """
+        infer_base = os.environ.get("INFER_BASE_URL", "http://localhost:8080/v1/").rstrip("/")
+        if not infer_base.endswith("/v1"):
+            infer_base = f"{infer_base}/v1"
+        url = f"{infer_base}/chat/completions"
+
+        model_name = os.environ.get("INFER_MODEL", "llama")
+        if model_name == "llama" and os.environ.get("LLAMA_MODEL_PATH"):
+            model_name = os.environ.get("LLAMA_MODEL_PATH")
+
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {os.environ.get('INFER_API_KEY', 'not-needed')}"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    raw_resp = json.loads(resp.read().decode("utf-8"))
+                    choices = raw_resp.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        content = (msg.get("content") or "").strip()
+                        reasoning = (msg.get("reasoning_content") or "").strip()
+                        return {"content": content, "reasoning": reasoning}
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def invoke_agent(cls, prompt: str, timeout: Optional[int] = None, flags: Optional[List[str]] = None,
+                     system_prompt: Optional[str] = None) -> str:
+        """Invokes the AI agent: tries direct high-speed local inference API first, then falls back to ai binary."""
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
             return "VERDICT: EXECUTE\nREASONING: Simulated test mode approval.\nSUGGESTION: Proceed with staged plan."
-            
+
+        sys_prompt = system_prompt or (
+            "You are a Senior Quantitative Portfolio Manager and Risk Officer for Robinhood Agentic Trading. "
+            "Your highest priority is capital preservation and long-term wealth compounding. "
+            "Never chase overbought spikes or trade low-conviction setups."
+        )
+
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt}
+        ]
+
+        # 1. Primary: Direct high-speed local LLM API (2-4 seconds)
+        llm_res = cls.invoke_local_llm(messages, timeout=min(timeout or 25, 25))
+        if llm_res:
+            content = llm_res.get("content", "")
+            reasoning = llm_res.get("reasoning", "")
+            if content:
+                clean_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                clean_content = re.sub(r"<tool_call>.*?</tool_call>", "", clean_content, flags=re.DOTALL).strip()
+                if clean_content:
+                    return clean_content
+            elif reasoning:
+                m_json = re.search(r"(\{.*\})", reasoning, re.DOTALL)
+                if m_json:
+                    try:
+                        parsed = json.loads(m_json.group(1))
+                        return json.dumps(parsed)
+                    except Exception:
+                        pass
+                sents = [s.strip() for s in reasoning.split(".") if s.strip()]
+                if sents:
+                    return ". ".join(sents[-2:]) + "."
+
+        # 2. Secondary fallback: ai CLI binary
         ai_bin = find_ai_binary()
         env = os.environ.copy()
         env["INFER_AUTO_APPROVE"] = "1"
         env["BROWSER"] = "none"
-        
-        timeout_sec = timeout or int(os.environ.get("ROBINHOOD_AI_TIMEOUT", 120))
+
+        timeout_sec = min(timeout or 60, 60)
         cmd = [ai_bin, "-y", "--no-agents", "--no-git", "--no-mcp", "-q", "--private"]
         if flags:
             cmd.extend(flags)
@@ -1035,7 +1115,7 @@ class AgentAdvisor:
             mode = os.environ.get("ROBINHOOD_AI_MODE", "instruct")
             cmd.extend(["--mode", mode, "-n"])
         cmd.append(prompt)
-        
+
         try:
             res = subprocess.run(
                 cmd,
@@ -1046,7 +1126,6 @@ class AgentAdvisor:
             )
             out = res.stdout.strip()
             if out:
-                # Clean up thinking artifacts or tool call tags if emitted
                 out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
                 out = re.sub(r"<tool_call>.*?</tool_call>", "", out, flags=re.DOTALL).strip()
                 return out
@@ -1060,7 +1139,7 @@ class AgentAdvisor:
         macro = briefing_data.get("macro_sentiment", {})
         top_buys = briefing_data.get("top_buy_candidates", [])
         warnings = briefing_data.get("top_risk_warnings", [])
-        
+
         lines = [
             "### 🧭 Algorithmic Macro & Strategic Assessment",
             f"- **Macro Bias:** `{macro.get('label', 'NEUTRAL')}` (Score: {macro.get('score', 0.0):+.2f})",
@@ -1072,12 +1151,12 @@ class AgentAdvisor:
                 lines.append(f"- **{b['ticker']}** (Score {b.get('score', 50)}): Entry around `${b.get('price', 0.0):.2f}` with Stop-Loss at `${b.get('stop_loss', 0.0):.2f}` and Target at `${b.get('take_profit_1', 0.0):.2f}`.")
         else:
             lines.append("- Monitoring core watchlist for opening volume breakouts.")
-            
+
         if warnings:
             lines.append("\n### ⚠️ Risk Warnings & Traps to Avoid")
             for w in warnings:
                 lines.append(f"- **{w['ticker']}**: {w.get('reason', 'Overextended momentum')}.")
-                
+
         lines.append("\n### 📋 Action Plan for Today's Session")
         lines.append("1. Monitor 09:30 AM ET opening volatility for 15 minutes before executing new breakout entries.")
         lines.append("2. Enforce trailing stop-loss brackets automatically via `risk-monitor`.")
@@ -1109,7 +1188,7 @@ class AgentAdvisor:
             for t in trades:
                 lines.append(f"- **{t.get('action', 'ORDER')} {t.get('ticker', '')}**: {t.get('qty', '')} shares at ${t.get('price', 0.0):.2f} (Reason: {t.get('reason', 'N/A')}, P&L: {t.get('pnl_pct', 0.0):+.2f}%).")
         else:
-            lines.append("- **Clean Risk Adherence:** Zero forced liquidations or stop-loss violations occurred today. All positions remained within configured risk bands (-3.0% trailing stop / +8.0% take-profit).")
+            lines.append("- **Clean Risk Adherence:** Zero forced liquidations or stop-loss violations occurred today. All positions remained within configured risk bands (-6.0% trailing stop / +10.0% take-profit).")
 
         if movers:
             lines.append("\n#### 📈 Key Watchlist Movers")
@@ -1120,7 +1199,7 @@ class AgentAdvisor:
             "",
             "#### 🔭 Preparation for Tomorrow's Market Open",
             "1. **Pre-Market Refresh:** The pre-market briefing will automatically run at 09:20 AM ET to scan overnight catalysts.",
-            "2. **Capital Allocation:** Maintain strict risk sizing per trade (max 2-5% portfolio allocation per setup).",
+            "2. **Capital Allocation:** Maintain strict risk sizing per trade (max 5-8% portfolio allocation per setup).",
             "3. **Stop Protection:** Keep stop-loss and take-profit triggers active for the next regular trading session."
         ])
         return "\n".join(lines)
@@ -1130,20 +1209,25 @@ class AgentAdvisor:
         """Asks the AI Agent to review the pre-market data, validate macro outlook, and suggest actionable adjustments."""
         top_buys = briefing_data.get("top_buy_candidates", [])
         macro = briefing_data.get("macro_sentiment", {})
-        
+
+        sys_prompt = (
+            "You are the Senior Quantitative Portfolio Manager and Trading Strategist for Robinhood Agentic Trading. "
+            "Write a concise, professional 3-paragraph pre-market briefing in Markdown. Focus on capital preservation, "
+            "macro catalysts, and high-probability trade setups."
+        )
+
         prompt = (
-            f"You are the senior trading strategist for Robinhood Agentic Trading.\n"
             f"Review today's pre-market briefing data:\n"
             f"Macro Sentiment: {macro.get('label')} (Score: {macro.get('score')})\n"
             f"Headlines: {json.dumps(macro.get('key_headlines', []))}\n"
             f"Top Staged Setups: {json.dumps(top_buys)}\n\n"
-            f"Provide a concise, professional assessment with:\n"
+            f"Provide a concise, professional assessment in markdown:\n"
             f"1. Validation of whether macro sentiment supports aggressive buying or conservative risk today.\n"
             f"2. Assessment of top candidates, key entry levels, and potential risk traps/catalysts.\n"
             f"3. Concrete actionable suggestions for today's trading session."
         )
-        res = cls.invoke_agent(prompt, timeout=180)
-        if not res or res.startswith("(AI Agent invocation error:") or ("error" in res.lower() and len(res) < 100):
+        res = cls.invoke_agent(prompt, timeout=25, system_prompt=sys_prompt)
+        if not res or res.startswith("(AI Agent invocation error:") or ("error" in res.lower() and len(res) < 100) or len(res) < 30:
             return cls.generate_algorithmic_premarket_briefing(briefing_data)
         return res
 
@@ -1151,9 +1235,11 @@ class AgentAdvisor:
     def validate_trade_decision(cls, ticker: str, action: str, current_price: float, avg_cost: float,
                                 pnl_pct: float, reason: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        When a Buy/Sell signal or Stop-Loss / Take-Profit is triggered, asks the AI Agent to validate:
-        - Should we EXECUTE immediately, or WAIT for confirmation?
-        - Evaluates risk, volume, momentum, and wash-sale/churn risk.
+        When a Buy/Sell signal or Stop-Loss / Take-Profit is triggered, the AI Agent acts as an
+        investment committee / risk officer:
+        - Evaluates risk, asymmetric upside, trend health, and portfolio allocation.
+        - Strictly forbids chasing overbought spikes or re-buying recently stopped-out stocks.
+        - Returns structured verdict: {"verdict": "EXECUTE" | "WAIT", "action": ..., "confidence": ..., "reasoning": ...}
         """
         details = details or {}
         acc_num = details.get("account", "")
@@ -1162,40 +1248,103 @@ class AgentAdvisor:
             if recent_exits:
                 details["recent_exits"] = recent_exits
 
-        prompt = (
-            f"You are the risk officer and execution validator for Robinhood Agentic Trading. "
-            f"A trade signal has triggered:\n"
-            f"- Action: {action.upper()}\n"
+        is_buy = action.lower() == "buy"
+
+        system_prompt = (
+            "You are the Senior Quantitative Portfolio Manager and Risk Officer for Robinhood Agentic Trading.\n"
+            "Your objective is LONG-TERM WEALTH GENERATION and CAPITAL PRESERVATION.\n"
+            "Warren Buffett Rule #1: Never lose money. Rule #2: Never forget Rule #1.\n\n"
+            "Decision Rules:\n"
+            "1. For BUY signals:\n"
+            "   - Strictly FORBID buying overbought stocks (RSI > 68 or daily gain > +3.5%).\n"
+            "   - Strictly FORBID buying high-volatility spikes without volume confirmation.\n"
+            "   - Strongly PREFER core wealth compounders (VTI, QQQ, secular leaders) on dips/pullbacks.\n"
+            "   - Require risk/reward ratio >= 2.0 (upside target must be at least double the stop loss).\n"
+            "   - If in doubt, confidence is low (< 0.65), or risk is elevated, choose WAIT (PASS).\n"
+            "2. For SELL signals:\n"
+            "   - If it's a Stop-Loss: confirm EXECUTE to cut losses cleanly unless live quote confirms a momentary flash-wick.\n"
+            "   - If it's a Take-Profit or Profit-Lock: confirm EXECUTE to lock in gains into cash/ballast.\n\n"
+            "OUTPUT REQUIREMENT:\n"
+            "Respond strictly in valid JSON format:\n"
+            "{\n"
+            '  "verdict": "EXECUTE" or "WAIT",\n'
+            '  "action": "BUY", "PASS", "SELL", or "HOLD",\n'
+            '  "confidence": 0.0 to 1.0,\n'
+            '  "reasoning": "concise 2-sentence rationale",\n'
+            '  "suggestion": "suggested entry level, limit price, or trailing stop adjustment"\n'
+            "}"
+        )
+
+        user_prompt = (
+            f"Trade Signal Triggered for Decision:\n"
+            f"- Action Proposed: {action.upper()}\n"
             f"- Ticker: {ticker}\n"
             f"- Current Price: ${current_price:.2f}\n"
             f"- Average Cost Basis: ${avg_cost:.2f}\n"
-            f"- P&L: {pnl_pct:+.2f}%\n"
+            f"- Unrealized P&L: {pnl_pct:+.2f}%\n"
             f"- Trigger Reason: {reason}\n"
-            f"- Context: {json.dumps(details)}\n\n"
-            f"Validate whether to EXECUTE immediately or WAIT. Note: strictly forbid re-buying a stock that was recently sold or stopped out.\n"
-            f"Output your verdict in this exact format:\n"
-            f"VERDICT: [EXECUTE | WAIT]\n"
-            f"REASONING: <concise 2-sentence rationale>\n"
-            f"SUGGESTION: <limit price, trailing stop or timing adjustment>"
+            f"- Market Context & Details: {json.dumps(details, default=str)}\n\n"
+            f"Evaluate this setup thoroughly. Should we EXECUTE immediately or WAIT?"
         )
-        agent_response = cls.invoke_agent(prompt, timeout=90)
-        
-        # Parse verdict
+
+        agent_response = cls.invoke_agent(user_prompt, timeout=25, system_prompt=system_prompt)
+
+        # Parse JSON from agent response
+        parsed_json = None
+        if agent_response:
+            try:
+                m = re.search(r"(\{.*\})", agent_response, re.DOTALL)
+                if m:
+                    parsed_json = json.loads(m.group(1))
+                else:
+                    parsed_json = json.loads(agent_response)
+            except Exception:
+                pass
+
+        if parsed_json and isinstance(parsed_json, dict):
+            raw_verdict = str(parsed_json.get("verdict", "")).upper()
+            raw_action = str(parsed_json.get("action", "")).upper()
+            confidence = float(parsed_json.get("confidence", 0.5) or 0.5)
+            reasoning = str(parsed_json.get("reasoning", ""))
+            suggestion = str(parsed_json.get("suggestion", ""))
+
+            if is_buy:
+                # STRICT BUY GATING:
+                # Must be explicitly EXECUTE, action BUY, and confidence >= 0.65.
+                if raw_verdict == "EXECUTE" and raw_action in ("BUY", "EXECUTE") and confidence >= 0.65:
+                    verdict = "EXECUTE"
+                else:
+                    verdict = "WAIT"
+            else:
+                # SELL: If stop-loss, protect capital unless agent is confident it's a momentary flash wick.
+                if raw_verdict == "WAIT" and confidence >= 0.75:
+                    verdict = "WAIT"
+                else:
+                    verdict = "EXECUTE"
+
+            return {
+                "verdict": verdict,
+                "confidence": confidence,
+                "action": raw_action,
+                "reasoning": reasoning,
+                "suggestion": suggestion,
+                "agent_response": agent_response
+            }
+
+        # Text fallback parsing if JSON parsing wasn't clean
         has_error = not agent_response or agent_response.startswith("(AI Agent invocation error:") or ("error" in agent_response.lower() and len(agent_response) < 100)
         if has_error:
-            # Conservative safety posture: on failure/timeout, NEVER execute a BUY; but DO execute protective stop-losses.
-            verdict = "WAIT" if action.lower() == "buy" else "EXECUTE"
-        elif "VERDICT: WAIT" in agent_response.upper() or "VERDICT: [WAIT]" in agent_response.upper():
+            verdict = "WAIT" if is_buy else "EXECUTE"
+        elif "VERDICT: WAIT" in agent_response.upper() or '"VERDICT": "WAIT"' in agent_response.upper() or '"ACTION": "PASS"' in agent_response.upper():
             verdict = "WAIT"
-        elif "VERDICT: EXECUTE" in agent_response.upper() or "VERDICT: [EXECUTE]" in agent_response.upper():
-            verdict = "EXECUTE"
-        else:
-            if "wait" in agent_response.lower() and ("do not execute" in agent_response.lower() or "hold off" in agent_response.lower() or "avoid" in agent_response.lower()):
-                verdict = "WAIT"
-            elif action.lower() == "buy" and ("wash" in agent_response.lower() or "cooldown" in agent_response.lower() or "risk" in agent_response.lower() and "high" in agent_response.lower()):
+        elif "VERDICT: EXECUTE" in agent_response.upper() or '"VERDICT": "EXECUTE"' in agent_response.upper():
+            if is_buy and any(neg in agent_response.lower() for neg in ("pass", "avoid", "caution", "overbought", "do not buy", "risk too high")):
                 verdict = "WAIT"
             else:
                 verdict = "EXECUTE"
+        else:
+            # Ambiguous: safety first, never buy!
+            verdict = "WAIT" if is_buy else "EXECUTE"
 
         return {
             "verdict": verdict,
@@ -1211,8 +1360,13 @@ class AgentAdvisor:
         trades = close_data.get("trades_executed_today", [])
         movers = close_data.get("top_market_movers", [])
 
+        sys_prompt = (
+            "You are the Senior Trading Strategist for Robinhood Agentic Trading. "
+            "Write a concise, professional 2-3 paragraph daily market close retrospective in markdown. "
+            "Evaluate risk discipline, portfolio preservation, and preparations for the next trading day."
+        )
+
         prompt = (
-            f"You are the trading strategist for Robinhood Agentic Trading.\n"
             f"The market has closed for today ({date_str}). Review daily performance:\n"
             f"- Macro Sentiment: {macro.get('label', 'NEUTRAL')} (Score: {macro.get('score', 0.0)})\n"
             f"- Account Equity: ${port.get('equity', 0.0):,.2f}\n"
@@ -1226,8 +1380,8 @@ class AgentAdvisor:
             f"2. Risk management audit and stop-loss / take-profit discipline.\n"
             f"3. Actionable preparation for tomorrow's market open."
         )
-        res = cls.invoke_agent(prompt, timeout=180)
-        if not res or res.startswith("(AI Agent invocation error:") or ("error" in res.lower() and len(res) < 100) or "<tool_call>" in res:
+        res = cls.invoke_agent(prompt, timeout=25, system_prompt=sys_prompt)
+        if not res or res.startswith("(AI Agent invocation error:") or ("error" in res.lower() and len(res) < 100) or len(res) < 30:
             return cls.generate_algorithmic_close_review(close_data)
         return res
 
@@ -3286,13 +3440,13 @@ def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: 
     core_ratio = (total_core_val / total_val) if total_val > 0 else 0.0
     cash_ratio = (cash / total_val) if total_val > 0 else 0.0
 
-    if cash_ratio > 0.25 and core_ratio < 0.35 and deployable_cash >= 20.0:
+    if cash_ratio >= 0.16 and core_ratio < 0.55 and deployable_cash >= 15.0:
         target_core = "VTI" if core_etf_holdings["VTI"] <= core_etf_holdings["QQQ"] else "QQQ"
-        core_buy_size = round(min(deployable_cash * 0.5, 50.0, deployable_cash - 10.0), 2)
-        if core_buy_size >= 15.0:
+        core_buy_size = round(min(deployable_cash * 0.5, 50.0, deployable_cash - 5.0), 2)
+        if core_buy_size >= 12.0:
             core_flag = os.path.join(RISK_MONITOR_FLAGS, f"ballast_buy_{today}_{target_core}.flag")
             if not os.path.exists(core_flag):
-                _risk_log(f"AUTO-TRADE CORE BALLAST: Cash is {cash_ratio*100:.1f}% (target 15%) & Core ETFs are {core_ratio*100:.1f}% (target 52%). Deploying ${core_buy_size:.2f} into {target_core} ballast...")
+                _risk_log(f"AUTO-TRADE CORE BALLAST: Cash is {cash_ratio*100:.1f}% & Core ETFs are {core_ratio*100:.1f}% (target 55%). Deploying ${core_buy_size:.2f} into {target_core} ballast...")
                 if not dry_run:
                     try:
                         res = RobinhoodExecutor.execute_market_order(account_number, target_core, "buy", dollar_amount=str(core_buy_size))
@@ -3327,6 +3481,10 @@ def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: 
     except Exception as exc:
         _risk_log(f"AUTO-TRADE: Broad market quote check failed: {exc}")
 
+    satellite_symbols = [s for s in held_symbols if s not in ("VTI", "QQQ", "SPY")]
+    single_stock_count = len(satellite_symbols)
+    daily_sat_flag = os.path.join(RISK_MONITOR_FLAGS, f"daily_sat_entry_{today}.flag")
+
     for opp in top_candidates:
         sym = opp.get("ticker", "").upper()
         score = opp.get("score", 0.0)
@@ -3344,6 +3502,15 @@ def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: 
         if market_defensive and not is_etf:
             _risk_log(f"AUTO-TRADE {sym}: Broad market regime is defensive ({regime_msg}) -> Suppressing satellite breakout.")
             continue
+
+        # 0.7. Satellite Portfolio Discipline: Max 3 single stocks & max 1 new satellite entry per day
+        if not is_etf:
+            if single_stock_count >= 3 and sym not in held_symbols:
+                _risk_log(f"AUTO-TRADE {sym}: Satellite capacity reached ({single_stock_count}/3 single stocks held); skipping.")
+                continue
+            if os.path.exists(daily_sat_flag):
+                _risk_log(f"AUTO-TRADE {sym}: Daily satellite entry limit reached (max 1 new satellite buy per day); skipping.")
+                continue
         
         # 1. Strict Wash-Sale & Re-Entry Cooldown Check (prevents selling and re-buying same stock)
         in_cooldown, cd_msg = ComplianceAndRiskGuard.is_in_cooldown(account_number, sym)
@@ -3410,15 +3577,27 @@ def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: 
         if trade_size < 5.0:
             break
 
-        _risk_log(f"AUTO-TRADE SIGNAL: {sym} Score {score:.1f} ({rec}, VolRatio: {indicators.get('volume_ratio', 1.0)}x) -> Sizing ${trade_size:.2f} trade...")
+        risk_targets = opp.get("risk_targets", {})
+        sl_price = risk_targets.get("stop_loss", round(price * 0.95, 2))
+        tp_price = risk_targets.get("take_profit_1", round(price * 1.08, 2))
+        risk_dist = max(0.01, price - sl_price)
+        reward_dist = max(0.01, tp_price - price)
+        rr_ratio = round(reward_dist / risk_dist, 2)
+
+        _risk_log(f"AUTO-TRADE SIGNAL: {sym} Score {score:.1f} ({rec}, VolRatio: {indicators.get('volume_ratio', 1.0)}x, R:R: {rr_ratio}x) -> Sizing ${trade_size:.2f} trade...")
         val = AgentAdvisor.validate_trade_decision(sym, "buy", price, price, 0.0, f"Breakout Setup (Score: {score:.1f}, VolRatio: {indicators.get('volume_ratio', 1.0)}x)", {
             "dollar_amount": trade_size,
             "account": account_number,
+            "total_equity": total_val,
+            "cash_buffer_pct": round(cash_ratio * 100, 1),
+            "core_etf_ratio": round(core_ratio * 100, 1),
             "rsi": indicators.get("rsi"),
             "volume_ratio": indicators.get("volume_ratio"),
             "macd_histogram": indicators.get("macd_histogram"),
-            "stop_loss": opp.get("risk_targets", {}).get("stop_loss"),
-            "target_1": opp.get("risk_targets", {}).get("take_profit_1")
+            "atr_pct": indicators.get("atr_pct"),
+            "stop_loss": sl_price,
+            "target_1": tp_price,
+            "risk_reward_ratio": rr_ratio
         })
         _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
 
@@ -3431,6 +3610,9 @@ def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: 
                     ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": trade_size, "price": price, "score": score, "reason": "AUTO_BREAKOUT", "agent_verdict": val["verdict"]})
                     with open(buy_flag, "w", encoding="utf-8") as fh:
                         json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dollar_amount": trade_size, "price": price, "score": score}, fh)
+                    if not is_etf:
+                        with open(daily_sat_flag, "w", encoding="utf-8") as fh:
+                            json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "symbol": sym}, fh)
                     deployable_cash -= trade_size
                 except Exception as exc:
                     _risk_log(f"AUTO-TRADE {sym}: Order failed: {exc}")
@@ -3438,6 +3620,9 @@ def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: 
                 _risk_log(f"AUTO-TRADE [DRY RUN] {sym}: Would place ${trade_size:.2f} BUY order at ~${price:.2f}.")
                 with open(buy_flag, "w", encoding="utf-8") as fh:
                     json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dry_run": True}, fh)
+                if not is_etf:
+                    with open(daily_sat_flag, "w", encoding="utf-8") as fh:
+                        json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dry_run": True, "symbol": sym}, fh)
 
 
 def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float, take_profit_pct: float) -> None:
@@ -3587,6 +3772,7 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
             _risk_log(f"RISK {sym}: Opening bell stabilization window (09:30-09:45 ET). Pausing stop-loss trigger ({pnl_pct:+.2f}%) to allow morning wicks to settle.")
             continue
 
+        is_core_etf = sym in ("VTI", "QQQ", "SPY")
         trigger_exit = False
         if ratchet_floor is not None:
             if pnl_pct <= ratchet_floor:
@@ -3594,6 +3780,12 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float
         else:
             if pnl_pct <= -effective_stop_pct:
                 trigger_exit = True
+
+        # Core Ballast Protection: VTI, QQQ, SPY are long-term compounding bedrock, NOT speculative swing trades.
+        # They should never be stopped out on routine 4-5% market pullbacks.
+        # Only trigger exit if catastrophic bear breakdown (e.g. <= -15.0%).
+        if is_core_etf and ratchet_floor is None and pnl_pct > -15.0:
+            trigger_exit = False
 
         if trigger_exit and not os.path.exists(stop_flag):
             # If position was bought today and PDT limit is exhausted, defer exit to next open
