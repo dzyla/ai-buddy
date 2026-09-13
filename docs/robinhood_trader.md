@@ -32,10 +32,11 @@ A production-grade, autonomous financial analysis, risk management, and trading 
 ```
 
 ### Core Design Principles
-1. **Intelligent Market-Hours Agent Involvement**: During active trading hours, the system invokes the AI Agent (`AgentAdvisor`) at high-value decision points:
-   - **Pre-Market Validation**: Validates macro outlook, assesses overnight catalysts, and suggests strategic adjustments.
-   - **Trade Confirmation Gating**: Before executing any Stop-Loss or Take-Profit order, the AI Agent validates whether to `EXECUTE` or `WAIT` (to avoid selling on temporary flash dips).
-   - **Market Close Retrospective**: Summarizes daily execution lessons in Obsidian notes.
+1. **Intelligent Local LLM Investment Committee (`AgentAdvisor`)**: During active trading hours, the system connects directly to the local inference server (`http://localhost:8080/v1/chat/completions`) for sub-second trade validation and risk gating:
+   - **Strict BUY Safety Gating**: Evaluates risk/reward ratio (>= 2.0x required), anti-chasing filters, and cash reserve buffers. Strictly requires LLM confidence >= 0.65 to approve any BUY; defaults to `WAIT` on ambiguity or low confidence.
+   - **Core-Satellite Wealth Compounding Engine**: Prioritizes 55-65% long-term compounding bedrock (VTI, QQQ) with pullback dollar-cost averaging. Restricts speculative satellites to max 3 positions and max 1 entry per day.
+   - **Core Ballast Immunity**: Protects core index ETFs (VTI, QQQ) from being stopped out on routine 4-5% market corrections.
+   - **Pre-Market Validation & Close Retrospectives**: Generates deep macro assessments and daily closing lessons into Obsidian trading notes.
 2. **Zero-LLM Quiet Hours**: Outside market hours (nights, weekends, holidays), the daemon strictly sleeps in power-saving mode without invoking the AI model or using GPU VRAM.
 3. **Context-Optimized Token Offloading**: Full portfolio datasets (60+ positions, balances, cost bases) are offloaded to disk (`~/.cache/ai/trading/`). CLI commands like `./robinhood_trader.py summary` output compact digests (<200 tokens) so LLMs maintain situational awareness without context overflow.
 4. **Multi-Factor Quantitative Scoring**: Tickers are evaluated on a 0–100 scale combining trend (SMA 20/50/200), momentum (RSI-14), MACD histogram, and real-time news sentiment.

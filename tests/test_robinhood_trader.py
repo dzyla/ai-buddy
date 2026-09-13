@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
@@ -590,6 +591,112 @@ class TestDynamicVolatilityAndRunnerRisk:
         # Satellite PLTR should be suppressed by defensive market regime!
         _auto_trade_entry_pulse("TEST_ACC", dry_run=False, top_candidates=top_candidates)
         assert not any(ord[0] == "PLTR" for ord in executed_orders)
+
+    def test_core_etf_stop_loss_immunity(self, tmp_path, monkeypatch):
+        import robinhood_trader
+        from robinhood_trader import _risk_monitor_pulse, RobinhoodExecutor, AgentAdvisor
+        
+        flags_dir = str(tmp_path / "flags")
+        os.makedirs(flags_dir, exist_ok=True)
+        monkeypatch.setattr(robinhood_trader, "RISK_MONITOR_FLAGS", flags_dir)
+        monkeypatch.setattr(AgentAdvisor, "validate_trade_decision", lambda *args, **kwargs: {"verdict": "EXECUTE", "agent_response": "ok"})
+        
+        # Portfolio with VTI at -5.0% dip (routine market correction)
+        monkeypatch.setattr(RobinhoodExecutor, "get_live_portfolio", lambda acc: {"total_value": 1000.0, "cash": 500.0})
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_positions", lambda acc: [
+            {"symbol": "VTI", "quantity": "1.0", "average_buy_price": "400.0"}
+        ])
+        monkeypatch.setattr(RobinhoodExecutor, "get_equity_quotes", lambda syms: {
+            "VTI": {"last_trade_price": "380.00", "price": "380.00"}  # -5.0% dip
+        })
+        
+        executed_orders = []
+        monkeypatch.setattr(RobinhoodExecutor, "execute_market_order", lambda acc, sym, side, **kwargs: executed_orders.append((sym, side, kwargs)))
+
+        # Pulse: VTI is at -5.0%. Core Ballast Immunity MUST protect it from being panic-sold
+        _risk_monitor_pulse("TEST_ACC", dry_run=False, stop_loss_pct=5.0, take_profit_pct=8.0)
+        assert len(executed_orders) == 0  # Not stopped out!
+
+
+class TestAgentAdvisorWealthGuard:
+    def test_invoke_local_llm_parsing(self, monkeypatch):
+        import json
+        import urllib.request
+        import io
+        from robinhood_trader import AgentAdvisor
+
+        fake_resp = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "verdict": "EXECUTE",
+                        "action": "BUY",
+                        "confidence": 0.88,
+                        "reasoning": "Strong trend above 200 SMA and neutral RSI."
+                    }),
+                    "reasoning_content": "Detailed reasoning trace here."
+                }
+            }]
+        }
+
+        class FakeHTTPResponse:
+            status = 200
+            def read(self):
+                return json.dumps(fake_resp).encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: FakeHTTPResponse())
+
+        res = AgentAdvisor.invoke_local_llm([{"role": "user", "content": "test"}])
+        assert res is not None
+        assert "confidence" in res["content"]
+        assert "Detailed reasoning" in res["reasoning"]
+
+    def test_strict_buy_rejection_on_low_confidence_or_pass(self, monkeypatch):
+        from robinhood_trader import AgentAdvisor
+
+        # 1. Test LLM returning PASS (overbought spike)
+        monkeypatch.setattr(AgentAdvisor, "invoke_agent", lambda *args, **kwargs: json.dumps({
+            "verdict": "WAIT",
+            "action": "PASS",
+            "confidence": 0.95,
+            "reasoning": "Parabolic gap up overextended."
+        }))
+        dec = AgentAdvisor.validate_trade_decision("SMCI", "buy", 40.0, 40.0, 0.0, "Breakout")
+        assert dec["verdict"] == "WAIT"
+
+        # 2. Test LLM returning EXECUTE but low confidence (0.50 < 0.65 threshold)
+        monkeypatch.setattr(AgentAdvisor, "invoke_agent", lambda *args, **kwargs: json.dumps({
+            "verdict": "EXECUTE",
+            "action": "BUY",
+            "confidence": 0.50,
+            "reasoning": "Uncertain edge."
+        }))
+        dec2 = AgentAdvisor.validate_trade_decision("SMCI", "buy", 40.0, 40.0, 0.0, "Breakout")
+        assert dec2["verdict"] == "WAIT"
+
+        # 3. Test LLM returning truncated / broken text -> MUST default to WAIT for BUY
+        monkeypatch.setattr(AgentAdvisor, "invoke_agent", lambda *args, **kwargs: "are the kill switch.")
+        dec3 = AgentAdvisor.validate_trade_decision("SMCI", "buy", 40.0, 40.0, 0.0, "Breakout")
+        assert dec3["verdict"] == "WAIT"
+
+    def test_strict_buy_approval_on_high_confidence(self, monkeypatch):
+        from robinhood_trader import AgentAdvisor
+
+        monkeypatch.setattr(AgentAdvisor, "invoke_agent", lambda *args, **kwargs: json.dumps({
+            "verdict": "EXECUTE",
+            "action": "BUY",
+            "confidence": 0.82,
+            "reasoning": "Solid pullback to 50 SMA with positive risk/reward."
+        }))
+        dec = AgentAdvisor.validate_trade_decision("NVDA", "buy", 220.0, 220.0, 0.0, "Secular Pullback")
+        assert dec["verdict"] == "EXECUTE"
+        assert dec["confidence"] == 0.82
+
 
 
 

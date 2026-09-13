@@ -323,3 +323,56 @@ def test_sync_gpu_to_systemd_writes_concrete_pin(ab, hermetic, monkeypatch, tmp_
     monkeypatch.setattr(ab.subprocess, "run", lambda *a, **k: None)
     ab.sync_gpu_to_systemd("0")
     assert "Environment=CUDA_VISIBLE_DEVICES=0" in unit.read_text()
+
+
+def test_is_windows_or_wsl_detection(ab):
+    """Verify is_windows_or_wsl returns a boolean and functions without crashing."""
+    res = ab.is_windows_or_wsl()
+    assert isinstance(res, bool)
+
+
+def test_auto_ctx_windows_wsl_clamps_total_vram_and_adds_safety_headroom(ab, hermetic, monkeypatch):
+    """On Windows/WSL, calculate_auto_ctx must clamp caller-supplied total VRAM and keep headroom."""
+    fake_gpus = [{"index": 0, "name": "RTX 5080", "total_mib": 16303, "free_mib": 14900}]
+    monkeypatch.setattr(ab, "list_gpu_info", lambda: fake_gpus)
+    monkeypatch.setattr(ab, "split_total_size", lambda p: 10.0)  # 10 GiB weights
+    monkeypatch.setattr(ab, "is_windows_or_wsl", lambda: True)
+
+    # Caller passes total physical capacity (16303)
+    ctx = ab.calculate_auto_ctx(hermetic, vram_free=16303, n_gpu_layers="99", gpu_indices=[0], use_mtp=False)
+    # Must fit within free_mib with at least 1024 MiB safety headroom
+    est = ab.estimate_vram_mb(hermetic, ctx, use_mtp=False)
+    assert est["total_mb"] <= 14900 - 512
+
+
+def test_auto_ctx_windows_wsl_zero_free_does_not_spill_to_ram(ab, hermetic, monkeypatch):
+    """When vram_free is 0 (e.g. transient 0 on restart), Windows/WSL must never spill into RAM or return 262144."""
+    fake_gpus = [{"index": 0, "name": "RTX 5080", "total_mib": 16303, "free_mib": 0}]
+    monkeypatch.setattr(ab, "list_gpu_info", lambda: fake_gpus)
+    monkeypatch.setattr(ab, "split_total_size", lambda p: 9.8)
+    monkeypatch.setattr(ab, "is_windows_or_wsl", lambda: True)
+
+    ctx_mtp = ab.calculate_auto_ctx(hermetic, vram_free=0, n_gpu_layers="99", gpu_indices=[0], use_mtp=True)
+    assert ctx_mtp <= 32768, f"MTP ctx must be <= 32768, got {ctx_mtp}"
+    assert ctx_mtp >= 4096
+
+    ctx_nomtp = ab.calculate_auto_ctx(hermetic, vram_free=0, n_gpu_layers="99", gpu_indices=[0], use_mtp=False)
+    assert ctx_nomtp <= 65536, f"No-MTP ctx must be <= 65536, got {ctx_nomtp}"
+    assert ctx_nomtp >= 4096
+
+
+def test_auto_ctx_windows_wsl_hard_caps_16gb_gpu(ab, hermetic, monkeypatch):
+    """On a 16GB GPU under Windows/WSL, ctx must strictly cap at 32768 (MTP) and 65536 (baseline)."""
+    fake_gpus = [{"index": 0, "name": "RTX 5080", "total_mib": 16303, "free_mib": 15000}]
+    monkeypatch.setattr(ab, "list_gpu_info", lambda: fake_gpus)
+    monkeypatch.setattr(ab, "split_total_size", lambda p: 9.8)
+    monkeypatch.setattr(ab, "is_windows_or_wsl", lambda: True)
+
+    # Even with huge free VRAM passed, hard caps must apply on <=16GB card
+    ctx_mtp = ab.calculate_auto_ctx(hermetic, vram_free=15000, n_gpu_layers="99", gpu_indices=[0], use_mtp=True)
+    assert ctx_mtp <= 32768
+
+    ctx_nomtp = ab.calculate_auto_ctx(hermetic, vram_free=15000, n_gpu_layers="99", gpu_indices=[0], use_mtp=False)
+    assert ctx_nomtp <= 65536
+
+
