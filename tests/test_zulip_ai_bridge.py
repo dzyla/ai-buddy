@@ -639,4 +639,171 @@ def test_error_reporting_on_failed_agent():
     assert any("CUDA out of memory" in m["content"] or "exit code 2" in m["content"] for m in client.sent_messages)
 
 
+# ---------------------------------------------------------------------------
+# Stream Mention Filtering & UX Tests
+# ---------------------------------------------------------------------------
+
+def test_stream_message_without_mention_is_ignored(monkeypatch):
+    """In shared streams/channels, messages without bot mention must be ignored."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    monkeypatch.setenv("ZULIP_USER", "owner@example.com")
+    client = MockZulipClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {
+        "id": 101,
+        "type": "stream",
+        "display_recipient": "general",
+        "subject": "random topic",
+        "sender_email": "owner@example.com",
+        "content": "Computational design of binders vs NiV: check metrics",
+    }
+
+    with patch.object(bridge, "_process_message") as mock_proc:
+        bridge.handle_message(msg)
+        mock_proc.assert_not_called()
+    assert len(client.sent_messages) == 0
+
+
+def test_stream_message_with_mention_is_processed(monkeypatch):
+    """In shared streams, messages explicitly mentioning the bot should be processed with mention stripped."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    monkeypatch.setenv("ZULIP_USER", "owner@example.com")
+    client = MockZulipClient()
+    bridge = ZulipAiBridge(client=client)
+    bridge.bot_name = "AI bot"
+
+    msg = {
+        "id": 102,
+        "type": "stream",
+        "display_recipient": "general",
+        "subject": "random topic",
+        "sender_email": "owner@example.com",
+        "content": "@**AI bot** summarize this paper for me",
+    }
+
+    processed_content = []
+
+    def fake_process(msg, content):
+        processed_content.append(content)
+
+    with patch.object(bridge, "_process_message", side_effect=fake_process):
+        bridge.handle_message(msg)
+
+    assert len(processed_content) == 1
+    assert processed_content[0] == "summarize this paper for me"
+
+
+def test_stream_message_with_user_id_mention(monkeypatch):
+    """Silent or user-id-qualified mentions like @_**AI bot|1101112** should be recognized."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    monkeypatch.setenv("ZULIP_USER", "owner@example.com")
+    client = MockZulipClient()
+    bridge = ZulipAiBridge(client=client)
+    bridge.bot_user_id = 1101112
+    bridge.bot_name = "AI bot"
+
+    msg = {
+        "id": 103,
+        "type": "stream",
+        "display_recipient": "research",
+        "subject": "binding",
+        "sender_email": "owner@example.com",
+        "content": "@_**AI bot|1101112**: what is the binding affinity?",
+    }
+
+    processed_content = []
+
+    def fake_process(msg, content):
+        processed_content.append(content)
+
+    with patch.object(bridge, "_process_message", side_effect=fake_process):
+        bridge.handle_message(msg)
+
+    assert len(processed_content) == 1
+    assert processed_content[0] == "what is the binding affinity?"
+
+
+def test_private_message_processed_without_mention(monkeypatch):
+    """In private 1-on-1 chats, messages should be processed directly without needing a mention."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+
+    monkeypatch.setenv("ZULIP_USER", "owner@example.com")
+    client = MockZulipClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {
+        "id": 104,
+        "type": "private",
+        "sender_email": "owner@example.com",
+        "content": "hello there",
+    }
+
+    processed_content = []
+
+    def fake_process(msg, content):
+        processed_content.append(content)
+
+    with patch.object(bridge, "_process_message", side_effect=fake_process):
+        bridge.handle_message(msg)
+
+    assert len(processed_content) == 1
+    assert processed_content[0] == "hello there"
+
+
+def test_help_command(monkeypatch):
+    """The /help command should return the available commands list."""
+    from zulip_ai_bridge import ZulipAiBridge
+
+    monkeypatch.setenv("ZULIP_USER", "owner@example.com")
+    client = MockZulipClient()
+    bridge = ZulipAiBridge(client=client)
+
+    msg = {
+        "id": 105,
+        "type": "private",
+        "sender_email": "owner@example.com",
+        "content": "/help",
+    }
+
+    bridge.handle_message(msg)
+    assert len(client.sent_messages) == 1
+    reply = client.sent_messages[0]["content"]
+    assert "Zulip AI Bridge Commands" in reply
+    assert "/ping" in reply
+    assert "/mode" in reply
+    assert "/wake" in reply
+
+
+def test_process_message_urls_relative_and_markdown(tmp_path):
+    """process_message_urls should parse relative and markdown upload links."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import FileParser
+
+    client = MockClient("https://example.zulipchat.com")
+    parser = FileParser(client, "https://example.zulipchat.com")
+
+    # Create dummy parsed file
+    test_file = tmp_path / "sample.txt"
+    test_file.write_text("Hello from uploaded document!")
+
+    content = "Please analyze [sample.txt](/user_uploads/12345/sample.txt) now."
+
+    with patch.object(parser, "_download_file", return_value=(True, None)), \
+         patch.object(parser, "parse_file", return_value="Hello from uploaded document!"):
+        new_content, processed = parser.process_message_urls(content)
+
+    assert "sample.txt" in processed
+    assert "```[File: sample.txt]" in new_content
+    assert "Hello from uploaded document!" in new_content
+
+
+
 

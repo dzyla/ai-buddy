@@ -244,7 +244,7 @@ def test_handle_message_downloads_uploads(mock_get, mock_thread, mock_client_cla
             "https://zulip.example.com/user_uploads/2/ce/hLbH-oDBjB_NUp3wcNvWi9OB/my%20report.pdf"
         )
         prompt_content = mock_thread.call_args[1]["args"][1]
-        assert "/tmp/zulip_uploads/my report.pdf" in prompt_content
+        assert "zulip_ai_uploads/my report.pdf" in prompt_content
         assert "/user_uploads/" not in prompt_content
 
         # Legacy 3-segment path still works
@@ -259,7 +259,7 @@ def test_handle_message_downloads_uploads(mock_get, mock_thread, mock_client_cla
         bridge.handle_message(msg)
         assert mock_get.call_args[0][0] == "https://zulip.example.com/user_uploads/2/abc123/old.txt"
         prompt_content = mock_thread.call_args[1]["args"][1]
-        assert "/tmp/zulip_uploads/old.txt" in prompt_content
+        assert "zulip_ai_uploads/old.txt" in prompt_content
 
 @patch('zulip.Client')
 def test_detect_owner(mock_client_class):
