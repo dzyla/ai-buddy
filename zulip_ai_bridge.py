@@ -62,7 +62,12 @@ class FileParser:
 
     def __init__(self, client, base_url):
         self.client = client
-        self.base_url = base_url.rstrip('/')
+        # Normalize base_url to root origin (e.g. strip trailing /api or /api/v1)
+        if isinstance(base_url, str):
+            cleaned_base = re.sub(r'/api(?:/v1)?/?$', '', base_url).rstrip('/')
+        else:
+            cleaned_base = ""
+        self.base_url = cleaned_base
         # Try to import optional dependencies
         self._pdfplumber = None
         self._tesseract = None
@@ -90,15 +95,33 @@ class FileParser:
 
     def _download_file(self, url, dest_path):
         """Download a file with retry and size checking."""
+        # If relative URL, make absolute with root origin
+        if url.startswith('/'):
+            try:
+                from urllib.parse import urlparse
+                pb = urlparse(self.base_url)
+                origin = f"{pb.scheme}://{pb.netloc}" if pb.netloc else self.base_url.rstrip('/')
+            except Exception:
+                origin = self.base_url.rstrip('/')
+            full_url = f"{origin}{url}"
+        else:
+            full_url = url
+
         # Validate URL is from a trusted domain (the configured Zulip server)
-        if not self._is_trusted_url(url):
-            logger.warning(f"Blocked download from untrusted domain: {url}")
+        if not self._is_trusted_url(full_url):
+            logger.warning(f"Blocked download from untrusted domain: {full_url}")
             return False, "Download from untrusted domain"
 
         try:
-            resp = requests.get(url, stream=True, timeout=30)
+            # Use authenticated Zulip session when available (crucial for private Zulip uploads)
+            session = getattr(self.client, "session", None)
+            if isinstance(session, requests.Session):
+                resp = session.get(full_url, stream=True, timeout=30)
+            else:
+                resp = requests.get(full_url, stream=True, timeout=30)
+
             # The final URL after following redirects must also be trusted.
-            if not self._is_trusted_redirect(resp.url, url):
+            if not self._is_trusted_redirect(resp.url, full_url):
                 logger.warning(f"Redirect to untrusted domain: {resp.url}")
                 return False, "Download redirects to untrusted domain"
             resp.raise_for_status()
@@ -135,8 +158,9 @@ class FileParser:
             # Relative paths (empty netloc) are same-origin and always trusted.
             if not parsed.netloc:
                 return True
-            # Use the stored base_url (already normalized by the constructor).
-            allowed = self.base_url.replace('https://', '').replace('http://', '').rstrip('/')
+            # Extract domain netloc from both allowed base_url and downloaded url
+            base_parsed = urlparse(self.base_url)
+            allowed = (base_parsed.netloc or self.base_url.replace('https://', '').replace('http://', '').split('/')[0]).rstrip('/')
             downloaded = parsed.netloc.replace('https://', '').replace('http://', '').rstrip('/')
             return (
                 downloaded == allowed
@@ -153,6 +177,8 @@ class FileParser:
         trusted domain to prevent redirects to malicious sites.
         """
         try:
+            if not isinstance(final_url, str):
+                return True
             from urllib.parse import urlparse
             final_parsed = urlparse(final_url)
             # If no netloc, treat as same-origin relative redirect.
@@ -353,43 +379,64 @@ class FileParser:
         """
         Process a message content string: find Zulip upload URLs,
         download the files, extract content, and replace URLs with content.
+        Supports both absolute and relative Zulip uploads as well as markdown link syntax.
         """
-        # Find all Zulip upload URLs
-        url_pattern = re.compile(r'https?://[^\s]+/user_uploads/[^\s\)]+')
-        urls = url_pattern.findall(content)
-
-        if not urls:
+        # Match both markdown links [filename](.../user_uploads/...) and bare URLs
+        pattern = re.compile(
+            r'\[([^\]]*)\]\(((?:https?://[^\s\)]+)?/user_uploads/[^\s\)]+)\)|'
+            r'(https?://[^\s\)]+/user_uploads/[^\s\)]+)|'
+            r'(?<!\()(/user_uploads/[^\s\)]+)'
+        )
+        matches = list(pattern.finditer(content))
+        if not matches:
             return content, []
 
         processed_urls = []
         download_dir = os.path.join(os.path.expanduser('~'), '.cache', 'zulip_ai_uploads')
         os.makedirs(download_dir, exist_ok=True)
 
-        for url in urls:
-            # Extract filename from URL
-            decoded_url = unquote(url)
-            filename = os.path.basename(decoded_url.split('?')[0])
-            if not filename:
-                filename = 'downloaded_file'
+        for m in matches:
+            full_match = m.group(0)
+            if m.group(2):
+                label = m.group(1)
+                raw_url = m.group(2)
+            elif m.group(3):
+                label = ""
+                raw_url = m.group(3)
+            else:
+                label = ""
+                raw_url = m.group(4)
+
+            # Ensure URL is absolute for download
+            if raw_url.startswith('/'):
+                download_url = f"{self.base_url}{raw_url}"
+            else:
+                download_url = raw_url
+
+            decoded_url = unquote(raw_url)
+            filename = label.strip() if label.strip() else os.path.basename(decoded_url.split('?')[0])
+            if not filename or filename == 'user_uploads':
+                filename = os.path.basename(decoded_url.split('?')[0]) or 'downloaded_file'
 
             dest_path = os.path.join(download_dir, filename)
 
             # Download the file
-            success, error = self._download_file(decoded_url, dest_path)
+            success, error = self._download_file(download_url, dest_path)
             if not success:
-                content = content.replace(url, f"*⚠️ Failed to download: {error}*")
+                content = content.replace(full_match, f"*⚠️ Failed to download: {error}*")
                 continue
 
             # Parse the file content
             extracted = self.parse_file(dest_path)
 
-            # Replace URL with extracted content or placeholder
+            # Replace match with extracted content or placeholder
             if extracted and not extracted.startswith('*['):
-                # Format the content nicely
-                content = content.replace(url, f"```[File: {filename}]\n{extracted}\n```")
+                # Cap extracted text to 50k chars so we don't overwhelm the prompt
+                if len(extracted) > 50000:
+                    extracted = extracted[:50000] + f"\n... [truncated. File was {len(extracted)} characters.]"
+                content = content.replace(full_match, f"```[File: {filename}]\n{extracted}\n```")
             else:
-                # File couldn't be parsed
-                content = content.replace(url, f"*⚠️ Cannot extract text from {filename}*\n*Note: File saved at {dest_path}*")
+                content = content.replace(full_match, f"*⚠️ Cannot extract text from {filename}*\n*Note: File saved at {dest_path}*")
 
             processed_urls.append(filename)
             logger.info(f"Processed: {filename}")
@@ -696,15 +743,198 @@ class ZulipAiBridge:
             raise RuntimeError("The 'zulip' Python package is required. Install it via `pip install zulip`.")
         # Allow dependency injection for testing / alternative backends
         self.client = client if client is not None else zulip.Client()
-        self.bot_email = self.client.email
-        print(f"Loaded credentials for: {self.bot_email} on {self.client.base_url}")
+        self.bot_email = getattr(self.client, 'email', None)
+        base_url = getattr(self.client, 'base_url', '') or ''
+        print(f"Loaded credentials for: {self.bot_email} on {base_url}")
+
+        # Resolve bot profile (name and user ID for mention checking)
+        self.bot_profile = {}
+        if hasattr(self.client, "get_profile"):
+            try:
+                res = self.client.get_profile()
+                if isinstance(res, dict) and res.get("result") == "success":
+                    self.bot_profile = res
+            except Exception as e:
+                logger.debug(f"Could not retrieve bot profile: {e}")
+        self.bot_user_id = self.bot_profile.get("user_id")
+        self.bot_name = self.bot_profile.get("full_name") or (self.bot_email.split('@')[0] if self.bot_email else "AI bot")
+
         self.detected_owner = self._detect_owner()
         # Initialize the file parser for processing uploaded documents
-        self._file_parser = FileParser(self.client, self.client.base_url)
+        self._file_parser = FileParser(self.client, base_url)
         print("File parser initialized — will extract content from uploaded documents.")
         # Initialize persistent Zulip chat memory
         self.memory = ZulipMemoryManager()
         print("Zulip chat memory manager initialized.")
+
+    def _add_reaction(self, msg, emoji_name):
+        """Add an emoji reaction to the message."""
+        try:
+            if hasattr(self.client, "add_reaction"):
+                self.client.add_reaction({
+                    "message_id": msg.get("id"),
+                    "emoji_name": emoji_name
+                })
+        except Exception:
+            pass
+
+    def _remove_reaction(self, msg, emoji_name):
+        """Remove an emoji reaction from the message."""
+        try:
+            if hasattr(self.client, "remove_reaction"):
+                self.client.remove_reaction({
+                    "message_id": msg.get("id"),
+                    "emoji_name": emoji_name
+                })
+        except Exception:
+            pass
+
+    def _set_typing(self, msg, op="start"):
+        """Send typing status to Zulip."""
+        try:
+            if hasattr(self.client, "set_typing_status"):
+                payload = {"op": op}
+                if msg.get("type") == "private":
+                    payload["to"] = [msg.get("sender_email")]
+                else:
+                    stream_id = msg.get("stream_id")
+                    if stream_id:
+                        payload["to"] = [stream_id]
+                    else:
+                        payload["to"] = [msg.get("display_recipient")]
+                    payload["topic"] = msg.get("subject")
+                self.client.set_typing_status(payload)
+        except Exception:
+            pass
+
+    def _is_bot_mentioned(self, msg, content):
+        """Check if this message explicitly mentions the bot."""
+        flags = msg.get("flags", [])
+        if "mentioned" in flags:
+            return True
+
+        # Check content for mention patterns:
+        # e.g. @**AI bot**, @_**AI bot**, @**AI bot|1101112**, @_**AI bot|1101112**
+        # or @**ai-bot**, @_**ai-bot**
+        names = []
+        if self.bot_name:
+            names.append(self.bot_name)
+        if self.bot_email:
+            names.append(self.bot_email)
+            names.append(self.bot_email.split('@')[0])
+
+        for n in names:
+            if not n:
+                continue
+            pat = rf'@_?\*\*{re.escape(n)}(?:\|[0-9]+)?\*\*'
+            if re.search(pat, content, re.IGNORECASE):
+                return True
+
+        if self.bot_user_id:
+            pat = rf'@_?\*\*[^*]+\|{self.bot_user_id}\*\*'
+            if re.search(pat, content):
+                return True
+
+        return False
+
+    def _strip_bot_mentions(self, content):
+        """Strip bot mention syntax from message content."""
+        names = []
+        if self.bot_name:
+            names.append(self.bot_name)
+        if self.bot_email:
+            names.append(self.bot_email)
+            names.append(self.bot_email.split('@')[0])
+
+        for n in names:
+            if not n:
+                continue
+            pat = rf'@_?\*\*{re.escape(n)}(?:\|[0-9]+)?\*\*'
+            content = re.sub(pat, '', content, flags=re.IGNORECASE)
+
+        if self.bot_user_id:
+            pat = rf'@_?\*\*[^*]+\|{self.bot_user_id}\*\*'
+            content = re.sub(pat, '', content)
+
+        content = content.strip()
+        if content.startswith(':') or content.startswith(','):
+            content = content[1:].strip()
+        return content
+
+    def _ensure_inference_server(self, msg=None):
+        """
+        Verify that the inference server is reachable and ready.
+        If local and down or loading, attempt to wake the service and wait until ready.
+        """
+        env = load_env_file()
+        base_url = env.get("INFER_BASE_URL", os.environ.get("INFER_BASE_URL", "http://localhost:8080/v1/"))
+
+        # Non-local endpoints don't need socket management
+        is_local = any(h in base_url for h in ("127.0.0.1", "localhost", "0.0.0.0"))
+        if not is_local:
+            return True, "remote"
+
+        health_url = base_url.rstrip("/")
+        if health_url.endswith("/v1"):
+            health_url = health_url[:-3]
+        health_url = f"{health_url}/health"
+        health_url = health_url.replace("://localhost:", "://127.0.0.1:")
+
+        def probe():
+            try:
+                r = requests.get(health_url, timeout=2.0)
+                if r.status_code == 200:
+                    return "ok"
+                if r.status_code == 503:
+                    return "loading"
+            except requests.exceptions.RequestException:
+                pass
+            except Exception:
+                pass
+            return "down"
+
+        state = probe()
+        if state == "ok":
+            return True, "ok"
+
+        # Server is not ready (down or loading). Attempt auto-wake and wait up to 45s for model load.
+        logger.info(f"Local inference server is not ready (state: {state}). Attempting auto-wake...")
+        if msg:
+            self._add_reaction(msg, "hourglass_flowing_sand")
+
+        try:
+            subprocess.run(["systemctl", "--user", "reset-failed", "llama-server.socket", "llama-server.service"], capture_output=True)
+            res = subprocess.run(["systemctl", "--user", "start", "llama-server.service"], capture_output=True)
+            if res.returncode != 0:
+                subprocess.run(["systemctl", "--user", "start", "llama-server.socket"], capture_output=True)
+                try:
+                    requests.get(health_url, timeout=0.5)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Failed to auto-wake inference server: {e}")
+
+        # Poll for up to 45s while the server starts and loads model into VRAM (typically 8-15s)
+        for _ in range(30):
+            time.sleep(1.5)
+            state = probe()
+            if state == "ok":
+                if msg:
+                    self._remove_reaction(msg, "hourglass_flowing_sand")
+                return True, "ok"
+
+            try:
+                chk = subprocess.run(["systemctl", "--user", "is-failed", "llama-server.service"], capture_output=True, text=True)
+                if chk.stdout.strip() == "failed":
+                    logger.error("llama-server.service entered failed state during startup")
+                    break
+            except Exception:
+                pass
+
+        if msg:
+            self._remove_reaction(msg, "hourglass_flowing_sand")
+
+        return False, state
 
     def _is_trusted_url(self, url):
         """Check if a URL is from the trusted Zulip domain."""
@@ -923,6 +1153,59 @@ class ZulipAiBridge:
 
         is_long = self._is_long_job(content)
         clean_content = self._strip_long_prefix(content)
+        sender_email = msg.get("sender_email")
+        ai_mode = self._ai_mode()
+
+        # Send visual feedback immediately (reaction and typing indicator)
+        self._add_reaction(msg, "thought_balloon")
+        self._set_typing(msg, "start")
+
+        # Verify inference server health and attempt auto-wake if down
+        is_real_zulip = (
+            type(self.client).__name__ == "Client" and
+            getattr(type(self.client), "__module__", "") == "zulip"
+        )
+        if is_real_zulip and os.environ.get("BRIDGE_SKIP_SERVER_PREFLIGHT") != "1":
+            server_ok, server_state = self._ensure_inference_server(msg)
+            if not server_ok:
+                self._remove_reaction(msg, "thought_balloon")
+                self._add_reaction(msg, "warning")
+                self._set_typing(msg, "stop")
+                offline_msg = (
+                    "⚠️ **Inference Server is Offline**\n\n"
+                    "The local AI backend is not responding and auto-wake did not succeed.\n\n"
+                    "**How to start it:**\n"
+                    "- Run `ai-backend serve` on the host, or\n"
+                    "- Send `/wake` here in Zulip to retry starting the server."
+                )
+                self._send_full_reply(msg, offline_msg)
+                try:
+                    self.memory.record_chat({
+                        "session_id": chat_id,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                        "sender_email": sender_email,
+                        "sender_full_name": msg.get("sender_full_name", ""),
+                        "type": msg.get("type", "private"),
+                        "stream": msg.get("display_recipient") if msg.get("type") != "private" else None,
+                        "topic": msg.get("subject") if msg.get("type") != "private" else None,
+                        "message_id": msg.get("id"),
+                        "query": content,
+                        "prompt_sent": content,
+                        "context_count": 0,
+                        "ai_mode": ai_mode,
+                        "duration_s": round(time.time() - start_time, 2),
+                        "exit_code": -1,
+                        "status": "server_offline",
+                        "stdout": "",
+                        "stderr": f"Server offline (state: {server_state})",
+                        "response_delivered": offline_msg,
+                        "extracted_reasoning": None,
+                        "fallback_used": None
+                    })
+                except Exception as mex:
+                    logger.warning(f"Failed to record Zulip chat memory: {mex}")
+                print(f"[thread-{tid}] [{chat_id}] Aborted: server offline.")
+                return
 
         # Timeouts: default 1800s (30 mins), long jobs 7200s (2 hours)
         default_timeout = int(os.environ.get("BRIDGE_TASK_TIMEOUT", os.environ.get("INFER_TASK_TIMEOUT", 1800)))
@@ -960,6 +1243,8 @@ class ZulipAiBridge:
             run_env["INFER_AUTO_APPROVE"] = "1"
         else:
             run_env.pop("INFER_AUTO_APPROVE", None)
+
+        run_env["INFER_RAW_OUTPUT"] = "1"
 
         sender_email = msg.get("sender_email")
         if sender_email:
@@ -1038,6 +1323,16 @@ class ZulipAiBridge:
 
         duration_s = round(time.time() - start_time, 2)
 
+        # Clear temporary thinking reaction and stop typing
+        self._remove_reaction(msg, "thought_balloon")
+        self._remove_reaction(msg, "hourglass_flowing_sand")
+        self._set_typing(msg, "stop")
+
+        if status in ("success", "stdout", "fallback_reasoning", "fallback_tools", "fallback_content"):
+            self._add_reaction(msg, "white_check_mark")
+        else:
+            self._add_reaction(msg, "warning")
+
         # Record this interaction to durable memory
         try:
             self.memory.record_chat({
@@ -1101,8 +1396,52 @@ class ZulipAiBridge:
             return
 
         content = msg['content'].strip()
+        is_private = msg.get('type') == 'private'
+
+        # If message is from a shared stream/channel, ONLY respond if the bot is explicitly mentioned!
+        if not is_private:
+            require_mention = os.environ.get("BRIDGE_REQUIRE_STREAM_MENTIONS", "1").lower() not in ("0", "false", "no")
+            if require_mention:
+                if not self._is_bot_mentioned(msg, content):
+                    stream_name = msg.get('display_recipient', 'unknown')
+                    topic_name = msg.get('subject', 'unknown')
+                    logger.debug(f"Ignoring message in stream '{stream_name}' > '{topic_name}' because bot was not mentioned")
+                    return
+                # Strip mention so prompt/commands are clean
+                content = self._strip_bot_mentions(content)
 
         # Built-in commands (cheap, instant, no agent round-trip)
+        if content.startswith(('/help', ':help')):
+            mode = self._ai_mode()
+            to = os.environ.get("BRIDGE_TASK_TIMEOUT", os.environ.get("INFER_TASK_TIMEOUT", "1800"))
+            self._send_reply(
+                msg,
+                "### 🤖 Zulip AI Bridge Commands\n\n"
+                "- **`/help`** — Show this command reference\n"
+                "- **`/ping`** — Quick bridge & model status check\n"
+                "- **`/debug`** (or `/diag`) — System diagnostics (server health, slot state, recent error logs)\n"
+                "- **`/history`** (or `/chats`) — View recent Zulip conversation audit trail\n"
+                f"- **`/mode <auto|plan|manual>`** — Switch bridge permission mode (current: `{mode}`)\n"
+                f"- **`/timeout <seconds>`** — Set standard task timeout (current: `{to}s`)\n"
+                "- **`/wake`** (or `/restart-server`) — Wake up or restart the local LLM inference server\n"
+                "- **`/long <query>`** — Execute deep research / long-running job with extended 2h timeout\n\n"
+                "*Note: In shared channels/streams, mention `@AI bot` to talk to me.*"
+            )
+            return
+
+        if content.startswith(('/wake', ':wake', '/restart-server', ':restart-server')):
+            self._send_reply(msg, "🔄 *Attempting to wake/restart the local inference server...*")
+            ok, st = self._ensure_inference_server(msg)
+            if ok:
+                self._send_reply(msg, "🟢 **Inference server is ONLINE and ready!**")
+            else:
+                self._send_reply(
+                    msg,
+                    f"⚠️ **Could not wake inference server** (status: `{st}`).\n"
+                    "Check host status with `ai-backend status` or `journalctl --user -u llama-server`."
+                )
+            return
+
         if content.startswith(('/ping', ':ping')):
             env = load_env_file()
             model = env.get("INFER_MODEL", "local")
@@ -1194,16 +1533,11 @@ class ZulipAiBridge:
             self._send_reply(msg, f"⏱️ Timeouts: Standard: **{default_to}s**, Long Jobs: **{long_to}s** (use `/timeout <seconds>` to update)")
             return
 
-        # If the bot is mentioned in a stream, strip the mention syntax (e.g. @**AI Bot**)
-        if msg['type'] != 'private' and content.startswith('@**'):
-            mention_end = content.find('**')
-            if mention_end != -1:
-                mention_end_close = content.find('**', mention_end + 2)
-                if mention_end_close != -1:
-                    content = content[mention_end_close + 2:].strip()
-
         # Replace Zulip upload URLs with extracted file content
         content, processed = self._file_parser.process_message_urls(content)
+
+        if not content.strip():
+            return
 
         print(f"Received query from {sender_email}: {content}")
 
@@ -1264,14 +1598,26 @@ class ZulipAiBridge:
 class ContextWindowManager:
     """Manages conversation context to stay within AI model's context window."""
     
-    def __init__(self, max_tokens=4096, max_messages=10):
+    def __init__(self, max_tokens=None, max_messages=15):
         """
         Initialize the context window manager.
         
         Args:
-            max_tokens: Maximum estimated tokens for the prompt (conservative estimate)
+            max_tokens: Maximum estimated tokens for the prompt (conservative estimate).
+                        If None, uses BRIDGE_MAX_CONTEXT_TOKENS or scales with LLAMA_CTX_SIZE.
             max_messages: Maximum number of context messages to include
         """
+        if max_tokens is None:
+            env_tokens = os.environ.get("BRIDGE_MAX_CONTEXT_TOKENS")
+            if env_tokens and env_tokens.isdigit():
+                max_tokens = int(env_tokens)
+            else:
+                ctx_env = os.environ.get("LLAMA_CTX_SIZE", "262144")
+                try:
+                    ctx_val = int(ctx_env)
+                    max_tokens = min(32768, max(4096, ctx_val // 4))
+                except ValueError:
+                    max_tokens = 32768
         self.max_tokens = max_tokens
         self.max_messages = max_messages
     

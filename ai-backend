@@ -493,10 +493,9 @@ def calculate_auto_ctx(model_path, vram_free=None, n_gpu_layers="99", gpu_indice
         # Base estimate already includes 3072 MiB of runtime buffer overhead;
         # safety margin is only a small buffer (256 MiB) to avoid double-counting.
         safety_gpu = 256
+        safety_ram = 4096
         ram_budget = max(0, ram_free - safety_ram) if partial_offload else 0
         ctx_ram_extend = int(ram_budget / kv_ram) if partial_offload else 0
-
-    safety_ram = 4096
 
     gpu_budget = max(0, vram_free - base_mb - safety_gpu)
     ctx_gpu_only = int(gpu_budget / kv_gpu) if kv_gpu > 0 else 0

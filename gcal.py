@@ -52,6 +52,8 @@ def _event_time(dt_str, time_zone):
     so naive values are unambiguous."""
     if dt_str and len(dt_str) == 10 and 'T' not in dt_str:
         return {'date': dt_str}
+    if dt_str:
+        dt_str = dt_str.strip().replace(' ', 'T')
     return {'dateTime': dt_str, 'timeZone': time_zone}
 
 def get_calendar_service():

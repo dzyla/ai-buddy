@@ -579,6 +579,8 @@ StartLimitIntervalSec=0
 [Socket]
 ListenStream=127.0.0.1:${PORT}
 Accept=no
+ReusePort=yes
+FreeBind=yes
 
 [Install]
 WantedBy=sockets.target
@@ -597,7 +599,7 @@ Environment=LLAMA_MODEL_PATH=${MODEL_PATH}
 Environment=LLAMA_IDLE_TIMEOUT=120
 ExecStartPre=/bin/bash -c 'systemctl --user stop llama-server.socket || true'
 ExecStart=${BIN_DIR}/ai-backend serve --foreground
-ExecStopPost=/bin/bash -c '/usr/bin/systemd-run --user /bin/bash -c "for i in {1..10}; do systemctl --user is-active -q llama-server.service || { systemctl --user start llama-server.socket; exit 0; }; sleep 0.5; done" || true'
+ExecStopPost=/usr/bin/systemd-run --user /bin/bash -c 'for i in $(seq 1 20); do if ! systemctl --user is-active -q llama-server.service; then if ! ss -tlpn 2>/dev/null | grep -q ":${PORT} "; then systemctl --user reset-failed llama-server.socket 2>/dev/null || true; if systemctl --user start llama-server.socket; then exit 0; fi; fi; fi; sleep 0.5; done'
 Restart=no
 StandardOutput=journal
 StandardError=journal

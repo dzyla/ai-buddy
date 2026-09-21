@@ -1053,6 +1053,10 @@ def fetch_webpage(url):
     (curl_cffi TLS impersonation → Playwright+stealth → plain urllib) so the
     model's everyday fetch handles bot-walls and JS-heavy sites, not just
     static HTML. Set INFER_FETCH_BASIC=1 to force the plain path."""
+    if isinstance(url, dict):
+        url = url.get("url") or url.get("link") or ""
+    if not isinstance(url, str):
+        url = str(url or "")
     if os.environ.get("INFER_FETCH_BASIC") == "1":
         return fetch_webpage_basic(url)
     return fetch_smart(url)
@@ -1060,6 +1064,10 @@ def fetch_webpage(url):
 
 def fetch_webpage_js(url, wait_for="networkidle", timeout_ms=30000):
     """Fetch a JS-rendered page via Playwright and return its content as markdown."""
+    if isinstance(url, dict):
+        url = url.get("url") or url.get("link") or ""
+    if not isinstance(url, str):
+        url = str(url or "")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
