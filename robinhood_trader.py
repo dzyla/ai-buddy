@@ -42,6 +42,8 @@ CACHE_DIR = os.path.expanduser("~/.cache/ai/trading")
 os.makedirs(CACHE_DIR, exist_ok=True)
 TRADING_STATE_FILE = os.path.join(CONFIG_DIR, "robinhood_trading_state.json")
 VAULT_DIR = os.path.join(CONFIG_DIR, "trading_vault")
+# Symbols listed here (one per line) are never sold by the automated strategy.
+TRADING_HOLD_FILE = os.path.join(CONFIG_DIR, "trading_hold.txt")
 
 # Multi-Sector High-Growth Universe (Curated by Sector)
 SECTOR_UNIVERSES = {
@@ -160,6 +162,18 @@ class ObsidianTradingVault:
             for b in buys:
                 lines.append(f"| [[{b['ticker']}]] | ${b['price']:.2f} | {b['score']} | {b['sentiment']} | ${b['stop_loss']:.2f} | ${b['take_profit_1']:.2f} | ${b['take_profit_2']:.2f} |")
         
+        sleeve = briefing.get("momentum_sleeve") or {}
+        if sleeve and not sleeve.get("error"):
+            regime = sleeve.get("regime", {}) or {}
+            lines.append("\n### 🧲 Momentum Sleeve (live strategy)")
+            lines.append(f"- **Regime:** `{regime.get('regime', '?')}` (SPY {regime.get('close', '?')} vs SMA200 {regime.get('sma200', '?')})")
+            lines.append(f"- **Sleeve targets this month:** {', '.join('[[' + t + ']]' for t in sleeve.get('targets', [])) or 'CASH (regime gate)'}")
+            lines.append("| # | Ticker | Price | 6m return | Eligible |")
+            lines.append("| :---: | :--- | ---: | ---: | :--- |")
+            for i, r in enumerate(sleeve.get("top", []), 1):
+                mom = f"{r['momentum_pct']:+.1f}%" if r.get("momentum_pct") is not None else "n/a"
+                lines.append(f"| {i} | [[{r['symbol']}]] | ${r.get('price', 0):.2f} | {mom} | {r.get('reason', '')} |")
+
         if briefing.get("ai_agent_validation"):
             lines.append("\n## 🤖 AI Strategist Pre-Market Validation & Plan")
             lines.append(briefing["ai_agent_validation"])
@@ -229,6 +243,38 @@ class ObsidianTradingVault:
         content = "\n".join(lines) + "\n"
         with open(filepath, "w") as f:
             f.write(content)
+        return filepath
+
+    @classmethod
+    def save_rebalance_note(cls, month: str, state: Dict[str, Any]) -> str:
+        """Records the monthly momentum-sleeve rebalance decision (regime, ranking, orders)."""
+        cls.init_vault()
+        filepath = os.path.join(VAULT_DIR, "retrospectives", f"rebalance_{month}.md")
+        regime = state.get("regime", {}) or {}
+        lines = [
+            "---", f"month: {month}", f"date: {state.get('date', '')}", f"regime: {regime.get('regime', '?')}",
+            f"dry_run: {state.get('dry_run', False)}", "type: momentum-rebalance", "tags: [trading, rebalance, robinhood-agentic]", "---\n",
+            f"# 🧲 Momentum Sleeve Rebalance: {month}\n",
+            f"- **Regime:** `{regime.get('regime', '?')}` (SPY {regime.get('close', '?')} vs SMA200 {regime.get('sma200', '?')})",
+            f"- **Equity / Cash at decision:** ${state.get('equity', 0):,.2f} / ${state.get('cash', 0):,.2f}",
+            f"- **Sleeve targets:** {', '.join('[[' + t + ']]' for t in state.get('targets', [])) or 'CASH (regime gate)'}",
+            f"- **Hold list (never sold):** {', '.join(state.get('hold', [])) or 'none'}\n",
+            "## Ranking (6-month momentum)",
+            "| # | Ticker | Price | 6m return | SMA200 | Eligible |",
+            "| :---: | :--- | ---: | ---: | ---: | :--- |",
+        ]
+        for i, r in enumerate(state.get("ranking", []), 1):
+            mom = f"{r['momentum_pct']:+.1f}%" if r.get("momentum_pct") is not None else "n/a"
+            lines.append(f"| {i} | [[{r['symbol']}]] | ${r.get('price', 0):.2f} | {mom} | {r.get('sma200') or 'n/a'} | {r.get('reason', '')} |")
+        lines.append("\n## Planned orders")
+        for sl in state.get("sells_pending", []) + state.get("sells_done", []):
+            lines.append(f"- SELL {sl['symbol']} {sl['quantity']} sh ({sl['reason']})")
+        for b in state.get("buys_pending", []) + state.get("buys_done", []):
+            lines.append(f"- BUY {b['symbol']} ${b['dollar_amount']:.2f} ({b['reason']})")
+        if not (state.get("sells_pending") or state.get("sells_done") or state.get("buys_pending") or state.get("buys_done")):
+            lines.append("- none (book already on target)")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
         return filepath
 
     @classmethod
@@ -620,14 +666,44 @@ class FinancialData:
             pass
 
         # 2. Secondary source: Yahoo Finance API
+        return cls.fetch_historical_yahoo(ticker, range_period=range_period, interval=interval)
+
+    @classmethod
+    def fetch_historical_yahoo(cls, ticker: str, range_period: str = "6mo", interval: str = "1d") -> List[Dict[str, Any]]:
+        """Yahoo Finance chart API only (no Robinhood MCP). Used as fallback and by `backtest`.
+
+        Yahoo accepts ranges such as 1mo, 6mo, 1y, 2y, 5y, max. Returns [] on any failure.
+        """
+        ticker = ticker.strip().upper()
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={range_period}"
+        # Daily on-disk cache: repeated backtests must not hammer Yahoo (it rate-limits with HTTP 429).
+        cache_dir = os.path.join(CACHE_DIR, "bars")
+        cache_fp = os.path.join(cache_dir, f"{ticker}_{interval}_{range_period}_{datetime.date.today().isoformat()}.json")
+        if os.path.exists(cache_fp):
+            try:
+                with open(cache_fp, encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                pass
         try:
-            raw = cls._http_get(url)
+            raw = None
+            for attempt in range(3):
+                try:
+                    # Yahoo answers a bare Mozilla UA but 429s the full browser header set used by _http_get.
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                    break
+                except urllib.error.HTTPError as he:
+                    if he.code == 429 and attempt < 2:
+                        time.sleep(2.0 * (attempt + 1))
+                        continue
+                    raise
             data = json.loads(raw)
             result = data["chart"]["result"][0]
             timestamps = result.get("timestamp", [])
             quote = result["indicators"]["quote"][0]
-            
+
             opens = quote.get("open", [])
             highs = quote.get("high", [])
             lows = quote.get("low", [])
@@ -646,6 +722,13 @@ class FinancialData:
                         "close": round(closes[i], 2),
                         "volume": int(volumes[i] or 0)
                     })
+            if bars:
+                try:
+                    os.makedirs(cache_dir, exist_ok=True)
+                    with open(cache_fp, "w", encoding="utf-8") as fh:
+                        json.dump(bars, fh)
+                except OSError:
+                    pass
             return bars
         except Exception:
             return []
@@ -1899,6 +1982,20 @@ class TradingStrategyEngine:
                 for s in top_sells[:3]
             ]
         }
+        # 3.5 Momentum sleeve view: the rules the live loop actually trades (regime + ranking)
+        try:
+            sleeve_bars = _fetch_strategy_bars(MomentumStrategy.universe() + ["SPY"])
+            spy_bars = sleeve_bars.pop("SPY", [])
+            regime = MomentumStrategy.regime(spy_bars)
+            ranked = MomentumStrategy.rank(sleeve_bars)
+            staged_plan["momentum_sleeve"] = {
+                "regime": regime,
+                "targets": MomentumStrategy.select_sleeve(ranked, regime["regime"]),
+                "top": ranked[:8],
+            }
+        except Exception as exc:  # noqa: BLE001
+            staged_plan["momentum_sleeve"] = {"error": str(exc)}
+
         # 4. Invoke AI Agent for deep strategic validation (Market Hours only)
         try:
             print("Invoking AI Agent to validate macro outlook and suggest trade setups...")
@@ -2053,6 +2150,202 @@ class TradingStrategyEngine:
             pass
             
         return daily_entry
+
+
+# ==============================================================================
+# 5.5. Core + Monthly Momentum Sleeve Strategy (pure functions, shared by live loop & backtest)
+# ==============================================================================
+#
+# Target book (see docs/superpowers/specs/2026-09-20-momentum-sleeve-trader-design.md):
+#   Core   60%  VTI + QQQ, topped up whenever cash exceeds the buffer; never sold by the bot.
+#   Sleeve 30%  top-N names by 6-month total return (close > SMA200, liquidity gate), equal
+#               weight, rebalanced on the first trading day the daemon sees each month.
+#   Regime      SPY close < SMA200 on rebalance day -> sleeve goes to cash.
+#   Cash   10%  buffer, never breached by buys.
+#   Risk        disaster stop -20% from average cost on sleeve names, checked every pulse.
+#
+class MomentumStrategy:
+    CORE_SYMBOLS: Tuple[str, ...] = ("VTI", "QQQ")
+    CORE_TARGET_PCT = 0.60
+    SLEEVE_TARGET_PCT = 0.30
+    CASH_BUFFER_PCT = 0.10
+    SLEEVE_TOP_N = 3
+    LOOKBACK_BARS = 126        # ~6 months of trading days
+    REGIME_SMA_BARS = 200
+    DISASTER_STOP_PCT = 20.0
+    MIN_AVG_VOLUME = 500_000
+    MIN_PRICE = 5.0
+    MIN_ORDER_DOLLARS = 5.0
+    REBALANCE_EARLIEST_ET = datetime.time(10, 0)   # never trade the opening auction
+
+    @classmethod
+    def universe(cls) -> List[str]:
+        """Momentum universe: every curated single name (ETF sector excluded), de-duplicated."""
+        out: List[str] = []
+        for sector, syms in SECTOR_UNIVERSES.items():
+            if sector == "CORE_INDEX_ETFS":
+                continue
+            for s in syms:
+                if s not in out and s not in cls.CORE_SYMBOLS:
+                    out.append(s)
+        return out
+
+    @staticmethod
+    def _closes(bars: List[Dict[str, Any]], upto: Optional[int]) -> List[float]:
+        end = len(bars) if upto is None else upto + 1
+        return [float(b["close"]) for b in bars[:end]]
+
+    @classmethod
+    def regime(cls, spy_bars: List[Dict[str, Any]], as_of: Optional[int] = None) -> Dict[str, Any]:
+        """BULL when SPY close > SMA200, BEAR otherwise. Insufficient history counts as BULL (no gate)."""
+        closes = cls._closes(spy_bars, as_of)
+        if len(closes) < cls.REGIME_SMA_BARS:
+            return {"regime": "BULL", "close": closes[-1] if closes else 0.0, "sma200": None, "note": "insufficient history"}
+        sma = sum(closes[-cls.REGIME_SMA_BARS:]) / cls.REGIME_SMA_BARS
+        return {"regime": "BULL" if closes[-1] > sma else "BEAR", "close": closes[-1], "sma200": round(sma, 2)}
+
+    @classmethod
+    def rank(cls, bars_by_symbol: Dict[str, List[Dict[str, Any]]],
+             as_of: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+        """Rank symbols by LOOKBACK_BARS total return. Eligible rows first (momentum desc), then the rest.
+
+        `as_of` maps symbol -> bar index to evaluate at (inclusive); default = last bar.
+        Bars need "close" and "volume" keys (as FinancialData.fetch_historical returns).
+        """
+        rows: List[Dict[str, Any]] = []
+        for sym, bars in bars_by_symbol.items():
+            idx = None if as_of is None else as_of.get(sym)
+            if as_of is not None and idx is None:
+                continue
+            end = len(bars) if idx is None else idx + 1
+            window = bars[:end]
+            if len(window) < 2:
+                continue
+            closes = [float(b["close"]) for b in window]
+            vols = [float(b.get("volume") or 0) for b in window]
+            price = closes[-1]
+            reasons: List[str] = []
+            if len(closes) <= cls.LOOKBACK_BARS:
+                reasons.append(f"history {len(closes)} < {cls.LOOKBACK_BARS + 1} bars")
+                momentum = None
+            else:
+                base = closes[-1 - cls.LOOKBACK_BARS]
+                momentum = (price / base - 1.0) * 100.0 if base > 0 else None
+            sma200 = (sum(closes[-cls.REGIME_SMA_BARS:]) / cls.REGIME_SMA_BARS) if len(closes) >= cls.REGIME_SMA_BARS else None
+            above = (sma200 is not None and price > sma200)
+            if sma200 is None:
+                reasons.append("no SMA200")
+            elif not above:
+                reasons.append("below SMA200")
+            avg_vol = sum(vols[-20:]) / min(20, len(vols)) if vols else 0.0
+            if avg_vol < cls.MIN_AVG_VOLUME:
+                reasons.append(f"avg vol {avg_vol:,.0f} < {cls.MIN_AVG_VOLUME:,}")
+            if price < cls.MIN_PRICE:
+                reasons.append(f"price ${price:.2f} < ${cls.MIN_PRICE:.2f}")
+            if momentum is None:
+                reasons.append("no momentum")
+            rows.append({
+                "symbol": sym, "price": round(price, 2),
+                "momentum_pct": round(momentum, 2) if momentum is not None else None,
+                "sma200": round(sma200, 2) if sma200 else None, "above_sma200": above,
+                "avg_volume_20": int(avg_vol), "eligible": not reasons,
+                "reason": "; ".join(reasons) if reasons else "eligible",
+            })
+        rows.sort(key=lambda r: (not r["eligible"], -(r["momentum_pct"] if r["momentum_pct"] is not None else -1e9)))
+        return rows
+
+    @classmethod
+    def select_sleeve(cls, ranked: List[Dict[str, Any]], regime: str, top_n: Optional[int] = None) -> List[str]:
+        if regime != "BULL":
+            return []
+        n = top_n or cls.SLEEVE_TOP_N
+        return [r["symbol"] for r in ranked if r["eligible"]][:n]
+
+    @classmethod
+    def load_hold_list(cls) -> set:
+        """Symbols the bot must never sell (one per line, '#' comments allowed)."""
+        try:
+            with open(TRADING_HOLD_FILE, encoding="utf-8") as fh:
+                return {ln.strip().upper() for ln in fh if ln.strip() and not ln.strip().startswith("#")}
+        except OSError:
+            return set()
+
+    @classmethod
+    def plan_rebalance(cls, equity: float, cash: float, positions: Dict[str, Dict[str, float]],
+                       targets: List[str], hold: Optional[set] = None) -> Dict[str, Any]:
+        """Deterministic sleeve rebalance: sells first (rotated-out names), then equal-weight buys.
+
+        positions: {symbol: {"quantity": q, "price": p}}. Returns {"sells": [...], "buys": [...],
+        "projected_cash": x}. Buys never push cash below CASH_BUFFER_PCT of equity.
+        """
+        hold = {h.upper() for h in (hold or set())}
+        sells: List[Dict[str, Any]] = []
+        buys: List[Dict[str, Any]] = []
+        projected_cash = float(cash)
+        for sym, pos in positions.items():
+            s = sym.upper()
+            qty = float(pos.get("quantity", 0) or 0)
+            price = float(pos.get("price", 0) or 0)
+            if qty <= 0 or s in cls.CORE_SYMBOLS or s in hold or s in targets:
+                continue
+            sells.append({"symbol": s, "quantity": round(qty, 6),
+                          "reason": "REGIME_EXIT" if not targets else "ROTATE_OUT"})
+            projected_cash += qty * price
+        if targets:
+            per_name = equity * cls.SLEEVE_TARGET_PCT / len(targets)
+            buffer = equity * cls.CASH_BUFFER_PCT
+            for s in targets:
+                pos = positions.get(s, {})
+                current_val = float(pos.get("quantity", 0) or 0) * float(pos.get("price", 0) or 0)
+                want = per_name - current_val
+                room = projected_cash - buffer
+                amt = round(min(want, room), 2)
+                if amt >= cls.MIN_ORDER_DOLLARS:
+                    buys.append({"symbol": s, "dollar_amount": amt, "reason": "SLEEVE_TARGET"})
+                    projected_cash -= amt
+        return {"sells": sells, "buys": buys, "projected_cash": round(projected_cash, 2)}
+
+    @classmethod
+    def plan_core_topup(cls, equity: float, cash: float, positions: Dict[str, Dict[str, float]],
+                        max_dollars: Optional[float] = None, core_target: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """One buy toward the core target: the ETF furthest below its equal share, sized to the smaller of
+        its own shortfall, the total core shortfall and the cash above the buffer. None if nothing to do."""
+        target_pct = core_target if core_target is not None else cls.CORE_TARGET_PCT
+        core_val = {s: float(positions.get(s, {}).get("quantity", 0) or 0) * float(positions.get(s, {}).get("price", 0) or 0)
+                    for s in cls.CORE_SYMBOLS}
+        total_deficit = equity * target_pct - sum(core_val.values())
+        per_etf_target = equity * target_pct / len(cls.CORE_SYMBOLS)
+        shortfalls = {s: per_etf_target - v for s, v in core_val.items()}
+        target = max(cls.CORE_SYMBOLS, key=lambda s: shortfalls[s])
+        room = cash - equity * cls.CASH_BUFFER_PCT
+        amt = min(shortfalls[target], total_deficit, room)
+        if max_dollars is not None:
+            amt = min(amt, max_dollars)
+        amt = round(amt, 2)
+        if amt < cls.MIN_ORDER_DOLLARS:
+            return None
+        return {"symbol": target, "dollar_amount": amt, "reason": "CORE_TOPUP"}
+
+    @classmethod
+    def disaster_stop_hits(cls, positions: List[Dict[str, Any]], quotes: Dict[str, Dict[str, Any]],
+                           hold: Optional[set] = None) -> List[Dict[str, Any]]:
+        """Sleeve positions at or below -DISASTER_STOP_PCT from average cost."""
+        hold = {h.upper() for h in (hold or set())}
+        hits = []
+        for pos in positions:
+            sym = str(pos.get("symbol", "")).upper()
+            qty = float(pos.get("quantity", 0) or 0)
+            avg = float(pos.get("average_buy_price", 0) or 0)
+            if not sym or qty <= 0 or avg <= 0 or sym in cls.CORE_SYMBOLS or sym in hold:
+                continue
+            q = quotes.get(sym, {})
+            price = float(q.get("last_trade_price") or q.get("price") or 0.0)
+            if price <= 0:
+                continue
+            pnl = (price - avg) / avg * 100.0
+            if pnl <= -cls.DISASTER_STOP_PCT:
+                hits.append({"symbol": sym, "quantity": qty, "price": price, "avg_cost": avg, "pnl_pct": round(pnl, 2)})
+        return hits
 
 
 # ==============================================================================
@@ -2452,7 +2745,7 @@ RobinhoodAPI = RobinhoodExecutor
 
 PDT_TRACKER_FILE = os.path.join(os.path.expanduser("~/.config/ai"), "pdt_tracker.json")
 CIRCUIT_BREAKER_FILE = os.path.join(os.path.expanduser("~/.config/ai"), "daily_circuit_breaker.json")
-# Written by Tier 3 emergency liquidation; read by _auto_trade_entry_pulse to block buys for the session
+# Written when circuit breaker Tier 3 is confirmed; read by _momentum_rebalance_pulse to block orders for the session
 SESSION_HALT_FLAG = os.path.join(os.path.expanduser("~/.config/ai"), ".monitor_flags", "tier3_halt_{date}.flag")
 # Written when a PDT-deferred exit is pending; reviewed at pre-market briefing
 DEFERRED_EXIT_FLAG_DIR = os.path.join(os.path.expanduser("~/.config/ai"), ".monitor_flags")
@@ -2615,44 +2908,83 @@ class ComplianceAndRiskGuard:
             return False, f"PDT Limit Reached ({count}/3 day trades used in 5-day window). Blocked from same-day round-trips."
         return True, f"PDT Compliant ({count}/3 day trades used in 5-day window)"
 
+    CB_GLITCH_PCT = 30.0   # a single reading this far from baseline is a data error, not a market move
+
     @classmethod
     def check_daily_circuit_breaker(cls, account_number: str, current_equity: float) -> Tuple[int, str]:
         """
-        Multi-tier intraday drawdown escalation:
-        Tier 0: Drawdown > -3.0% (Normal operation)
-        Tier 1: Drawdown <= -3.0% (Halt new buy entries)
-        Tier 2: Drawdown <= -6.0% (Tighten all trailing stops to 1.0x ATR)
-        Tier 3: Drawdown <= -10.0% (Emergency risk liquidation mode)
+        Intraday drawdown tiers versus the first equity reading of the day:
+        Tier 0: > -3.0%   normal operation
+        Tier 1: <= -3.0%  halt new buys for the day
+        Tier 2: <= -6.0%  (reserved; same effect as Tier 1)
+        Tier 3: <= -10.0% halt all bot activity for the day (no forced liquidation)
+
+        Two guards against bad API reads (2026-08-25 a phantom -57% tripped Tier 3):
+        - a reading more than CB_GLITCH_PCT away from baseline is ignored;
+        - any tier must be observed on two consecutive pulses before it is reported.
+        File format: {acc_date: {"baseline": x, "pending_tier": t, "pending_count": n}};
+        legacy float values are upgraded in place.
         """
         today = MarketHours.now_et().strftime("%Y-%m-%d")
         os.makedirs(os.path.dirname(CIRCUIT_BREAKER_FILE), exist_ok=True)
-        baseline_data = {}
+        data: Dict[str, Any] = {}
         if os.path.exists(CIRCUIT_BREAKER_FILE):
             try:
                 with open(CIRCUIT_BREAKER_FILE, "r", encoding="utf-8") as f:
-                    baseline_data = json.load(f)
+                    data = json.load(f)
             except Exception:
-                pass
-        
-        acc_key = f"{account_number}_{today}"
-        start_equity = baseline_data.get(acc_key)
-        if not start_equity or start_equity <= 0:
-            baseline_data[acc_key] = current_equity
+                data = {}
+
+        def _save():
             try:
                 with open(CIRCUIT_BREAKER_FILE, "w", encoding="utf-8") as f:
-                    json.dump(baseline_data, f, indent=2)
+                    json.dump(data, f, indent=2)
             except Exception:
                 pass
+
+        acc_key = f"{account_number}_{today}"
+        rec = data.get(acc_key)
+        if isinstance(rec, (int, float)):
+            rec = {"baseline": float(rec), "pending_tier": 0, "pending_count": 0}
+            data[acc_key] = rec
+            _save()
+        if not isinstance(rec, dict) or not rec.get("baseline") or rec["baseline"] <= 0:
+            if current_equity <= 0:
+                return 0, "No equity reading yet; baseline not set"
+            data[acc_key] = {"baseline": current_equity, "pending_tier": 0, "pending_count": 0}
+            _save()
             return 0, f"Starting daily baseline set at ${current_equity:,.2f}"
 
+        start_equity = float(rec["baseline"])
         drawdown_pct = (current_equity - start_equity) / start_equity * 100.0
+        if current_equity <= 0 or abs(drawdown_pct) > cls.CB_GLITCH_PCT:
+            return 0, (f"Circuit breaker ignored implausible equity reading ${current_equity:,.2f} "
+                       f"({drawdown_pct:+.1f}% vs baseline ${start_equity:,.2f}); treating as data glitch")
+
         if drawdown_pct <= -10.0:
-            return 3, f"CIRCUIT BREAKER TIER 3 TRIPPED: Drawdown is {drawdown_pct:.2f}% (Limit: -10.0%). Emergency risk liquidation mode."
+            raw_tier, label = 3, "halting all bot activity for today"
         elif drawdown_pct <= -6.0:
-            return 2, f"CIRCUIT BREAKER TIER 2 TRIPPED: Drawdown is {drawdown_pct:.2f}% (Limit: -6.0%). Tightening all stops to 1.0x ATR."
+            raw_tier, label = 2, "new buy entries halted for today"
         elif drawdown_pct <= -3.0:
-            return 1, f"CIRCUIT BREAKER TIER 1 TRIPPED: Drawdown is {drawdown_pct:.2f}% (Limit: -3.0%). New buy entries halted for today."
-        return 0, f"Intraday P&L: {drawdown_pct:+.2f}% vs open ${start_equity:,.2f} (Within risk limits)"
+            raw_tier, label = 1, "new buy entries halted for today"
+        else:
+            raw_tier, label = 0, ""
+
+        if raw_tier == 0:
+            if rec.get("pending_tier"):
+                rec["pending_tier"], rec["pending_count"] = 0, 0
+                data[acc_key] = rec
+                _save()
+            return 0, f"Intraday P&L: {drawdown_pct:+.2f}% vs open ${start_equity:,.2f} (Within risk limits)"
+
+        if int(rec.get("pending_tier", 0)) >= raw_tier and int(rec.get("pending_count", 0)) >= 1:
+            return raw_tier, (f"CIRCUIT BREAKER TIER {raw_tier} TRIPPED: Drawdown is {drawdown_pct:.2f}% "
+                              f"(confirmed on consecutive pulses); {label}.")
+        rec["pending_tier"], rec["pending_count"] = raw_tier, 1
+        data[acc_key] = rec
+        _save()
+        return 0, (f"Circuit breaker Tier {raw_tier} observed once ({drawdown_pct:.2f}%); "
+                   f"awaiting confirmation on next pulse")
 
     @classmethod
     def get_ticker_risk_parameters(cls, symbol: str, current_price: float, default_stop_pct: float = 5.0) -> Dict[str, float]:
@@ -2706,7 +3038,7 @@ class TradingDataManager:
 
     @classmethod
     def get_cache_dir(cls) -> str:
-        d = os.path.expanduser("~/.cache/ai/trading")
+        d = CACHE_DIR
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -3220,36 +3552,17 @@ def run_scheduled_trading_lifecycle(interval_seconds: int = 900, auto_trade: boo
         # Phase 2: Active Trading Session (09:30 - 16:00 ET)
         elif session == "REGULAR":
             has_run_closing = False
-            print(f"\n[{time_str}] ⚡ REGULAR SESSION PULSE CHECK (Every {interval_seconds}s)", flush=True)
-            
-            scan_universe = BALANCED_LIFECYCLE_WATCHLIST if (watchlist is None or set(watchlist) == set(DEFAULT_WATCHLIST)) else watchlist[:14]
-            top_opportunities = []
-            for ticker in scan_universe:
-                try:
-                    res = TradingStrategyEngine.analyze_ticker(ticker)
-                    top_opportunities.append(res)
-                except Exception as exc:
-                    print(f"Notice analyzing {ticker}: {exc}", flush=True)
-
-            top_opportunities.sort(key=lambda x: x["score"], reverse=True)
-            print(f"{'Ticker':<7} | {'Price':<9} | {'Chg%':<7} | {'RSI':<6} | {'Score':<6} | {'Signal':<12} | {'Stop Loss':<10} | {'Target'}", flush=True)
-            print("-" * 80, flush=True)
-            for r in top_opportunities:
-                print(f"{r['ticker']:<7} | ${r['price']:<8.2f} | {r['change_pct']:>+5.2f}% | {r['indicators']['rsi']:<6.1f} | {r['score']:<6.1f} | {r['recommendation']:<12} | ${r['risk_targets']['stop_loss']:<9.2f} | ${r['risk_targets']['take_profit_1']:.2f}", flush=True)
-
-            # Active Risk Management & Autonomous Opportunity Execution Pulse
+            print(f"\n[{time_str}] ⚡ REGULAR SESSION PULSE (every {interval_seconds}s) | core + monthly momentum sleeve", flush=True)
             try:
                 acc_num = RobinhoodExecutor.get_agentic_account_number()
-                today_str = now.strftime("%Y-%m-%d")
-                rules = _read_plan_risk_rules(today_str)
-                _risk_monitor_pulse(acc_num, dry_run, rules["stop_loss_pct"], rules["take_profit_pct"])
+                _risk_monitor_pulse(acc_num, dry_run)          # circuit breaker + disaster stop, every pulse
                 if auto_trade:
-                    _auto_trade_entry_pulse(acc_num, dry_run, top_opportunities)
+                    _momentum_rebalance_pulse(acc_num, dry_run)  # core top-up daily, sleeve rebalance monthly
             except Exception as e:
                 print(f"Trading pulse notice: {e}", flush=True)
 
             time_left = MarketHours.seconds_until_close(now)
-            print(f"\nSession active: {int(time_left // 60)} minutes remaining. Sleeping {interval_seconds}s until next check...", flush=True)
+            print(f"Session active: {int(time_left // 60)} minutes remaining. Sleeping {interval_seconds}s until next check...", flush=True)
             time.sleep(interval_seconds)
 
         # Phase 3: Post-Market Closing Summary (16:00 - 16:15 ET)
@@ -3359,612 +3672,280 @@ def _read_plan_risk_rules(today: str) -> Dict[str, float]:
     return rules
 
 
-def _auto_trade_entry_pulse(account_number: str, dry_run: bool, top_candidates: List[Dict[str, Any]]) -> None:
-    """Executes high-conviction buy setups when cash buffer, circuit breakers, and risk rules permit."""
-    if not top_candidates:
-        return
-    
-    port = RobinhoodExecutor.get_live_portfolio(account_number)
+def _account_snapshot(account_number: str) -> Dict[str, Any]:
+    """Live equity, cash, positions and quotes for one account, in the shapes the strategy needs."""
+    port = RobinhoodExecutor.get_live_portfolio(account_number) or {}
     bp_dict = port.get("buying_power", {})
     bp = float(bp_dict.get("buying_power", 0.0) if isinstance(bp_dict, dict) else (bp_dict or 0.0))
     cash = float(port.get("cash", bp) or bp or 0.0)
-    total_val = float(port.get("total_value", 0.0) or (float(port.get("equity_value", 0.0) or 0.0) + cash) or 0.0)
-    if total_val <= 0:
-        total_val = cash
-
-    # 0. Session halt flag check (written by Tier 3 emergency liquidation)
-    _today = MarketHours.now_et().strftime("%Y-%m-%d")
-    _halt_flag = SESSION_HALT_FLAG.format(date=_today)
-    if os.path.exists(_halt_flag):
-        _risk_log(f"AUTO-TRADE: Session halt flag present (Tier 3 triggered earlier today). "
-                  f"All new buy entries blocked for the remainder of this session.")
-        return
-
-    # 0.5. Opening Bell Noise Window (09:30 - 09:45 ET)
-    # Never chase opening gaps or buy during opening auction volatility
-    now_et = MarketHours.now_et()
-    if datetime.time(9, 30) <= now_et.time() < datetime.time(9, 45):
-        _risk_log(f"AUTO-TRADE: Opening range stabilization in effect (09:30-09:45 ET). Postponing breakout entries until after 09:45 ET.")
-        return
-
-    # 0.6. Midday Chop Lockout (11:30 - 13:30 ET)
-    # Between 11:30 and 13:30 ET, trading volume drops dramatically into a midday lull.
-    # Whipsaws and false breakouts dominate during this period.
-    if datetime.time(11, 30) <= now_et.time() < datetime.time(13, 30):
-        _risk_log(f"AUTO-TRADE: Midday chop lockout in effect (11:30-13:30 ET). Volume lull increases false breakout risk; postponing new satellite entries.")
-        return
-
-    # 1. Multi-Tier Daily Circuit Breaker Check (halt buying on Tier 1+)
-    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, total_val)
-    if tier >= 1:
-        _risk_log(f"AUTO-TRADE: {cb_msg}")
-        return
-
-    # 2. Pre-Purchase PDT Budget Check
-    if total_val < 25000.0:
-        day_trades_used = ComplianceAndRiskGuard.get_day_trades_count(account_number)
-        if day_trades_used >= 3:
-            _risk_log(f"AUTO-TRADE: PDT budget exhausted ({day_trades_used}/3 day trades used in 5-day window). Blocking new entries.")
-            return
-        elif day_trades_used == 2:
-            _risk_log(f"AUTO-TRADE ADVISORY: 2/3 day trades used. Only 1 day trade remaining in 5-day window.")
-
-    # 3. Minimum viable account size guard (prevent trivially-small trades)
-    if total_val < 150.0:
-        _risk_log(f"AUTO-TRADE: Total portfolio value ${total_val:.2f} below $150 minimum. "
-                  f"Suspending auto-trade until sufficient capital is present.")
-        return
-
-    # 4. Ensure min 15% cash buffer is preserved after buy
-    min_cash_buffer = total_val * 0.15
-    deployable_cash = max(0.0, cash - min_cash_buffer)
-    
-    if deployable_cash < 10.0:
-        _risk_log(f"AUTO-TRADE: Cash ${cash:.2f} (deployable: ${deployable_cash:.2f} above 15% buffer). No capital for new entry.")
-        return
-
-    today = MarketHours.now_et().strftime("%Y-%m-%d")
-    positions = RobinhoodExecutor.get_equity_positions(account_number)
-    held_symbols = {str(p.get("symbol", "")).upper(): float(p.get("quantity", 0) or 0) for p in positions if float(p.get("quantity", 0) or 0) > 0}
-
-    # 4.5. Core-Satellite Ballast Management:
-    # If cash buffer is in surplus (> 25%) and Core ETFs (VTI/QQQ) are underfunded (< 35% of portfolio),
-    # prioritize funding Core ETFs to reduce portfolio volatility and eliminate dead cash drag.
-    core_etf_holdings = {"VTI": 0.0, "QQQ": 0.0}
+    positions = [p for p in (RobinhoodExecutor.get_equity_positions(account_number) or [])
+                 if float(p.get("quantity", 0) or 0) > 0]
+    symbols = [str(p.get("symbol", "")).upper() for p in positions if p.get("symbol")]
+    quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
+    pos_map: Dict[str, Dict[str, float]] = {}
     for p in positions:
-        s = str(p.get("symbol", "")).upper()
-        if s in core_etf_holdings:
-            core_etf_holdings[s] = float(p.get("quantity", 0) or 0) * float(p.get("average_buy_price", 0) or 0)
-    
-    total_core_val = sum(core_etf_holdings.values())
-    core_ratio = (total_core_val / total_val) if total_val > 0 else 0.0
-    cash_ratio = (cash / total_val) if total_val > 0 else 0.0
+        sym = str(p.get("symbol", "")).upper()
+        qty = float(p.get("quantity", 0) or 0)
+        avg = float(p.get("average_buy_price", 0) or 0)
+        q = quotes.get(sym, {})
+        price = float(q.get("last_trade_price") or q.get("price") or avg or 0.0)
+        pos_map[sym] = {"quantity": qty, "price": price, "average_buy_price": avg}
+    equity = float(port.get("total_value", 0.0) or 0.0)
+    if equity <= 0:
+        equity = float(port.get("equity_value", 0.0) or 0.0) + cash
+    if equity <= cash + 0.01 and pos_map:
+        equity = cash + sum(v["quantity"] * v["price"] for v in pos_map.values())
+    return {"equity": equity, "cash": cash, "positions": positions, "pos_map": pos_map, "quotes": quotes}
 
-    if cash_ratio >= 0.16 and core_ratio < 0.55 and deployable_cash >= 15.0:
-        target_core = "VTI" if core_etf_holdings["VTI"] <= core_etf_holdings["QQQ"] else "QQQ"
-        core_buy_size = round(min(deployable_cash * 0.5, 50.0, deployable_cash - 5.0), 2)
-        if core_buy_size >= 12.0:
-            core_flag = os.path.join(RISK_MONITOR_FLAGS, f"ballast_buy_{today}_{target_core}.flag")
-            if not os.path.exists(core_flag):
-                _risk_log(f"AUTO-TRADE CORE BALLAST: Cash is {cash_ratio*100:.1f}% & Core ETFs are {core_ratio*100:.1f}% (target 55%). Deploying ${core_buy_size:.2f} into {target_core} ballast...")
-                if not dry_run:
-                    try:
-                        res = RobinhoodExecutor.execute_market_order(account_number, target_core, "buy", dollar_amount=str(core_buy_size))
-                        _risk_log(f"AUTO-TRADE {target_core}: Core Ballast BUY placed! Response={str(res)[:160]}")
-                        ComplianceAndRiskGuard.record_trade(account_number, target_core, "BUY", qty=None)
-                        with open(core_flag, "w", encoding="utf-8") as fh:
-                            json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dollar_amount": core_buy_size}, fh)
-                        deployable_cash -= core_buy_size
-                    except Exception as exc:
-                        _risk_log(f"AUTO-TRADE {target_core} ballast buy failed: {exc}")
 
-    # 4.6. Broad Market Regime Gate:
-    # If the broad market is undergoing distribution (SPY <= -0.8% or QQQ <= -1.0%),
-    # speculative satellite breakouts have an extremely high failure rate.
-    market_defensive = False
-    regime_msg = ""
-    try:
-        broad_quotes = RobinhoodExecutor.get_equity_quotes(["SPY", "QQQ"])
-        spy_q = broad_quotes.get("SPY", {})
-        qqq_q = broad_quotes.get("QQQ", {})
-        spy_pr = float(spy_q.get("last_trade_price") or spy_q.get("price") or 0.0)
-        spy_prev = float(spy_q.get("adjusted_previous_close") or spy_q.get("previous_close") or spy_pr)
-        spy_chg = ((spy_pr - spy_prev) / spy_prev * 100.0) if spy_prev > 0 and spy_pr > 0 else 0.0
-
-        qqq_pr = float(qqq_q.get("last_trade_price") or qqq_q.get("price") or 0.0)
-        qqq_prev = float(qqq_q.get("adjusted_previous_close") or qqq_q.get("previous_close") or qqq_pr)
-        qqq_chg = ((qqq_pr - qqq_prev) / qqq_prev * 100.0) if qqq_prev > 0 and qqq_pr > 0 else 0.0
-
-        if spy_chg <= -0.8 or qqq_chg <= -1.0:
-            market_defensive = True
-            regime_msg = f"SPY: {spy_chg:+.2f}%, QQQ: {qqq_chg:+.2f}%"
-    except Exception as exc:
-        _risk_log(f"AUTO-TRADE: Broad market quote check failed: {exc}")
-
-    satellite_symbols = [s for s in held_symbols if s not in ("VTI", "QQQ", "SPY")]
-    single_stock_count = len(satellite_symbols)
-    daily_sat_flag = os.path.join(RISK_MONITOR_FLAGS, f"daily_sat_entry_{today}.flag")
-
-    for opp in top_candidates:
-        sym = opp.get("ticker", "").upper()
-        score = opp.get("score", 0.0)
-        rec = opp.get("recommendation", "")
-        price = opp.get("price", 0.0)
-        indicators = opp.get("indicators", {})
-        
-        # Calibrated selective threshold (STRONG_BUY >= 80.0)
-        if score < 80.0 or rec != "STRONG_BUY" or price <= 0:
-            continue
-
-        is_etf = sym in ("VTI", "QQQ", "SPY")
-
-        # 0. Broad Market Regime Filter for speculative satellite breakouts
-        if market_defensive and not is_etf:
-            _risk_log(f"AUTO-TRADE {sym}: Broad market regime is defensive ({regime_msg}) -> Suppressing satellite breakout.")
-            continue
-
-        # 0.7. Satellite Portfolio Discipline: Max 3 single stocks & max 1 new satellite entry per day
-        if not is_etf:
-            if single_stock_count >= 3 and sym not in held_symbols:
-                _risk_log(f"AUTO-TRADE {sym}: Satellite capacity reached ({single_stock_count}/3 single stocks held); skipping.")
-                continue
-            if os.path.exists(daily_sat_flag):
-                _risk_log(f"AUTO-TRADE {sym}: Daily satellite entry limit reached (max 1 new satellite buy per day); skipping.")
-                continue
-        
-        # 1. Strict Wash-Sale & Re-Entry Cooldown Check (prevents selling and re-buying same stock)
-        in_cooldown, cd_msg = ComplianceAndRiskGuard.is_in_cooldown(account_number, sym)
-        if in_cooldown:
-            _risk_log(f"AUTO-TRADE {sym}: {cd_msg} -> Skipping entry.")
-            continue
-
-        # 2. Daily Exit Flag Guard (prevents same-day re-entry after stop-loss or take-profit)
-        stop_flag = os.path.join(RISK_MONITOR_FLAGS, f"stop_loss_{today}_{sym}.flag")
-        tp_flag = os.path.join(RISK_MONITOR_FLAGS, f"take_profit_{today}_{sym}.flag")
-        if os.path.exists(stop_flag) or os.path.exists(tp_flag):
-            _risk_log(f"AUTO-TRADE {sym}: Exit flag present today (stop-loss or take-profit active) -> Skipping entry.")
-            continue
-
-        # 3. Position Sizing and Hard Concentration Cap:
-        # Cap single stocks strictly at 15% of portfolio (Core ETFs allowed up to 35%)
-        pos_val = 0.0
-        for p in positions:
-            if str(p.get("symbol", "")).upper() == sym:
-                pos_val = float(p.get("quantity", 0) or 0) * price
-                break
-        
-        max_cap = 0.35 if is_etf else 0.15
-        max_allowed_val = total_val * max_cap
-        room_for_pos = max_allowed_val - pos_val
-        if room_for_pos < 10.0:
-            _risk_log(f"AUTO-TRADE {sym}: Already at {pos_val/total_val*100:.1f}% concentration cap (max {int(max_cap*100)}%); skipping.")
-            continue
-
-        # 4. Sector Concentration Guard (Max 2 satellite positions per sector to prevent semi overlap)
-        if not is_etf:
-            sym_sector = None
-            for sec_name, sec_syms in SECTOR_UNIVERSES.items():
-                if sym in sec_syms and sec_name != "CORE_INDEX_ETFS":
-                    sym_sector = sec_name
-                    break
-            if sym_sector:
-                sector_held_count = sum(1 for held_sym in held_symbols if held_sym in SECTOR_UNIVERSES.get(sym_sector, []))
-                if sector_held_count >= 2 and sym not in held_symbols:
-                    _risk_log(f"AUTO-TRADE {sym}: Sector {sym_sector} already has {sector_held_count} active positions; skipping to ensure diversification.")
-                    continue
-
-        # 5. Bid-Ask Spread Guard against slippage
+def _fetch_strategy_bars(symbols: List[str], range_period: str = "1y") -> Dict[str, List[Dict[str, Any]]]:
+    """Daily bars for the strategy (Robinhood MCP first, Yahoo fallback). Symbols with < 30 bars are dropped."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for s in symbols:
         try:
-            quote_map = RobinhoodExecutor.get_equity_quotes([sym])
-            q_info = quote_map.get(sym, {})
-            bid_pr = float(q_info.get("bid_price") or 0.0)
-            ask_pr = float(q_info.get("ask_price") or 0.0)
-            if bid_pr > 0 and ask_pr > 0 and (ask_pr - bid_pr) / ask_pr > 0.01:
-                _risk_log(f"AUTO-TRADE {sym}: Bid-ask spread too wide ({((ask_pr-bid_pr)/ask_pr*100):.2f}% > 1.0%); skipping entry to prevent slippage.")
-                continue
+            b = FinancialData.fetch_historical(s, range_period=range_period, interval="1d")
+            if len(b) >= 30:
+                out[s] = b
+            else:
+                _risk_log(f"STRATEGY: {s} skipped ({len(b)} bars)")
+        except Exception as exc:  # noqa: BLE001
+            _risk_log(f"STRATEGY: {s} history fetch failed: {exc}")
+    return out
+
+
+def _rebalance_flag_path(month: str) -> str:
+    return os.path.join(RISK_MONITOR_FLAGS, f"rebalance_{month}.json")
+
+
+def _save_json(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, default=str)
+
+
+def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
+    """Once-a-day strategy pulse: monthly sleeve rebalance (sells, then buys on a later pulse
+    once cash has settled), then a daily core top-up. Idempotent via flag files; no LLM."""
+    now = MarketHours.now_et()
+    today = now.strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+    if now.time() < MomentumStrategy.REBALANCE_EARLIEST_ET:
+        return  # never trade the opening auction; the disaster-stop pass still runs
+
+    halt_flag = SESSION_HALT_FLAG.format(date=today)
+    if os.path.exists(halt_flag):
+        _risk_log("STRATEGY: session halt flag present (circuit breaker Tier 3 today); no strategy orders.")
+        return
+
+    snap = _account_snapshot(account_number)
+    equity, cash, pos_map = snap["equity"], snap["cash"], snap["pos_map"]
+    if equity <= 0:
+        _risk_log("STRATEGY: no equity reading; skipping pulse.")
+        return
+
+    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, equity)
+    buys_allowed = tier == 0
+    if tier >= 3:
+        _save_json(halt_flag, {"tier": tier, "reason": cb_msg, "ts": now.isoformat()})
+        _risk_log(f"🚨 STRATEGY: {cb_msg} -> halting all strategy orders for today (no forced liquidation).")
+        return
+
+    hold = MomentumStrategy.load_hold_list()
+    os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
+    flag = _rebalance_flag_path(month)
+    state: Optional[Dict[str, Any]] = None
+    if os.path.exists(flag):
+        try:
+            with open(flag, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, ValueError):
+            state = None
+
+    if state is None:
+        # First strategy pulse this month: rank the universe and plan the sleeve.
+        bars = _fetch_strategy_bars(MomentumStrategy.universe() + ["SPY"])
+        spy_bars = bars.pop("SPY", [])
+        regime = MomentumStrategy.regime(spy_bars)
+        ranked = MomentumStrategy.rank(bars)
+        targets = MomentumStrategy.select_sleeve(ranked, regime["regime"])
+        plan = MomentumStrategy.plan_rebalance(equity, cash, pos_map, targets, hold)
+        state = {
+            "month": month, "date": today, "dry_run": dry_run,
+            "equity": round(equity, 2), "cash": round(cash, 2),
+            "regime": regime, "targets": targets, "hold": sorted(hold),
+            "ranking": ranked[:10],
+            "sells_pending": plan["sells"], "buys_pending": plan["buys"],
+            "sells_done": [], "buys_done": [], "done": False,
+        }
+        _save_json(flag, state)
+        _risk_log(f"STRATEGY REBALANCE {month}: regime={regime['regime']} (SPY {regime.get('close')} vs SMA200 {regime.get('sma200')}) "
+                  f"targets={targets or 'CASH'} sells={[s['symbol'] for s in plan['sells']]} "
+                  f"buys={[(b['symbol'], b['dollar_amount']) for b in plan['buys']]} equity=${equity:,.2f} cash=${cash:,.2f}")
+        try:
+            ObsidianTradingVault.save_rebalance_note(month, state)
         except Exception:
             pass
 
-        buy_flag = os.path.join(RISK_MONITOR_FLAGS, f"buy_{today}_{sym}.flag")
-        if os.path.exists(buy_flag):
-            continue
-
-        # Position sizing scaled to portfolio growth (8% target, min $15, max concentration room)
-        target_size = max(15.0, total_val * 0.08)
-        trade_size = round(min(deployable_cash, target_size, room_for_pos), 2)
-        if trade_size < 10.0:
-            trade_size = round(min(deployable_cash, 10.0, room_for_pos), 2)
-        if trade_size < 5.0:
-            break
-
-        risk_targets = opp.get("risk_targets", {})
-        sl_price = risk_targets.get("stop_loss", round(price * 0.95, 2))
-        tp_price = risk_targets.get("take_profit_1", round(price * 1.08, 2))
-        risk_dist = max(0.01, price - sl_price)
-        reward_dist = max(0.01, tp_price - price)
-        rr_ratio = round(reward_dist / risk_dist, 2)
-
-        _risk_log(f"AUTO-TRADE SIGNAL: {sym} Score {score:.1f} ({rec}, VolRatio: {indicators.get('volume_ratio', 1.0)}x, R:R: {rr_ratio}x) -> Sizing ${trade_size:.2f} trade...")
-        val = AgentAdvisor.validate_trade_decision(sym, "buy", price, price, 0.0, f"Breakout Setup (Score: {score:.1f}, VolRatio: {indicators.get('volume_ratio', 1.0)}x)", {
-            "dollar_amount": trade_size,
-            "account": account_number,
-            "total_equity": total_val,
-            "cash_buffer_pct": round(cash_ratio * 100, 1),
-            "core_etf_ratio": round(core_ratio * 100, 1),
-            "rsi": indicators.get("rsi"),
-            "volume_ratio": indicators.get("volume_ratio"),
-            "macd_histogram": indicators.get("macd_histogram"),
-            "atr_pct": indicators.get("atr_pct"),
-            "stop_loss": sl_price,
-            "target_1": tp_price,
-            "risk_reward_ratio": rr_ratio
-        })
-        _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
-
-        if val["verdict"] in ("EXECUTE", "PROCEED", "BUY"):
-            if not dry_run:
-                try:
-                    res = RobinhoodExecutor.execute_market_order(account_number, sym, "buy", dollar_amount=str(trade_size))
-                    _risk_log(f"AUTO-TRADE {sym}: BUY order placed! Response={str(res)[:200]}")
-                    ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY", price=price, qty=round(trade_size / price, 6) if price > 0 else None)
-                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": trade_size, "price": price, "score": score, "reason": "AUTO_BREAKOUT", "agent_verdict": val["verdict"]})
-                    with open(buy_flag, "w", encoding="utf-8") as fh:
-                        json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dollar_amount": trade_size, "price": price, "score": score}, fh)
-                    if not is_etf:
-                        with open(daily_sat_flag, "w", encoding="utf-8") as fh:
-                            json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "symbol": sym}, fh)
-                    deployable_cash -= trade_size
-                except Exception as exc:
-                    _risk_log(f"AUTO-TRADE {sym}: Order failed: {exc}")
-            else:
-                _risk_log(f"AUTO-TRADE [DRY RUN] {sym}: Would place ${trade_size:.2f} BUY order at ~${price:.2f}.")
-                with open(buy_flag, "w", encoding="utf-8") as fh:
-                    json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dry_run": True}, fh)
-                if not is_etf:
-                    with open(daily_sat_flag, "w", encoding="utf-8") as fh:
-                        json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dry_run": True, "symbol": sym}, fh)
-
-
-def _risk_monitor_pulse(account_number: str, dry_run: bool, stop_loss_pct: float, take_profit_pct: float) -> None:
-    """One risk-management pass over all open equity positions with multi-tier circuit breaker escalation."""
-    today = MarketHours.now_et().strftime("%Y-%m-%d")
-    port = RobinhoodExecutor.get_live_portfolio(account_number)
-    bp_dict = port.get("buying_power", {})
-    bp = float(bp_dict.get("buying_power", 0.0) if isinstance(bp_dict, dict) else (bp_dict or 0.0))
-    cash = float(port.get("cash", bp) or bp or 0.0)
-    total_equity = float(port.get("total_value", 0.0) or (float(port.get("equity_value", 0.0) or 0.0) + cash) or 0.0)
-    positions = RobinhoodExecutor.get_equity_positions(account_number)
-    symbols = [str(p.get("symbol", "")).upper() for p in positions if float(p.get("quantity", 0) or 0) > 0]
-    quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
-    os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
-
-    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, total_equity)
-
-    # Tier 3 Emergency Liquidation Mode (Drawdown <= -10%)
-    if tier == 3:
-        _risk_log(f"🚨 {cb_msg} -> Executing emergency capital liquidation...")
-
-        # Write session-halt flag so _auto_trade_entry_pulse is blocked even if called again
-        _halt_flag = SESSION_HALT_FLAG.format(date=today)
-        os.makedirs(os.path.dirname(_halt_flag), exist_ok=True)
-        try:
-            with open(_halt_flag, "w", encoding="utf-8") as _fh:
-                json.dump({"tier": 3, "reason": cb_msg,
-                           "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()}, _fh)
-        except OSError:
-            pass
-
-        positions_with_pnl = []
-        for pos in positions:
-            sym = str(pos.get("symbol", "")).upper()
-            qty = float(pos.get("quantity", 0) or 0)
-            avg_cost = float(pos.get("average_buy_price", 0) or 0)
-            if not sym or qty <= 0 or avg_cost <= 0:
-                continue
-            quote = quotes.get(sym, {})
-            price = float(quote.get("last_trade_price") or quote.get("price") or avg_cost)
-            pnl_pct = (price - avg_cost) / avg_cost * 100.0 if avg_cost > 0 else 0.0
-            positions_with_pnl.append((pnl_pct, sym, qty, price, avg_cost))
-
-        for pnl_pct, sym, qty, price, avg_cost in positions_with_pnl:
-            _risk_log(f"EMERGENCY LIQUIDATION {sym}: selling {qty} sh @ ${price:.2f} ({pnl_pct:+.2f}%)")
-            if not dry_run:
-                try:
-                    # PDT deferral is OVERRIDDEN during Tier 3 emergency liquidation
-                    RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
-                    ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason="EMERGENCY_CIRCUIT_BREAKER_TIER_3")
-                    ObsidianTradingVault.log_trade_execution({
-                        "ticker": sym, "action": "SELL", "qty": qty, "price": price,
-                        "pnl_pct": pnl_pct, "reason": "EMERGENCY_CIRCUIT_BREAKER_TIER_3",
-                        "pdt_override": True
-                    })
-                except Exception as exc:
-                    _risk_log(f"EMERGENCY LIQUIDATION {sym} FAILED: {exc}")
-        return
-
-    # Tier 2 Stop Tightening Mode (Drawdown <= -6%)
-    if tier == 2:
-        _risk_log(f"⚠️ {cb_msg} -> Tightening active stop-loss to 4.0% / 1.0x ATR.")
-        stop_loss_pct = min(stop_loss_pct, 4.0)
-
-    now_et = MarketHours.now_et()
-    is_opening_bell = (datetime.time(9, 30) <= now_et.time() < datetime.time(9, 45))
-
-    # Clean up any orphaned position guard tracking files
-    try:
-        for f in os.listdir(RISK_MONITOR_FLAGS):
-            if f.startswith("pos_guard_") and f.endswith(".json"):
-                g_sym = f[len("pos_guard_"):-len(".json")]
-                if g_sym not in symbols:
-                    os.remove(os.path.join(RISK_MONITOR_FLAGS, f))
-    except Exception:
-        pass
-
-    for pos in positions:
-        sym = str(pos.get("symbol", "")).upper()
-        qty = float(pos.get("quantity", 0) or 0)
-        avg_cost = float(pos.get("average_buy_price", 0) or 0)
-        if not sym or qty <= 0 or avg_cost <= 0:
-            continue
-        quote = quotes.get(sym, {})
-        price = float(quote.get("last_trade_price") or quote.get("price") or avg_cost)
-        if price <= 0:
-            _risk_log(f"RISK {sym}: no live quote (price={price}); skipping")
-            continue
-        pnl_pct = (price - avg_cost) / avg_cost * 100.0
-
-        # Calculate dynamic volatility-adjusted risk thresholds
-        risk_params = ComplianceAndRiskGuard.get_ticker_risk_parameters(sym, price, default_stop_pct=stop_loss_pct)
-        effective_stop_pct = risk_params["stop_loss_pct"]
-        trailing_stop_pct = risk_params["trailing_stop_pct"]
-        tp1_pct = risk_params["take_profit_1_pct"]
-        tp2_pct = risk_params["take_profit_2_pct"]
-
-        stop_flag = os.path.join(RISK_MONITOR_FLAGS, f"stop_loss_{today}_{sym}.flag")
-        tp_flag = os.path.join(RISK_MONITOR_FLAGS, f"take_profit_{today}_{sym}.flag")
-
-        # Multi-Tier Profit Lock Ladder & Persistent High-Water Mark:
-        # Tracks peak P&L% across pulses so that gains are locked in and never surrendered
-        pos_guard_flag = os.path.join(RISK_MONITOR_FLAGS, f"pos_guard_{sym}.json")
-        guard_data = {}
-        if os.path.exists(pos_guard_flag):
-            try:
-                with open(pos_guard_flag, encoding="utf-8") as fh:
-                    guard_data = json.load(fh)
-            except (OSError, ValueError):
-                guard_data = {}
-
-        if abs(float(guard_data.get("entry_cost") or 0.0) - avg_cost) > 0.01:
-            guard_data = {"entry_cost": avg_cost, "peak_pnl_pct": pnl_pct}
-        else:
-            guard_data["peak_pnl_pct"] = max(float(guard_data.get("peak_pnl_pct", pnl_pct)), pnl_pct)
-
-        try:
-            with open(pos_guard_flag, "w", encoding="utf-8") as fh:
-                json.dump(guard_data, fh)
-        except OSError:
-            pass
-
-        peak_pnl = float(guard_data.get("peak_pnl_pct", pnl_pct))
-
-        # Ratchet Floor Tiers:
-        # Tier 2 (+6.0% Peak): Lock in +2.5% minimum profit floor
-        # Tier 1 (+4.0% Peak): Lock in +0.5% breakeven floor (covers slippage/fees)
-        ratchet_floor = None
-        exit_label = f"Stop-Loss (-{effective_stop_pct}%)"
-        exit_reason_code = "STOP_LOSS"
-        if peak_pnl >= 6.0:
-            ratchet_floor = 2.5
-            exit_label = f"Profit-Lock (+2.5% floor, peaked +{peak_pnl:.1f}%)"
-            exit_reason_code = "PROFIT_LOCK_LADDER"
-        elif peak_pnl >= 4.0:
-            ratchet_floor = 0.5
-            exit_label = f"Breakeven-Stop (+0.5% floor, peaked +{peak_pnl:.1f}%)"
-            exit_reason_code = "BREAKEVEN_PROTECTION"
-
-        # PDT Safety check: ONLY same-day positions trigger day-trade round-trips!
-        is_same_day = ComplianceAndRiskGuard.is_same_day_position(account_number, sym)
-        can_dt, pdt_reason = ComplianceAndRiskGuard.can_day_trade(account_number, total_equity)
-
-        # Opening Bell Noise Buffer: During 09:30-09:45 ET, pause stop-loss executions unless catastrophic (> -12%)
-        # Note: does not pause green profit-lock exits.
-        if is_opening_bell and ratchet_floor is None and pnl_pct > -12.0 and pnl_pct <= -effective_stop_pct:
-            _risk_log(f"RISK {sym}: Opening bell stabilization window (09:30-09:45 ET). Pausing stop-loss trigger ({pnl_pct:+.2f}%) to allow morning wicks to settle.")
-            continue
-
-        is_core_etf = sym in ("VTI", "QQQ", "SPY")
-        trigger_exit = False
-        if ratchet_floor is not None:
-            if pnl_pct <= ratchet_floor:
-                trigger_exit = True
-        else:
-            if pnl_pct <= -effective_stop_pct:
-                trigger_exit = True
-
-        # Core Ballast Protection: VTI, QQQ, SPY are long-term compounding bedrock, NOT speculative swing trades.
-        # They should never be stopped out on routine 4-5% market pullbacks.
-        # Only trigger exit if catastrophic bear breakdown (e.g. <= -15.0%).
-        if is_core_etf and ratchet_floor is None and pnl_pct > -15.0:
-            trigger_exit = False
-
-        if trigger_exit and not os.path.exists(stop_flag):
-            # If position was bought today and PDT limit is exhausted, defer exit to next open
-            if is_same_day and not can_dt:
-                _risk_log(f"PDT GUARD {sym}: Position bought today, 3/3 day trades used. "
-                          f"Deferring {exit_reason_code} exit to tomorrow 09:30 ET open (deferred_exit flag written).")
-                _deferred_flag = os.path.join(DEFERRED_EXIT_FLAG_DIR, f"deferred_exit_{today}_{sym}.flag")
-                os.makedirs(DEFERRED_EXIT_FLAG_DIR, exist_ok=True)
-                try:
-                    with open(_deferred_flag, "w", encoding="utf-8") as _fh:
-                        json.dump({
-                            "symbol": sym, "reason": f"PDT_{exit_reason_code}_DEFERRAL",
-                            "pnl_pct": round(pnl_pct, 2), "price": price,
-                            "avg_cost": avg_cost, "qty": qty,
-                            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                            "execute_at": "next_market_open_09:30_ET"
-                        }, _fh)
-                except OSError:
-                    pass
-                continue
-
-            action = f"{exit_reason_code} {sym} {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f}, trigger: {exit_label})"
-            _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
-            
-            val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, exit_label, {
-                "qty": qty, "account": account_number, "pdt_status": pdt_reason, "is_same_day": is_same_day
-            })
-            _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
-            
-            if val["verdict"] == "WAIT":
-                _risk_log(f"RISK {sym}: AI Agent advised WAIT. Holding position for confirmation.")
-                continue
-
-            if not dry_run:
+    _just_completed = False
+    if not state.get("done"):
+        # ---- sells first ----
+        if state.get("sells_pending"):
+            still: List[Dict[str, Any]] = []
+            executed_live = False
+            for s in state["sells_pending"]:
+                sym = s["symbol"]
+                if sym in hold:
+                    continue
+                qty = float(s["quantity"])
+                avg = float(pos_map.get(sym, {}).get("average_buy_price", 0) or 0)
+                price = float(pos_map.get(sym, {}).get("price", 0) or 0)
+                pnl_pct = ((price - avg) / avg * 100.0) if avg > 0 and price > 0 else 0.0
+                if sym not in pos_map:
+                    _risk_log(f"STRATEGY SELL {sym}: no longer held; dropping from plan.")
+                    continue
+                if dry_run:
+                    _risk_log(f"STRATEGY [DRY RUN] SELL {sym} {qty} sh @ ~${price:.2f} ({pnl_pct:+.1f}%) reason={s['reason']}")
+                    state["sells_done"].append(s)
+                    state["dry_run_proceeds"] = round(float(state.get("dry_run_proceeds", 0.0)) + qty * price, 2)
+                    continue
                 try:
                     res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
-                    _risk_log(f"RISK {sym}: order response={str(res)[:300]}")
-                    ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason=exit_reason_code)
-                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": exit_reason_code, "agent_verdict": val["verdict"]})
-                    with open(stop_flag, "w", encoding="utf-8") as fh:
-                        json.dump({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                    "price": price, "qty": qty, "pnl_pct": pnl_pct, "reason": exit_reason_code, "agent_verdict": val["verdict"]}, fh)
-                    if os.path.exists(pos_guard_flag):
-                        try:
-                            os.remove(pos_guard_flag)
-                        except OSError:
-                            pass
+                    _risk_log(f"STRATEGY SELL {sym} {qty} sh @ ~${price:.2f} ({pnl_pct:+.1f}%) reason={s['reason']} response={str(res)[:160]}")
+                    ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason=s["reason"])
+                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price,
+                                                              "pnl_pct": pnl_pct, "reason": s["reason"], "strategy": "MOMENTUM_SLEEVE"})
+                    state["sells_done"].append(s)
+                    executed_live = True
                 except Exception as exc:  # noqa: BLE001
-                    _risk_log(f"RISK {sym}: order FAILED: {exc}")
-        elif pnl_pct >= tp1_pct or os.path.exists(tp_flag):
-            tp_info = {}
-            if os.path.exists(tp_flag):
+                    _risk_log(f"STRATEGY SELL {sym} FAILED: {exc}")
+                    still.append(s)
+            state["sells_pending"] = still
+            _save_json(flag, state)
+            if executed_live:
+                _risk_log("STRATEGY: sells placed; buys resume on the next pulse once cash settles.")
+                return
+        # ---- then buys ----
+        if state.get("buys_pending"):
+            if not buys_allowed:
+                _risk_log(f"STRATEGY: buys deferred ({cb_msg})")
+                _save_json(flag, state)
+                return
+            deployable = cash - equity * MomentumStrategy.CASH_BUFFER_PCT
+            if dry_run:
+                deployable += float(state.get("dry_run_proceeds", 0.0))  # simulated sells never produced real cash
+            still = []
+            for b in state["buys_pending"]:
+                sym = b["symbol"]
+                amt = round(min(float(b["dollar_amount"]), deployable), 2)
+                if amt < MomentumStrategy.MIN_ORDER_DOLLARS:
+                    still.append(b)  # wait for cash
+                    continue
+                if dry_run:
+                    _risk_log(f"STRATEGY [DRY RUN] BUY {sym} ${amt:.2f} reason={b['reason']}")
+                    state["buys_done"].append({**b, "dollar_amount": amt})
+                    deployable -= amt
+                    continue
                 try:
-                    with open(tp_flag, encoding="utf-8") as fh:
-                        tp_info = json.load(fh)
-                except (OSError, ValueError):
-                    tp_info = {}
+                    res = RobinhoodExecutor.execute_market_order(account_number, sym, "buy", dollar_amount=str(amt))
+                    _risk_log(f"STRATEGY BUY {sym} ${amt:.2f} reason={b['reason']} response={str(res)[:160]}")
+                    ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY")
+                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": amt,
+                                                              "reason": b["reason"], "strategy": "MOMENTUM_SLEEVE"})
+                    state["buys_done"].append({**b, "dollar_amount": amt})
+                    deployable -= amt
+                except Exception as exc:  # noqa: BLE001
+                    _risk_log(f"STRATEGY BUY {sym} FAILED: {exc}")
+                    still.append(b)
+            state["buys_pending"] = still
+            if still:
+                _risk_log(f"STRATEGY: {len(still)} buy(s) waiting for cash (deployable ${deployable:.2f}).")
+        if not state.get("sells_pending") and not state.get("buys_pending"):
+            state["done"] = True
+            state["completed"] = today
+            _just_completed = True
+            _risk_log(f"STRATEGY REBALANCE {month}: complete.")
+        _save_json(flag, state)
+        if not state["done"] or _just_completed:
+            # Rebalance still in flight, or its orders were placed on this pulse (the cash snapshot from
+            # the top of the pulse is stale): the daily core top-up waits for the next pulse.
+            return
 
-            stage = tp_info.get("stage", "none")
+    # ---- daily core top-up (one per day) ----
+    if not buys_allowed:
+        _risk_log(f"STRATEGY: core top-up skipped ({cb_msg})")
+        return
+    core_flag = os.path.join(RISK_MONITOR_FLAGS, f"core_topup_{today}.flag")
+    if os.path.exists(core_flag):
+        return
+    topup = MomentumStrategy.plan_core_topup(equity, cash, pos_map)
+    if not topup:
+        return
+    sym, amt = topup["symbol"], topup["dollar_amount"]
+    if dry_run:
+        _risk_log(f"STRATEGY [DRY RUN] CORE TOP-UP BUY {sym} ${amt:.2f}")
+        _save_json(core_flag, {"ts": now.isoformat(), "dry_run": True, **topup})
+        return
+    try:
+        res = RobinhoodExecutor.execute_market_order(account_number, sym, "buy", dollar_amount=str(amt))
+        _risk_log(f"STRATEGY CORE TOP-UP BUY {sym} ${amt:.2f} response={str(res)[:160]}")
+        ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY")
+        ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": amt,
+                                                  "reason": "CORE_TOPUP", "strategy": "MOMENTUM_SLEEVE"})
+        _save_json(core_flag, {"ts": now.isoformat(), **topup})
+    except Exception as exc:  # noqa: BLE001
+        _risk_log(f"STRATEGY CORE TOP-UP {sym} FAILED: {exc}")
 
-            # Stage 1: Hit +8% -> Lock in 50% profits, start trailing runner
-            if stage == "none" and pnl_pct >= tp1_pct:
-                if is_same_day and not can_dt:
-                    _tp_stage_label = "PDT_TP1_DEFERRAL"
-                    _risk_log(f"PDT GUARD {sym}: Position bought today, 3/3 day trades used. "
-                              f"Deferring {_tp_stage_label} exit to tomorrow 09:30 ET open (runner held at {pnl_pct:+.1f}%).")
-                    _deferred_flag = os.path.join(DEFERRED_EXIT_FLAG_DIR, f"deferred_exit_{today}_{sym}.flag")
-                    os.makedirs(DEFERRED_EXIT_FLAG_DIR, exist_ok=True)
-                    try:
-                        with open(_deferred_flag, "w", encoding="utf-8") as _fh:
-                            json.dump({
-                                "symbol": sym, "reason": _tp_stage_label,
-                                "pnl_pct": round(pnl_pct, 2), "price": price,
-                                "avg_cost": avg_cost, "qty": qty,
-                                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                "execute_at": "next_market_open_09:30_ET"
-                            }, _fh)
-                    except OSError:
-                        pass
-                    continue
 
-                sell_qty = round(qty / 2.0, 4)  # market orders allow fractional shares
-                action = f"TAKE-PROFIT (Stage 1 - 50%) {sym} {sell_qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${avg_cost:.2f})"
-                _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
-                
-                val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, f"Take-Profit 50% (+{tp1_pct}%)", {
-                    "qty": sell_qty, "account": account_number, "pdt_status": pdt_reason, "is_same_day": is_same_day
-                })
-                _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
-                
-                if val["verdict"] == "WAIT":
-                    _risk_log(f"RISK {sym}: AI Agent advised WAIT. Holding position.")
-                    continue
+def _risk_monitor_pulse(account_number: str, dry_run: bool,
+                        stop_loss_pct: Optional[float] = None, take_profit_pct: Optional[float] = None) -> None:
+    """Every-pulse safety pass: circuit breaker (halt only, never liquidates) and the -20%
+    disaster stop on sleeve names. Core ETFs and hold-listed symbols are never sold.
+    `stop_loss_pct` / `take_profit_pct` are accepted for backwards compatibility and ignored."""
+    now = MarketHours.now_et()
+    today = now.strftime("%Y-%m-%d")
+    snap = _account_snapshot(account_number)
+    equity, positions, quotes, pos_map = snap["equity"], snap["positions"], snap["quotes"], snap["pos_map"]
+    os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
 
-                if not dry_run:
-                    try:
-                        res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(sell_qty))
-                        _risk_log(f"RISK {sym}: Stage 1 order response={str(res)[:300]}")
-                        ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=sell_qty, pnl_pct=pnl_pct, reason="TAKE_PROFIT_HALF")
-                        ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": sell_qty, "price": price, "pnl_pct": pnl_pct, "reason": "TAKE_PROFIT_HALF", "agent_verdict": val["verdict"]})
-                        with open(tp_flag, "w", encoding="utf-8") as fh:
-                            json.dump({
-                                "stage": "runner",
-                                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                "price_stage1": price,
-                                "high_water_mark": price,
-                                "entry_price": avg_cost,
-                                "qty_sold_half": sell_qty,
-                                "remaining_qty": qty - sell_qty,
-                                "trailing_stop_pct": trailing_stop_pct,
-                                "target_2_pct": tp2_pct
-                            }, fh)
-                    except Exception as exc:  # noqa: BLE001
-                        _risk_log(f"RISK {sym}: order FAILED: {exc}")
+    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, equity)
+    if tier >= 3:
+        halt_flag = SESSION_HALT_FLAG.format(date=today)
+        if not os.path.exists(halt_flag):
+            _save_json(halt_flag, {"tier": tier, "reason": cb_msg, "ts": now.isoformat()})
+            _risk_log(f"🚨 {cb_msg} -> session halt flag written. Positions are HELD (no forced liquidation).")
 
-            # Stage 2: Manage Runner with True Dynamic Trailing Stop & Target 2
-            elif stage in ("runner", "half"):
-                hwm = max(float(tp_info.get("high_water_mark") or price), price)
-                # Persist updated high water mark if price printed higher
-                if price > float(tp_info.get("high_water_mark", 0.0)):
-                    tp_info["high_water_mark"] = price
-                    try:
-                        with open(tp_flag, "w", encoding="utf-8") as fh:
-                            json.dump(tp_info, fh)
-                    except OSError:
-                        pass
+    hold = MomentumStrategy.load_hold_list()
+    hits = MomentumStrategy.disaster_stop_hits(positions, quotes, hold)
+    _, pdt_reason = ComplianceAndRiskGuard.can_day_trade(account_number, equity)
+    for h in hits:
+        sym, qty, price, pnl_pct = h["symbol"], h["quantity"], h["price"], h["pnl_pct"]
+        stop_flag = os.path.join(RISK_MONITOR_FLAGS, f"stop_loss_{today}_{sym}.flag")
+        if os.path.exists(stop_flag):
+            continue
+        is_same_day = ComplianceAndRiskGuard.is_same_day_position(account_number, sym)
+        can_dt, _ = ComplianceAndRiskGuard.can_day_trade(account_number, equity)
+        if is_same_day and not can_dt:
+            _risk_log(f"PDT GUARD {sym}: bought today and day-trade budget exhausted; disaster stop deferred to next session.")
+            continue
+        _risk_log(f"RISK {sym}: DISASTER_STOP {qty} sh @ ${price:.2f} ({pnl_pct:+.1f}% vs avg ${h['avg_cost']:.2f}, limit -{MomentumStrategy.DISASTER_STOP_PCT:.0f}%)")
+        if dry_run:
+            _risk_log(f"RISK [DRY RUN] {sym}: would sell {qty} sh.")
+            continue
+        try:
+            res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+            _risk_log(f"RISK {sym}: order response={str(res)[:200]}")
+            ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason="DISASTER_STOP")
+            ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price,
+                                                      "pnl_pct": pnl_pct, "reason": "DISASTER_STOP", "strategy": "MOMENTUM_SLEEVE"})
+            _save_json(stop_flag, {"ts": now.isoformat(), "price": price, "qty": qty, "pnl_pct": pnl_pct, "reason": "DISASTER_STOP"})
+        except Exception as exc:  # noqa: BLE001
+            _risk_log(f"RISK {sym}: order FAILED: {exc}")
 
-                drop_from_peak = ((hwm - price) / hwm * 100.0) if hwm > 0 else 0.0
-                effective_trail = float(tp_info.get("trailing_stop_pct") or trailing_stop_pct)
-                target_2 = float(tp_info.get("target_2_pct") or tp2_pct)
-
-                exit_runner = False
-                exit_reason = ""
-                if pnl_pct >= target_2:
-                    exit_runner = True
-                    exit_reason = f"TAKE_PROFIT_FULL (Target 2 +{pnl_pct:.1f}% >= +{target_2}%)"
-                elif drop_from_peak >= effective_trail:
-                    exit_runner = True
-                    exit_reason = f"TRAILING_STOP_EXIT (Dropped {drop_from_peak:.1f}% >= {effective_trail:.1f}% from high ${hwm:.2f})"
-                elif pnl_pct <= 1.0:
-                    exit_runner = True
-                    exit_reason = f"RUNNER_BREAKEVEN_PROTECTION (P&L {pnl_pct:+.1f}% dropped near entry)"
-
-                if exit_runner:
-                    if is_same_day and not can_dt:
-                        _risk_log(f"PDT GUARD {sym}: Position bought today, 3/3 day trades used. Deferring runner exit.")
-                        continue
-
-                    action = f"RUNNER EXIT {sym} {qty} sh @ ${price:.2f} ({exit_reason})"
-                    _risk_log(f"RISK {sym}: {action} -> Consulting AI Agent Validator...")
-                    val = AgentAdvisor.validate_trade_decision(sym, "sell", price, avg_cost, pnl_pct, exit_reason, {
-                        "qty": qty, "account": account_number, "pdt_status": pdt_reason, "is_same_day": is_same_day
-                    })
-                    _risk_log(f"AI AGENT VALIDATION {sym}: Verdict={val['verdict']} | Rationale: {val['agent_response'][:180]}")
-                    if val["verdict"] == "WAIT":
-                        _risk_log(f"RISK {sym}: AI Agent advised WAIT on runner exit. Holding runner.")
-                        continue
-
-                    if not dry_run:
-                        try:
-                            res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
-                            _risk_log(f"RISK {sym}: Runner order response={str(res)[:300]}")
-                            ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason=exit_reason)
-                            ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price, "pnl_pct": pnl_pct, "reason": exit_reason, "agent_verdict": val["verdict"]})
-                            with open(tp_flag, "w", encoding="utf-8") as fh:
-                                json.dump({"stage": "completed",
-                                            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                            "price": price, "qty_sold": qty, "reason": exit_reason}, fh)
-                            if os.path.exists(pos_guard_flag):
-                                try:
-                                    os.remove(pos_guard_flag)
-                                except OSError:
-                                    pass
-                        except Exception as exc:  # noqa: BLE001
-                            _risk_log(f"RISK {sym}: runner exit FAILED: {exc}")
-                else:
-                    _risk_log(f"RISK {sym}: Holding runner (P&L: {pnl_pct:+.2f}%, High: ${hwm:.2f}, Pullback: {drop_from_peak:.1f}% / Trail: {effective_trail:.1f}%)")
-        else:
-            _risk_log(f"RISK {sym}: {pnl_pct:+.2f}% vs avg ${avg_cost:.2f} (price ${price:.2f}, dynamic stop: -{effective_stop_pct:.1f}%) - no action")
+    summary = ", ".join(
+        f"{sym} {((v['price'] - v['average_buy_price']) / v['average_buy_price'] * 100.0):+.1f}%"
+        for sym, v in sorted(pos_map.items()) if v["average_buy_price"] > 0
+    ) or "no positions"
+    _risk_log(f"RISK pulse: equity ${equity:,.2f} | {summary} | {cb_msg} | {pdt_reason}")
 
 
 def run_risk_monitor(interval_seconds: int = 900, dry_run: bool = False,
@@ -4003,6 +3984,157 @@ def run_risk_monitor(interval_seconds: int = 900, dry_run: bool = False,
 
 
 # ==============================================================================
+# 7.7. Backtest (same MomentumStrategy functions the live loop trades with)
+# ==============================================================================
+
+def run_backtest(years: int = 5, start: Optional[str] = None, start_cash: float = 600.0,
+                 top_n: Optional[int] = None, sleeve: bool = True, universe: Optional[List[str]] = None,
+                 slippage_pct: float = 0.05, verbose: bool = True, core_target: Optional[float] = None,
+                 bars_override: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
+    """Daily-bar simulation of the core + monthly momentum sleeve book.
+
+    Rebalance on the first trading day of each month at the close (signal and fill on the same
+    close, i.e. slightly optimistic by one day); disaster stop checked against daily lows; core
+    topped up daily. Reports total return, CAGR, max drawdown and buy-and-hold benchmarks.
+    `sleeve=False` runs the core-only variant for comparison (core target defaults to 90% there,
+    i.e. the sleeve's 30% goes to core instead of sitting in cash).
+    """
+    if core_target is None:
+        core_target = MomentumStrategy.CORE_TARGET_PCT if sleeve else MomentumStrategy.CORE_TARGET_PCT + MomentumStrategy.SLEEVE_TARGET_PCT
+    syms = list(universe or MomentumStrategy.universe())
+    core = list(MomentumStrategy.CORE_SYMBOLS)
+    if bars_override is not None:
+        bars = {s: b for s, b in bars_override.items() if len(b) >= 2}
+    else:
+        bars = {}
+        for s in syms + core + ["SPY"]:
+            b = FinancialData.fetch_historical_yahoo(s, range_period=f"{years}y")
+            if len(b) >= 260:
+                bars[s] = b
+            elif verbose:
+                print(f"  (skipping {s}: {len(b)} bars)")
+    if "SPY" not in bars or not all(c in bars for c in core):
+        raise RuntimeError("backtest needs SPY and core ETF history")
+    syms = [s for s in syms if s in bars]
+    idx = {s: {b["datetime"]: i for i, b in enumerate(bars[s])} for s in bars}
+    dates = [b["datetime"] for b in bars["SPY"]]
+    warm = min(MomentumStrategy.REGIME_SMA_BARS + 10, max(0, len(dates) - 2))
+    dates = dates[warm:]
+    if start:
+        dates = [d for d in dates if d >= start]
+    if len(dates) < 2:
+        raise RuntimeError("not enough history for the requested window")
+
+    slip = slippage_pct / 100.0
+    cash = float(start_cash)
+    pos: Dict[str, Dict[str, float]] = {}
+    trades: List[Dict[str, Any]] = []
+    curve: List[Tuple[str, float]] = []
+    last_month = None
+
+    def _px(s: str, d: str, key: str = "close") -> Optional[float]:
+        i = idx[s].get(d)
+        return float(bars[s][i][key]) if i is not None else None
+
+    def _buy(s: str, amt: float, price: float, d: str, reason: str) -> None:
+        nonlocal cash
+        fill = price * (1 + slip)
+        qty = amt / fill
+        cash -= amt
+        p = pos.get(s)
+        if p:
+            tot = p["qty"] + qty
+            p["entry"] = (p["entry"] * p["qty"] + fill * qty) / tot
+            p["qty"] = tot
+        else:
+            pos[s] = {"qty": qty, "entry": fill}
+        trades.append({"date": d, "symbol": s, "side": "BUY", "amount": round(amt, 2), "reason": reason})
+
+    def _sell(s: str, price: float, d: str, reason: str) -> None:
+        nonlocal cash
+        p = pos.pop(s)
+        fill = price * (1 - slip)
+        cash += p["qty"] * fill
+        trades.append({"date": d, "symbol": s, "side": "SELL", "pnl_pct": round((fill - p["entry"]) / p["entry"] * 100, 2),
+                       "pnl": round(p["qty"] * (fill - p["entry"]), 2), "reason": reason})
+
+    for d in dates:
+        prices = {s: _px(s, d) for s in bars}
+        prices = {s: p for s, p in prices.items() if p}
+        # disaster stop on the day's low (sleeve only)
+        for s in list(pos):
+            if s in core or d not in idx[s]:
+                continue
+            stop = pos[s]["entry"] * (1 - MomentumStrategy.DISASTER_STOP_PCT / 100.0)
+            if _px(s, d, "low") <= stop:
+                _sell(s, min(_px(s, d, "open"), stop), d, "DISASTER_STOP")
+        eq = cash + sum(p["qty"] * prices.get(s, p["entry"]) for s, p in pos.items())
+        month = d[:7]
+        if month != last_month:
+            last_month = month
+            as_of = {s: idx[s][d] for s in syms if d in idx[s]}
+            regime = MomentumStrategy.regime(bars["SPY"], as_of=idx["SPY"][d])
+            ranked = MomentumStrategy.rank({s: bars[s] for s in as_of}, as_of=as_of)
+            targets = MomentumStrategy.select_sleeve(ranked, regime["regime"], top_n) if sleeve else []
+            pos_map = {s: {"quantity": p["qty"], "price": prices.get(s, p["entry"])} for s, p in pos.items()}
+            plan = MomentumStrategy.plan_rebalance(eq, cash, pos_map, targets)
+            for sl in plan["sells"]:
+                if sl["symbol"] in prices:
+                    _sell(sl["symbol"], prices[sl["symbol"]], d, sl["reason"])
+            for b in plan["buys"]:
+                if b["symbol"] in prices:
+                    _buy(b["symbol"], b["dollar_amount"], prices[b["symbol"]], d, b["reason"])
+        pos_map = {s: {"quantity": p["qty"], "price": prices.get(s, p["entry"])} for s, p in pos.items()}
+        topup = MomentumStrategy.plan_core_topup(eq, cash, pos_map, core_target=core_target)
+        if topup and topup["symbol"] in prices:
+            _buy(topup["symbol"], topup["dollar_amount"], prices[topup["symbol"]], d, "CORE_TOPUP")
+        eq = cash + sum(p["qty"] * prices.get(s, p["entry"]) for s, p in pos.items())
+        curve.append((d, eq))
+
+    start_eq, end_eq = curve[0][1], curve[-1][1]
+    peak, max_dd = start_eq, 0.0
+    for _, e in curve:
+        peak = max(peak, e)
+        max_dd = min(max_dd, (e - peak) / peak * 100.0)
+    years_span = max(len(curve) / 252.0, 1e-9)
+    cagr = ((end_eq / start_eq) ** (1.0 / years_span) - 1.0) * 100.0 if start_eq > 0 else 0.0
+    by_year: Dict[str, float] = {}
+    first_of_year: Dict[str, float] = {}
+    for d, e in curve:
+        y = d[:4]
+        first_of_year.setdefault(y, e)
+        by_year[y] = (e / first_of_year[y] - 1.0) * 100.0
+    bench = {}
+    for s in core + ["SPY"]:
+        p0, p1 = _px(s, dates[0]), _px(s, dates[-1])
+        if p0 and p1:
+            bench[s] = round((p1 / p0 - 1.0) * 100.0, 1)
+    sleeve_trades = [t for t in trades if t["side"] == "SELL"]
+    wins = [t for t in sleeve_trades if t["pnl"] > 0]
+    result = {
+        "period": [dates[0], dates[-1]], "days": len(curve), "start": round(start_eq, 2), "end": round(end_eq, 2),
+        "total_return_pct": round((end_eq / start_eq - 1.0) * 100.0, 1), "cagr_pct": round(cagr, 1),
+        "max_drawdown_pct": round(max_dd, 1), "by_year_pct": {y: round(v, 1) for y, v in by_year.items()},
+        "benchmarks_buy_hold_pct": bench, "sleeve_round_trips": len(sleeve_trades),
+        "sleeve_win_rate_pct": round(len(wins) / len(sleeve_trades) * 100.0, 0) if sleeve_trades else None,
+        "sleeve_pnl": round(sum(t["pnl"] for t in sleeve_trades), 2), "trades": trades, "curve": curve,
+        "final_positions": {s: round(p["qty"] * prices.get(s, p["entry"]), 2) for s, p in pos.items()}, "final_cash": round(cash, 2),
+    }
+    if verbose:
+        label = f"core {int(core_target*100)}% + sleeve {int(MomentumStrategy.SLEEVE_TARGET_PCT*100)}% top-{top_n or MomentumStrategy.SLEEVE_TOP_N}" if sleeve else f"core only {int(core_target*100)}%"
+        print(f"\n=== BACKTEST [{label}] {dates[0]} .. {dates[-1]} ({len(curve)} trading days, ${start_cash:,.0f} start) ===")
+        print(f"  end ${end_eq:,.0f}  total {result['total_return_pct']:+.1f}%  CAGR {cagr:+.1f}%  max drawdown {max_dd:.1f}%")
+        print("  by year: " + "  ".join(f"{y} {v:+.1f}%" for y, v in result["by_year_pct"].items()))
+        print("  buy & hold: " + "  ".join(f"{s} {v:+.1f}%" for s, v in bench.items()))
+        if sleeve:
+            print(f"  sleeve round trips {len(sleeve_trades)}  win rate {result['sleeve_win_rate_pct']}%  sleeve P&L ${result['sleeve_pnl']:+,.0f}")
+            from collections import Counter
+            print("  exit reasons: " + ", ".join(f"{k} {v}" for k, v in Counter(t['reason'] for t in sleeve_trades).items()))
+        print(f"  final: cash ${cash:,.0f} " + " ".join(f"{s} ${v:,.0f}" for s, v in result["final_positions"].items()))
+    return result
+
+
+# ==============================================================================
 # 8. Command Line Interface (CLI) Dispatch
 # ==============================================================================
 
@@ -4031,8 +4163,10 @@ Commands:
   scan [TICKERS...]          Scan watchlist for highest conviction buy/sell opportunities.
   news <TICKER/QUERY>        Fetch latest financial news headlines and calculate sentiment score.
   rebalance                  Analyze portfolio allocation and generate optimal profit trades.
-  monitor [--auto-trade]     Autonomous trading loop running during US market hours.
-  risk-monitor [--live]      Deterministic risk manager (enforces stop-loss & take-profit rules).
+  monitor [--auto-trade]     Autonomous loop: 60% VTI/QQQ core, 30% monthly top-3 momentum sleeve, 10% cash.
+  risk-monitor [--live]      Deterministic safety pass (circuit breaker + -20% disaster stop).
+  backtest [--years N]       Simulate the core + monthly momentum sleeve rules on Yahoo daily bars
+                             (--start YYYY-MM-DD, --top N, --cash X, --no-core-only).
   service <start|stop|...>   Manage background systemd service.
   auth                       Verify stored credentials status (cached and active).
 
@@ -4589,6 +4723,26 @@ def main():
         else:
             print(f"  ✓ Portfolio is well-balanced. Surplus deployable cash is ${surplus_cash:.2f} (< $10 threshold). No action required.")
         print("=" * 80)
+
+    elif cmd == "backtest":
+        years = 5
+        start = None
+        top_n = None
+        for i, a in enumerate(sys.argv):
+            if a == "--years" and i + 1 < len(sys.argv):
+                years = int(sys.argv[i + 1])
+            elif a == "--start" and i + 1 < len(sys.argv):
+                start = sys.argv[i + 1]
+            elif a == "--top" and i + 1 < len(sys.argv):
+                top_n = int(sys.argv[i + 1])
+        cash = 600.0
+        for i, a in enumerate(sys.argv):
+            if a == "--cash" and i + 1 < len(sys.argv):
+                cash = float(sys.argv[i + 1])
+        print(f"Fetching {years}y of daily bars from Yahoo for {len(MomentumStrategy.universe())} names + core + SPY...")
+        run_backtest(years=years, start=start, start_cash=cash, top_n=top_n, sleeve=True)
+        if "--no-core-only" not in sys.argv:
+            run_backtest(years=years, start=start, start_cash=cash, sleeve=False)
 
     elif cmd == "monitor":
         interval = 60

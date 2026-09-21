@@ -32,7 +32,7 @@ The US Stock Market (NYSE / NASDAQ) operates on **US Eastern Time (ET)**. For us
 | :--- | :---: | :---: | :--- |
 | **Pre-Market Briefing** | **07:20 AM MT** | 09:20 AM ET | Scans watchlist, checks macro sentiment, generates staged trade setups & creates Obsidian daily note |
 | **Market Open** | **07:30 AM MT** | 09:30 AM ET | Opening bell; reviews staged orders and opens live session pulse |
-| **Regular Trading Hours (RTH)** | **07:30 AM – 02:00 PM MT** | 09:30 AM – 04:00 PM ET | Active market monitoring (every 60s); monitors stop-losses, take-profits, and breakout opportunities |
+| **Regular Trading Hours (RTH)** | **07:30 AM – 02:00 PM MT** | 09:30 AM – 04:00 PM ET | Safety pulse every 60s (circuit breaker, -20% disaster stop); from 10:00 ET daily core top-up and, on the first trading day of the month, the momentum-sleeve rebalance |
 | **Market Close Summary** | **02:00 PM – 02:15 PM MT** | 04:00 PM – 04:15 PM ET | Compiles daily closing summary, updates Obsidian daily note, and logs to `trading_journal.json` |
 | **Off-Hours / Power Save** | **02:15 PM – 07:20 AM MT** (Nights/Weekends/Holidays) | 04:15 PM – 09:20 AM ET | Sleeps until the next trading day's pre-market briefing |
 
@@ -121,8 +121,9 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 | `status` | Checks US market open/closed status, session, Eastern & Mountain times | `./robinhood_trader.py status` |
 | `scan [watchlist]` | Scans ticker universe and ranks highest-conviction opportunities | `./robinhood_trader.py scan` |
 | `news <ticker/query>` | Searches latest financial news and computes sentiment score (-1.0 to +1.0) | `./robinhood_trader.py news TSLA` |
-| `monitor [--auto-trade]` | Autonomous market hours daemon (9:30 AM - 4:00 PM ET / 7:30 AM - 2:00 PM MT) | `./robinhood_trader.py monitor --interval 60` |
-| `risk-monitor [--live]` | Deterministic risk monitor enforcing stop-losses and take-profit targets | `./robinhood_trader.py risk-monitor` |
+| `monitor [--auto-trade]` | Autonomous daemon: 60% VTI/QQQ core, 30% monthly top-3 momentum sleeve, 10% cash | `./robinhood_trader.py monitor --interval 60` |
+| `risk-monitor [--live]` | Deterministic safety pass: circuit breaker + -20% disaster stop | `./robinhood_trader.py risk-monitor --once --force` |
+| `backtest [--years N]` | Simulate the live strategy rules on Yahoo daily bars (vs buy-and-hold, core-only) | `./robinhood_trader.py backtest --years 5` |
 | `service <cmd>` | Manage background systemd service (`status`, `logs`, `start`, `stop`, `restart`) | `./robinhood_trader.py service status` |
 
 ---
@@ -132,30 +133,20 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 > [!CAUTION]
 > Trading involves real financial risk. Adhere strictly to the following rules:
 
-1. **Local LLM Investment Committee & Strict BUY Gating**:
-   - Every buy setup is evaluated directly by the local LLM (`AgentAdvisor`) for risk/reward ratio (>= 2.0x required), anti-chasing filters, and cash reserves.
-   - For any BUY signal to execute, the LLM must explicitly return `verdict: EXECUTE`, `action: BUY`, and `confidence >= 0.65`.
-   - Any ambiguity, low confidence (< 0.65), `PASS`, or timeout strictly defaults to `WAIT` (no-buy safety gate).
-2. **Core-Satellite Wealth Compounding Engine**:
-   - Bedrock Core ETFs (`VTI`, `QQQ` target 55-65% allocation) are dollar-cost-averaged on pullbacks to build sustainable compounding equity.
-   - Core Ballast Immunity: Core broad-market ETFs (`VTI`, `QQQ`) are protected from routine -4% to -5% stops; they hold through normal pullbacks and only exit on catastrophic bear breaks (<= -15.0%).
-   - Speculative Satellites: Restricted to max 3 active single-stock positions and max 1 new satellite entry per calendar day to eliminate rapid-fire churn.
-3. **Multi-Tier Intraday Circuit Breakers**:
-   - **Tier 1 ($\le -3.0\%$ Drawdown from Open):** Halts all automated buy orders for the rest of the day.
-   - **Tier 2 ($\le -6.0\%$ Drawdown from Open):** Tightens active stop-losses to $\min(4.0\%, 1.0\times\text{ATR})$.
-   - **Tier 3 ($\le -10.0\%$ Drawdown from Open):** Triggers Emergency Capital Liquidation (cancels open orders, exits positions in loss-ranked order overriding PDT deferral, disables auto-trade).
-4. **FINRA PDT Rule 4210 Compliance & Anti-Churn Cooldown**:
-   - Small sandbox accounts ($<\$25,000$) are limited to 3 day trades in rolling 5 business days (`pdt_tracker.json`).
-   - If day trades used reaches $3/3$, same-day round-trip buys/sells are blocked; stop-losses on same-day buys defer to the next 09:30 ET market open (`deferred_exit.flag`).
-   - Strict 14-day cooldown on any ticker stopped out at a loss; same-day re-entry after selling is 100% blocked.
-5. **Dynamic Volatility Trailing Stop & Take-Profit**:
-   - Single-Stock Stop-loss: $\max(6.0\%, 2.0\times\text{ATR}_{\text{pct}})$.
-   - Stage 1 Take-Profit: Exit 50% shares at $+8.0\%$.
-   - Stage 2 Runner: Trail remaining 50% shares with dynamic trailing stop $\max(4.5\%, 1.5\times\text{ATR}_{\text{pct}})$ up to $+15.0\%+$.
-6. **Portfolio Diversification, Sizing & Cash Buffer**:
-   - Dynamic Growth-Scaled Position Sizing: $\text{Size} = \text{round}\big(\min(\text{Cash}, \max(\$15.00, 0.08\times\text{Equity}), 0.15\times\text{Equity}), 2\big)$.
-   - Max single-stock allocation: 15% of total portfolio value.
-   - Maintain at least 15% cash reserve buffer for market pullbacks.
+1. **Strategy = Core + Monthly Momentum Sleeve (`MomentumStrategy`)** — deterministic, no LLM in the order path:
+   - Core 60% (`VTI`, `QQQ`): topped up daily from cash above the buffer; never sold by the bot.
+   - Sleeve 30%: top 3 by 6-month return among names with close > SMA200, avg 20d volume >= 500k, price >= $5; equal weight; rebalanced once a month (first trading day the daemon sees). Sells first, buys on the following pulse.
+   - Regime gate: `SPY` below SMA200 on rebalance day -> sleeve to cash.
+   - Cash buffer 10%: never breached by buys.
+   - Orders only after 10:00 ET (never the opening auction). Symbols in `~/.config/ai/trading_hold.txt` are never sold.
+2. **Exits**: the only automated sells are monthly rotation, regime exit, and a -20% disaster stop from average cost (checked every pulse). No partial take-profits, profit-lock floors or trailing stops — the 5-year backtest showed they clipped winners and netted ~$0 over 250 trades.
+3. **Intraday Circuit Breaker** (vs first equity reading of the day, must be observed on two consecutive pulses; single readings > 30% off baseline are ignored as data glitches):
+   - Tier 1 (<= -3.0%) / Tier 2 (<= -6.0%): new buys halted for the day.
+   - Tier 3 (<= -10.0%): all bot orders halted for the day (`tier3_halt_<date>.flag`). Positions are held, never force-liquidated.
+4. **FINRA PDT Rule 4210 Compliance**:
+   - Small accounts ($<\$25,000$) are limited to 3 day trades in rolling 5 business days (`pdt_tracker.json`); a disaster stop on a same-day buy is deferred when the budget is exhausted.
+5. **Evidence before rule changes**: `./robinhood_trader.py backtest --years 5` runs the same `MomentumStrategy` functions the live loop uses. Change the rules only if the backtest (and its core-only comparison) supports it.
+6. **Tests never touch live state**: `tests/conftest.py` redirects every trader state path to a temp dir. Never remove that fixture.
 7. **Account Permission Boundary**:
    - Automated orders MUST target `517198354` (`agentic_allowed: true`).
    - Non-agentic accounts (`837546068`, `422982744`) are protected against automated mutation.

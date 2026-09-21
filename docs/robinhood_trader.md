@@ -32,11 +32,15 @@ A production-grade, autonomous financial analysis, risk management, and trading 
 ```
 
 ### Core Design Principles
-1. **Intelligent Local LLM Investment Committee (`AgentAdvisor`)**: During active trading hours, the system connects directly to the local inference server (`http://localhost:8080/v1/chat/completions`) for sub-second trade validation and risk gating:
-   - **Strict BUY Safety Gating**: Evaluates risk/reward ratio (>= 2.0x required), anti-chasing filters, and cash reserve buffers. Strictly requires LLM confidence >= 0.65 to approve any BUY; defaults to `WAIT` on ambiguity or low confidence.
-   - **Core-Satellite Wealth Compounding Engine**: Prioritizes 55-65% long-term compounding bedrock (VTI, QQQ) with pullback dollar-cost averaging. Restricts speculative satellites to max 3 positions and max 1 entry per day.
-   - **Core Ballast Immunity**: Protects core index ETFs (VTI, QQQ) from being stopped out on routine 4-5% market corrections.
-   - **Pre-Market Validation & Close Retrospectives**: Generates deep macro assessments and daily closing lessons into Obsidian trading notes.
+1. **Core + Monthly Momentum Sleeve (`MomentumStrategy`)** — the only rules the live loop trades (spec: `docs/superpowers/specs/2026-09-20-momentum-sleeve-trader-design.md`):
+   - **Core 60%**: `VTI` + `QQQ`, topped up once a day whenever cash exceeds the buffer. Never sold by the bot.
+   - **Sleeve 30%**: top 3 names from the curated universe by 6-month (126-bar) total return, eligible only when close > SMA200, average 20-day volume >= 500k and price >= $5. Equal weight, rebalanced on the first trading day the daemon sees each month (flag `rebalance_YYYY-MM.json`). Sells go first; buys follow on the next pulse once cash has settled.
+   - **Regime gate**: if `SPY` closes below its SMA200 on rebalance day, the sleeve goes to cash.
+   - **Cash 10%**: buffer that buys never breach.
+   - **Disaster stop**: any sleeve position at or below -20% from average cost is sold on the next pulse. There are no partial take-profits, profit-lock floors or trailing stops (the 5-year backtest showed those clipped winners and netted ~$0 on 250 trades).
+   - **Hold list**: symbols in `~/.config/ai/trading_hold.txt` (one per line) are never sold by the bot.
+   - **No LLM in the order path.** `AgentAdvisor` only writes the pre-market and close notes.
+   - Evidence: `./robinhood_trader.py backtest --years 5` runs the same functions the live loop uses on Yahoo daily bars and prints returns, CAGR, max drawdown and buy-and-hold benchmarks (plus a core-only comparison).
 2. **Zero-LLM Quiet Hours**: Outside market hours (nights, weekends, holidays), the daemon strictly sleeps in power-saving mode without invoking the AI model or using GPU VRAM.
 3. **Context-Optimized Token Offloading**: Full portfolio datasets (60+ positions, balances, cost bases) are offloaded to disk (`~/.cache/ai/trading/`). CLI commands like `./robinhood_trader.py summary` output compact digests (<200 tokens) so LLMs maintain situational awareness without context overflow.
 4. **Multi-Factor Quantitative Scoring**: Tickers are evaluated on a 0–100 scale combining trend (SMA 20/50/200), momentum (RSI-14), MACD histogram, and real-time news sentiment.
@@ -67,7 +71,7 @@ US Equities (NYSE / NASDAQ) trade on **US Eastern Time (ET)**. For operators in 
 | :--- | :---: | :---: | :--- |
 | **🌅 Pre-Market Briefing** | **07:20 AM MT** | 09:20 AM ET | Scans watchlist, analyzes overnight news sentiment, calculates staged setups, updates Obsidian daily note & ticker theses. |
 | **🔔 Market Open Bell** | **07:30 AM MT** | 09:30 AM ET | Verifies opening quotes and begins the 60-second active session pulse. |
-| **⚡ Regular Trading Hours** | **07:30 AM – 02:00 PM MT** | 09:30 AM – 04:00 PM ET | Active market monitoring pulse (every 60s); monitors stop-losses (-5%), take-profits (+8%), and breakout candidates. |
+| **⚡ Regular Trading Hours** | **07:30 AM – 02:00 PM MT** | 09:30 AM – 04:00 PM ET | Safety pulse every 60s (circuit breaker, -20% disaster stop). From 10:00 ET: daily core top-up; on the first trading day of the month, the sleeve rebalance. |
 | **🔕 Market Close Summary** | **02:00 PM – 02:15 PM MT** | 04:00 PM – 04:15 PM ET | Compiles daily closing summary, writes to `trading_journal.json`, and updates Obsidian daily note. |
 | **🌙 Off-Hours Power Save** | **02:15 PM – 07:20 AM MT** (Nights/Weekends/Holidays) | 04:15 PM – 09:20 AM ET | Sleeps until 07:20 AM MT of the next trading day. |
 
@@ -134,8 +138,9 @@ All commands are accessible directly via [`./robinhood_trader.py`](file:///home/
 | `scan` | `[tickers...]` | Scans watchlist and ranks highest-conviction buy/sell opportunities | `./robinhood_trader.py scan` |
 | `news` | `<ticker/query>` | Searches latest financial news and calculates sentiment score (-1.0 to +1.0) | `./robinhood_trader.py news TSLA` |
 | `discover` | — | Searches market for high-momentum breakout candidates | `./robinhood_trader.py discover` |
-| `risk-monitor` | `[--live] [--once]`| Runs deterministic risk monitor enforcing stop-loss and take-profit rules | `./robinhood_trader.py risk-monitor --live` |
-| `monitor` | `[--auto-trade] [--live]`| Starts the autonomous lifecycle loop in foreground | `./robinhood_trader.py monitor --interval 60 --auto-trade --live` |
+| `risk-monitor` | `[--live] [--once] [--force]`| Deterministic safety pass: circuit breaker + -20% disaster stop (no LLM) | `./robinhood_trader.py risk-monitor --once --force` |
+| `backtest` | `[--years N] [--start D] [--top N] [--cash X]` | Simulates the live strategy rules on Yahoo daily bars vs buy-and-hold and core-only | `./robinhood_trader.py backtest --years 5` |
+| `monitor` | `[--auto-trade] [--live]`| Autonomous lifecycle loop: 60% core / 30% monthly momentum sleeve / 10% cash | `./robinhood_trader.py monitor --interval 60 --auto-trade --live` |
 | `service` | `<start\|stop\|live\|...>`| Manage background systemd user service | `./robinhood_trader.py service live` |
 | `accounts` | — | Lists authorized brokerage accounts and agentic permissions | `./robinhood_trader.py accounts` |
 | `auth` | — | Verifies stored MCP OAuth credentials | `./robinhood_trader.py auth` |
@@ -157,7 +162,8 @@ The suite automatically records all activity into an Obsidian-compatible Markdow
 │   └── ASML.md
 ├── playbooks/                 # Trading rules and strategies
 └── retrospectives/
-    └── trade_ledger.jsonl     # Append-only chronological execution ledger
+    ├── trade_ledger.jsonl     # Append-only chronological execution ledger
+    └── rebalance_2026-09.md   # Monthly sleeve decision: regime, ranking, planned orders
 ```
 
 ### Cached Portfolio Datasets (`~/.cache/ai/trading/`)
