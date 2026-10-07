@@ -57,7 +57,7 @@ def auto_approve_lessons(monkeypatch):
 def isolate_embedder(monkeypatch):
     """Never reach a real embedder (aitools/embed.py) from a test: AI_EMBED_URL points at a port
     nothing listens on (connection refused at once); tests/test_semantic_search.py starts a fake
-    one. No background queue drains spawned by `state-export memory --query` either."""
+    one. INFER_EMBED_AUTODRAIN=0: reserved for the (future) tool server's idle-time queue drain."""
     monkeypatch.setenv("AI_EMBED_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("INFER_EMBED_AUTODRAIN", "0")
     monkeypatch.delenv("INFER_RECALL_K", raising=False)

@@ -28,7 +28,8 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 2  # 2: pinned memories, vectors + embed_queue, item_fts + triggers (Task 5b)
+SCHEMA_VERSION = 3  # 2: pinned memories, vectors + embed_queue, item_fts + triggers (Task 5b);
+                    # 3: embed_queue.attempts, triggers recreated (named columns, PK range delete)
 BUSY_TIMEOUT_MS = 5000
 LEDGER_MAX_ROWS = 5000
 CHAT_AUDIT_RETENTION_DAYS = 90
@@ -65,8 +66,10 @@ _SCHEMA = (
     "v768 BLOB, updated REAL, hash TEXT, source_ts REAL, PRIMARY KEY(item_type, item_id))",
     # Items written since the last index pass (filled by the triggers below and by the notes
     # writers in aitools/memory.py); drained by `ai_mcp.py embed-backfill`, never at ai startup.
+    # attempts: failed embedding tries; a row at 3+ is skipped (never wedges the queue) until its
+    # content changes (the trigger replaces the row, resetting it).
     "CREATE TABLE IF NOT EXISTS embed_queue(item_type TEXT, item_id TEXT, enqueued REAL, "
-    "PRIMARY KEY(item_type, item_id))",
+    "attempts INT DEFAULT 0, PRIMARY KEY(item_type, item_id))",
 )
 _NOW_SQL = "((julianday('now') - 2440587.5) * 86400.0)"
 # The former ~/.config/ai/memory.db tables (remember/recall FTS and the vault note index). They
@@ -94,16 +97,18 @@ _INDEXED = (
 def _trigger_sql():
     out = []
     for typ, table, code, expr, cols in _INDEXED:
+        out += ["DROP TRIGGER IF EXISTS %s_fts_%s" % (table, w) for w in ("ai", "au", "ad")]
         ins = ("INSERT OR REPLACE INTO item_fts(rowid, text, item_type, item_id) VALUES "
-               "(new.id * 4 + %d, %s, '%s', new.id); INSERT OR REPLACE INTO embed_queue VALUES "
-               "('%s', new.id, %s);" % (code, expr.format(r="new"), typ, typ, _NOW_SQL))
+               "(new.id * 4 + %d, %s, '%s', new.id); INSERT OR REPLACE INTO embed_queue(item_type, item_id, "
+               "enqueued) VALUES ('%s', new.id, %s);" % (code, expr.format(r="new"), typ, typ, _NOW_SQL))
         out.append("CREATE TRIGGER IF NOT EXISTS %s_fts_ai AFTER INSERT ON %s BEGIN %s END" % (table, table, ins))
         out.append("CREATE TRIGGER IF NOT EXISTS %s_fts_au AFTER UPDATE OF %s ON %s BEGIN %s END"
                    % (table, cols, table, ins))
         out.append("CREATE TRIGGER IF NOT EXISTS %s_fts_ad AFTER DELETE ON %s BEGIN "
                    "DELETE FROM item_fts WHERE rowid = old.id * 4 + %d; "
+                   # chunk ids are '<id>#<n>': a PK range ('#' < '$') instead of LIKE
                    "DELETE FROM vectors WHERE item_type = '%s' AND (item_id = CAST(old.id AS TEXT) "
-                   "OR item_id LIKE old.id || '#%%'); "
+                   "OR (item_id >= old.id || '#' AND item_id < old.id || '$')); "
                    "DELETE FROM embed_queue WHERE item_type = '%s' AND item_id = CAST(old.id AS TEXT); END"
                    % (table, table, code, typ, typ))
     return out
@@ -289,6 +294,8 @@ def _init_schema(conn, path):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
         if "pinned" not in cols:  # v1 -> v2
             conn.execute("ALTER TABLE memory ADD COLUMN pinned INT DEFAULT 0")
+        if "attempts" not in {r[1] for r in conn.execute("PRAGMA table_info(embed_queue)")}:  # v2 -> v3
+            conn.execute("ALTER TABLE embed_queue ADD COLUMN attempts INT DEFAULT 0")
         for stmt in _FTS_SCHEMA:
             try:
                 conn.execute(stmt)

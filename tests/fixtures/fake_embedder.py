@@ -8,11 +8,13 @@ Vectors are deterministic hashed bags of words: the EmbeddingGemma prompt prefix
 ("task: search result | query: ", "title: ... | text: ") are stripped, each lowercased word is cut
 to its first 5 characters (a crude stemmer, so "deploying" ~ "deploys", which FTS5's unicode61
 tokenizer does NOT match) and hashed to 3 signed dimensions (one always in the first 128, so the
-Matryoshka 128-d prefix stays informative), then L2-normalised. Cosine similarity is therefore
-word(stem) overlap.
+Matryoshka 128-d prefix stays informative), then L2-normalised, giving u. Like EmbeddingGemma,
+unrelated texts are NOT orthogonal: v = sqrt(BASE) * c + sqrt(1 - BASE) * u with a shared unit
+direction c (dims 0 and 767, excluded from hashing), so cos(v1, v2) = BASE + (1 - BASE) * overlap
+with BASE = 0.55: unrelated ~0.55, the real model's non-target median is 0.58.
 
 In-process: `srv = start(); srv.url; srv.requests; srv.delay = 0.3; srv.stop()`.
-Standalone: `python3 fake_embedder.py PORT`.
+Standalone: `python3 fake_embedder.py PORT`. A request containing "POISON" gets HTTP 500.
 """
 import hashlib
 import json
@@ -23,6 +25,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DIM = 768
+BASE = 0.55
 _QUERY_RE = re.compile(r"^task: [^|]*\| query: ", re.S)
 _DOC_RE = re.compile(r"^title: (.*?) \| text: ", re.S)
 
@@ -44,15 +47,15 @@ def vector(text):
     for w in re.findall(r"\w+", _strip_prefix(text).lower()):
         stem = w[:5]
         h = hashlib.md5(stem.encode("utf-8")).digest()
-        idx = (h[0] % 128, 128 + (int.from_bytes(h[1:3], "little") % (DIM - 128)),
-               int.from_bytes(h[3:5], "little") % DIM)
+        idx = (1 + h[0] % 127, 128 + (int.from_bytes(h[1:3], "little") % (DIM - 129)),
+               1 + int.from_bytes(h[3:5], "little") % (DIM - 2))
         for j, i in enumerate(idx):
             v[i] += 1.0 if (h[5 + j] & 1) else -1.0
     n = math.sqrt(sum(x * x for x in v))
-    if n == 0:
-        v[DIM - 1] = 1.0
-        return v
-    return [x / n for x in v]
+    w = math.sqrt(1.0 - BASE) / n if n else 0.0
+    v = [x * w for x in v]
+    v[0] = v[DIM - 1] = math.sqrt(BASE / 2.0)
+    return v
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -89,6 +92,8 @@ class _Handler(BaseHTTPRequestHandler):
             inputs = [inputs]
         with srv.lock:
             srv.requests.append(list(inputs or []))
+        if any("POISON" in str(t) for t in inputs or []):  # lets tests simulate a rejected document
+            return self._send(500, {"error": "cannot embed this input"})
         data = [{"object": "embedding", "index": i, "embedding": vector(t)}
                 for i, t in enumerate(inputs or [])]
         self._send(200, {"object": "list", "data": data, "model": req.get("model") or "fake"})

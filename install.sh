@@ -58,6 +58,10 @@ setup_embedder() {
         for cmd in git cmake; do
             command -v "$cmd" &>/dev/null || { echo "ERROR: ${cmd} is required to build the embedder" >&2; exit 1; }
         done
+        if [ -e "${EMBED_SRC}" ] && [ ! -f "${EMBED_SRC}/CMakeLists.txt" ]; then
+            echo "==> ${EMBED_SRC} has no CMakeLists.txt (interrupted clone?): removing it and re-cloning"
+            rm -rf "${EMBED_SRC}"
+        fi
         if [ ! -f "${EMBED_SRC}/CMakeLists.txt" ]; then
             echo "==> Cloning llama.cpp (embedder build) into ${EMBED_SRC}..."
             mkdir -p "$(dirname "${EMBED_SRC}")"
@@ -143,6 +147,11 @@ fi
 
 # ── Subcommand: embed — semantic-memory embedder only ─────────────────────────
 if [ "${1:-}" = "embed" ]; then
+    # ai-embed.service runs `ai-backend embed serve`: make sure that ai-backend is installed.
+    mkdir -p "${BIN_DIR}"
+    cp "${SCRIPT_DIR}/ai-backend" "${BIN_DIR}/ai-backend"
+    chmod +x "${BIN_DIR}/ai-backend"
+    echo "==> Installed ${BIN_DIR}/ai-backend"
     setup_embedder
     exit 0
 fi

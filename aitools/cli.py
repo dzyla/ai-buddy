@@ -165,18 +165,15 @@ def _main(argv):
     if action == "state-export":
         # ai.c reads the persistent memory (and the scheduled-task countdown) through this.
         what = argv[2] if len(argv) > 2 else ""
-        recalled = False
         try:
             if what == "memory":
-                # --query <user request>: auto-recall (pinned + top-k relevant items) instead of the
-                # full dump; falls back to the full render when recall is off or the embedder is down.
+                # --query <user request>: the unchanged memory render plus an additive block of
+                # relevant chats/history/lessons/notes (and memories beyond the 4 KB budget).
                 query = argv[argv.index("--query") + 1] if "--query" in argv[3:-1] else ""
-                out = None
                 if query.strip():
                     from . import search
-                    out = search.recall_section(query)
-                    recalled = out is not None
-                if out is None:
+                    out = search.memory_section(query)
+                else:
                     out = state.memory_render()
             elif what == "lessons":
                 out = state.lessons_render()
@@ -191,14 +188,11 @@ def _main(argv):
             sys.exit(1)
         if out:
             print(out)
-        if recalled:
-            sys.stdout.flush()
-            from . import search
-            search.spawn_drain()  # detached; the embedder is up and the caller already has its output
         sys.exit(0)
 
     if action == "embed-backfill":
-        # embed-backfill [--limit N] [--quiet]: drain embed_queue and (re-)embed every changed item.
+        # embed-backfill [--limit N] [--queued-only] [--quiet]: drain embed_queue and (unless
+        # --queued-only) re-embed every changed item. Never run from the ai startup path.
         rest = argv[2:]
         limit = None
         if "--limit" in rest[:-1]:
@@ -208,7 +202,7 @@ def _main(argv):
                 print("Usage: ai_mcp.py embed-backfill [--limit N]", file=sys.stderr)
                 sys.exit(1)
         from . import search
-        stats = search.backfill_locked(limit=limit)
+        stats = search.backfill_locked(limit=limit, queued_only="--queued-only" in rest)
         if "--quiet" not in rest:
             print(json.dumps(stats if stats is not None else {"skipped": "another backfill is running"}))
         sys.exit(0 if stats is None or stats.get("embedder") == "up" else 2)

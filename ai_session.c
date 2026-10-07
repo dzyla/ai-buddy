@@ -95,9 +95,9 @@ static char* sh_single_quote(const char *s) {
 }
 
 /* Memory section of the system prompt. With a user request it runs
-   `ai_mcp.py state-export memory --query <request>`: auto-recall (pinned memories + the most
-   relevant memories/lessons/chats/history/notes, aitools/search.py). That command itself falls
-   back to the full memory render when recall is off (INFER_RECALL_K=0) or the embedder is down.
+   `ai_mcp.py state-export memory --query <request>`: the unchanged 4 KB memory render plus an
+   additive block of relevant chats/history/lessons/notes (aitools/search.py); recall adds nothing
+   when it is off (INFER_RECALL_K=0), the embedder is down or nothing is relevant.
    The query is cut to 1000 bytes (at a UTF-8 boundary) and single-quoted for the shell.
    Without a request this is read_memory_file(). Returns malloc'd text or NULL. */
 char* read_memory_for_prompt(const char *mcp_script, const char *query) {
@@ -122,14 +122,17 @@ char* read_memory_for_prompt(const char *mcp_script, const char *query) {
     free(esc);
     char *out = run_shell_command(cmd, NULL);
     free(cmd);
-    if (!out) return NULL;
-    size_t m = strlen(out);
-    while (m > 0 && isspace((unsigned char)out[m - 1])) out[--m] = '\0';
-    char *p = out;
-    while (*p && isspace((unsigned char)*p)) p++;
-    char *res = *p ? strdup(p) : NULL;
-    free(out);
-    return res;
+    char *res = NULL;
+    if (out) {
+        size_t m = strlen(out);
+        while (m > 0 && isspace((unsigned char)out[m - 1])) out[--m] = '\0';
+        char *p = out;
+        while (*p && isspace((unsigned char)*p)) p++;
+        res = *p ? strdup(p) : NULL;
+        free(out);
+    }
+    /* the recall subprocess failed or printed nothing: the plain memory render, never no section */
+    return res ? res : read_memory_file(mcp_script, 0);
 }
 
 char* load_system_prompt(void) {

@@ -15,11 +15,11 @@ Item types: memory (state.memory rows), lesson (approved, unexpired lessons only
 `memories` rows as r<rowid>, vault notes as v:<title>). A chunk past the first has the id
 <id>#<n>; results report the document id plus the best chunk's text.
 
-index_items(limit=None) drains embed_queue and (re-)embeds every item whose content hash changed
-(`ai_mcp.py embed-backfill [--limit N]`). recall_section(query) renders the system-prompt memory
-section: pinned memories (<= 1 KB) + the top INFER_RECALL_K (default 6, 0 disables) results;
-None means "fall back to the full memory render" (disabled, the embedder is down, or nothing has
-been embedded yet).
+index_items(limit=None, queued_only=False) drains embed_queue and (unless queued_only)
+(re-)embeds every item whose content hash changed (`ai_mcp.py embed-backfill`). memory_section(query)
+is what `state-export memory --query` prints: the unchanged 4 KB memory render plus, when anything
+passes the relevance gate, recall_section(query): <= 1.5 KB of up to INFER_RECALL_K (default 6)
+relevant chats/history/lessons/notes and memories beyond the render's budget.
 """
 import contextlib
 import datetime
@@ -46,10 +46,19 @@ FTS_TOP = 50
 RRF_K = 60
 BATCH = 8
 NUMPY_MIN_ROWS = 20000
-MIN_SIM_DEFAULT = 0.2  # vector hits below this cosine are noise, not recall ($INFER_SEARCH_MIN_SIM)
+# Relevance gate for vector hits (calibrated for EmbeddingGemma-2 on evals/retrieval: targets
+# min 0.675 / median 0.827, non-targets median 0.58 / p95 0.656): keep cos >= max(MIN_SIM,
+# top - DELTA); hits below MIN_SIM + WEAK_MARGIN count only when FTS found the same item.
+MIN_SIM_DEFAULT = 0.68   # $INFER_SEARCH_MIN_SIM
+DELTA_DEFAULT = 0.08     # $INFER_SEARCH_DELTA
+WEAK_MARGIN = 0.05
 RECALL_K_DEFAULT = 6
-RECALL_BUDGET_BYTES = 4096
+RECALL_BUDGET_BYTES = 1536   # the additive recall block; the memory render keeps its own 4 KB
 PINNED_BUDGET_BYTES = 1024
+_STOPWORDS = frozenset("""a an and are as at be been but by can could did do does doing for from had has have
+how i if in into is it its me my no not of on or our please should so than that the their them then there
+these they this those to too up us was we were what when where which while who why will with would you your
+yours hi hello hey thanks thank ok okay yes just also any some all about can't don't""".split())
 RECALL_ITEM_CHARS = 300
 TEXT_CHARS = 1500
 
@@ -136,9 +145,10 @@ def _hash(title, text):
 
 
 def _fts_query(query):
+    """OR of the query's content words (stopwords and tokens shorter than 3 chars dropped)."""
     toks = []
     for t in re.findall(r"\w+", str(query or "").lower()):
-        if t not in toks:
+        if len(t) >= 3 and t not in _STOPWORDS and t not in toks:
             toks.append(t)
     return " OR ".join('"%s"' % t for t in toks[:24])
 
@@ -281,7 +291,8 @@ def _dot_scores(blobs, qv, dim):
 
 
 def _vector_hits(c, qvec, types, since):
-    """Ranked [(doc key, best chunk item_id)] by cosine: coarse v128 over all, rerank top v768."""
+    """Ranked [(doc key, best chunk item_id, cosine)] by cosine (coarse v128 over all, rerank top
+    v768), relevance-gated: cos >= max(min_sim(), top - delta())."""
     q128 = embed.truncate(qvec, embed.COARSE_DIM)
     q768 = embed.truncate(qvec, embed.DIM)
     sql = ("SELECT item_type, item_id, v128 FROM vectors WHERE model=? AND item_type IN (%s)"
@@ -309,15 +320,26 @@ def _vector_hits(c, qvec, types, since):
         key = (t, _doc_of(iid)[0])
         if key not in best or s > best[key][0]:
             best[key] = (s, iid)
-    floor = min_sim()
-    return [(k, v[1]) for k, v in sorted(best.items(), key=lambda kv: -kv[1][0]) if v[0] >= floor]
+    ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
+    if not ranked:
+        return []
+    floor = max(min_sim(), ranked[0][1][0] - delta())
+    return [(k, v[1], v[0]) for k, v in ranked if v[0] >= floor]
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
 
 
 def min_sim():
-    try:
-        return float(os.environ.get("INFER_SEARCH_MIN_SIM", MIN_SIM_DEFAULT))
-    except ValueError:
-        return MIN_SIM_DEFAULT
+    return _env_float("INFER_SEARCH_MIN_SIM", MIN_SIM_DEFAULT)
+
+
+def delta():
+    return _env_float("INFER_SEARCH_DELTA", DELTA_DEFAULT)
 
 
 def search(query, sources=None, since=None, k=8, use_vectors=True, exclude=()):
@@ -337,7 +359,10 @@ def search(query, sources=None, since=None, k=8, use_vectors=True, exclude=()):
         for rank, key in enumerate(fts, 1):
             fused[key] = fused.get(key, 0.0) + 1.0 / (RRF_K + rank)
             via.setdefault(key, []).append("fts")
-        for rank, (key, iid) in enumerate(vec, 1):
+        weak = min_sim() + WEAK_MARGIN
+        fts_set = set(fts)
+        vec = [v for v in vec if v[2] >= weak or v[0] in fts_set]  # weak hits need FTS agreement
+        for rank, (key, iid, _) in enumerate(vec, 1):
             fused[key] = fused.get(key, 0.0) + 1.0 / (RRF_K + rank)
             via.setdefault(key, []).append("vec")
             chunk_of[key] = iid
@@ -420,28 +445,35 @@ def _fit(lines, budget):
     return out
 
 
-def recall_section(query, k=None, budget=RECALL_BUDGET_BYTES):
-    """Pinned memories + the top-k recalled items for `query`, or None to fall back to the full
-    memory render (recall disabled, empty query, embedder down, or any error)."""
+def recall_section(query, k=None, budget=RECALL_BUDGET_BYTES, rendered=None):
+    """The ADDITIVE recall block for `query` ('' when nothing passes the relevance gate), or None
+    when recall is unavailable (INFER_RECALL_K=0, empty query, embedder down, nothing embedded
+    yet, any error). Memory lines already in `rendered` (the 4 KB memory render) are excluded, so
+    only memories beyond that budget compete; pinned ones beyond it are listed first."""
     k = recall_k() if k is None else int(k)
     if k <= 0 or not str(query or "").strip():
         return None
+    if rendered is None:
+        rendered = state.memory_render()
+    shown = {ln.strip().lower() for ln in str(rendered or "").splitlines() if ln.strip()}
     try:
         with state._conn(read=True) as c:
             try:
-                pinned_rows = [(str(r[0]), r[1]) for r in c.execute("SELECT id, text FROM memory WHERE pinned=1 "
-                                                                    "ORDER BY id")]
+                rows = [(str(r[0]), r[1] or "", r[2]) for r in c.execute("SELECT id, text, pinned FROM memory ORDER BY id")]
             except sqlite3.OperationalError:
-                pinned_rows = []
-        results, info = search(query, k=k, exclude={("memory", i) for i, _ in pinned_rows})
+                rows = [(str(r[0]), r[1] or "", 0) for r in c.execute("SELECT id, text FROM memory ORDER BY id")]
+        in_render = {("memory", i) for i, t, _ in rows if t.strip().lower() in shown}
+        overflow_pinned = [t for i, t, p in rows if p and ("memory", i) not in in_render]
+        results, info = search(query, k=k, exclude=in_render | {("memory", i) for i, _, p in rows if p})
     except Exception:
         return None
     if not info["vector"] or not info["indexed"]:
         return None  # embedder down, or nothing embedded yet (before the first embed-backfill)
-    pinned = list(reversed(_fit([t for _, t in reversed(pinned_rows)], PINNED_BUDGET_BYTES)))
     parts = []
+    pinned = list(reversed(_fit(["- " + _one_line(t, PINNED_BUDGET_BYTES) for t in reversed(overflow_pinned)],
+                                PINNED_BUDGET_BYTES)))
     if pinned:
-        parts += ["Pinned:"] + ["- " + _one_line(t, PINNED_BUDGET_BYTES) for t in pinned]
+        parts += ["Pinned (beyond the memory budget):"] + pinned
     recalled = ["- [%s %s] %s" % (_LABEL.get(r["item_type"], r["item_type"]), _date(r["source_ts"]),
                                   _one_line(r["text"], RECALL_ITEM_CHARS)) for r in results]
     if recalled:
@@ -453,6 +485,19 @@ def recall_section(query, k=None, budget=RECALL_BUDGET_BYTES):
     return "\n".join(_fit(parts, budget))
 
 
+def memory_section(query):
+    """What `state-export memory --query` prints: the unchanged 4 KB memory render, plus the
+    additive recall block when anything relevant passes. Never empty when memory exists."""
+    base = state.memory_render()
+    try:
+        rec = recall_section(query, rendered=base)
+    except Exception:
+        rec = None
+    if rec:
+        return (base + "\n\n" + rec) if base else rec
+    return base
+
+
 # ── indexing ─────────────────────────────────────────────────────────────────
 def queue_size():
     try:
@@ -462,24 +507,73 @@ def queue_size():
         return 0
 
 
-def index_items(limit=None, types=None):
-    """Drain embed_queue and (re-)embed every item whose content changed, queued items first.
+MAX_ATTEMPTS = 3
 
-    Unchanged chunks (same content+model hash) are skipped; a chunk whose hash already exists
-    under another id (a rebuilt history index) is copied instead of re-embedded; vectors of items
-    that no longer exist are removed. `limit` caps the number of chunks embedded in this call.
-    Returns stats: embedded, copied, unchanged, removed, queue_left, embedder ('up'|'down')."""
+
+def _doc_for(c, h, item_type, doc_id):
+    """(item_type, doc_id, title, text, source_ts) of one item for indexing, or None if gone."""
+    try:
+        if item_type == "memory":
+            r = c.execute("SELECT text, created FROM memory WHERE id=?", (int(doc_id),)).fetchone()
+            return r and (item_type, doc_id, None, r[0], r[1])
+        if item_type == "lesson":
+            r = c.execute("SELECT kind, tool, body, created FROM lessons WHERE id=?", (int(doc_id),)).fetchone()
+            return r and (item_type, doc_id, None, _lesson_text(r[0], r[1], r[2]), r[3])
+        if item_type == "chat":
+            r = c.execute("SELECT prompt, reply, ts FROM chat_audit WHERE id=?", (int(doc_id),)).fetchone()
+            return r and (item_type, doc_id, None, _chat_text(r[0], r[1]), r[2])
+        if item_type == "note":
+            if doc_id.startswith("r"):
+                r = c.execute("SELECT content FROM memories WHERE rowid=?", (int(doc_id[1:]),)).fetchone()
+                return r and (item_type, doc_id, None, r[0], None)
+            r = c.execute("SELECT content FROM vault_fts WHERE title=? LIMIT 1", (doc_id[2:],)).fetchone()
+            return r and (item_type, doc_id, doc_id[2:], r[0], None)
+        if item_type == "history_chunk" and h is not None:
+            r = h.execute("SELECT ts, body FROM history_fts WHERE rowid=?", (int(doc_id),)).fetchone()
+            return r and (item_type, doc_id, None, r[1], _history_ts(r[0]))
+    except (sqlite3.Error, ValueError):
+        return None
+    return None
+
+
+def _log(msg):
+    import sys
+    print("embed-backfill: " + msg, file=sys.stderr)
+
+
+def index_items(limit=None, types=None, queued_only=False):
+    """Index changed items: queued items first, then (unless queued_only) a full scan.
+
+    queued_only=True looks only at embed_queue rows (no corpus scan): what an idle-time drainer
+    (the Task 7 tool server) runs. The full scan re-embeds every chunk whose content+model hash
+    changed, copies vectors of identical chunks (a rebuilt history index), and removes vectors of
+    vanished items. A batch that fails while /health is ok is retried item by item; each failure
+    bumps embed_queue.attempts and an item at MAX_ATTEMPTS is skipped (logged) until its content
+    changes, so one bad item never wedges the queue. Queue rows are deleted only when processed
+    AND enqueued no later than this run's start. `limit` caps chunks embedded in this call.
+    Returns stats: embedded, copied, unchanged, removed, failed, skipped, queue_left, embedder."""
     types = parse_sources(types)
-    stats = {"embedded": 0, "copied": 0, "unchanged": 0, "removed": 0, "queue_left": 0, "embedder": "up"}
+    stats = {"embedded": 0, "copied": 0, "unchanged": 0, "removed": 0, "failed": 0, "skipped": 0,
+             "queue_left": 0, "embedder": "up"}
     model = embed.model_id()
+    run_start = time.time()
     c = state.connect()
     try:
         existing = {(r[0], r[1]): r[2] for r in c.execute(
             "SELECT item_type, item_id, hash FROM vectors WHERE model=?", (model,))}
         by_hash = {h: key for key, h in existing.items() if h}
-        queued = {(r[0], str(r[1])) for r in c.execute("SELECT item_type, item_id FROM embed_queue")}
-        docs, unavailable = _iter_docs(c, types)
-        docs.sort(key=lambda d: (d[0], d[1]) not in queued)
+        queue = {(r[0], str(r[1])): r[2] or 0 for r in c.execute(
+            "SELECT item_type, item_id, attempts FROM embed_queue")}
+        wedged = {k for k, a in queue.items() if a >= MAX_ATTEMPTS}
+        stats["skipped"] = len(wedged)
+        unavailable = set()
+        if queued_only:
+            with _history_conn() as h:
+                docs = [d for d in (_doc_for(c, h, t, i) for t, i in queue if t in types and (t, i) not in wedged) if d]
+        else:
+            docs, unavailable = _iter_docs(c, types)
+            docs = [d for d in docs if (d[0], d[1]) not in wedged]
+            docs.sort(key=lambda d: (d[0], d[1]) not in queue)
         doc_chunks = {}
         for key in existing:
             d, n = _doc_of(key[1])
@@ -496,23 +590,38 @@ def index_items(limit=None, types=None):
                 else:
                     todo.append((key, title, piece, h, ts))
             stale += [key for n, key in doc_chunks.get((t, did), ()) if n >= len(pieces)]
-        stale += [key for dk, lst in doc_chunks.items() if dk[0] in types and dk[0] not in unavailable
-                  and dk not in live for _, key in lst]
-        # vectors from another model are stale too (re-embedded above via the hash/model filter)
+        if not queued_only:
+            stale += [key for dk, lst in doc_chunks.items() if dk[0] in types and dk[0] not in unavailable
+                      and dk not in live and dk not in wedged for _, key in lst]
         with state.transaction(c):
             for key in set(stale):
                 c.execute("DELETE FROM vectors WHERE item_type=? AND item_id=?", key)
-            c.execute("DELETE FROM vectors WHERE model IS NOT ? AND item_type IN (%s)"
-                      % ",".join("?" * len(types)), [model] + list(types))
+            if not queued_only:  # vectors from another model are stale too (re-embedded above)
+                c.execute("DELETE FROM vectors WHERE model IS NOT ? AND item_type IN (%s)"
+                          % ",".join("?" * len(types)), [model] + list(types))
         stats["removed"] = len(set(stale))
+
+        def put(key, h, ts, v128, v768, dim):
+            c.execute("INSERT OR REPLACE INTO vectors(item_type, item_id, model, dim, v128, v768, updated, hash, "
+                      "source_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (key[0], key[1], model, dim, v128, v768, time.time(), h, ts))
 
         def write(rows):
             with state.transaction(c):
                 for key, h, ts, v in rows:
-                    c.execute("INSERT OR REPLACE INTO vectors(item_type, item_id, model, dim, v128, v768, updated, "
-                              "hash, source_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                              (key[0], key[1], model, len(v), embed.to_blob(embed.truncate(v, embed.COARSE_DIM)),
-                               embed.to_blob(embed.truncate(v, embed.DIM)), time.time(), h, ts))
+                    put(key, h, ts, embed.to_blob(embed.truncate(v, embed.COARSE_DIM)),
+                        embed.to_blob(embed.truncate(v, embed.DIM)), len(v))
+
+        def fail(item):
+            doc = (item[0][0], _doc_of(item[0][1])[0])
+            with state.transaction(c):
+                c.execute("INSERT INTO embed_queue(item_type, item_id, enqueued, attempts) VALUES (?, ?, ?, 1) "
+                          "ON CONFLICT(item_type, item_id) DO UPDATE SET attempts = coalesce(attempts, 0) + 1",
+                          (doc[0], doc[1], time.time()))
+                a = c.execute("SELECT attempts FROM embed_queue WHERE item_type=? AND item_id=?", doc).fetchone()[0]
+            stats["failed"] += 1
+            if a >= MAX_ATTEMPTS:
+                _log("skipping %s %s after %d failed attempts (re-tried when its content changes)" % (doc + (a,)))
 
         pending = set()
         need = []
@@ -522,15 +631,12 @@ def index_items(limit=None, types=None):
                 r = c.execute("SELECT v128, v768, dim FROM vectors WHERE item_type=? AND item_id=?", src).fetchone()
                 if r:
                     with state.transaction(c):
-                        c.execute("INSERT OR REPLACE INTO vectors(item_type, item_id, model, dim, v128, v768, "
-                                  "updated, hash, source_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                  (item[0][0], item[0][1], model, r[2], r[0], r[1], time.time(), item[3], item[4]))
+                        put(item[0], item[3], item[4], r[0], r[1], r[2])
                     stats["copied"] += 1
                     continue
             need.append(item)
         if limit is not None:
-            for item in need[max(0, int(limit)):]:
-                pending.add((item[0][0], _doc_of(item[0][1])[0]))
+            pending.update((it[0][0], _doc_of(it[0][1])[0]) for it in need[max(0, int(limit)):])
             need = need[:max(0, int(limit))]
         if need and not embed.health(timeout=2.0):
             stats["embedder"] = "down"
@@ -539,43 +645,34 @@ def index_items(limit=None, types=None):
         for i in range(0, len(need), BATCH):
             batch = need[i:i + BATCH]
             vecs = embed.embed([b[2] for b in batch], "document", titles=[b[1] for b in batch])
-            if vecs is None:
+            if vecs is not None:
+                write([(b[0], b[3], b[4], v) for b, v in zip(batch, vecs)])
+                stats["embedded"] += len(batch)
+                continue
+            if not embed.health(timeout=2.0):
                 stats["embedder"] = "down"
                 pending.update((it[0][0], _doc_of(it[0][1])[0]) for it in need[i:])
                 break
-            write([(b[0], b[3], b[4], v) for b, v in zip(batch, vecs)])
-            stats["embedded"] += len(batch)
+            for b in batch:  # the server is up: find the item(s) it rejects
+                v = embed.embed([b[2]], "document", titles=[b[1]])
+                if v is None:
+                    fail(b)
+                    pending.add((b[0][0], _doc_of(b[0][1])[0]))
+                else:
+                    write([(b[0], b[3], b[4], v[0])])
+                    stats["embedded"] += 1
         with state.transaction(c):
-            for key in queued:
-                if key not in pending:
-                    c.execute("DELETE FROM embed_queue WHERE item_type=? AND item_id=?", key)
+            for key in queue:
+                if key not in pending and key not in wedged:
+                    c.execute("DELETE FROM embed_queue WHERE item_type=? AND item_id=? AND enqueued <= ?",
+                              key + (run_start,))
         stats["queue_left"] = c.execute("SELECT count(*) FROM embed_queue").fetchone()[0]
     finally:
         c.close()
     return stats
 
 
-def spawn_drain(limit=64):
-    """Start a detached `ai_mcp.py embed-backfill --limit N` when items are queued (called after
-    the auto-recall output is printed, so it never delays startup). INFER_EMBED_AUTODRAIN=0
-    disables it; the backfill itself is serialised by a lock file."""
-    if os.environ.get("INFER_EMBED_AUTODRAIN", "1").strip().lower() in ("0", "false", "no", "off"):
-        return False
-    if not queue_size():
-        return False
-    import subprocess
-    import sys
-    from . import entry_script
-    try:
-        subprocess.Popen([sys.executable, entry_script(), "embed-backfill", "--limit", str(int(limit)), "--quiet"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                         start_new_session=True, close_fds=True)
-        return True
-    except Exception:
-        return False
-
-
-def backfill_locked(limit=None):
+def backfill_locked(limit=None, queued_only=False):
     """index_items under an exclusive non-blocking lock next to the state db. Returns the stats,
     or None when another backfill is already running."""
     import fcntl
@@ -586,4 +683,4 @@ def backfill_locked(limit=None):
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return None
-        return index_items(limit=limit)
+        return index_items(limit=limit, queued_only=queued_only)
