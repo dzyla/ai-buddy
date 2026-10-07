@@ -62,8 +62,8 @@ if [ "${1:-}" = "uninstall" ]; then
         rm -f "${BIN_DIR}/$f"
     done
 
-    # 3b. Remove the installed trader package (deployed releases in ~/.local/share/ai-trader are kept)
-    rm -rf "${DATA_DIR}/lib/trader"
+    # 3b. Remove the installed trader and aitools packages (deployed releases in ~/.local/share/ai-trader are kept)
+    rm -rf "${DATA_DIR}/lib/trader" "${DATA_DIR}/lib/aitools"
 
     # 4. Remove custom skills
     if [ -d "${SKILLS_DST}" ]; then
@@ -246,6 +246,14 @@ mkdir -p "${HOME}/.local/share/ai"
 cp "${SCRIPT_DIR}/dev/probe_mtp.py" "${HOME}/.local/share/ai/probe_mtp.py" 2>/dev/null || true
 chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
 echo "==> Installed: ai  libremote_harness.so  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py  probe_mtp.py"
+# ai_mcp.py is a shim over the aitools/ package: it looks next to its realpath first (a checkout),
+# then in ~/.local/share/ai/lib, so the installed ~/.local/bin/ai_mcp.py uses this copy.
+AITOOLS_LIB="${DATA_DIR}/lib"
+mkdir -p "${AITOOLS_LIB}"
+rm -rf "${AITOOLS_LIB}/aitools"
+cp -r "${SCRIPT_DIR}/aitools" "${AITOOLS_LIB}/aitools"
+find "${AITOOLS_LIB}/aitools" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+echo "==> Installed aitools package to ${AITOOLS_LIB}/aitools"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."

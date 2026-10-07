@@ -448,11 +448,13 @@ def test_dispatch_no_dead_duplicates(tmp_path):
     """Every tool must be dispatched exactly once — a duplicate elif after the
     first match is dead code (append_to_context_pool was unreachable before the
     fix because its block sat behind 7 duplicate entries)."""
-    src = open(os.path.join(REPO, "ai_mcp.py"), encoding="utf-8").read()
-    body = src.split('    elif action == "call-tool":', 1)[1]
-    # Dispatch entries always pair tool_name with server_name (the pre-dispatch
-    # argument-validation ifs do not, which keeps them out of the scan).
-    names = re.findall(r'^\s{8}(?:if|elif) tool_name == "([^"]+)" or server_name', body, flags=re.M)
+    # The call-tool dispatch table is the HANDLERS dict literal in aitools/registry.py;
+    # a repeated key there would silently shadow the earlier handler.
+    import ast
+    src = open(os.path.join(REPO, "aitools", "registry.py"), encoding="utf-8").read()
+    table = next(n.value for n in ast.parse(src).body
+                 if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "HANDLERS")
+    names = [k.value for k in table.keys]
     seen = set()
     dups = []
     for n in names:
