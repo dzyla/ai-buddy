@@ -311,6 +311,14 @@ def list_scheduled_tasks():
 
     return "\n".join(lines) if lines else "No scheduled tasks found."
 
+DB_BACKOFF_CAP = 300.0
+
+
+def _db_backoff_delay(n, cap=DB_BACKOFF_CAP):
+    """Sleep before retry #n (1-based) when the state db is unusable: 1, 2, 4, ... capped."""
+    return float(min(cap, 2 ** (max(1, n) - 1)))
+
+
 def run_scheduler_loop(task_id):
     import time
     import json
@@ -394,15 +402,19 @@ def run_scheduler_loop(task_id):
                 return False  # cancelled
 
     log_message(f"Scheduler loop started (PID {my_pid}).")
+    db_errors = 0   # consecutive failures to read the task from the state db
 
     # ── Main loop ────────────────────────────────────────────────────────────
     while True:
         try:
             task_data = state.task_get(safe_task_id)
         except Exception as e:
-            log_message(f"Error reading task: {e}")
-            time.sleep(1)
+            db_errors += 1
+            delay = _db_backoff_delay(db_errors)
+            log_message(f"State db unavailable ({e}); retry #{db_errors} in {delay:g}s.")
+            time.sleep(delay)
             continue
+        db_errors = 0
         if task_data is None:
             log_message("Task deleted. Exiting scheduler loop.")
             break

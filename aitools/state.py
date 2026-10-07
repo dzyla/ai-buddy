@@ -69,6 +69,27 @@ _FTS_SCHEMA = (
 _ready = set()            # (path, dev, inode) whose schema is known to exist in this process
 _migrate_tried = set()    # db paths the lazy migration already ran (or failed) for
 _guard = threading.Lock()
+# Seconds a caller may wait on the write lock (busy_timeout + retries). Read at open time;
+# lowered with lock_budget() on latency-critical paths (ai startup subcommands).
+_lock_budget = [_LOCK_RETRY_SECONDS]
+READ_BUDGET_SECONDS = 1.0
+
+
+class _Conn(sqlite3.Connection):
+    """sqlite3 connection carrying its lock budget (seconds) and read-only flag."""
+    lock_budget = _LOCK_RETRY_SECONDS
+    read_only = False
+
+
+@contextlib.contextmanager
+def lock_budget(seconds):
+    """Within the block, connections opened here wait at most `seconds` for the write lock."""
+    old = _lock_budget[0]
+    _lock_budget[0] = float(seconds)
+    try:
+        yield
+    finally:
+        _lock_budget[0] = old
 
 
 # ── connection ───────────────────────────────────────────────────────────────
@@ -89,57 +110,103 @@ def _is_lock_error(e):
     return "locked" in s or "busy" in s
 
 
-def _retry(fn):
-    """Run fn() retrying lock errors past the busy timeout (bounded)."""
-    deadline = time.monotonic() + _LOCK_RETRY_SECONDS
+def _retry(fn, budget=_LOCK_RETRY_SECONDS):
+    """Run fn() retrying lock errors past the busy timeout, for at most `budget` seconds."""
+    deadline = time.monotonic() + budget
     delay = 0.05
     while True:
         try:
             return fn()
         except sqlite3.OperationalError as e:
-            if not _is_lock_error(e) or time.monotonic() > deadline:
+            if not _is_lock_error(e) or time.monotonic() + delay > deadline:
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 1.0)
 
 
+def _commit(conn):
+    conn.execute("COMMIT")
+
+
+def _rollback(conn):
+    try:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def _tx(conn):
-    """BEGIN IMMEDIATE ... COMMIT (rollback on error). Takes the write lock up front. Nested use
-    (an API call made with the conn of an open transaction, e.g. during migration) joins the
-    outer transaction."""
+    """BEGIN IMMEDIATE ... COMMIT. Takes the write lock up front. On any error, in the body OR in
+    COMMIT, the transaction is rolled back and the error re-raised, so the connection is never
+    left inside an open transaction. Nested use (an API call made with the conn of an open
+    transaction, e.g. during migration) joins the outer transaction."""
     if conn.in_transaction:
         yield conn
         return
-    _retry(lambda: conn.execute("BEGIN IMMEDIATE"))
+    budget = getattr(conn, "lock_budget", _LOCK_RETRY_SECONDS)
+    _retry(lambda: conn.execute("BEGIN IMMEDIATE"), budget)
     try:
         yield conn
+        _retry(lambda: _commit(conn), budget)
     except BaseException:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
+        _rollback(conn)
         raise
-    _retry(lambda: conn.execute("COMMIT"))
 
 
 transaction = _tx  # public: group several API calls (each given conn=...) into one write transaction
 
 
-def _open(path):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-    if not os.path.exists(path):
-        try:  # create private before sqlite does (WAL/SHM files inherit the db file's mode)
-            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-        except OSError:
-            pass
-    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None,
-                           check_same_thread=False)
+def _writable(path):
+    d = os.path.dirname(path) or "."
+    if os.path.exists(path):
+        return os.access(path, os.W_OK) and os.access(d, os.W_OK)
+    return os.access(d, os.W_OK) if os.path.isdir(d) else True
+
+
+def _open(path, budget=None, read_only=False):
+    budget = _lock_budget[0] if budget is None else budget
+    busy_ms = int(min(BUSY_TIMEOUT_MS, budget * 1000))
+    if read_only:
+        conn = None
+        for uri in ("file:%s?mode=ro", "file:%s?immutable=1"):
+            try:
+                conn = sqlite3.connect(uri % path, uri=True, timeout=busy_ms / 1000.0,
+                                       isolation_level=None, check_same_thread=False, factory=_Conn)
+                conn.execute("SELECT count(*) FROM meta").fetchone()
+                break
+            except sqlite3.Error:
+                if conn is not None:
+                    conn.close()
+                conn = None
+        if conn is None:
+            raise sqlite3.OperationalError("state db not readable: %s" % path)
+        conn.read_only = True
+    else:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        if not os.path.exists(path):
+            try:  # create private before sqlite does (WAL/SHM files inherit the db file's mode)
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+            except OSError:
+                pass
+        conn = sqlite3.connect(path, timeout=busy_ms / 1000.0, isolation_level=None,
+                               check_same_thread=False, factory=_Conn)
+    conn.lock_budget = budget
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+    conn.execute("PRAGMA busy_timeout=%d" % busy_ms)
     return conn
+
+
+def _schema_current(conn):
+    """Plain read (no lock): is the schema already created at this version?"""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return bool(row) and row[0] == str(SCHEMA_VERSION)
 
 
 def _init_schema(conn, path):
@@ -150,9 +217,11 @@ def _init_schema(conn, path):
         key = None
     if key is not None and key in _ready:
         return
-    mode = _retry(lambda: conn.execute("PRAGMA journal_mode=WAL").fetchone())
-    if not mode or str(mode[0]).lower() != "wal":  # pragma: no cover - e.g. network fs
-        pass
+    if _schema_current(conn):  # the common case: no write lock taken just to open the db
+        if key is not None:
+            _ready.add(key)
+        return
+    _retry(lambda: conn.execute("PRAGMA journal_mode=WAL").fetchone(), conn.lock_budget)
     with _tx(conn):
         for stmt in _SCHEMA:
             conn.execute(stmt)
@@ -161,24 +230,34 @@ def _init_schema(conn, path):
                 conn.execute(stmt)
             except sqlite3.OperationalError:  # pragma: no cover - sqlite built without FTS5
                 pass
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
                      (str(SCHEMA_VERSION),))
     if key is not None:
         _ready.add(key)
 
 
-def connect(path=None, migrate=True):
-    """Open the state db (creating the schema). On the default path ($AI_STATE_DB unset, no
-    explicit path) the first connect() of a process also runs the legacy migration once; it never
-    raises from here. Applies chat_audit retention (at most once per day)."""
+def connect(path=None, migrate=True, read=False):
+    """Open the state db (creating the schema when missing). On the default path ($AI_STATE_DB
+    unset, no explicit path) the first connect() of a process also imports pending legacy files
+    (see migrate_legacy; only a stat per source when nothing is pending); it never raises from
+    there. Writer opens apply chat_audit retention (at most once per day).
+
+    read=True is the degraded-mode open used by read paths (state-export, renders, lists): it
+    waits at most READ_BUDGET_SECONDS on any lock (WAL readers are not blocked by a writer),
+    skips retention, and opens a db it cannot write via a `mode=ro` URI (`immutable=1` as the
+    last resort)."""
     explicit = path is not None or bool(os.environ.get("AI_STATE_DB", "").strip())
     path = path or db_path()
-    conn = _open(path)
+    budget = min(_lock_budget[0], READ_BUDGET_SECONDS) if read else None
+    if read and os.path.exists(path) and not _writable(path):
+        return _open(path, budget=budget, read_only=True)
+    conn = _open(path, budget=budget)
     try:
         _init_schema(conn, path)
     except Exception:
-        conn.close()
-        raise
+        if not (read and _schema_current(conn)):
+            conn.close()
+            raise
     if migrate and not explicit:
         with _guard:
             first = path not in _migrate_tried
@@ -188,19 +267,21 @@ def connect(path=None, migrate=True):
                 migrate_legacy(_home(), conn=conn)
             except Exception:
                 pass
-    try:
-        chat_audit_prune(conn=conn)
-    except Exception:
-        pass
+            _rollback(conn)  # never hand out a connection stuck in a failed transaction
+    if not read:
+        try:
+            chat_audit_prune(conn=conn)
+        except Exception:
+            _rollback(conn)
     return conn
 
 
 @contextlib.contextmanager
-def _conn(conn=None):
+def _conn(conn=None, read=False):
     if conn is not None:
         yield conn
         return
-    c = connect()
+    c = connect(read=read)
     try:
         yield c
     finally:
@@ -235,7 +316,7 @@ def memory_add(text, conn=None):
 
 def memory_list(conn=None):
     """All memory entries, oldest first."""
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         return [r[0] for r in c.execute("SELECT text FROM memory ORDER BY id")]
 
 
@@ -303,7 +384,7 @@ def lesson_exists(kind, tool="", signature="", conn=None):
     kind = str(kind or "").strip().upper()
     sig = str(signature or "").strip().lower()
     t = str(tool or "").strip().lower()
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         if sig:
             row = c.execute("SELECT 1 FROM lessons WHERE kind=? AND lower(signature)=? LIMIT 1",
                             (kind, sig)).fetchone()
@@ -331,7 +412,7 @@ def lessons_list(status="approved", kinds=None, limit=None, include_expired=Fals
     sql = "SELECT * FROM lessons" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC"
     if limit is not None:
         sql += " LIMIT %d" % max(0, int(limit))
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         rows = [dict(r) for r in c.execute(sql, params)]
     return list(reversed(rows))
 
@@ -399,13 +480,13 @@ def _ledger_where(chain_id, signature, kind):
 def ledger_rows(chain_id=None, signature=None, kind=None, conn=None):
     """Ledger rows as dicts, oldest first, optionally filtered."""
     w, p = _ledger_where(chain_id, signature, kind)
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         return [dict(r) for r in c.execute("SELECT * FROM ledger" + w + " ORDER BY id", p)]
 
 
 def ledger_count(chain_id=None, signature=None, kind=None, conn=None):
     w, p = _ledger_where(chain_id, signature, kind)
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         return c.execute("SELECT count(*) FROM ledger" + w, p).fetchone()[0]
 
 
@@ -427,7 +508,7 @@ def sessions_list(limit=None, conn=None):
     sql = "SELECT * FROM sessions ORDER BY coalesce(ended, started, 0) DESC, id DESC"
     if limit is not None:
         sql += " LIMIT %d" % max(0, int(limit))
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         return [dict(r) for r in c.execute(sql)]
 
 
@@ -457,7 +538,7 @@ def task_update(task_id, spec, conn=None):
 
 
 def task_get(task_id, conn=None):
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         row = c.execute("SELECT spec_json FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone()
     if not row:
         return None
@@ -470,7 +551,7 @@ def task_get(task_id, conn=None):
 
 
 def task_exists(task_id, conn=None):
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         return c.execute("SELECT 1 FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone() is not None
 
 
@@ -487,13 +568,13 @@ def task_set_next_run(task_id, next_run, conn=None):
 
 def task_rows(conn=None):
     """[(id, next_run, kind)] sorted by id (what `state-export tasks` prints for ai.c)."""
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         return [tuple(r) for r in c.execute("SELECT id, next_run, kind FROM scheduled_tasks ORDER BY id")]
 
 
 def task_list(conn=None):
     """Every task spec, sorted by id."""
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         rows = list(c.execute("SELECT id, spec_json FROM scheduled_tasks ORDER BY id"))
     out = []
     for tid, sj in rows:
@@ -533,7 +614,7 @@ def chat_audit_recent(limit=10, exclude_status=(), session_id=None, source=None,
     sql = ("SELECT * FROM chat_audit" + (" WHERE " + " AND ".join(where) if where else "")
            + " ORDER BY ts DESC, id DESC LIMIT ?")
     params.append(max(0, int(limit)))
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         rows = [dict(r) for r in c.execute(sql, params)]
     for r in rows:
         try:
@@ -567,7 +648,7 @@ _TABLES = ("memory", "lessons", "ledger", "sessions", "scheduled_tasks", "chat_a
 
 
 def stats(conn=None):
-    with _conn(conn) as c:
+    with _conn(conn, read=True) as c:
         tables = {}
         for t in _TABLES:
             try:
@@ -847,9 +928,45 @@ def _mig_sessions(c, home, counts):
             session_upsert(sid, ended=mt, path=p, conn=c)
 
 
-_MIGRATIONS = (("memory.txt", _mig_memory_txt), ("memory.db", _mig_memory_db),
-               ("lessons.md", _mig_lessons), ("ledger.jsonl", _mig_ledger),
-               ("zulip_chats.jsonl", _mig_chats))
+def _cfg(home, *parts):
+    return os.path.join(home, ".config", "ai", *parts)
+
+
+def _source_paths(name, home):
+    """Legacy file(s) one migration source reads (and renames)."""
+    return {
+        "memory.txt": [_cfg(home, "memory.txt")],
+        "memory.db": [_cfg(home, "memory.db")],
+        "lessons.md": [_cfg(home, "self_improve", "lessons.md")],
+        "ledger.jsonl": [_cfg(home, "self_improve", "ledger.jsonl")],
+        "zulip_chats.jsonl": [os.path.join(home, ".local", "share", "ai", "zulip_chats.jsonl"),
+                              os.path.join(home, ".cache", "ai", "zulip_chats.jsonl")],
+    }.get(name, [])
+
+
+def _present(name, home):
+    """Stat-only: does this legacy source currently exist (again) under `home`?"""
+    if name == "scheduled_tasks":
+        d = _cfg(home, "scheduled_tasks")
+        try:
+            return any(fn.endswith(".json") for fn in os.listdir(d))
+        except OSError:
+            return False
+    return any(os.path.exists(p) for p in _source_paths(name, home))
+
+
+# (source name, importer(conn, home, counts, renames, live)); per-source state in meta:
+# migrated:<name> (last successful import) / migrate_failed:<name> (last error, retried only
+# by migrate_legacy(retry=True) i.e. `ai_mcp.py state-migrate --retry`).
+_SOURCES = (
+    ("memory.txt", lambda c, h, k, r, l: _mig_memory_txt(c, h, k, r)),
+    ("memory.db", lambda c, h, k, r, l: _mig_memory_db(c, h, k, r)),
+    ("lessons.md", lambda c, h, k, r, l: _mig_lessons(c, h, k, r)),
+    ("ledger.jsonl", lambda c, h, k, r, l: _mig_ledger(c, h, k, r)),
+    ("zulip_chats.jsonl", lambda c, h, k, r, l: _mig_chats(c, h, k, r)),
+    ("scheduled_tasks", lambda c, h, k, r, l: _mig_tasks(c, h, k, r, l)),
+)
+SOURCE_NAMES = tuple(n for n, _ in _SOURCES)
 _COUNT_KEYS = ("memory", "memories", "vault", "lessons", "lessons_skipped", "ledger", "ledger_skipped",
                "scheduled_tasks", "scheduled_tasks_skipped", "chat_audit", "chat_audit_skipped",
                "sessions", "renamed", "errors")
@@ -864,40 +981,69 @@ def _bak_name(path):
     return bak
 
 
-def migrate_legacy(home=None, conn=None):
-    """Import the legacy state files under `home` into the state db (once: meta.migrated_v1).
+def _pending(c, home, retry):
+    """Sources to import now: everything on the first pass; afterwards only legacy files that
+    exist again (written by a still-running old-code process, or hand-made) - stat only - minus
+    the ones whose last attempt failed unless retry."""
+    if not _meta_get(c, "migrated_v1"):
+        return list(SOURCE_NAMES), True
+    todo = []
+    for name in SOURCE_NAMES:
+        if not _present(name, home):
+            continue
+        if not retry and _meta_get(c, "migrate_failed:" + name):
+            continue
+        todo.append(name)
+    return todo, False
 
-    Everything is imported in one transaction together with the migrated_v1 flag (so a concurrent
-    process either sees nothing or everything); each file runs under its own savepoint, so a file
-    that fails is reported (counts['errors']) and left in place while the rest is imported.
-    Afterwards the imported originals are renamed to *.migrated.bak. Returns the per-category
-    counts, or {} when the migration already ran."""
+
+def migrate_legacy(home=None, conn=None, retry=False):
+    """Import the legacy state files under `home` into the state db.
+
+    First pass (no meta.migrated_v1): every source, plus a sessions-index backfill, in ONE
+    transaction that also sets migrated_v1, so a concurrent process sees nothing or everything.
+    Each source runs under its own savepoint: one that fails is rolled back, recorded as
+    meta.migrate_failed:<source> (and in counts['errors'] / migration_report) and left in place,
+    while the rest is imported (meta.migrated:<source>). After COMMIT the imported files are
+    renamed to *.migrated.bak (.migrated.bak.N if taken); nothing is deleted.
+
+    Later calls (each process's first connect(), `state-migrate`) are a stat per source: a legacy
+    file that exists again is imported and renamed again (second pass). Failed sources are only
+    re-attempted with retry=True (`state-migrate --retry`). Returns per-category counts, or {}
+    when there was nothing to do."""
     home = home or _home()
     own = conn is None
     c = connect(migrate=False) if own else conn
     counts = dict.fromkeys(_COUNT_KEYS, 0)
     renames, live, errors = [], [], []
     try:
-        if _meta_get(c, "migrated_v1"):
+        todo, _ = _pending(c, home, retry)
+        if not todo:
             return {}
         with _tx(c):
-            if _meta_get(c, "migrated_v1"):
+            todo, first_pass = _pending(c, home, retry)  # re-check under the write lock
+            if not todo:
                 return {}
-            steps = list(_MIGRATIONS) + [("scheduled_tasks", lambda c_, h, k, r: _mig_tasks(c_, h, k, r, live)),
-                                         ("sessions", lambda c_, h, k, r: _mig_sessions(c_, h, k))]
+            steps = [(n, fn) for n, fn in _SOURCES if n in todo]
+            if first_pass:
+                steps.append(("sessions", lambda c_, h, k, r, l: _mig_sessions(c_, h, k)))
             for name, fn in steps:
                 before = len(renames)
                 c.execute("SAVEPOINT mig")
                 try:
-                    fn(c, home, counts, renames)
+                    fn(c, home, counts, renames, live)
                     c.execute("RELEASE mig")
+                    c.execute("DELETE FROM meta WHERE key=?", ("migrate_failed:" + name,))
+                    _meta_set(c, "migrated:" + name, time.time())
                 except Exception as e:
                     c.execute("ROLLBACK TO mig")
                     c.execute("RELEASE mig")
                     del renames[before:]
                     counts["errors"] += 1
                     errors.append("%s: %s" % (name, e))
-            _meta_set(c, "migrated_v1", json.dumps({"at": time.time(), "home": home}))
+                    _meta_set(c, "migrate_failed:" + name, "%s: %s" % (type(e).__name__, e))
+            if first_pass:
+                _meta_set(c, "migrated_v1", json.dumps({"at": time.time(), "home": home}))
             _meta_set(c, "migration_report", json.dumps(dict(counts, error_details=errors)))
         for p in renames:
             try:

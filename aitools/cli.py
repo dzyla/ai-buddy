@@ -4,6 +4,7 @@ session-transcript, run-scheduler, the self-improvement/ledger subcommands and f
 main(argv) -> int takes the arguments after the program name. Output (stdout bytes, exit codes)
 is identical to the former single-file ai_mcp.py main().
 """
+import contextlib
 import io
 import json
 import os
@@ -25,11 +26,19 @@ from .sessions import session_transcript, trim_messages
 from . import state
 
 
+_FAST_SUBCOMMANDS = ("state-export", "session-recap", "lessons-for", "rag-memories")
+_FAST_LOCK_BUDGET = 1.5
+
+
 def main(argv=None):
     """Run one subcommand; returns the process exit code."""
     argv = sys.argv if argv is None else [sys.argv[0] if sys.argv else "ai_mcp.py"] + list(argv)
+    # Subcommands ai.c runs synchronously at startup / on the idle prompt must never stall on a
+    # state-db write lock held by another process: cap their lock waits (reads are lock-free).
+    fast = len(argv) > 1 and argv[1] in _FAST_SUBCOMMANDS
     try:
-        _main(argv)
+        with (state.lock_budget(_FAST_LOCK_BUDGET) if fast else contextlib.nullcontext()):
+            _main(argv)
     except SystemExit as e:
         code = e.code
         if code is None:
@@ -172,7 +181,12 @@ def _main(argv):
         sys.exit(0)
 
     if action == "state-migrate":
-        print(json.dumps(state.migrate_legacy(argv[2] if len(argv) > 2 else None)))
+        # state-migrate [--retry] [HOME]: import pending legacy files; --retry re-attempts
+        # sources whose last import failed (meta.migrate_failed:<source>).
+        rest = argv[2:]
+        retry = "--retry" in rest
+        rest = [a for a in rest if a != "--retry"]
+        print(json.dumps(state.migrate_legacy(rest[0] if rest else None, retry=retry)))
         sys.exit(0)
 
     if action == "state-stats":

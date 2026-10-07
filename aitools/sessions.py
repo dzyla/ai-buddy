@@ -5,16 +5,22 @@ import json
 from . import state
 
 
+_session_index_down = [False]   # set after the first failed write: skip the rest this process
+
+
 def record_session(session_id, path=None, ended=None, summary=None, started=None):
     """Upsert one row of the sessions index (id, started, ended, path, summary). Called when the
-    history indexer (re)indexes a saved session file; never raises."""
-    if not session_id or session_id == "last":
+    history indexer (re)indexes a saved session file; never raises. After one failure (e.g. the
+    db is locked past the caller's lock budget) further calls in this process are skipped, so a
+    sync over many files cannot multiply the lock wait (rows are refreshed on a later sync)."""
+    if not session_id or session_id == "last" or _session_index_down[0]:
         return False
     try:
         state.session_upsert(session_id, started=started, ended=ended, path=path,
                              summary=(summary or "")[:300] or None)
         return True
     except Exception:
+        _session_index_down[0] = True
         return False
 
 # ── Context trimming (called by ai.c when messages_json exceeds the budget) ──

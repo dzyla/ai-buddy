@@ -214,10 +214,12 @@ def _ledger_append(rec):
                         max_rows=_SI_LEDGER_MAX_LINES)
 
 def _append_lesson(kind, tool, signature, body):
+    """Best-effort lesson write; returns False when the state db refused it."""
     try:
         state.lesson_upsert(kind, tool or "", signature or "", body)
+        return True
     except Exception:
-        pass  # learning is best-effort; never break the tool call that triggered it
+        return False  # learning is best-effort; never break the tool call that triggered it
 
 def _chain_id(tool, error):
     """Stable id for an ERROR CHAIN: the same mistake, however many times it
@@ -519,11 +521,9 @@ def _metrics_lesson_sync(min_fails=3):
             continue
         body = ("Metric-detected recurring failure (%dx so far): `%s` failed with:\n"                "> %s\n"                "This tool is flaky for this error — check '## FIX' lessons and "\
                 "show-metrics before retrying the same call." % (n, t or "?", err))
-        try:
-            _append_lesson("PITFALL", t, sig, body)
-            created.append(sig)
-        except Exception:
-            pass
+        if not _append_lesson("PITFALL", t, sig, body):
+            break  # db locked/unwritable: don't wait once per lesson (session-recap is on ai's startup path)
+        created.append(sig)
     return created
 
 def metrics_lesson_sync(min_fails=3):

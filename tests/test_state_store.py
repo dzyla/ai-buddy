@@ -174,10 +174,16 @@ def test_migrate_legacy_imports_renames_and_is_idempotent(tmp_path):
     conn.close()
 
     # second run: no-op, nothing duplicated
-    (cfg / "memory.txt").write_text("written after the migration\n")
     assert state.migrate_legacy(str(home)) == {}
     assert len(state.memory_list()) == 101
-    assert (cfg / "memory.txt").exists()
+    # a legacy file that re-appears (old-code process still running) gets a second pass
+    (cfg / "memory.txt").write_text("written after the migration\n")
+    again = state.migrate_legacy(str(home))
+    assert again["memory"] == 1 and again["renamed"] == 1
+    assert len(state.memory_list()) == 102
+    assert not (cfg / "memory.txt").exists()
+    assert (cfg / "memory.txt.migrated.bak.1").exists()
+    assert state.migrate_legacy(str(home)) == {}
 
 
 def test_lazy_migration_on_first_connect(tmp_path, monkeypatch):
@@ -414,3 +420,179 @@ def test_binary_injects_state_memory_not_memory_txt(tmp_path):
     system = next(m["content"] for m in reqs[0]["messages"] if m["role"] == "system")
     assert "Persistent Memory/Preferences:\nprefers SI units (from the state db)" in system
     assert "STALE FILE MEMORY" not in system
+
+
+# ── fix round 1: lock-free reads, safe commit, retryable/second-pass migration ──
+def test_export_memory_not_blocked_by_a_writer_holding_the_lock():
+    state.memory_add("likes oolong")
+    holder = state.connect()
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO ledger(ts, tool, ok, kind) VALUES (1, 't', 0, 'failure')")
+    try:
+        t0 = time.monotonic()
+        r = _cli("state-export", "memory")
+        took = time.monotonic() - t0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "likes oolong"
+    assert took < 2.0, took
+
+
+def test_export_memory_from_a_read_only_db():
+    state.memory_add("likes oolong")
+    state.lesson_upsert("FIX", "t", "s", "the fix")
+    path = state.db_path()
+    os.chmod(path, 0o444)
+    try:
+        r = _cli("state-export", "memory")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "likes oolong"
+        assert "the fix" in _cli("state-export", "lessons").stdout
+        assert state.memory_list() == ["likes oolong"]     # in-process read path too
+    finally:
+        os.chmod(path, 0o600)
+
+
+def test_commit_failure_rolls_back_and_next_write_is_durable(monkeypatch):
+    state.connect().close()
+    real = state._commit
+    calls = []
+
+    def flaky(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        real(conn)
+    monkeypatch.setattr(state, "_commit", flaky)
+    conn = state.connect()
+    with pytest.raises(sqlite3.OperationalError):
+        state.memory_add("lost", conn=conn)
+    assert not conn.in_transaction
+    assert state.memory_add("kept", conn=conn) == "added"
+    conn.close()
+    assert state.memory_list() == ["kept"]
+
+
+def test_failed_lazy_migration_returns_a_usable_connection(tmp_path, monkeypatch):
+    home = _legacy_home(tmp_path)
+    monkeypatch.delenv("AI_STATE_DB", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    real = state._commit
+    calls = []
+
+    def fail_second(conn):     # commit #1 creates the schema, #2 is the migration
+        calls.append(1)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError("disk I/O error")
+        real(conn)
+    monkeypatch.setattr(state, "_commit", fail_second)
+    conn = state.connect()
+    assert not conn.in_transaction
+    assert state.memory_add("durable", conn=conn) == "added"
+    conn.close()
+    assert state.memory_list() == ["durable"]              # nothing half-imported
+    assert (home / ".config/ai/memory.txt").exists()       # originals untouched -> retried later
+    monkeypatch.setattr(state, "_migrate_tried", set())
+    assert "café au lait is the preferred drink" in state.memory_list()
+    assert (home / ".config/ai/memory.txt.migrated.bak").exists()
+
+
+def test_failed_source_stays_retryable(tmp_path):
+    home = _legacy_home(tmp_path)
+    lessons = home / ".config/ai/self_improve/lessons.md"
+    os.chmod(lessons, 0)              # transiently unreadable
+    try:
+        counts = state.migrate_legacy(str(home))
+    finally:
+        os.chmod(lessons, 0o600)
+    assert counts["errors"] == 1 and counts["lessons"] == 0 and counts["memory"] == 101
+    assert lessons.exists()
+    conn = state.connect()
+    assert "PermissionError" in conn.execute(
+        "SELECT value FROM meta WHERE key='migrate_failed:lessons.md'").fetchone()[0]
+    conn.close()
+    assert state.migrate_legacy(str(home)) == {}           # not retried implicitly
+    out = json.loads(_cli("state-migrate", "--retry", str(home)).stdout)
+    assert out["lessons"] == 4 and out["errors"] == 0
+    assert not lessons.exists() and (home / ".config/ai/self_improve/lessons.md.migrated.bak").exists()
+    conn = state.connect()
+    assert conn.execute("SELECT 1 FROM meta WHERE key='migrate_failed:lessons.md'").fetchone() is None
+    conn.close()
+
+
+def test_lazy_second_pass_imports_lines_written_by_old_processes(tmp_path, monkeypatch):
+    home = _legacy_home(tmp_path)
+    monkeypatch.delenv("AI_STATE_DB", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    assert state.ledger_count() == 3
+    si = home / ".config/ai/self_improve"
+    (si / "ledger.jsonl").write_text(json.dumps({"ts": "2026-10-01 10:00:00", "kind": "failure",
+                                                 "tool": "late", "error": "x", "chain_id": "c"}) + "\n")
+    (home / ".cache/ai/zulip_chats.jsonl").write_text(json.dumps(
+        {"session_id": "zulip_late", "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+         "query": "late q", "status": "success"}) + "\n")
+    monkeypatch.setattr(state, "_migrate_tried", set())   # = a new process
+    assert state.ledger_count() == 4
+    assert state.chat_audit_recent(limit=1)[0]["session_id"] == "zulip_late"
+    assert (si / "ledger.jsonl.migrated.bak.1").exists() and not (si / "ledger.jsonl").exists()
+
+
+def test_scheduler_backs_off_when_the_state_db_is_unusable(tmp_path, monkeypatch):
+    import ai_mcp
+    monkeypatch.setenv("HOME", str(tmp_path))
+    calls = []
+
+    def broken(task_id):
+        calls.append(task_id)
+        if len(calls) <= 12:
+            raise sqlite3.OperationalError("unable to open database file")
+        return None                 # then the task is gone -> loop exits
+    monkeypatch.setattr(state, "task_get", broken)
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))   # fake clock
+    ai_mcp.run_scheduler_loop("t_backoff")
+    assert sleeps == [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]
+    log = (tmp_path / ".cache/ai/scheduler.log").read_text()
+    assert log.count("State db unavailable") == 12        # one line per backoff step
+
+
+def test_session_index_writes_stop_after_first_lock_failure(monkeypatch):
+    from aitools import sessions
+    monkeypatch.setattr(sessions, "_session_index_down", [False])
+    calls = []
+
+    def locked(*a, **k):
+        calls.append(1)
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(state, "session_upsert", locked)
+    assert [sessions.record_session("s%d" % i) for i in range(5)] == [False] * 5
+    assert len(calls) == 1
+
+
+def test_session_recap_stays_fast_while_a_writer_holds_the_lock(tmp_path):
+    """session-recap runs synchronously at ai startup and re-indexes changed session files
+    (each one a sessions-index write) and may write metric-derived lessons."""
+    home = tmp_path / "home"
+    sess = home / ".local/share/ai/sessions"
+    sess.mkdir(parents=True)
+    for i in range(30):
+        (sess / ("s%02d.json" % i)).write_text(json.dumps([{"role": "user", "content": "task %d" % i}]))
+    cache = home / ".cache/ai"
+    cache.mkdir(parents=True)
+    (cache / "metrics.jsonl").write_text("".join(
+        json.dumps({"tool": "t%d" % (i % 10), "duration_ms": 1, "success": False, "error": "boom %d" % (i % 10)})
+        + "\n" for i in range(30)))
+    state.connect().close()
+    holder = state.connect()
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.monotonic()
+        r = _cli("session-recap", env=dict(os.environ, HOME=str(home)))
+        took = time.monotonic() - t0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert r.returncode == 0, r.stderr
+    assert took < 6.0, took
