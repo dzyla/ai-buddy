@@ -1428,3 +1428,13 @@ def test_effective_owner_sources(monkeypatch):
     assert bridge.effective_owner() == ("owner@example.com", "bot_owner_id")
     monkeypatch.setenv("ZULIP_USER", "42")
     assert bridge.effective_owner() == ("42", "ZULIP_USER")
+
+
+def test_check_placeholder_zuliprc_is_not_configured(check_env):
+    """config/zuliprc.example's REPLACE_WITH_... key must read as "not configured", not as creds."""
+    check_env.write_text("[api]\nemail=your-bot@example.com\nkey=REPLACE_WITH_BOT_API_KEY\n"
+                         "site=https://chat.example.com\n")
+    rc, out = _run_check(_CheckClient())
+    assert rc == 1
+    assert "not configured" in out and "placeholder" in out
+    assert "Credentials: bot email" not in out

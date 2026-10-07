@@ -1,6 +1,7 @@
 """Robinhood Agentic MCP bridge: account resolution, reads and the order mutator."""
 
 import os
+import re
 import sys
 import json
 import time
@@ -54,6 +55,19 @@ class AccountResolutionError(RuntimeError):
 
 class OrderNotConfirmed(RuntimeError):
     """An order request was sent but no response arrived: it may or may not have been placed."""
+
+_PLACEHOLDER_RE = re.compile(r"^<.*>$")
+
+
+def _real_account(val) -> Optional[str]:
+    """Stripped account number, or None when empty or a "<...>" template placeholder."""
+    if val is None:
+        return None
+    val = str(val).strip()
+    if not val or _PLACEHOLDER_RE.match(val):
+        return None
+    return val
+
 
 class RobinhoodExecutor:
     """Direct, high-speed execution bridge for Robinhood Agentic MCP (sub-second order placement)."""
@@ -262,12 +276,12 @@ class RobinhoodExecutor:
         """Account number for a role ('agentic', 'primary', 'roth') from env or the trader config.
 
         Env var RH_<ROLE>_ACCOUNT wins; otherwise {"accounts": {role: number}} in
-        trader_config_path(). Numbers are never hardcoded in this file (public repo)."""
-        env_val = os.environ.get(f"RH_{role.upper()}_ACCOUNT", "").strip()
+        trader_config_path(). Numbers are never hardcoded in this file (public repo). Template
+        placeholders such as "<AGENTIC_ACCOUNT>" (config/trader.example.json) count as unset."""
+        env_val = _real_account(os.environ.get(f"RH_{role.upper()}_ACCOUNT"))
         if env_val:
             return env_val
-        val = (load_trader_config().get("accounts") or {}).get(role)
-        return str(val).strip() if val not in (None, "") else None
+        return _real_account((load_trader_config().get("accounts") or {}).get(role))
 
     @classmethod
     def get_agentic_account(cls) -> Optional[Dict[str, Any]]:

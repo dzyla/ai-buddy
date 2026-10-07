@@ -39,7 +39,8 @@
         "tool": "execute_command",
         "args": {
           "command": "python3 build.py"
-        }
+        },
+        "expect_error": true
       },
       {
         "tool": "read_file",

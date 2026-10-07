@@ -46,7 +46,8 @@
         "tool": "execute_command",
         "args": {
           "command": "python3 test_calc.py"
-        }
+        },
+        "expect_error": true
       },
       {
         "tool": "read_file",

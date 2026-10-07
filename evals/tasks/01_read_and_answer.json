@@ -19,6 +19,11 @@
       "name": "read_file"
     },
     {
+      "type": "tool_result_contains",
+      "tool": "read_file",
+      "text": "10 mM HEPES"
+    },
+    {
       "type": "max_steps",
       "value": 6
     }

@@ -130,13 +130,35 @@ def get_zulip_client():
     
     config_file = os.environ.get("ZULIP_CONFIG_PATH")
     if config_file:
-        return zulip.Client(config_file=os.path.expanduser(config_file))
+        config_file = os.path.expanduser(config_file)
+        _reject_placeholder_zuliprc(config_file)
+        return zulip.Client(config_file=config_file)
         
     default_config_path = os.path.expanduser("~/.config/zulip/zuliprc")
     if os.path.exists(default_config_path):
+        _reject_placeholder_zuliprc(default_config_path)
         return zulip.Client(config_file=default_config_path)
 
+    _reject_placeholder_zuliprc(os.path.expanduser("~/.zuliprc"))  # zulip.Client()'s default
     return zulip.Client()
+
+
+def zuliprc_is_placeholder(path):
+    """True when the zuliprc's API key is still the config/zuliprc.example placeholder."""
+    import configparser
+    parser = configparser.ConfigParser()
+    try:
+        with open(path) as f:
+            parser.read_file(f)
+    except (OSError, configparser.Error):
+        return False
+    return "REPLACE_WITH" in parser.get("api", "key", fallback="")
+
+
+def _reject_placeholder_zuliprc(path):
+    if zuliprc_is_placeholder(path):
+        raise Exception(f"Zulip is not configured: {path} still holds the template placeholder key "
+                        "(REPLACE_WITH_...). Save your bot's real zuliprc there (chmod 600).")
 
 def _send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")

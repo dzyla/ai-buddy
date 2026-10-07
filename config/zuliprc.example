@@ -1,7 +1,8 @@
-# Template zuliprc (install.sh copies it to ~/.config/ai/zuliprc only if missing, mode 600).
-# Download the real file for your bot from Zulip: Settings > Personal > Bots > download zuliprc.
-# Nothing reads ~/.config/ai/zuliprc by default: move it to ~/.zuliprc (read by both the bridge
-# and zulip_mcp_server.py), or point ZULIP_CONFIG (bridge) / ZULIP_CONFIG_PATH (MCP server) at it.
+# Template zuliprc showing the format (install.sh does NOT install it; a key containing
+# REPLACE_WITH is reported as "not configured" by the bridge --check and the MCP server).
+# Download the real file for your bot from Zulip: Settings > Personal > Bots > download zuliprc,
+# save it as ~/.zuliprc (read by both the bridge and zulip_mcp_server.py) with chmod 600, or
+# point ZULIP_CONFIG (bridge) / ZULIP_CONFIG_PATH (MCP server) at it.
 # See docs/zulip_setup.md.
 [api]
 email=your-bot@example.com

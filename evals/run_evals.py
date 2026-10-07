@@ -4,16 +4,22 @@
 Each task in evals/tasks/*.json runs the real `ai` binary (`ai -y "<prompt>"`) in a fresh temp
 workdir with an isolated HOME, then is scored by the task's checks:
 
-  answer_contains  {"text": "..."} or {"any": ["...", "..."]}  case-insensitive, on the final answer
-  file_exists      {"path": "rel/path"}
-  file_contains    {"path": "rel/path", "text": "..."}
-  tool_used        {"name": "read_file", "min": 1}               tool calls recorded in the session
-  max_steps        {"value": N}                                  model turns (assistant messages)
+  answer_contains      {"text": "..."} or {"any": [...]}   case-insensitive, on the final answer
+  file_exists          {"path": "rel/path"}                 "in": "home" = under the eval HOME
+  file_contains        {"path": "rel/path", "text": "..."}  (also takes "in": "home")
+  tool_used            {"name": "read_file", "min": 1}      tool calls recorded in the session
+  tool_result_contains {"tool": "read_file", "text": "..."} what a tool really returned
+  max_steps            {"value": N}                         model turns (assistant messages)
 Any check takes "not": true to invert it.
 
-Task file fields: id, prompt, checks, optional files {relpath: content}, env {VAR: value},
-timeout (s), and mock {"steps": [...], "final": "..."}. A mock step is {"tool", "args"} or a list
-of them (parallel calls in one turn); "final" becomes the task_complete summary.
+Task file fields: id, prompt, checks, optional files {relpath: content} (workdir), home_files
+{relpath: content} (eval HOME), env {VAR: value}, timeout (s), and mock {"steps": [...],
+"final": "..."}. A mock step is {"tool", "args"[, "expect_error": true]} or a list of them
+(parallel calls in one turn); "final" becomes the task_complete summary.
+
+In --mock mode the answer text and the tool calls are scripted, so the runner also fails a task
+when a scripted tool call returns an error, unless that step has "expect_error": true; such a
+step must then really error (recovery tasks prove their failure is real).
 
 Modes:
   --mock    start tests/mock_llm_server.py per task, scripted by the task's `mock` field. Offline
@@ -33,6 +39,7 @@ import concurrent.futures
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -46,7 +53,9 @@ REPO = os.path.dirname(HERE)
 TASKS_DIR = os.path.join(HERE, "tasks")
 AI_BIN = os.path.join(REPO, "ai")
 MOCK_SERVER = os.path.join(REPO, "tests", "mock_llm_server.py")
-CHECK_TYPES = ("answer_contains", "file_exists", "file_contains", "tool_used", "max_steps")
+CHECK_TYPES = ("answer_contains", "file_exists", "file_contains", "tool_used", "max_steps",
+               "tool_result_contains")
+_STATE_RE = re.compile(r"^\[CURRENT STATE step \d+\] \S+ -> (\w+)")
 # Variables that must not leak from the developer's shell into an eval run.
 SCRUB = ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS",
          "LLAMA_MODEL_PATH", "PYTHONPATH")
@@ -70,19 +79,40 @@ def load_tasks(only=None, tasks_dir=TASKS_DIR):
     return tasks
 
 
-def mock_tool_seq(task):
-    """Task `mock.steps` -> MOCK_TOOL_SEQ items (OpenAI tool_call dicts, string arguments)."""
-    seq, n = [], 0
+def _mock_calls(task):
+    """Task `mock.steps` -> (MOCK_TOOL_SEQ items, {call id: expect_error})."""
+    seq, expect, n = [], {}, 0
 
     def call(c):
         nonlocal n
         n += 1
-        return {"id": "call_eval_%d" % n, "type": "function",
+        cid = "call_eval_%d" % n
+        expect[cid] = bool(c.get("expect_error"))
+        return {"id": cid, "type": "function",
                 "function": {"name": c["tool"], "arguments": json.dumps(c["args"])}}
 
     for step in task.get("mock", {}).get("steps", []):
         seq.append([call(c) for c in step] if isinstance(step, list) else call(step))
-    return seq
+    return seq, expect
+
+
+def mock_tool_seq(task):
+    """Task `mock.steps` -> MOCK_TOOL_SEQ items (OpenAI tool_call dicts, string arguments)."""
+    return _mock_calls(task)[0]
+
+
+def tool_result_is_error(content):
+    """True for a failed tool result: the C loop's "[CURRENT STATE step N] tool -> error" header,
+    "[Command Failed ...]", or an "Error..." result from the Python backend."""
+    text = str(content or "").lstrip()
+    m = _STATE_RE.match(text)
+    if m:
+        return m.group(1) == "error"
+    if text.startswith("[Command Failed"):
+        return True
+    if text.startswith("[Command Success"):
+        return False
+    return text.startswith("Error")
 
 
 # ── environment ──────────────────────────────────────────────────────────────
@@ -98,6 +128,9 @@ def agent_env(home, base_url, model, api_key, engine=None, extra=None):
         "INFER_QUIET": "1",
         "INFER_NO_MCP": "1",
         "BROWSER": ":", "NO_BROWSER": "1",
+        # An edit within the same second as the first run, with the same file size, would
+        # otherwise reuse a stale __pycache__ entry (fix_failing_test: a - b -> a + b).
+        "PYTHONDONTWRITEBYTECODE": "1",
         # The binary's rpath for libremote_harness.so is "." (cwd) and the build user's
         # ~/.local/lib; runs happen in a temp cwd, so point the loader at the checkout.
         "LD_LIBRARY_PATH": REPO + (os.pathsep + os.environ["LD_LIBRARY_PATH"]
@@ -217,6 +250,42 @@ def _tool_names(session):
     return names
 
 
+def _tool_results(session):
+    """[(call id, tool name, content)] for every tool message, in order."""
+    names, out = {}, []
+    for m in session or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                names[tc.get("id")] = (tc.get("function") or {}).get("name", "")
+        elif m.get("role") == "tool":
+            cid = m.get("tool_call_id")
+            out.append((cid, names.get(cid, ""), str(m.get("content") or "")))
+    return out
+
+
+def _mock_error_checks(task, results):
+    """--mock only: every scripted call ran, and errored exactly when marked expect_error."""
+    _, expect = _mock_calls(task)
+    by_id = {cid: (name, content) for cid, name, content in results}
+    checks = []
+    for cid, want_err in expect.items():
+        if cid not in by_id:
+            checks.append((False, "scripted tool call %s ran" % cid, "no tool result"))
+            continue
+        name, content = by_id[cid]
+        is_err = tool_result_is_error(content)
+        snippet = content[-200:].replace("\n", " | ")
+        if is_err and not want_err:
+            checks.append((False, "unexpected tool error: %s (%s)" % (name, cid), snippet))
+        elif want_err and not is_err:
+            checks.append((False, "expected error did not happen: %s (%s)" % (name, cid), snippet))
+    if not checks:
+        checks.append((True, "scripted tool calls errored only where expected", ""))
+    return checks
+
+
 def _final_answer(session, stdout):
     """The last task_complete summary, else the last assistant text, else stdout."""
     for m in reversed(session or []):
@@ -234,6 +303,15 @@ def _final_answer(session, stdout):
     return stdout
 
 
+def _check_path(check, ctx):
+    base = ctx["home"] if check.get("in") == "home" else ctx["workdir"]
+    return os.path.join(base, check["path"])
+
+
+def _check_label(check):
+    return ("~/" if check.get("in") == "home" else "") + check["path"]
+
+
 def run_check(check, ctx):
     """-> (ok, label, detail). Raises ValueError for an unknown check type."""
     kind = check.get("type")
@@ -244,23 +322,28 @@ def run_check(check, ctx):
         label = "answer contains %s" % " | ".join(repr(o) for o in options)
         detail = ctx["answer"][:160]
     elif kind == "file_exists":
-        ok = os.path.exists(os.path.join(ctx["workdir"], check["path"]))
-        label, detail = "file %s exists" % check["path"], ""
+        ok = os.path.exists(_check_path(check, ctx))
+        label, detail = "file %s exists" % _check_label(check), ""
     elif kind == "file_contains":
-        p = os.path.join(ctx["workdir"], check["path"])
+        p = _check_path(check, ctx)
         try:
             with open(p, encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except OSError:
             content = None
         ok = content is not None and check["text"] in content
-        label = "%s contains %r" % (check["path"], check["text"])
+        label = "%s contains %r" % (_check_label(check), check["text"])
         detail = "(missing)" if content is None else repr(content[:120])
     elif kind == "tool_used":
         n = ctx["tools"].count(check["name"])
         ok = n >= int(check.get("min", 1))
         label = "%s used >= %d" % (check["name"], int(check.get("min", 1)))
         detail = ", ".join(ctx["tools"])[:160]
+    elif kind == "tool_result_contains":
+        hits = [c for name, c in ctx.get("tool_results", []) if name == check["tool"]]
+        ok = any(check["text"] in c for c in hits)
+        label = "%s result contains %r" % (check["tool"], check["text"])
+        detail = " || ".join(c[-120:].replace("\n", " | ") for c in hits)[:240] or "(no such tool result)"
     elif kind == "max_steps":
         ok = ctx["steps"] <= int(check["value"])
         label, detail = "steps <= %d" % int(check["value"]), "steps=%d" % ctx["steps"]
@@ -280,13 +363,14 @@ def run_task(task, endpoint, engine, keep=False):
     # shim into the isolated HOME so the workdir holds only the task's own files.
     os.makedirs(os.path.join(home, ".local", "bin"))
     os.symlink(os.path.join(REPO, "ai_mcp.py"), os.path.join(home, ".local", "bin", "ai_mcp.py"))
-    for rel, content in task.get("files", {}).items():
-        p = os.path.join(work, rel)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(content)
-        if rel.endswith(".sh"):
-            os.chmod(p, 0o755)
+    for base, files in ((work, task.get("files", {})), (home, task.get("home_files", {}))):
+        for rel, content in files.items():
+            p = os.path.join(base, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(content)
+            if rel.endswith(".sh"):
+                os.chmod(p, 0o755)
     timeout = int(task.get("timeout", 300 if endpoint else 60))
     cmd = [AI_BIN, "-y", task["prompt"]]
     t0 = time.time()
@@ -303,8 +387,10 @@ def run_task(task, endpoint, engine, keep=False):
         session = _session(home)
         tools = _tool_names(session)
         steps = sum(1 for m in session or [] if isinstance(m, dict) and m.get("role") == "assistant")
-        ctx = {"answer": _final_answer(session, out), "workdir": work, "tools": tools,
-               "steps": steps}
+        results = _tool_results(session)
+        ctx = {"answer": _final_answer(session, out), "workdir": work, "home": home,
+               "tools": tools, "steps": steps,
+               "tool_results": [(name, content) for _, name, content in results]}
         checks = []
         if timed_out:
             checks.append((False, "finished within %ds" % timeout, "timeout"))
@@ -315,9 +401,12 @@ def run_task(task, endpoint, engine, keep=False):
                 checks.append(run_check(c, ctx))
             except (KeyError, ValueError) as e:
                 checks.append((False, "check %r" % c.get("type"), "bad check: %r" % e))
+        if endpoint is None and session is not None:
+            checks.extend(_mock_error_checks(task, results))
         passed = bool(checks) and all(ok for ok, _, _ in checks)
         return {"id": task["id"], "passed": passed, "steps": steps,
                 "duration_s": round(time.time() - t0, 2), "tools": tools,
+                "tool_errors": [c[-300:] for _, _, c in results if tool_result_is_error(c)],
                 "answer": ctx["answer"][:500],
                 "checks": [{"ok": bool(ok), "check": label, "detail": str(detail)}
                            for ok, label, detail in checks]}
@@ -326,6 +415,15 @@ def run_task(task, endpoint, engine, keep=False):
             print("kept %s: %s" % (task["id"], root), file=sys.stderr)
         else:
             shutil.rmtree(root, ignore_errors=True)
+
+
+def python_engine_available():
+    """True once the checkout has the Python engine (`import agent` works from the repo)."""
+    if not os.path.isdir(os.path.join(REPO, "agent")):
+        return False
+    r = subprocess.run([sys.executable, "-c", "import agent"], cwd=REPO,
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode == 0
 
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -364,6 +462,10 @@ def main(argv=None):
 
     if not os.access(AI_BIN, os.X_OK):
         print("ERROR: %s not found; run `make` first." % AI_BIN, file=sys.stderr)
+        return 2
+    if args.engine == "py" and not python_engine_available():
+        print("ERROR: --engine py: the Python engine (agent/ package, Task 8) is not in this "
+              "checkout yet; use --engine c or omit --engine.", file=sys.stderr)
         return 2
     endpoint = None
     if not args.mock:

@@ -77,6 +77,10 @@ def run_check(online=False, client_factory=None, env_applied=None, out=print):
                            and f"ZULIP_{'API_KEY' if k == 'key' else k.upper()}" not in env_creds]
                 if missing:
                     fail(f"{cfg}: missing {', '.join(missing)} in the [api] section")
+                elif "REPLACE_WITH" in parser.get("api", "key", fallback="") \
+                        and "ZULIP_API_KEY" not in env_creds:
+                    fail(f"Zulip not configured: {cfg} still has the template placeholder key "
+                         f"(REPLACE_WITH_...). Download the bot's zuliprc and save it there.")
                 else:
                     cfg_ok = True
                     email = os.environ.get("ZULIP_EMAIL") or parser.get("api", "email", fallback="")

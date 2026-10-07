@@ -664,6 +664,34 @@ class TestAccountResolution:
         assert rt.RobinhoodExecutor.get_agentic_account() is None
 
 
+    def test_template_placeholders_count_as_unconfigured(self, fake_accounts, monkeypatch):
+        """install.sh may seed ~/.config/ai/trader.json from config/trader.example.json, whose
+        accounts are '<AGENTIC_ACCOUNT>'-style placeholders: they must behave like no config."""
+        import robinhood_trader as rt
+        tpl = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "config", "trader.example.json")
+        monkeypatch.setenv("RH_TRADER_CONFIG", tpl)
+        R = rt.RobinhoodExecutor
+        for role in ("agentic", "primary", "roth"):
+            assert R.configured_account(role) is None, role
+        # single agentic account auto-detected, broker default used, roth unresolved
+        assert R.get_agentic_account_number() == FAKE_AGENTIC
+        assert R.resolve_account(None) == FAKE_PRIMARY
+        with pytest.raises(rt.AccountResolutionError):
+            R.resolve_account("roth")
+        fake_accounts[1]["agentic_allowed"] = False
+        with pytest.raises(rt.AccountResolutionError):
+            R.get_agentic_account_number()
+
+    def test_placeholder_env_values_are_ignored(self, fake_accounts, monkeypatch):
+        import robinhood_trader as rt
+        monkeypatch.setenv("RH_AGENTIC_ACCOUNT", "<AGENTIC_ACCOUNT>")
+        monkeypatch.setenv("RH_PRIMARY_ACCOUNT", " <PRIMARY_ACCOUNT> ")
+        assert rt.RobinhoodExecutor.configured_account("agentic") is None
+        assert rt.RobinhoodExecutor.get_agentic_account_number() == FAKE_AGENTIC
+        assert rt.RobinhoodExecutor.resolve_account(None) == FAKE_PRIMARY
+
+
 class TestOrderGuard:
     def _capture(self, monkeypatch, result):
         import robinhood_trader as rt

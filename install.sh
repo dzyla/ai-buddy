@@ -276,19 +276,27 @@ fi
 # ── 4b. Seed ~/.config/ai from config/*.example.* (never overwrites) ─────────
 # Personal config lives outside the repo. Each template is copied to ~/.config/ai/<name without
 # .example> only when that file does not exist yet; files are mode 600 (they will hold secrets).
+# zuliprc.example is not seeded: a placeholder zuliprc would only look like real credentials
+# (see docs/zulip_setup.md for where the real one goes).
 CONFIG_DST="${HOME}/.config/ai"
 if [ -d "${SCRIPT_DIR}/config" ]; then
     mkdir -p "${CONFIG_DST}"
     for tpl in "${SCRIPT_DIR}"/config/*.example*; do
         [ -f "$tpl" ] || continue
         name="$(basename "$tpl")"
+        case "$name" in zuliprc*) continue ;; esac
         target="${CONFIG_DST}/${name/.example/}"
         if [ -e "$target" ]; then
             echo "==> Kept existing ${target}"
         else
             (umask 077 && cp "$tpl" "$target")
             chmod 600 "$target"
-            echo "==> Created ${target} from config/${name} (edit it to enable servers / add secrets)"
+            echo "==> Created ${target} from config/${name}"
+            if [ "${name}" = "mcp.example.json" ]; then
+                echo "    NOTE: MCP servers ship disabled (robinhood, zulip, pubmed). To enable one, set"
+                echo "    \"disabled\": false for it in ${target}. This file now takes precedence over"
+                echo "    ./mcp.json and the legacy config paths."
+            fi
         fi
     done
 fi

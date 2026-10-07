@@ -191,11 +191,12 @@ def test_install_seeds_config_without_overwriting(tmp_path):
     cfg.mkdir(parents=True)
     sentinel = '{"mcpServers": {"mine": {"command": "SENTINEL"}}}\n'
     (cfg / "mcp.json").write_text(sentinel)
-    _install(tmp_path, home)
+    r = _install(tmp_path, home)
     assert (cfg / "mcp.json").read_text() == sentinel
+    assert "ship disabled" not in r.stdout  # nothing seeded, no notice
+    assert not (cfg / "zuliprc").exists(), "a placeholder zuliprc must not be seeded"
     for tpl, target in [("trader.example.json", "trader.json"),
-                        ("private_patterns.example.txt", "private_patterns.txt"),
-                        ("zuliprc.example", "zuliprc")]:
+                        ("private_patterns.example.txt", "private_patterns.txt")]:
         dst = cfg / target
         assert dst.exists(), target
         with open(os.path.join(CONFIG, tpl), encoding="utf-8") as f:
@@ -211,8 +212,10 @@ def test_install_seeds_config_without_overwriting(tmp_path):
 def test_install_creates_mcp_json_from_template(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    _install(tmp_path, home)
+    r = _install(tmp_path, home)
     dst = home / ".config" / "ai" / "mcp.json"
+    assert "MCP servers ship disabled" in r.stdout
+    assert '"disabled": false' in r.stdout and str(dst) in r.stdout
     with open(os.path.join(CONFIG, "mcp.example.json"), encoding="utf-8") as f:
         assert dst.read_text() == f.read()
 
@@ -258,3 +261,26 @@ def test_zulip_mcp_server_expands_config_path(tmp_path, monkeypatch):
     monkeypatch.setenv("ZULIP_CONFIG_PATH", "~/.config/ai/zuliprc")
     assert zms.get_zulip_client() == "client"
     assert seen["config_file"] == str(tmp_path / ".config" / "ai" / "zuliprc")
+
+
+def test_zulip_mcp_server_rejects_placeholder_zuliprc(tmp_path, monkeypatch):
+    import types
+    import zulip_mcp_server as zms
+    stub = types.ModuleType("zulip")
+    stub.Client = lambda **kw: "client"
+    monkeypatch.setitem(sys.modules, "zulip", stub)
+    monkeypatch.setattr(zms, "zulip", stub, raising=False)
+    for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY", "ZULIP_CONFIG_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with open(os.path.join(CONFIG, "zuliprc.example"), encoding="utf-8") as f:
+        (tmp_path / ".zuliprc").write_text(f.read())
+    with pytest.raises(Exception, match="not configured"):
+        zms.get_zulip_client()
+    rc = tmp_path / "rc"
+    rc.write_text("[api]\nemail=bot@example.com\nkey=REPLACE_WITH_KEY\nsite=https://x.example.com\n")
+    monkeypatch.setenv("ZULIP_CONFIG_PATH", str(rc))
+    with pytest.raises(Exception, match="not configured"):
+        zms.get_zulip_client()
+    rc.write_text("[api]\nemail=bot@example.com\nkey=realkey123\nsite=https://x.example.com\n")
+    assert zms.get_zulip_client() == "client"
