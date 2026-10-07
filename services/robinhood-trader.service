@@ -5,11 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/ai-buddy
+# Runs the deployed release (trader/deploy.sh), never the working tree: edits in a checkout do not
+# reach the live daemon until they are committed, deployed and the unit is restarted.
+WorkingDirectory=%h/.local/share/ai-trader/current
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=BROWSER=none
-ExecStart=/usr/bin/python3 %h/ai-buddy/robinhood_trader.py monitor --interval 60
+# Optional: AI_TRADER_ZULIP_TO=<zulip address> for the daily summary (see docs/robinhood_trader.md).
+EnvironmentFile=-%h/.config/ai/trader.env
+ExecStart=/usr/bin/python3 %h/.local/share/ai-trader/current/robinhood_trader.py monitor --interval 60 --auto-trade --live
 Restart=always
 RestartSec=15
 StandardOutput=journal

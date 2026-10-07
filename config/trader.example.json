@@ -1,0 +1,14 @@
+{
+  "accounts": {
+    "agentic": "<AGENTIC_ACCOUNT>",
+    "primary": "<PRIMARY_ACCOUNT>",
+    "roth": "<ROTH_ACCOUNT>"
+  },
+  "strategy": {
+    "sleeve_rank_buffer": 2
+  },
+  "shadow": {
+    "enabled": false,
+    "strategy": {}
+  }
+}

@@ -62,6 +62,9 @@ if [ "${1:-}" = "uninstall" ]; then
         rm -f "${BIN_DIR}/$f"
     done
 
+    # 3b. Remove the installed trader package (deployed releases in ~/.local/share/ai-trader are kept)
+    rm -rf "${DATA_DIR}/lib/trader"
+
     # 4. Remove custom skills
     if [ -d "${SKILLS_DST}" ]; then
         echo "--> Removing custom skills from ${SKILLS_DST}..."
@@ -274,6 +277,28 @@ if [ -f "${SCRIPT_DIR}/services/zulip-ai-bridge.service" ] && command -v systemc
         "${SCRIPT_DIR}/services/zulip-ai-bridge.service" > "${SYSTEMD_DIR}/zulip-ai-bridge.service"
     systemctl --user daemon-reload 2>/dev/null || true
     echo "==> Installed ${SYSTEMD_DIR}/zulip-ai-bridge.service (not enabled; python: ${PY_BIN})"
+fi
+
+# ── 7. Trader package + user unit (installed only; the daemon is NEVER restarted here) ──
+# robinhood_trader.py finds the package next to itself first, then in ~/.local/share/ai/lib.
+# The live daemon runs a versioned release (bash trader/deploy.sh), not this copy.
+TRADER_LIB="${DATA_DIR}/lib"
+if [ -d "${SCRIPT_DIR}/trader" ]; then
+    mkdir -p "${TRADER_LIB}"
+    rm -rf "${TRADER_LIB}/trader"
+    cp -r "${SCRIPT_DIR}/trader" "${TRADER_LIB}/trader"
+    find "${TRADER_LIB}/trader" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    echo "==> Installed trader package to ${TRADER_LIB}/trader"
+fi
+if [ -f "${SCRIPT_DIR}/services/robinhood-trader.service" ] && command -v systemctl &>/dev/null; then
+    if [ -e "${HOME}/.local/share/ai-trader/current" ]; then
+        mkdir -p "${SYSTEMD_DIR}"
+        cp "${SCRIPT_DIR}/services/robinhood-trader.service" "${SYSTEMD_DIR}/robinhood-trader.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "==> Installed ${SYSTEMD_DIR}/robinhood-trader.service (not restarted; restart it yourself after a deploy)"
+    else
+        echo "==> Skipped robinhood-trader.service: no deployed release yet (run: bash trader/deploy.sh)"
+    fi
 fi
 
 # Configuration is loaded directly by the ai binary from ~/.local/share/ai/env

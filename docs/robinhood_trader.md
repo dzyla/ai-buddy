@@ -13,7 +13,7 @@ A production-grade, autonomous financial analysis, risk management, and trading 
                                 │
                                 ▼
  ┌─────────────────────────────────────────────────────────────┐
- │                     robinhood_trader.py                     │
+ │  robinhood_trader.py (shim) -> trader/ package              │
  │  • MarketHours Engine (NYSE/NASDAQ calendar & sessions)     │
  │  • FinancialData & Quotes (MCP primary + Yahoo fallback)    │
  │  • TechnicalIndicators (Pure Python: RSI, SMA, MACD, ATR)   │
@@ -30,6 +30,28 @@ A production-grade, autonomous financial analysis, risk management, and trading 
  │  • audit_latest.json      │  │  • Real-time quotes & orders │
  └───────────────────────────┘  └──────────────────────────────┘
 ```
+
+### Package layout (`trader/`)
+
+`robinhood_trader.py` is a thin shim: run as a script it calls `trader.cli.main()`; imported, it returns
+`trader.legacy`, a flat namespace with every name the old single-file module had (so
+`import robinhood_trader` and `monkeypatch.setattr(robinhood_trader, ...)` keep working).
+
+| Module | Contents |
+| :--- | :--- |
+| `config.py` | State paths (`~/.config/ai`, `~/.cache/ai/trading`, monitor flags, PDT / circuit-breaker files), universes, `trader.json` loading |
+| `market_hours.py` | `MarketHours` (NYSE calendar, sessions) |
+| `data.py` / `indicators.py` | `FinancialData` (quotes, daily bars) / `TechnicalIndicators` |
+| `strategy.py` | `MomentumStrategy`, `_floor_qty`, `_fmt_qty` (pure planning functions) |
+| `broker.py` | `RobinhoodExecutor` (MCP bridge, order mutator), account resolution, `OrderNotConfirmed` |
+| `risk.py` | `ComplianceAndRiskGuard` (PDT, cooldowns, circuit breaker) |
+| `journal.py` | `ObsidianTradingVault` (notes, trade ledger) |
+| `advisor.py` | `NewsSentimentEngine`, `AgentAdvisor`, `TradingStrategyEngine` (notes only, never orders) |
+| `portfolio.py` | `TradingDataManager`, `PortfolioAuditor` |
+| `daemon.py` | lifecycle loop, `_momentum_rebalance_pulse`, `_risk_monitor_pulse`, risk monitor, backtest |
+| `shadow.py` / `summary.py` | shadow mode and the daily summary (below) |
+| `cli.py` | `main(argv) -> int` |
+| `deploy.sh` | versioned release + `current` symlink |
 
 ### Core Design Principles
 1. **Core + Monthly Momentum Sleeve (`MomentumStrategy`)** — the only rules the live loop trades (spec: `docs/superpowers/specs/2026-09-20-momentum-sleeve-trader-design.md`):
@@ -116,7 +138,62 @@ Output:
 
 ## 4. Background Service Management
 
-The automated trader runs as a systemd user daemon (`robinhood-trader.service`):
+The automated trader runs as a systemd user daemon (`robinhood-trader.service`, tracked in
+`services/`). It runs the **deployed release** in `~/.local/share/ai-trader/current`, never a checkout,
+so editing the repo cannot change a running trader. `./install.sh` installs the unit only once a
+release exists and never restarts it.
+
+### Deploying
+
+```bash
+bash trader/deploy.sh             # refuses on a dirty tree or failing trader tests
+cp services/robinhood-trader.service ~/.config/systemd/user/   # first time / when the unit changed
+systemctl --user daemon-reload && systemctl --user restart robinhood-trader
+journalctl --user -u robinhood-trader -f                       # confirm two clean pulses
+```
+
+`deploy.sh` builds `~/.local/share/ai-trader/releases/<UTC-timestamp>-<shortsha>/` from the committed
+tree (`trader/`, `robinhood_trader.py`, `VERSION` with the commit), atomically repoints the `current`
+symlink, keeps the newest five releases and prints the release path. `--dry-run` skips the test gate and
+exists for the deploy tests only. Rollback: `ln -sfn releases/<older> ~/.local/share/ai-trader/current`
+and restart the unit.
+
+The release reads exactly the same state as before (`~/.config/ai/trader.json`,
+`~/.config/ai/.monitor_flags/`, `~/.cache/ai/trading/`), so switching mid-session or mid-month repeats
+neither the month's rebalance (`rebalance_<YYYY-MM>.json`) nor the day's core top-up
+(`core_topup_<date>.flag`). Optional environment for the unit goes in `~/.config/ai/trader.env`
+(`EnvironmentFile`, e.g. `AI_TRADER_ZULIP_TO=...`).
+
+### Shadow mode
+
+A what-if run of the strategy with different parameters, on the live account's data, that never trades.
+Enable it in `~/.config/ai/trader.json` (template: `config/trader.example.json`):
+
+```json
+{"shadow": {"enabled": true, "strategy": {"sleeve_rank_buffer": 0, "sleeve_top_n": 4}}}
+```
+
+Once per trading day, after the live pulse (from 10:00 ET), the daemon calls
+`trader.shadow.run_shadow_pulse`: it reads the account through `ReadOnlyBroker` (every order, cancel or
+raw MCP method raises `PermissionError`), ranks the universe with a `MomentumStrategy` subclass carrying
+the overrides, and appends one line to `~/.cache/ai/trading/shadow/<YYYY-MM>.jsonl` with the shadow
+`targets`, the default-parameter `baseline_targets`, the live month's `live_targets` and the
+`planned_orders` (sells, buys, core top-up) it would place today. It writes no live flag, ledger or note;
+`shadow_<date>.flag` limits it to one attempt a day. Accepted keys: `sleeve_rank_buffer`, `sleeve_top_n`,
+`core_target_pct`, `sleeve_target_pct`, `cash_buffer_pct`, `lookback_bars`, `regime_sma_bars`,
+`disaster_stop_pct`, `min_avg_volume`, `min_price`; unknown or out-of-range keys are listed as
+`ignored_overrides`.
+
+### Daily summary
+
+After the close on each trading day (16:00 ET or the first loop after it) the daemon takes a read-only
+account snapshot (appended to `~/.cache/ai/trading/equity_journal.jsonl`) and sends a short markdown
+report built by `trader.summary.build_daily_summary(day)`: equity change versus the circuit-breaker
+opening baseline, the day's fills from the trade ledger, sleeve holdings, the month's regime,
+circuit-breaker state, and the shadow-vs-live target diff. Account numbers are never included.
+Delivery: a Zulip private message to `AI_TRADER_ZULIP_TO` (else `AI_REMINDER_ZULIP_TO`) through
+`zulip_mcp_server.py`; if that fails or no recipient is set, `notify-send`; otherwise the risk log only.
+`summary_<date>.flag` makes it once a day.
 
 ### CLI Service Controls
 ```bash
@@ -127,6 +204,8 @@ The automated trader runs as a systemd user daemon (`robinhood-trader.service`):
 ./robinhood_trader.py service restart    # Restart daemon process
 ./robinhood_trader.py service stop       # Stop the background daemon
 ```
+`service install|live|dry-run` rewrite the unit; it points at the deployed release when
+`~/.local/share/ai-trader/current` exists, else at the checkout the command ran from.
 
 ### Direct Systemd Commands
 ```bash
