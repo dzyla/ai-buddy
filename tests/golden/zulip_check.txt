@@ -1,0 +1,13 @@
+rc=1
+--stdout--
+[INFO] Python interpreter: <PY> (<PYVER>)
+[INFO] No env file at <TMP>/home/.local/share/ai/env (optional)
+[FAIL] zulip package not importable by this interpreter. Install it with: <PY> -m pip install zulip
+[FAIL] No Zulip credentials: <TMP>/home/.zuliprc does not exist. Download the bot's zuliprc and save it there (chmod 600), or set ZULIP_CONFIG=/path/to/zuliprc.
+[INFO] ZULIP_USER not set: the owner is auto-detected at startup (bot_owner_id, else a single unique DM partner)
+[INFO] Effective owner: resolved at startup; run with --online to see it
+[INFO] Offline check: the server was not contacted. Add --online to verify the API key and resolve the owner.
+[ OK ] ai binary: <TMP>/bin/ai
+
+2 problem(s) found.
+--stderr--

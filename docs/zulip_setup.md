@@ -5,7 +5,7 @@ in a channel) from any device. It uses two parts of this repo:
 
 | Part | What it does |
 |---|---|
-| `zulip_ai_bridge.py` | A long-running listener. It receives your Zulip messages, runs `ai` locally, and posts the answer back. |
+| `zulip_ai_bridge.py` | A long-running listener. It receives your Zulip messages, runs `ai` locally, and posts the answer back. It is a thin entry point over the `zulip_bridge/` package (`install.sh` copies the package to `~/.local/share/ai/lib`). |
 | `zulip_mcp_server.py` | Optional tools the agent can call (`zulip_send_message`, `zulip_get_messages`, `zulip_add_reaction`, `zulip_edit_message`). Reminders also use it. |
 
 Examples below use `example.zulipchat.com` as the organization. Replace it with
