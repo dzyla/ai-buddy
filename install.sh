@@ -337,7 +337,7 @@ rm -rf "${AITOOLS_LIB}/zulip_bridge"
 cp -r "${SCRIPT_DIR}/zulip_bridge" "${AITOOLS_LIB}/zulip_bridge"
 find "${AITOOLS_LIB}/zulip_bridge" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 echo "==> Installed zulip_bridge package to ${AITOOLS_LIB}/zulip_bridge"
-# The Python agent engine (INFER_ENGINE=py): the installed ~/.local/bin/ai runs
+# The Python agent engine (the default; INFER_ENGINE=c is the legacy C loop): the installed ~/.local/bin/ai runs
 # `python3 ~/.local/share/ai/lib/agent --frontend-fd 3 ...`, which imports aitools from the same lib dir.
 rm -rf "${AITOOLS_LIB}/agent"
 cp -r "${SCRIPT_DIR}/agent" "${AITOOLS_LIB}/agent"

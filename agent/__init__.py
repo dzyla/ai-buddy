@@ -1,4 +1,4 @@
-"""Python agent engine for the `ai` CLI (INFER_ENGINE=py).
+"""Python agent engine for the `ai` CLI (the default engine; INFER_ENGINE=c selects the legacy C loop).
 
 The C binary stays the terminal front-end (ai_frontend.c): it forks `python3 <lib>/agent
 --frontend-fd 3 <ai args>` and renders the events this engine sends over fd 3 (protocol.py).

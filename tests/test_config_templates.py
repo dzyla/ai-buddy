@@ -245,6 +245,22 @@ def test_ci_workflow_jobs():
     assert {"test", "privacy", "evals-mock"} <= set(jobs), jobs
 
 
+def test_ci_builds_with_werror_and_runs_both_engines():
+    """CI builds with `make ci` (-Werror) and runs the suite and the mock evals for both engines."""
+    with open(CI, encoding="utf-8") as f:
+        text = f.read()
+    assert "make ci" in text and "\n        run: make\n" not in text
+    assert "AI_TEST_ENGINE: ${{ matrix.engine }}" in text
+    assert "evals/run_evals.py --mock --engine ${{ matrix.engine }}" in text
+    try:
+        import yaml
+    except ImportError:
+        return
+    jobs = yaml.safe_load(text)["jobs"]
+    for name in ("test", "evals-mock"):
+        assert jobs[name]["strategy"]["matrix"]["engine"] == ["py", "c"], name
+
+
 def test_zulip_mcp_server_expands_config_path(tmp_path, monkeypatch):
     """ZULIP_CONFIG_PATH may be given as ~/.config/ai/zuliprc (the zuliprc template's location);
     MCP `env` values are not expanded by the client, so the server must expand ~ itself."""

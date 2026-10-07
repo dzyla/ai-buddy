@@ -6,6 +6,8 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 int raw_mode_active = 0;
 volatile int g_esc_requested = 0;
@@ -46,4 +48,43 @@ void poll_agent_stdin(void) {
             }
         }
     }
+}
+
+/* ── orphan reaping (see ai_terminal.h) ── */
+static pid_t g_reap_tracked = -1;
+static int   g_reap_tracked_done = 0, g_reap_tracked_status = 0;
+
+static void on_sigchld(int sig) { (void)sig; /* wake-up only: reaping happens at the next tick */ }
+
+void reap_install_sigchld(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigchld;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+}
+
+void reap_track(pid_t pid) {
+    g_reap_tracked = pid;
+    g_reap_tracked_done = 0;
+    g_reap_tracked_status = 0;
+}
+
+void reap_children(void) {
+    int saved = errno, st;
+    pid_t p;
+    while ((p = waitpid(-1, &st, WNOHANG)) > 0) {
+        if (p == g_reap_tracked) {
+            g_reap_tracked_done = 1;
+            g_reap_tracked_status = st;
+        }
+    }
+    errno = saved;
+}
+
+int reap_tracked(int *status) {
+    if (!g_reap_tracked_done) return 0;
+    if (status) *status = g_reap_tracked_status;
+    return 1;
 }

@@ -25,6 +25,7 @@
 #include "remote_harness.h"
 #include "ai_toolclient.h"
 #include "ai_frontend.h"
+#include "ai_reap.h"
 
 /* ── Remote Server State ───────────────────────────────────────────────────── */
 static remote_server_t *g_remote_server = NULL;
@@ -1330,6 +1331,24 @@ static char* get_system_context() {
     return buf;
 }
 
+/* mkdir -p: create path and its missing parents (0755). Returns 0 when the directory exists
+   afterwards, -1 with errno set otherwise. */
+static int mkdir_p(const char *path) {
+    char tmp[1024];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(tmp, path, n + 1);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    struct stat st;
+    return (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode)) ? 0 : (errno = ENOTDIR, -1);
+}
+
 static char* json_escape(const char *src);
 
 static void log_job(const char *prompt, const char *pipe_writer, const char *response, int interactive) {
@@ -2259,6 +2278,38 @@ static int lineed_visible_len(const char *s) {
     return n;
 }
 
+/* Set when the terminal stops accepting output (EIO/EPIPE: hung up or closed); the editor then
+   returns EOF instead of looping on a dead tty. */
+static int lineed_tty_lost = 0;
+
+/* Write all of data to the terminal: retries on EINTR and partial writes and waits for
+   writability on EAGAIN (non-blocking tty). Returns 0, or -1 (and sets lineed_tty_lost) on a
+   hard error. */
+static int lineed_write(const void *data, size_t n) {
+    const char *p = data;
+    while (n > 0) {
+        ssize_t w = write(STDOUT_FILENO, p, n);
+        if (w > 0) { p += w; n -= (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pf = { STDOUT_FILENO, POLLOUT, 0 };
+            if (poll(&pf, 1, -1) >= 0 || errno == EINTR) continue;
+        }
+        lineed_tty_lost = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int lineed_puts(const char *s) { return lineed_write(s, strlen(s)); }
+
+/* Copy a NUL-terminated line into a LINEED_MAX_LINE buffer, truncating and always terminating. */
+static void lineed_copy(char *dst, const char *src) {
+    size_t n = strnlen(src, LINEED_MAX_LINE - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 static int lineed_term_cols(void) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
@@ -2279,14 +2330,14 @@ static void lineed_redraw(const char *prompt, const char *buf, int len, int curs
     /* Move to the first row of the previous draw, then erase to end of screen */
     if (lineed_prev_rows > 0) {
         snprintf(tmp, sizeof(tmp), "\033[%dA", lineed_prev_rows);
-        write(STDOUT_FILENO, tmp, strlen(tmp));
+        lineed_puts(tmp);
     }
-    write(STDOUT_FILENO, "\r\033[J", 4);
+    lineed_write("\r\033[J", 4);
 
     /* Write prompt and buffer */
-    write(STDOUT_FILENO, prompt, strlen(prompt));
+    lineed_puts(prompt);
     if (len > 0)
-        write(STDOUT_FILENO, buf, (size_t)len);
+        lineed_write(buf, (size_t)len);
 
     /* Record how many extra rows this draw occupies */
     int total = plen + len;
@@ -2301,12 +2352,12 @@ static void lineed_redraw(const char *prompt, const char *buf, int len, int curs
     int rows_up = end_row - cursor_row;
     if (rows_up > 0) {
         snprintf(tmp, sizeof(tmp), "\033[%dA", rows_up);
-        write(STDOUT_FILENO, tmp, strlen(tmp));
+        lineed_puts(tmp);
     }
-    write(STDOUT_FILENO, "\r", 1);
+    lineed_write("\r", 1);
     if (cursor_col > 0) {
         snprintf(tmp, sizeof(tmp), "\033[%dC", cursor_col);
-        write(STDOUT_FILENO, tmp, strlen(tmp));
+        lineed_puts(tmp);
     }
 }
 
@@ -2339,7 +2390,7 @@ static int get_next_scheduled_task_delay(void) {
 static char *read_line_interactive(const char *prompt) {
     if (!isatty(STDIN_FILENO)) {
         static char buf[LINEED_MAX_LINE];
-        write(STDOUT_FILENO, prompt, strlen(prompt));
+        lineed_puts(prompt);
         if (!fgets(buf, sizeof(buf), stdin)) return NULL;
         size_t l = strlen(buf);
         while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
@@ -2349,7 +2400,7 @@ static char *read_line_interactive(const char *prompt) {
     struct termios saved, raw;
     if (tcgetattr(STDIN_FILENO, &saved) < 0) {
         static char buf[LINEED_MAX_LINE];
-        write(STDOUT_FILENO, prompt, strlen(prompt));
+        lineed_puts(prompt);
         if (!fgets(buf, sizeof(buf), stdin)) return NULL;
         size_t l = strlen(buf);
         while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
@@ -2365,12 +2416,13 @@ static char *read_line_interactive(const char *prompt) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 
     lineed_prev_rows = 0;
-    write(STDOUT_FILENO, "\033[?2004h", 8); /* enable bracketed paste */
-    write(STDOUT_FILENO, prompt, strlen(prompt));
+    lineed_tty_lost = 0;
+    lineed_write("\033[?2004h", 8); /* enable bracketed paste */
+    lineed_puts(prompt);
 
 /* Disable bracketed paste and restore terminal at any exit point. */
 #define LINEED_RESTORE() do { \
-    write(STDOUT_FILENO, "\033[?2004l", 8); \
+    lineed_write("\033[?2004l", 8); \
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); \
 } while (0)
 
@@ -2398,10 +2450,15 @@ static char *read_line_interactive(const char *prompt) {
     saved_buf[0] = '\0';
 
     if (len > 0) {
-        write(STDOUT_FILENO, buf, len);
+        lineed_write(buf, len);
     }
 
     for (;;) {
+        reap_children();  /* finished background orphans (ai is their subreaper); see ai_terminal.h */
+        if (lineed_tty_lost) {  /* terminal gone: end the session like EOF, don't spin */
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+            return NULL;
+        }
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
@@ -2433,20 +2490,20 @@ static char *read_line_interactive(const char *prompt) {
                 
                 char draw_cmd[256];
                 snprintf(draw_cmd, sizeof(draw_cmd), "\0337\033[%dG\033[2m[%s]\033[0m\0338", pos, timer_str);
-                write(STDOUT_FILENO, draw_cmd, strlen(draw_cmd));
+                lineed_puts(draw_cmd);
             }
             continue;
         }
 
         unsigned char c;
         if (read(STDIN_FILENO, &c, 1) <= 0) {
-            write(STDOUT_FILENO, "\r\n", 2);
+            lineed_write("\r\n", 2);
             LINEED_RESTORE();
             return len > 0 ? strdup(buf) : NULL;
         }
 
         if (c == '\r' || c == '\n') {
-            write(STDOUT_FILENO, "\r\n", 2);
+            lineed_write("\r\n", 2);
             break;
         }
 
@@ -2459,7 +2516,7 @@ static char *read_line_interactive(const char *prompt) {
 
         if (c == 4) { /* Ctrl+D */
             if (len == 0) {
-                write(STDOUT_FILENO, "\r\n", 2);
+                lineed_write("\r\n", 2);
                 LINEED_RESTORE();
                 return NULL;
             }
@@ -2473,7 +2530,7 @@ static char *read_line_interactive(const char *prompt) {
         }
 
         if (c == 3) { /* Ctrl+C — quit interactive mode */
-            write(STDOUT_FILENO, "^C\r\n", 4);
+            lineed_write("^C\r\n", 4);
             LINEED_RESTORE();
             return NULL;
         }
@@ -2529,7 +2586,7 @@ static char *read_line_interactive(const char *prompt) {
             continue;
         }
         if (c == 12) { /* Ctrl+L — clear screen */
-            write(STDOUT_FILENO, "\033[2J\033[H", 7);
+            lineed_write("\033[2J\033[H", 7);
             lineed_redraw(prompt, buf, len, cursor);
             continue;
         }
@@ -2596,9 +2653,9 @@ static char *read_line_interactive(const char *prompt) {
                         case 'A': /* Up — history back */
                             if (hidx > 0) {
                                 if (hidx == lineed_history_len)
-                                    strncpy(saved_buf, buf, LINEED_MAX_LINE - 1);
+                                    lineed_copy(saved_buf, buf);
                                 hidx--;
-                                strncpy(buf, lineed_history[hidx], LINEED_MAX_LINE - 1);
+                                lineed_copy(buf, lineed_history[hidx]);
                                 len = cursor = (int)strlen(buf);
                                 lineed_redraw(prompt, buf, len, cursor);
                             }
@@ -2608,7 +2665,7 @@ static char *read_line_interactive(const char *prompt) {
                                 hidx++;
                                 const char *src = (hidx == lineed_history_len)
                                                     ? saved_buf : lineed_history[hidx];
-                                strncpy(buf, src, LINEED_MAX_LINE - 1);
+                                lineed_copy(buf, src);
                                 len = cursor = (int)strlen(buf);
                                 lineed_redraw(prompt, buf, len, cursor);
                             }
@@ -2622,7 +2679,7 @@ static char *read_line_interactive(const char *prompt) {
                         case 'H': cursor = 0;   lineed_redraw(prompt, buf, len, cursor); break;
                         case 'F': cursor = len; lineed_redraw(prompt, buf, len, cursor); break;
                         case 'Z': /* Shift-Tab */
-                            write(STDOUT_FILENO, "\r\n", 2);
+                            lineed_write("\r\n", 2);
                             LINEED_RESTORE();
                             return strdup("\033[Z");
                     }
@@ -2635,9 +2692,9 @@ static char *read_line_interactive(const char *prompt) {
                     case 'A':
                         if (hidx > 0) {
                             if (hidx == lineed_history_len)
-                                strncpy(saved_buf, buf, LINEED_MAX_LINE - 1);
+                                lineed_copy(saved_buf, buf);
                             hidx--;
-                            strncpy(buf, lineed_history[hidx], LINEED_MAX_LINE - 1);
+                            lineed_copy(buf, lineed_history[hidx]);
                             len = cursor = (int)strlen(buf);
                             lineed_redraw(prompt, buf, len, cursor);
                         }
@@ -2647,7 +2704,7 @@ static char *read_line_interactive(const char *prompt) {
                             hidx++;
                             const char *src2 = (hidx == lineed_history_len)
                                                  ? saved_buf : lineed_history[hidx];
-                            strncpy(buf, src2, LINEED_MAX_LINE - 1);
+                            lineed_copy(buf, src2);
                             len = cursor = (int)strlen(buf);
                             lineed_redraw(prompt, buf, len, cursor);
                         }
@@ -4167,7 +4224,7 @@ static void print_mode_current(void) {
     printf("  presets: xhigh (deep) · normal (medium) · low (fast) · instruct (no CoT)\n");
 }
 
-/* ── Front-end mode (INFER_ENGINE=py) adapters over the static UI helpers above ── */
+/* ── Front-end mode (default Python engine) adapters over the static UI helpers above ── */
 static void fe_print_response_box(const char *model_name, const char *content, int turn_count,
                                   int tool_count, double elapsed_sec, double tokens_per_sec, int prerendered) {
     g_response_prerendered = prerendered;
@@ -4350,11 +4407,20 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* INFER_ENGINE=py: run the agent loop in the Python engine (agent/) behind this front-end
-       (ai_frontend.c); falls through to the C engine when agent/ cannot be found. */
+    /* Agent engine. Default (INFER_ENGINE unset/empty/py): the Python engine (agent/) behind this
+       front-end (ai_frontend.c); falls through to the C engine when agent/ cannot be found (unless
+       INFER_ENGINE_STRICT=1). INFER_ENGINE=c: the legacy C loop below, kept for one release. */
     {
         const char *engine_env = getenv("INFER_ENGINE");
-        if (engine_env && strcmp(engine_env, "py") == 0) {
+        int use_c = engine_env && strcmp(engine_env, "c") == 0;
+        if (use_c) {
+            /* stderr only: stdout is the answer (pipes, -q) */
+            fprintf(stderr, "[ai] INFER_ENGINE=c is deprecated: the legacy C engine will be removed "
+                            "in the next release; unset INFER_ENGINE to use the Python engine.\n");
+        } else if (engine_env && *engine_env && strcmp(engine_env, "py") != 0) {
+            fprintf(stderr, "[ai] unknown INFER_ENGINE=%s (expected py or c); using py.\n", engine_env);
+        }
+        if (!use_c) {
             frontend_ui_t ui = {
                 print_tool_box, print_think_box, fe_print_response_box, print_info_box,
                 print_user_message, read_line_interactive, lineed_init, lineed_add_history,
@@ -4717,12 +4783,24 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: cannot open '%s': %s\n", cmd_file, strerror(errno));
                 return 1;
             }
-            fseek(fp, 0, SEEK_END);
-            long fsz = ftell(fp);
+            long fsz = (fseek(fp, 0, SEEK_END) == 0) ? ftell(fp) : -1;
             rewind(fp);
-            char *fbuf = malloc(fsz + 1);
-            fread(fbuf, 1, fsz, fp);
-            fbuf[fsz] = '\0';
+            char *fbuf = fsz >= 0 ? malloc((size_t)fsz + 1) : NULL;
+            if (!fbuf) {
+                fprintf(stderr, "Error: cannot read '%s': %s\n", cmd_file,
+                        fsz < 0 ? "not a seekable regular file" : "out of memory");
+                fclose(fp);
+                return 1;
+            }
+            size_t got = fread(fbuf, 1, (size_t)fsz, fp);
+            if (got < (size_t)fsz && ferror(fp)) {
+                fprintf(stderr, "Error: cannot read '%s': %s\n", cmd_file, strerror(errno));
+                free(fbuf);
+                fclose(fp);
+                return 1;
+            }
+            fbuf[got] = '\0';  /* a file that shrank since ftell is read as-is */
+            fsz = (long)got;
             fclose(fp);
             if (pipe_in && strlen(pipe_in) > 0) {
                 size_t clen = (size_t)fsz + strlen(pipe_in) + 32;
@@ -5231,8 +5309,8 @@ int main(int argc, char **argv) {
                     char preset[32] = "";
                     const char *src = user_input + 6;
                     while (*src == ' ') src++;
-                    strncpy(preset, src, sizeof(preset) - 1);
-                    preset[sizeof(preset) - 1] = '\0';
+                    /* a name longer than any preset stays empty and falls to "Unknown Mode" */
+                    if (strlen(src) < sizeof(preset)) memcpy(preset, src, strlen(src) + 1);
                     if (apply_mode_preset(preset)) {
                         char msg[256];
                         snprintf(msg, sizeof(msg),
@@ -5328,8 +5406,11 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (strcmp(user_input, ":undo") == 0) {
-                    system("git -C . log -1 --format=%h 2>/dev/null | xargs -I{} git -C . reset --soft HEAD~1 2>/dev/null");
-                    print_info_box("Git Undo", "Last commit undone (changes kept staged).");
+                    if (system("git -C . rev-parse -q --verify HEAD~1 >/dev/null 2>&1"
+                               " && git -C . reset -q --soft HEAD~1 2>/dev/null") == 0)
+                        print_info_box("Git Undo", "Last commit undone (changes kept staged).");
+                    else
+                        print_info_box("Git Undo", "Nothing undone: not a git repository, or no earlier commit to return to.");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -6670,16 +6751,20 @@ step_limit_check:
                                               fprintf(stderr, "\r\033[2K\033[36m  ⬡ $ %s (background)\033[0m\n", cmd_val);
                                               char log_file[512];
                                               snprintf(log_file, sizeof(log_file), "%s/.config/ai/logs/bg_proc_%d.log", getenv("HOME"), (int)time(NULL));
-                                              char mkdir_cmd[512];
-                                              snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s/.config/ai/logs", getenv("HOME"));
-                                              system(mkdir_cmd);
+                                              char log_dir[512];
+                                              snprintf(log_dir, sizeof(log_dir), "%s/.config/ai/logs", getenv("HOME"));
+                                              if (mkdir_p(log_dir) != 0)  /* the redirect below then fails visibly */
+                                                  fprintf(stderr, "[ai] cannot create %s: %s\n", log_dir, strerror(errno));
                                               char bg_cmd[4096];
                                               snprintf(bg_cmd, sizeof(bg_cmd), "nohup sh -c '%s' > '%s' 2>&1 & echo $!", cmd_val, log_file);
                                               FILE *fp = popen(bg_cmd, "r");
                                               char pid_str[32] = {0};
                                               if (fp) {
-                                                  fgets(pid_str, sizeof(pid_str), fp);
+                                                  if (!fgets(pid_str, sizeof(pid_str), fp))
+                                                      snprintf(pid_str, sizeof(pid_str), "unknown");
                                                   pclose(fp);
+                                              } else {
+                                                  snprintf(pid_str, sizeof(pid_str), "unknown (launch failed)");
                                               }
                                               char *nl = strchr(pid_str, '\n');
                                               if (nl) *nl = '\0';

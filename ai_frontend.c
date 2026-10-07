@@ -1,6 +1,7 @@
-/* ai_frontend.c — the C side of INFER_ENGINE=py (see ai_frontend.h, agent/protocol.py). */
+/* ai_frontend.c — the C side of the default (Python) engine (see ai_frontend.h, agent/protocol.py). */
 #include "ai_frontend.h"
 #include "cJSON.h"
+#include "ai_reap.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -49,7 +50,7 @@ static void raw_off(void) {
 
 static void fe_signal(int sig) {
     raw_off();
-    if (g_engine > 0) kill(g_engine, SIGTERM);
+    if (g_engine > 0 && !reap_tracked(NULL)) kill(g_engine, SIGTERM);  /* not a reused pid */
     static const char msg[] = "\n[ai] Signal received \xe2\x80\x94 restoring terminal and exiting.\n";
     ssize_t w = write(STDERR_FILENO, msg, sizeof(msg) - 1);
     (void)w;
@@ -518,11 +519,11 @@ int frontend_main(int argc, char **argv, const frontend_ui_t *ui) {
     if (!find_engine(engine, sizeof(engine))) {
         const char *strict = getenv("INFER_ENGINE_STRICT");
         if (strict && *strict && strcmp(strict, "0") != 0) {
-            fprintf(stderr, "[ai] INFER_ENGINE=py: the Python engine (agent/) was not found.\n");
+            fprintf(stderr, "[ai] the Python engine (agent/) was not found (INFER_ENGINE_STRICT=1).\n");
             return 1;
         }
-        fprintf(stderr, "\033[33m[ai] INFER_ENGINE=py: the Python engine (agent/) was not found; "
-                        "using the C engine.\033[0m\n");
+        fprintf(stderr, "\033[33m[ai] the Python engine (agent/) was not found; "
+                        "using the legacy C engine.\033[0m\n");
         return -1;
     }
     U = ui;
@@ -566,6 +567,8 @@ int frontend_main(int argc, char **argv, const frontend_ui_t *ui) {
     close(sv[1]);
     g_fd = sv[0];
     g_engine = pid;
+    reap_track(pid);         /* reap_children() keeps the engine's status for the exit below */
+    reap_install_sigchld();  /* a finished orphan wakes poll(); the loop tick reaps it */
     signal(SIGINT, fe_signal);
     signal(SIGTERM, fe_signal);
     signal(SIGPIPE, SIG_IGN);
@@ -575,6 +578,7 @@ int frontend_main(int argc, char **argv, const frontend_ui_t *ui) {
     char *buf = malloc(cap);
     int running = 1;
     while (running && buf) {
+        reap_children();  /* finished background orphans reparented to us (see ai_reap.h) */
         struct pollfd p[2];
         nfds_t np = 0;
         p[np].fd = g_fd; p[np].events = POLLIN; p[np].revents = 0; np++;
@@ -614,7 +618,9 @@ int frontend_main(int argc, char **argv, const frontend_ui_t *ui) {
     raw_off();
     close(g_fd);
     int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (!reap_tracked(&st)) {  /* not yet collected by a reaper tick */
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
     if (code < 0) {
         fprintf(stderr, "[ai] the Python engine exited unexpectedly (%s %d)\n",
                 WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));

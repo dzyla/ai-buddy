@@ -28,7 +28,7 @@ cd ai
 ./install.sh
 ```
 
-Everything goes to `~/.local/bin` — no sudo required. To uninstall (this will also cleanly stop and remove systemd service and socket files if you installed llama):
+`install.sh` builds with `make` and installs into `~/.local/bin` (Python packages into `~/.local/share/ai/lib`) — no sudo required. To only build in the checkout: `make` (or `make ci`, the warning-free `-Werror` build CI uses). To uninstall (this will also cleanly stop and remove systemd service and socket files if you installed llama):
 
 ```bash
 ./install.sh uninstall
@@ -312,7 +312,7 @@ ai -i "let's look at this project"   # start with an initial prompt
 
 | Command | Effect |
 |---------|--------|
-| `:compact` | Summarise conversation and reset context |
+| `:compact` | Trim older turns to shrink the context (no LLM call) |
 | `:clear` | Wipe conversation history entirely |
 | `:status` | Show context size, model, auto-approve state |
 | `:memory` | Show persistent memory |
@@ -441,6 +441,25 @@ ai "remember my name is Alice and I prefer TypeScript. Save to memory."
 ai "what's my name?"   # recalled in a fresh session
 ```
 
+With the optional local embedder (EmbeddingGemma on a CPU-only llama.cpp build), the agent also
+recalls relevant past chats, notes and lessons for each request (`search_memory` tool; plain
+full-text search when the embedder is down):
+
+```bash
+./install.sh embed          # build the CPU-only embed server, download the model (opt-in)
+ai-backend embed start      # or: status | stop | serve [--dry-run]
+```
+
+### Lessons (human-reviewed)
+
+Lessons the agent learns from failures are queued as *proposed* and only reach the system prompt
+after you approve them (approved lessons expire after 60 days unless they recur):
+
+```bash
+ai lessons review           # walk the queue: approve / reject / edit / skip
+ai lessons list             # or: approve <id> | reject <id> | prune
+```
+
 ---
 
 ## Tools
@@ -499,7 +518,7 @@ ai:   ⏰ Reminder set for 2026-07-04 09:00 (in ~840 min) → DM to you@…: "su
 
 From Zulip the recipient is auto-filled (the requester). In the terminal, pass a recipient (`zulip_to` email, or a `zulip_stream`). Under the hood this is the `set_reminder` tool.
 
-For complete configuration instructions, bot creation, and setting up the systemd user service background daemon, see [docs/zulip-setup.md](docs/zulip-setup.md).
+For complete configuration instructions, bot creation, and setting up the systemd user service background daemon, see [docs/zulip_setup.md](docs/zulip_setup.md).
 
 ---
 
@@ -520,21 +539,37 @@ For complete configuration instructions, bot creation, and setting up the system
 
 ## Architecture
 
-Two cooperating processes talk via subprocess calls — no shared library or IPC:
+```mermaid
+flowchart LR
+    user([terminal / pipe]) --> fe["ai (C front-end)<br/>line editor, keys, approvals, rendering"]
+    fe <-- "JSON events (fd 3)" --> eng["Python engine (agent/)<br/>agent loop, LLM client"]
+    eng --> llm[(OpenAI-compatible LLM)]
+    eng -- "in-process" --> tools["aitools/<br/>native tools + MCP pool"]
+    tools --> mcp[["MCP servers<br/>(mcp.json)"]]
+    tools --> db[("state.db<br/>memory, lessons, tasks, vectors")]
+    tools -. "optional" .-> embed["ai-embed<br/>(local embedder)"]
+    zulip["Zulip bridge"] --> fe
+```
 
-- **`ai.c`** — the agent loop. Owns the conversation, calls the LLM, handles `think` / `task_complete` / `execute_command` natively, delegates all other tool calls to `ai_mcp.py`.
-- **`ai_mcp.py`** — the tool backend. Implements a large set of native tools (file I/O, web search, fetch, scheduling, background processes, memory/vault, search APIs, agent spawning) and acts as a generic MCP client for any server in `mcp.json`. It has a `#!/usr/bin/env python3` shebang and is directly executable via `./ai_mcp.py`.
-
-Additional processes and services:
-
-- **`gcal.py`** — Google Calendar authentication and CLI helper.
-- **`pubmed_mcp_server.py`** — PubMed MCP server for literature search.
-- **`deep_research.py`** — Deep research tool (multi-hop, iterative retrieval).
-- **`zulip_ai_bridge.py`** — Zulip bot bridge that pipes messages to the `ai` CLI and downloads/extracts file attachments before passing them to the agent.
-- **`zulip_mcp_server.py`** — Zulip MCP server exposing `zulip_send_message`, `zulip_get_messages`, `zulip_add_reaction`, `zulip_edit_message`.
-- **`robinhood_trader.py`** — Autonomous US equities trading, quantitative risk management, technical indicator engine, and official Robinhood Agentic MCP bridge. See [`docs/robinhood_trader.md`](docs/robinhood_trader.md).
-- **`ContextWindowManager`** — monitors context-window budget across calls; on overflow it auto-splits the response and continues the conversation so work proceeds even when a single LLM call would exceed the token limit.
-- **Scheduling/background processes** — `schedule_task` and `set_reminder` run deferred work in detached background processes with explicit termination guards (`max_runs`, `ttl_hours`); `start_background_process` / `check_process_status` / `stop_process` manage long-running jobs.
+- **`ai` (C)** owns the terminal: the line editor and history, ESC / Shift-Tab / Ctrl-O while a
+  task runs, `/dev/tty` approval prompts and all rendering. By default it starts the
+  **Python engine** (`agent/`), which runs the agent loop, talks to the LLM and runs tools
+  in-process through **`aitools/`** (native tools plus a pool of persistent MCP sessions).
+- **State** lives in one SQLite store, `~/.local/share/ai/state.db`: persistent memory, the lesson
+  review queue, failure ledger, scheduled tasks, session index, Zulip chat audit, and the
+  vectors of the optional semantic memory (`ai-embed` service).
+- **Legacy C engine** (`INFER_ENGINE=c`, deprecated, kept for one release): the agent loop runs
+  inside `ai` itself and reaches `aitools/` through a persistent per-user **tool server**
+  (`ai_mcp.py serve`, which also pools MCP sessions), falling back to one `python3 ai_mcp.py`
+  call per tool.
+- **Integrations**: `zulip_ai_bridge.py` (Zulip in, runs `ai` per message), `zulip_mcp_server.py`
+  and `pubmed_mcp_server.py` (MCP servers), `gcal.py` (Google Calendar), `deep_research.py`.
+- **Trader** (`trader/`, `robinhood_trader.py`) is deployed separately from the working tree:
+  `bash trader/deploy.sh` builds a versioned release from the committed tree (tests must pass)
+  and repoints `~/.local/share/ai-trader/current`, which `services/robinhood-trader.service`
+  runs. See [`docs/robinhood_trader.md`](docs/robinhood_trader.md).
+- **Config**: personal config is never tracked; `config/*.example*` are templates that
+  `install.sh` copies to `~/.config/ai/` only when missing (MCP servers ship disabled).
 
 For details on the architecture, adding tools, and cross-process contracts, see [`CLAUDE.md`](CLAUDE.md).
 
@@ -543,35 +578,25 @@ For details on the architecture, adding tools, and cross-process contracts, see 
 ## Project Structure
 
 ```
-├── ai.c                  # Main agent loop (C)
-├── ai_mcp.py             # Tool backend (Python)
-├── ai-backend            # Backend manager (installed to ~/.local/bin)
-├── ai_session.c/h        # Session management
-├── ai_terminal.c/h       # Terminal handling
-├── ai_git.c/h            # Git integration
-├── cJSON.c/h             # JSON parsing library (vendored)
-├── jsmn.h                # Lightweight JSON parser (vendored)
-├── remote_harness.c/h    # Remote harness library
-├── Makefile              # Build system
-├── install.sh            # Install script
-├── config/               # *.example* templates for ~/.config/ai (mcp.json, trader.json, ...)
+├── ai.c                  # CLI entry, terminal UI, line editor; legacy C agent loop
+├── ai_frontend.c/h       # front-end side of the Python engine (event loop, fd-3 protocol)
+├── ai_toolclient.c/h     # client of the persistent tool server (legacy C engine)
+├── ai_session.c/h, ai_terminal.c/h, ai_git.c/h, ai_reap.h
+├── remote_harness.c/h    # libremote_harness.so
+├── cJSON.c/h, jsmn.h     # vendored JSON libraries
+├── agent/                # Python engine (agent loop, LLM client, fd-3 protocol)
+├── aitools/              # tools, MCP client/pool, tool server, state store, memory, learning
+├── ai_mcp.py             # shim: python3 ai_mcp.py <subcommand> -> aitools
+├── ai-backend            # backend / model / embedder manager
+├── zulip_bridge/         # Zulip bridge package (zulip_ai_bridge.py is its shim)
+├── trader/               # trading package + deploy.sh (robinhood_trader.py is its shim)
+├── config/               # *.example* templates for ~/.config/ai
+├── services/             # systemd user units (zulip bridge, trader, embedder)
 ├── evals/                # agent eval set + runner (python3 evals/run_evals.py --mock)
-├── gcal.py               # Google Calendar integration
-├── pubmed_mcp_server.py  # PubMed MCP server
-├── deep_research.py      # Deep research tool
-├── robinhood_trader.py   # Robinhood Agentic Trading & Market Hours analysis suite
-├── zulip_ai_bridge.py    # Zulip AI bridge
-├── zulip_mcp_server.py   # Zulip MCP server
-├── tests/                # Test suite
-├── docs/                 # Documentation
-├── .agents/              # Project skills
-├── build/                # Compiled binaries (not tracked)
-│   ├── ai                # Compiled CLI binary
-│   └── libremote_harness.so
-└── dev/                  # Development utilities
-    ├── benchmark*.py     # Benchmarking scripts
-    ├── test_*.py         # Standalone test scripts
-    └── *.py              # Debugging and reporting utilities
+├── tests/                # offline test suite (pytest)
+├── Makefile, install.sh
+├── docs/, dev/, scripts/, .agents/skills/
+└── gcal.py, deep_research.py, pubmed_mcp_server.py, zulip_mcp_server.py
 ```
 
 ---

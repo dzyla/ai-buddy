@@ -13,4 +13,6 @@ void disable_raw_mode(void);
 char* read_line_interactive(const char *prompt);
 void poll_agent_stdin(void);
 
+#include "ai_reap.h"   /* orphan reaper, implemented in ai_terminal.c */
+
 #endif /* AI_TERMINAL_H */

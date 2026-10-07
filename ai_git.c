@@ -39,12 +39,16 @@ int has_sensitive_staged_files(void) {
 
 static void restore_index(const char *tree) {
     char cmd[128];
+    int rc;
     if (tree && strlen(tree) == 40 && strspn(tree, "0123456789abcdef") == 40) {
         snprintf(cmd, sizeof(cmd), "git -C . read-tree %s 2>/dev/null", tree);
-        (void)system(cmd);
+        rc = system(cmd);
     } else {
-        (void)system("git -C . reset -q HEAD 2>/dev/null");
+        rc = system("git -C . reset -q HEAD 2>/dev/null");
     }
+    if (rc != 0)  /* the user's staging may now differ from before auto-commit: say so */
+        fprintf(stderr, "\033[1;33m[ai] auto-commit: could not restore the git index; "
+                        "check `git status` before committing\033[0m\n");
 }
 
 /* Single-quote-safe copy for the shell: drop ' so a custom message can't
@@ -79,7 +83,10 @@ void git_commit(const char *extra_msg) {
     /* Stage modifications to files git already tracks. Never `add -A`: that
        sweeps untracked files (data, notes, credentials) from the cwd into
        the repo and is how personal files ended up committed. */
-    (void)system("git -C . add -u 2>/dev/null");
+    if (system("git -C . add -u 2>/dev/null") != 0) {
+        restore_index(saved_tree);  /* partial staging must not linger; skip this commit */
+        return;
+    }
 
     /* Safety check for sensitive staged files */
     if (has_sensitive_staged_files()) {

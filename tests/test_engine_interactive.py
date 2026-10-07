@@ -411,3 +411,47 @@ def test_ctrl_o_redraw_keeps_turn_and_tool_counts(tmp_path, engine):
             assert "1 tools" in shown, shown
         p.send(":quit\r")
         assert p.wait() == 0
+
+
+def _zombie_children(pid):
+    """PIDs of <defunct> processes whose parent is `pid` (from /proc/<n>/stat)."""
+    out = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name) as f:
+                stat = f.read()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(")") + 2:].split()  # after "pid (comm) ": state ppid ...
+        if fields[0] == "Z" and int(fields[1]) == pid:
+            out.append(int(name))
+    return out
+
+
+def test_finished_background_orphans_are_reaped(tmp_path):
+    """`ai` is a child subreaper, so `nohup … &` jobs a command leaves behind are reparented to it.
+    Once they finish, the front-end (Python engine) or the C loop reaps them: no <defunct> children
+    pile up while the session idles at the prompt; the engine itself is still handled normally."""
+    home = tmp_path / "home"
+    home.mkdir()
+    work = _work(tmp_path)
+    jobs = "for i in 1 2 3 4 5; do nohup sh -c 'sleep 0.3' >/dev/null 2>&1 & done; echo LAUNCHED"
+    seq = [{"id": "z1", "type": "function",
+            "function": {"name": "execute_command", "arguments": json.dumps({"command": jobs})}}]
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq), MOCK_TASK_COMPLETE="ORPHANS_DONE") as srv:
+        p = Pty(["-i", "-y"], _env(home, srv.base_url, INFER_AUTO_APPROVE="1"), str(work))
+        p.expect(PROMPT)
+        p.send("start the jobs\r")
+        p.expect("ORPHANS_DONE")
+        p.expect(PROMPT)
+        time.sleep(1.0)                 # the jobs finish after ~0.3 s
+        deadline = time.time() + 5      # reaping may lag one idle tick of the prompt
+        zombies = _zombie_children(p.pid)
+        while zombies and time.time() < deadline:
+            p._read(0.2)
+            zombies = _zombie_children(p.pid)
+        assert zombies == [], "defunct children of ai: %s" % zombies
+        p.send(":quit\r")
+        assert p.wait() == 0

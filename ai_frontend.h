@@ -1,7 +1,7 @@
 #ifndef AI_FRONTEND_H
 #define AI_FRONTEND_H
 
-/* Front-end mode (INFER_ENGINE=py): the C binary keeps the terminal — line editor + history,
+/* Front-end mode (the default engine; not INFER_ENGINE=c): the C binary keeps the terminal — line editor + history,
    raw-mode keys (ESC, Shift-Tab, Ctrl-O, :btw), /dev/tty approval prompts, the answer/tool/think
    boxes and the spinner — and the agent loop runs in the Python engine
    (`python3 <lib>/agent --frontend-fd 3 <ai args>`), newline-delimited JSON over fd 3 (a socketpair).
