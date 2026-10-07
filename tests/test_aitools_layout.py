@@ -8,6 +8,7 @@ the split, so these tests prove the split changed no observable output:
 Regenerate (only when a behaviour change is intended): AITOOLS_REGEN_GOLDEN=1 pytest tests/test_aitools_layout.py
 Every subprocess runs with an isolated HOME, cwd outside the repo and INFER_NO_MCP=1.
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -21,6 +22,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHIM = os.path.join(REPO, "ai_mcp.py")
 GOLDEN = os.path.join(REPO, "tests", "golden")
 REGEN = os.environ.get("AITOOLS_REGEN_GOLDEN") == "1"
+HAVE_RICH = importlib.util.find_spec("rich") is not None
+RICH_CASES = {"render_markdown"}
 sys.path.insert(0, REPO)
 
 SAMPLE_MD = """# Title
@@ -113,11 +116,15 @@ def _normalise(text, tmp_path):
 
 
 def _golden_bytes(name, data):
+    """The golden file's content. A missing golden is a failure (a test that silently writes its
+    own expectation proves nothing); it is (re)written only under AITOOLS_REGEN_GOLDEN=1."""
     path = os.path.join(GOLDEN, name)
-    if REGEN or not os.path.exists(path):
+    if REGEN:
         os.makedirs(GOLDEN, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(data)
+    if not os.path.exists(path):
+        pytest.fail(f"golden file {path} is missing; regenerate it with AITOOLS_REGEN_GOLDEN=1")
     with open(path, encoding="utf-8") as f:
         return f.read()
 
@@ -144,6 +151,8 @@ def test_cli_outputs_match_golden(tmp_path):
     blob = json.dumps(got, indent=1, ensure_ascii=False, sort_keys=True) + "\n"
     want = json.loads(_golden_bytes("cli_cases.json", blob))
     for name, _ in CLI_CASES:
+        if name in RICH_CASES and not HAVE_RICH:
+            continue  # golden captured with `rich`; without it render-markdown uses its fallback
         assert got[name] == want[name], name
 
 
@@ -235,3 +244,41 @@ def test_install_layout(tmp_path):
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip().startswith(str(lib)), r.stdout
     shutil.rmtree(home, ignore_errors=True)
+
+
+def test_missing_golden_fails_instead_of_regenerating(tmp_path, monkeypatch):
+    import test_aitools_layout as mod
+    monkeypatch.setattr(mod, "GOLDEN", str(tmp_path))
+    monkeypatch.setattr(mod, "REGEN", False)
+    with pytest.raises(pytest.fail.Exception, match="AITOOLS_REGEN_GOLDEN=1"):
+        mod._golden_bytes("nope.json", "data")
+    assert not (tmp_path / "nope.json").exists()
+    monkeypatch.setattr(mod, "REGEN", True)
+    assert mod._golden_bytes("nope.json", "data") == "data"
+
+
+@pytest.mark.parametrize("shim,pkg", [("ai_mcp.py", "aitools"),
+                                      ("zulip_ai_bridge.py", "zulip_bridge"),
+                                      ("robinhood_trader.py", "trader")])
+def test_installed_lib_precedes_site_packages(tmp_path, shim, pkg):
+    """An installed shim (no package beside it) must load the package from
+    ~/.local/share/ai/lib even when an unrelated distribution with the same top-level name
+    (PyPI has an `aitools`) sits on sys.path - the lib dir goes right after the shim's dir."""
+    home = tmp_path / "home"
+    lib = home / ".local" / "share" / "ai" / "lib"
+    lib.mkdir(parents=True)
+    os.symlink(os.path.join(REPO, pkg), lib / pkg)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shutil.copy(os.path.join(REPO, shim), bindir / shim)
+    decoy = tmp_path / "site"
+    (decoy / pkg).mkdir(parents=True)
+    (decoy / pkg / "__init__.py").write_text("raise ImportError('DECOY package imported')\n")
+    probe = ("import runpy, sys; sys.argv = ['x']; "
+             f"runpy.run_path({str(bindir / shim)!r}, run_name='shim_probe'); "
+             f"import {pkg}; print({pkg}.__file__)")
+    env = dict(_env(home), PYTHONPATH=f"{decoy}{os.pathsep}{lib}")
+    r = subprocess.run([sys.executable, "-c", probe], cwd=str(tmp_path), env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout.strip().startswith(str(lib / pkg)), r.stdout

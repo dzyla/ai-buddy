@@ -31,8 +31,7 @@ fasta_parser.py
 create_valid_mmcif.py
 
 # ─────────────────────────────────────────
-# Non-app: data files (scoped to data/ so app configs like mcp.json
-# can still be tracked)
+# Non-app: data files
 # ─────────────────────────────────────────
 data/*.csv
 data/*.json
@@ -138,6 +137,9 @@ zuliprc
 gcal_token.json
 gcal_credentials.json
 trader.json
+# Personal MCP registry: lives in ~/.config/ai/mcp.json (template: config/mcp.example.json)
+/mcp.json
+/mcp_config.json
 # Machine/lab-specific skills: keep locally (install.sh still syncs them)
 .agents/skills/boltzgen-ops/
 .agents/skills/*_private/

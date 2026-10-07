@@ -1,0 +1,57 @@
+{
+  "id": "collect_todos",
+  "description": "Search several source files and write a report of TODO comments.",
+  "prompt": "Find every TODO comment in the .py files of this directory and write a list of them to todo.md, one per line as <file>:<line number>: <comment text>.",
+  "files": {
+    "parser.py": "def parse(s):\n    # TODO: handle empty input\n    return s.split(',')\n",
+    "cli.py": "import sys\n\n\ndef main():\n    # TODO: add --verbose flag\n    print(sys.argv)\n",
+    "main.py": "from cli import main\n\nmain()\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "todo.md",
+      "text": "parser.py:2"
+    },
+    {
+      "type": "file_contains",
+      "path": "todo.md",
+      "text": "cli.py:5"
+    },
+    {
+      "type": "file_contains",
+      "path": "todo.md",
+      "text": "handle empty input"
+    },
+    {
+      "type": "file_contains",
+      "path": "todo.md",
+      "text": "main.py",
+      "not": true
+    },
+    {
+      "type": "max_steps",
+      "value": 10
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "search_files",
+        "args": {
+          "pattern": "TODO",
+          "path": ".",
+          "file_glob": "*.py"
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "todo.md",
+          "content": "parser.py:2: TODO: handle empty input\ncli.py:5: TODO: add --verbose flag\n"
+        }
+      }
+    ],
+    "final": "Found 2 TODOs (parser.py:2, cli.py:5) and wrote them to todo.md."
+  }
+}

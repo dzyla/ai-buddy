@@ -1,0 +1,37 @@
+{
+  "id": "read_and_answer",
+  "description": "Read a lab note and answer a factual question from it.",
+  "prompt": "Read notes.txt in the current directory. What concentration of HEPES was the sample prepared in? Answer briefly with the number and unit.",
+  "files": {
+    "notes.txt": "Sample preparation log\n======================\nThe protein sample was prepared in 10 mM HEPES, 150 mM NaCl, pH 7.4.\nThe buffer was made from a 1 M stock on Monday.\n"
+  },
+  "checks": [
+    {
+      "type": "answer_contains",
+      "any": [
+        "10 mM",
+        "10mM",
+        "10 millimolar"
+      ]
+    },
+    {
+      "type": "tool_used",
+      "name": "read_file"
+    },
+    {
+      "type": "max_steps",
+      "value": 6
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "notes.txt"
+        }
+      }
+    ],
+    "final": "The sample was prepared in **10 mM HEPES** (with 150 mM NaCl, pH 7.4)."
+  }
+}

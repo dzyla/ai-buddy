@@ -1,0 +1,26 @@
+{
+  "_comment": "Template for ~/.config/ai/mcp.json (install.sh copies it there only if missing). Every server ships disabled: set \"disabled\": false (or delete the key) to turn one on. Secrets never go here; servers read them from the environment (e.g. ~/.local/share/ai/env).",
+  "mcpServers": {
+    "robinhood": {
+      "disabled": true,
+      "command": "mcp-remote",
+      "args": ["https://agent.robinhood.com/mcp/trading"],
+      "env": {
+        "BROWSER": ":",
+        "NO_BROWSER": "1",
+        "CI": "1",
+        "DISPLAY": ""
+      }
+    },
+    "zulip": {
+      "disabled": true,
+      "command": "python3",
+      "args": ["~/.local/bin/zulip_mcp_server.py"]
+    },
+    "pubmed": {
+      "disabled": true,
+      "command": "python3",
+      "args": ["~/.local/bin/pubmed_mcp_server.py"]
+    }
+  }
+}

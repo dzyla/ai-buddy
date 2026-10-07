@@ -12,6 +12,7 @@ touched. Run: python3 -m pytest tests/test_core_tools.py -v
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -487,6 +488,7 @@ def test_python_playground():
     assert "42" in res2
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js ('node') not installed")
 def test_js_playground():
     import ai_mcp
     res = ai_mcp.js_playground("const a = 15; const b = 27; a + b;")

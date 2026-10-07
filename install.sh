@@ -273,6 +273,26 @@ if [ -d "$SKILLS_SRC" ]; then
     echo "==> Synced ${count} skill(s) to ${SKILLS_DST}"
 fi
 
+# ── 4b. Seed ~/.config/ai from config/*.example.* (never overwrites) ─────────
+# Personal config lives outside the repo. Each template is copied to ~/.config/ai/<name without
+# .example> only when that file does not exist yet; files are mode 600 (they will hold secrets).
+CONFIG_DST="${HOME}/.config/ai"
+if [ -d "${SCRIPT_DIR}/config" ]; then
+    mkdir -p "${CONFIG_DST}"
+    for tpl in "${SCRIPT_DIR}"/config/*.example*; do
+        [ -f "$tpl" ] || continue
+        name="$(basename "$tpl")"
+        target="${CONFIG_DST}/${name/.example/}"
+        if [ -e "$target" ]; then
+            echo "==> Kept existing ${target}"
+        else
+            (umask 077 && cp "$tpl" "$target")
+            chmod 600 "$target"
+            echo "==> Created ${target} from config/${name} (edit it to enable servers / add secrets)"
+        fi
+    done
+fi
+
 # ── 5. Privacy pre-commit hook (this repo is public) ─────────────────────────
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "${REPO_DIR}/.git" ] && [ -f "${REPO_DIR}/.githooks/pre-commit" ]; then

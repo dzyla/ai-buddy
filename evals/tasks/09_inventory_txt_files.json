@@ -1,0 +1,54 @@
+{
+  "id": "inventory_txt_files",
+  "description": "List a directory and write a sorted inventory of one file type.",
+  "prompt": "Write the names of all .txt files in the current directory, sorted alphabetically, one per line, to inventory.md. Do not include other file types.",
+  "files": {
+    "beta.txt": "b\n",
+    "alpha.txt": "a\n",
+    "delta.txt": "d\n",
+    "gamma.txt": "g\n",
+    "main.py": "print('hi')\n",
+    "README.md": "# demo\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "inventory.md",
+      "text": "alpha.txt\nbeta.txt\ndelta.txt\ngamma.txt"
+    },
+    {
+      "type": "file_contains",
+      "path": "inventory.md",
+      "text": "main.py",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "inventory.md",
+      "text": "README",
+      "not": true
+    },
+    {
+      "type": "max_steps",
+      "value": 8
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "list_directory",
+        "args": {
+          "path": "."
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "inventory.md",
+          "content": "alpha.txt\nbeta.txt\ndelta.txt\ngamma.txt\n"
+        }
+      }
+    ],
+    "final": "Wrote 4 .txt files to inventory.md: alpha.txt, beta.txt, delta.txt, gamma.txt."
+  }
+}

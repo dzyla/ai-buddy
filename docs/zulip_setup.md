@@ -343,11 +343,11 @@ you register the server in an MCP config:
 ```
 
 Only the **first** config file that exists is used, in this order:
-`./mcp.json`, `./mcp_config.json`, `~/.config/ai/mcp.json`,
-`~/.config/ai/mcp_config.json`, and so on. The service runs inside the repo,
-which ships its own `mcp.json`, so for the bridge the entry has to go into
-the repo's `mcp.json`. For `ai` started elsewhere it goes into
-`~/.config/ai/mcp.json`. The tools act **as the bot** with the same
+`$INFER_MCP_CONFIG`, `~/.config/ai/mcp.json`, `~/.config/ai/mcp_config.json`,
+then `./mcp.json` in the current directory, and so on. Put the entry in
+`~/.config/ai/mcp.json`; it then applies to the bridge and to `ai` started
+anywhere. `install.sh` creates that file from `config/mcp.example.json`, which
+already has a `zulip` entry with `"disabled": true`: set it to `false`. The tools act **as the bot** with the same
 credentials, and when no filter is given `zulip_get_messages` reads only
 channels the bot is subscribed to and its DMs.
 

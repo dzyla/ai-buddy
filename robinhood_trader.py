@@ -24,8 +24,12 @@ sys.path[:] = [p for p in sys.path if not p or os.path.realpath(p) != _HERE or p
 if _HERE in sys.path:
     sys.path.remove(_HERE)
 sys.path.insert(0, _HERE)
-if _LIB not in sys.path:
-    sys.path.append(_LIB)
+# The installed lib goes right after this file's dir: appended, a same-named distribution in
+# site-packages (PyPI has an `aitools`) would shadow it.
+if _LIB != _HERE:
+    if _LIB in sys.path:
+        sys.path.remove(_LIB)
+    sys.path.insert(sys.path.index(_HERE) + 1, _LIB)
 
 if __name__ == "__main__":
     import trader.legacy  # noqa: F401 - load every module now, while this release is the one on disk

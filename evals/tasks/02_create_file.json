@@ -1,0 +1,32 @@
+{
+  "id": "create_file",
+  "description": "Create a file with exact content.",
+  "prompt": "Create a file named hello.txt in the current directory whose content is exactly the line: hello world",
+  "checks": [
+    {
+      "type": "file_exists",
+      "path": "hello.txt"
+    },
+    {
+      "type": "file_contains",
+      "path": "hello.txt",
+      "text": "hello world"
+    },
+    {
+      "type": "max_steps",
+      "value": 6
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "hello.txt",
+          "content": "hello world\n"
+        }
+      }
+    ],
+    "final": "Created hello.txt containing `hello world`."
+  }
+}

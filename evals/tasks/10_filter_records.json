@@ -1,0 +1,49 @@
+{
+  "id": "filter_records",
+  "description": "Filter structured records by a condition and write the result.",
+  "prompt": "people.txt has lines of the form name,age. Write the names of everyone aged 18 or older to adults.txt, one per line, in the original order.",
+  "files": {
+    "people.txt": "Alice,34\nBob,17\nCarol,18\nDan,9\nErin,52\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "adults.txt",
+      "text": "Alice\nCarol\nErin"
+    },
+    {
+      "type": "file_contains",
+      "path": "adults.txt",
+      "text": "Bob",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "adults.txt",
+      "text": "Dan",
+      "not": true
+    },
+    {
+      "type": "max_steps",
+      "value": 8
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "people.txt"
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "adults.txt",
+          "content": "Alice\nCarol\nErin\n"
+        }
+      }
+    ],
+    "final": "Alice (34), Carol (18) and Erin (52) are 18 or older; wrote them to adults.txt."
+  }
+}

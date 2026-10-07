@@ -5,24 +5,47 @@ import json
 import subprocess
 import time
 
-CONFIG_PATHS = [
-    os.path.join(os.getcwd(), "mcp.json"),
-    os.path.join(os.getcwd(), "mcp_config.json"),
-    os.path.expanduser("~/.config/ai/mcp.json"),
-    os.path.expanduser("~/.config/ai/mcp_config.json"),
-    os.path.expanduser("~/.gemini/config/mcp_config.json"),
-    os.path.expanduser("~/.lmstudio/mcp.json"),
-]
+def config_paths():
+    """MCP config search order (first non-empty file wins), resolved at call time so HOME/cwd/env
+    changes are honoured: $INFER_MCP_CONFIG, the user's ~/.config/ai (seeded by install.sh from
+    config/mcp.example.json), then ./mcp.json for development (no longer tracked), then the
+    legacy locations of other tools."""
+    paths = []
+    override = os.environ.get("INFER_MCP_CONFIG")
+    if override:
+        paths.append(os.path.expanduser(override))
+    paths += [
+        os.path.expanduser("~/.config/ai/mcp.json"),
+        os.path.expanduser("~/.config/ai/mcp_config.json"),
+        os.path.join(os.getcwd(), "mcp.json"),
+        os.path.join(os.getcwd(), "mcp_config.json"),
+        os.path.expanduser("~/.gemini/config/mcp_config.json"),
+        os.path.expanduser("~/.lmstudio/mcp.json"),
+    ]
+    return paths
+
+
+# Snapshot for callers that read the list directly; load_config() always re-resolves.
+CONFIG_PATHS = config_paths()
+
+
+def _enabled(servers):
+    """Drop entries marked "disabled": true (the shipped template disables every server)."""
+    if not isinstance(servers, dict):
+        return servers
+    return {name: cfg for name, cfg in servers.items()
+            if not (isinstance(cfg, dict) and cfg.get("disabled") is True)}
+
 
 def load_config():
-    for path in CONFIG_PATHS:
+    for path in config_paths():
         if os.path.exists(path) and os.path.getsize(path) > 0:
             try:
                 with open(path, "r") as f:
                     data = json.load(f)
                     if "mcpServers" in data:
-                        return data["mcpServers"]
-                    return data
+                        return _enabled(data["mcpServers"])
+                    return _enabled(data)
             except Exception as e:
                 print(f"Warning: failed to load config from {path}: {e}", file=sys.stderr)
     return {}

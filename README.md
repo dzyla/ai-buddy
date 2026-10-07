@@ -274,7 +274,7 @@ All config lives in `~/.local/share/ai/env` (managed by `ai-backend`) and is loa
 
 ### MCP servers
 
-Register additional tool servers in `mcp.json` (project-local) or `~/.config/ai/mcp.json` (global):
+Register tool servers in `~/.config/ai/mcp.json`. `install.sh` creates it from `config/mcp.example.json` if it is missing (robinhood, zulip and pubmed entries, all `"disabled": true`; set `"disabled": false` to enable one). Keep secrets in the environment, not in this file:
 
 ```json
 {
@@ -290,7 +290,7 @@ Register additional tool servers in `mcp.json` (project-local) or `~/.config/ai/
 
 Paths in `args` support `~` and `$HOME`. Tools appear as `my_server__tool_name` in the model's catalog.
 
-Config search order: `./mcp.json` → `./mcp_config.json` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`
+Config search order (first file found wins): `$INFER_MCP_CONFIG` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `./mcp.json` → `./mcp_config.json` (cwd, for development; not tracked) → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`. Entries with `"disabled": true` are skipped.
 
 ---
 
@@ -554,7 +554,8 @@ For details on the architecture, adding tools, and cross-process contracts, see 
 ├── remote_harness.c/h    # Remote harness library
 ├── Makefile              # Build system
 ├── install.sh            # Install script
-├── mcp.json              # MCP server configuration
+├── config/               # *.example* templates for ~/.config/ai (mcp.json, trader.json, ...)
+├── evals/                # agent eval set + runner (python3 evals/run_evals.py --mock)
 ├── gcal.py               # Google Calendar integration
 ├── pubmed_mcp_server.py  # PubMed MCP server
 ├── deep_research.py      # Deep research tool

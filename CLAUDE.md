@@ -32,6 +32,12 @@ Tests (pytest):
 - `tests/test_offline.py` — **offline** suite (no backend). Drives the binary against a mock OpenAI server (`tests/mock_llm_server.py`, supports both `stream:false` and SSE) and asserts on the exact request the binary sent. Also unit-tests `ai_mcp.py` pure functions (fetch routing, `session-transcript`). Run: `python3 -m pytest tests/test_offline.py -v`.
 - The mock server keys off `MOCK_TASK_COMPLETE` (return a `task_complete` tool call so the agent loop ends in one turn) and `MOCK_CAPTURE` (append each received request as one JSON line). Integration tests use an isolated `HOME` so `load_env_file()` can't override the mock `INFER_*` vars.
 
+- `tests/test_config_templates.py` — `config/*.example*` templates parse and hold no personal data; `load_config` order and `"disabled"`; `install.sh` seeding. `tests/test_evals_runner.py` — the eval set (below) runs under `--mock`.
+
+Agent eval set (`evals/`): `evals/tasks/NN_<id>.json` are realistic CLI-assistant tasks (file edits, shell, multi-step tool use, recovering from a failing command, refusing a destructive script, ...). Each has `prompt`, optional `files`/`env`, `checks` (`answer_contains`, `file_exists`, `file_contains`, `tool_used`, `max_steps`; any check takes `"not": true`) and a `mock` script (`steps` of `{tool, args}`, a list = parallel calls; `final` = the task_complete summary). `python3 evals/run_evals.py --mock [--json out.json]` runs every task offline against `tests/mock_llm_server.py` (tools really run in a temp workdir with an isolated HOME; exit 1 on any failure). Against a model: `python3 evals/run_evals.py [--engine c|py] --base-url URL --model M --json out.json` (defaults to `INFER_*` / `~/.local/share/ai/env`; `--min-pass` sets the exit threshold, default 0).
+
+CI (`.github/workflows/ci.yml`, ubuntu-latest): `test` (apt `libcurl4-openssl-dev libssl-dev`, pip `pytest requests google-api-python-client google-auth google-auth-oauthlib`, `make`, `pytest tests/ -q`), `privacy` (`privacy_check.py --all` with `AI_PRIVATE_PATTERNS=/dev/null`, i.e. generic patterns only), `evals-mock`. The suite must not depend on this machine: no `zulip`, `rich`, `node`, local model, real `~/.config/ai` or `~/.local/bin/ai` on the runner (tests needing optional tools skip with a reason).
+
 No linter or package manifest. For quick manual checks, run the binary directly (e.g. `INFER_* env vars set; echo "hi" | ./ai "say hello"`).
 
 Required environment variables (the binary exits early without all three):
@@ -126,7 +132,11 @@ A native tool needs, kept in sync:
 - `~/.config/ai/memory.txt` — persistent memory (capped 4KB), injected into every system prompt. `save_memory` appends, skips duplicates, and evicts the oldest whole lines past the cap (`replace=true` overwrites).
 - `~/.config/ai/self_improve/` — failure-learning ledger (`ledger.jsonl`, capped at 5000 lines) and `lessons.md`. Guard/timeout errors are not learned from. Tests must use an isolated `HOME`.
 - `~/.config/ai/trader.json` — Robinhood account mapping (`{"accounts": {"agentic": ..., "primary": ..., "roth": ...}}`); env `RH_*_ACCOUNT` overrides. Trading refuses if the agentic account can't be resolved.
-- `mcp.json` / `~/.config/ai/mcp.json` (and several other paths checked in `CONFIG_PATHS` order) — MCP server registry. Full search order: `./mcp.json`, `./mcp_config.json`, `~/.config/ai/mcp.json`, `~/.config/ai/mcp_config.json`, `~/.gemini/config/mcp_config.json`, `~/.lmstudio/mcp.json`.
+- `~/.config/ai/mcp.json` — MCP server registry (`aitools/mcp_client.py: load_config`). Search order, first non-empty file wins: `$INFER_MCP_CONFIG`, `~/.config/ai/mcp.json`, `~/.config/ai/mcp_config.json`, `./mcp.json`, `./mcp_config.json` (cwd; dev only, gitignored), `~/.gemini/config/mcp_config.json`, `~/.lmstudio/mcp.json`. Entries with `"disabled": true` are skipped.
+
+### Config templates (`config/`)
+
+Personal config is not tracked. `config/*.example*` are the templates: `mcp.example.json` (robinhood, zulip, pubmed entries, all `"disabled": true`, no secrets; pubmed reads `PUBMED_SEARCH_URL`/`PUBMED_API_KEY` from the env), `trader.example.json`, `private_patterns.example.txt` (comments only), `zuliprc.example`. `install.sh` copies each to `~/.config/ai/<name without .example>` (mode 600) **only when the target is missing**; it never overwrites. Templates use placeholders / example.com only; `tests/test_config_templates.py` enforces that.
 
 ## Privacy (the GitHub repo is public)
 

@@ -18,8 +18,12 @@ _LIB = os.path.expanduser("~/.local/share/ai/lib")
 if sys.path[:1] != [_HERE]:
     sys.path[:] = [p for p in sys.path if p != _HERE]
     sys.path.insert(0, _HERE)
-if _LIB not in sys.path:
-    sys.path.append(_LIB)
+# The installed lib goes right after this file's dir: appended, a same-named distribution in
+# site-packages (PyPI has an `aitools`) would shadow it.
+if _LIB != _HERE:
+    if _LIB in sys.path:
+        sys.path.remove(_LIB)
+    sys.path.insert(sys.path.index(_HERE) + 1, _LIB)
 
 import aitools  # noqa: E402
 

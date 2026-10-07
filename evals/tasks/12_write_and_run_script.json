@@ -1,0 +1,42 @@
+{
+  "id": "write_and_run_script",
+  "description": "Write a small program, run it, and save its output.",
+  "prompt": "Write a Python script fib.py that prints the first 10 Fibonacci numbers (starting 0, 1), one per line. Run it and save its output to fib_out.txt.",
+  "checks": [
+    {
+      "type": "file_exists",
+      "path": "fib.py"
+    },
+    {
+      "type": "file_contains",
+      "path": "fib_out.txt",
+      "text": "21\n34"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command"
+    },
+    {
+      "type": "max_steps",
+      "value": 10
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "fib.py",
+          "content": "a, b = 0, 1\nfor _ in range(10):\n    print(a)\n    a, b = b, a + b\n"
+        }
+      },
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 fib.py > fib_out.txt && cat fib_out.txt"
+        }
+      }
+    ],
+    "final": "fib.py prints 0 1 1 2 3 5 8 13 21 34; the output is saved in fib_out.txt."
+  }
+}

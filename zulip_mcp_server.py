@@ -130,7 +130,7 @@ def get_zulip_client():
     
     config_file = os.environ.get("ZULIP_CONFIG_PATH")
     if config_file:
-        return zulip.Client(config_file=config_file)
+        return zulip.Client(config_file=os.path.expanduser(config_file))
         
     default_config_path = os.path.expanduser("~/.config/zulip/zuliprc")
     if os.path.exists(default_config_path):

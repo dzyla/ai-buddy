@@ -1,0 +1,18 @@
+# Personal denylist for scripts/privacy_check.py (the pre-commit hook of this public repo).
+# install.sh copies this file to ~/.config/ai/private_patterns.txt only if that file is missing;
+# the real list lives there, OUTSIDE the repo, so the denylist itself is never published.
+#
+# One Python regex per line, matched case-insensitively against every added line.
+# Lines starting with # are ignored, so everything below is an inactive example:
+# uncomment and adapt the ones you need.
+#
+# Your name / usernames / lab name:
+#   \bjane\s+doe\b
+#   \bjdoe\b
+# Private hostnames and internal domains:
+#   \bmy-lab-server\b
+#   \binternal\.example\.org\b
+# Brokerage account numbers (match the shape you use, e.g. 4 digits + 4 digits):
+#   \b\d{4}-\d{4}\b
+# Project or grant identifiers that must stay private:
+#   \bPROJ-[A-Z]{3}\d+\b

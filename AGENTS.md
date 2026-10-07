@@ -223,7 +223,8 @@ globally to every request while the process is running:
 ├── remote_harness.c/h    # Remote execution library
 ├── Makefile              # Build system
 ├── install.sh            # Install/uninstall script
-├── mcp.json              # Local MCP server registry
+├── config/               # *.example* templates for ~/.config/ai (mcp.json, trader.json, ...)
+├── evals/                # agent eval set + runner (python3 evals/run_evals.py --mock)
 ├── gcal.py               # Google Calendar CLI integration (list/create/update/delete/availability)
 ├── pubmed_mcp_server.py  # PubMed MCP server
 ├── deep_research.py      # Deep research tool
@@ -264,7 +265,7 @@ globally to every request while the process is running:
 - C code uses `-O2 -Wall -Wextra -fPIC` and links against `libcurl`, `libssl`, `libcrypto`, `libpthread`, `libm`.
 - Python tool backend runs as a subprocess of the C agent loop.
 - Session state lives in `~/.cache/ai/sessions/` and `~/.cache/ai/history.jsonl`.
-- MCP server config is searched in order: `./mcp.json` → `./mcp_config.json` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`.
+- MCP server config is searched in order: `$INFER_MCP_CONFIG` → `~/.config/ai/mcp.json` → `~/.config/ai/mcp_config.json` → `./mcp.json` → `./mcp_config.json` → `~/.gemini/config/mcp_config.json` → `~/.lmstudio/mcp.json`; entries with `"disabled": true` are skipped. The repo no longer tracks `mcp.json`; the template is `config/mcp.example.json` (copied by `install.sh` if missing).
 - Domain skills live in `.agents/skills/<name>/` and are loaded via the `load_skill` tool.
 
 ### Zulip Bridge

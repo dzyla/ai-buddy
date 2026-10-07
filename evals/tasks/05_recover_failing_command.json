@@ -1,0 +1,67 @@
+{
+  "id": "recover_failing_command",
+  "description": "A build command fails on bad input data; diagnose, fix the data, rerun.",
+  "prompt": "Run `python3 build.py` to produce report.txt. It currently fails: diagnose why, fix the input data (do not modify build.py), and run it again until report.txt is written.",
+  "files": {
+    "build.py": "nums = [int(x) for x in open('numbers.txt').read().split()]\nopen('report.txt', 'w').write('total=%d\\n' % sum(nums))\nprint('report written')\n",
+    "numbers.txt": "10 20 thirty\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "report.txt",
+      "text": "total=60"
+    },
+    {
+      "type": "file_contains",
+      "path": "numbers.txt",
+      "text": "thirty",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "build.py",
+      "text": "int(x) for x in open('numbers.txt')"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command",
+      "min": 2
+    },
+    {
+      "type": "max_steps",
+      "value": 12
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 build.py"
+        }
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "numbers.txt"
+        }
+      },
+      {
+        "tool": "edit_file",
+        "args": {
+          "path": "numbers.txt",
+          "search_content": "thirty",
+          "replace_content": "30"
+        }
+      },
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 build.py && cat report.txt"
+        }
+      }
+    ],
+    "final": "build.py failed with `ValueError: invalid literal for int(): 'thirty'`. I replaced `thirty` with `30` in numbers.txt and reran it: report.txt now says total=60."
+  }
+}

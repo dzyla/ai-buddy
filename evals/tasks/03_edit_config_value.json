@@ -1,0 +1,54 @@
+{
+  "id": "edit_config_value",
+  "description": "Change one value in a config file and leave the rest untouched.",
+  "prompt": "In settings.ini, change the server port from 8080 to 9090. Do not change anything else in the file.",
+  "files": {
+    "settings.ini": "[server]\nhost = localhost\nport = 8080\nworkers = 4\n\n[logging]\nlevel = info\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "settings.ini",
+      "text": "port = 9090"
+    },
+    {
+      "type": "file_contains",
+      "path": "settings.ini",
+      "text": "8080",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "settings.ini",
+      "text": "host = localhost"
+    },
+    {
+      "type": "file_contains",
+      "path": "settings.ini",
+      "text": "level = info"
+    },
+    {
+      "type": "max_steps",
+      "value": 8
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "settings.ini"
+        }
+      },
+      {
+        "tool": "edit_file",
+        "args": {
+          "path": "settings.ini",
+          "search_content": "port = 8080",
+          "replace_content": "port = 9090"
+        }
+      }
+    ],
+    "final": "Changed `port = 8080` to `port = 9090` in settings.ini; nothing else was touched."
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "combine_two_files",
+  "description": "Read two files (parallel tool calls) and combine their contents.",
+  "prompt": "part1.txt and part2.txt each contain one code word. Read both and write the two words, part1 first, separated by a single space, to combined.txt.",
+  "files": {
+    "part1.txt": "aurora\n",
+    "part2.txt": "basalt\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "combined.txt",
+      "text": "aurora basalt"
+    },
+    {
+      "type": "max_steps",
+      "value": 8
+    }
+  ],
+  "mock": {
+    "steps": [
+      [
+        {
+          "tool": "read_file",
+          "args": {
+            "path": "part1.txt"
+          }
+        },
+        {
+          "tool": "read_file",
+          "args": {
+            "path": "part2.txt"
+          }
+        }
+      ],
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "combined.txt",
+          "content": "aurora basalt\n"
+        }
+      }
+    ],
+    "final": "part1.txt says `aurora`, part2.txt says `basalt`; wrote `aurora basalt` to combined.txt."
+  }
+}

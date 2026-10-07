@@ -1,0 +1,40 @@
+{
+  "id": "shell_count_errors",
+  "description": "Use the shell to count matching log lines and save the number.",
+  "prompt": "app.log has one event per line. Using a shell command, count how many lines have level ERROR, then write just that number to count.txt.",
+  "files": {
+    "app.log": "2026-10-01T12:00:00 INFO worker-0 request handled\n2026-10-01T12:01:00 ERROR worker-1 request handled\n2026-10-01T12:02:00 INFO worker-2 request handled\n2026-10-01T12:03:00 WARN worker-0 request handled\n2026-10-01T12:04:00 ERROR worker-1 request handled\n2026-10-01T12:05:00 INFO worker-2 request handled\n2026-10-01T12:06:00 ERROR worker-0 request handled\n2026-10-01T12:07:00 ERROR worker-1 request handled\n2026-10-01T12:08:00 INFO worker-2 request handled\n2026-10-01T12:09:00 ERROR worker-0 request handled\n2026-10-01T12:10:00 DEBUG worker-1 request handled\n2026-10-01T12:11:00 ERROR worker-2 request handled\n2026-10-01T12:12:00 ERROR worker-0 request handled\n2026-10-01T12:13:00 INFO worker-1 request handled\n2026-10-01T12:14:00 ERROR worker-2 request handled\n2026-10-01T12:15:00 WARN worker-0 request handled\n2026-10-01T12:16:00 ERROR worker-1 request handled\n2026-10-01T12:17:00 ERROR worker-2 request handled\n2026-10-01T12:18:00 INFO worker-0 request handled\n2026-10-01T12:19:00 ERROR worker-1 request handled\n2026-10-01T12:20:00 ERROR worker-2 request handled\n2026-10-01T12:21:00 INFO worker-0 request handled\n2026-10-01T12:22:00 ERROR worker-1 request handled\n2026-10-01T12:23:00 INFO worker-2 request handled\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "count.txt",
+      "text": "13"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command"
+    },
+    {
+      "type": "max_steps",
+      "value": 8
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "grep -c ' ERROR ' app.log"
+        }
+      },
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "grep -c ' ERROR ' app.log > count.txt"
+        }
+      }
+    ],
+    "final": "There are 13 ERROR lines; wrote `13` to count.txt."
+  }
+}

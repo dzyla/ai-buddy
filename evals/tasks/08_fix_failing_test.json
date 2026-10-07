@@ -1,0 +1,74 @@
+{
+  "id": "fix_failing_test",
+  "description": "Fix a bug so a test script passes, without editing the test.",
+  "prompt": "`python3 test_calc.py` fails. Fix the bug in calc.py (do not modify test_calc.py) and run the test again to confirm it passes.",
+  "files": {
+    "calc.py": "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n",
+    "test_calc.py": "from calc import add, mul\n\nassert add(2, 3) == 5, add(2, 3)\nassert mul(4, 5) == 20\nprint('ALL TESTS PASSED')\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "calc.py",
+      "text": "a + b"
+    },
+    {
+      "type": "file_contains",
+      "path": "calc.py",
+      "text": "a - b",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "test_calc.py",
+      "text": "assert add(2, 3) == 5, add(2, 3)"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command",
+      "min": 2
+    },
+    {
+      "type": "answer_contains",
+      "any": [
+        "pass",
+        "ALL TESTS PASSED"
+      ]
+    },
+    {
+      "type": "max_steps",
+      "value": 12
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 test_calc.py"
+        }
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "calc.py"
+        }
+      },
+      {
+        "tool": "edit_file",
+        "args": {
+          "path": "calc.py",
+          "search_content": "return a - b",
+          "replace_content": "return a + b"
+        }
+      },
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 test_calc.py"
+        }
+      }
+    ],
+    "final": "add() subtracted instead of adding. Fixed `return a - b` to `return a + b` in calc.py; `python3 test_calc.py` now prints ALL TESTS PASSED."
+  }
+}

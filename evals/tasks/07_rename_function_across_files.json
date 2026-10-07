@@ -1,0 +1,73 @@
+{
+  "id": "rename_function_across_files",
+  "description": "Find which module defines a function and rename it there and at its call site.",
+  "prompt": "One of util_a.py, util_b.py, util_c.py defines a function compute_flux. Rename that function to compute_flux_v2, and update main.py, which imports and calls it. Change nothing else.",
+  "files": {
+    "util_a.py": "def load_config():\n    return {}\n",
+    "util_b.py": "def compute_flux(x):\n    return x * 2\n",
+    "util_c.py": "def save_report(s):\n    pass\n",
+    "main.py": "from util_b import compute_flux\n\nprint(compute_flux(21))\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "util_b.py",
+      "text": "def compute_flux_v2(x):"
+    },
+    {
+      "type": "file_contains",
+      "path": "main.py",
+      "text": "from util_b import compute_flux_v2"
+    },
+    {
+      "type": "file_contains",
+      "path": "main.py",
+      "text": "compute_flux_v2(21)"
+    },
+    {
+      "type": "file_contains",
+      "path": "util_a.py",
+      "text": "def load_config():"
+    },
+    {
+      "type": "max_steps",
+      "value": 12
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "search_files",
+        "args": {
+          "pattern": "def compute_flux",
+          "path": "."
+        }
+      },
+      [
+        {
+          "tool": "edit_file",
+          "args": {
+            "path": "util_b.py",
+            "search_content": "def compute_flux(x):",
+            "replace_content": "def compute_flux_v2(x):"
+          }
+        },
+        {
+          "tool": "edit_file",
+          "args": {
+            "path": "main.py",
+            "search_content": "from util_b import compute_flux\n\nprint(compute_flux(21))",
+            "replace_content": "from util_b import compute_flux_v2\n\nprint(compute_flux_v2(21))"
+          }
+        }
+      ],
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 main.py"
+        }
+      }
+    ],
+    "final": "compute_flux was defined in util_b.py. Renamed it to compute_flux_v2 there and in main.py; `python3 main.py` still prints 42."
+  }
+}

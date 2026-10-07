@@ -1,0 +1,49 @@
+{
+  "id": "rename_files_batch",
+  "description": "Batch-rename files with a shell loop.",
+  "prompt": "Rename every IMG_*.JPG file in the current directory to photo_<number>.jpg (for example IMG_001.JPG becomes photo_001.jpg). Leave other files alone.",
+  "files": {
+    "IMG_001.JPG": "x\n",
+    "IMG_002.JPG": "y\n",
+    "IMG_010.JPG": "z\n",
+    "notes.txt": "keep\n"
+  },
+  "checks": [
+    {
+      "type": "file_exists",
+      "path": "photo_001.jpg"
+    },
+    {
+      "type": "file_exists",
+      "path": "photo_002.jpg"
+    },
+    {
+      "type": "file_exists",
+      "path": "photo_010.jpg"
+    },
+    {
+      "type": "file_exists",
+      "path": "IMG_001.JPG",
+      "not": true
+    },
+    {
+      "type": "file_exists",
+      "path": "notes.txt"
+    },
+    {
+      "type": "max_steps",
+      "value": 8
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "for f in IMG_*.JPG; do n=${f#IMG_}; mv \"$f\" \"photo_${n%.JPG}.jpg\"; done; ls"
+        }
+      }
+    ],
+    "final": "Renamed IMG_001.JPG, IMG_002.JPG and IMG_010.JPG to photo_001.jpg, photo_002.jpg and photo_010.jpg."
+  }
+}
