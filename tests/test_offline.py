@@ -831,3 +831,77 @@ def test_mcp_tool_call_routes_to_server(tmp_path, engine):
     starts = len(pids.read_text().split())
     # list-tools starts it once (catalog), then: C one start per call, Python engine one pooled session
     assert starts == (3 if engine == "c" else 2), starts
+
+
+def test_non_utf8_tool_output_and_prompt_do_not_crash(tmp_path, engine):
+    """A Latin-1 file name in a tool result and a non-UTF-8 prompt argument: the run completes
+    (both requests sent) and the session is saved. The Python engine used to die encoding it."""
+    d = tmp_path / "latin"
+    d.mkdir()
+    fd = os.open(os.path.join(os.fsencode(str(d)), b"caf\xe9.txt"), os.O_CREAT | os.O_WRONLY, 0o644)
+    os.close(fd)
+    seq = [{"id": "l1", "type": "function", "function": {"name": "list_directory", "arguments": json.dumps({"path": str(d)})}}]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        home = tmp_path / "home"
+        home.mkdir()
+        work = tmp_path / "work"
+        work.mkdir()
+        os.symlink(os.path.join(REPO, "ai_mcp.py"), work / "ai_mcp.py")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+        env.update(HOME=str(home), INFER_BASE_URL=srv.base_url, INFER_API_KEY="t", INFER_MODEL="mock",
+                   INFER_TOOL_CHOICE="auto", INFER_AUTO_APPROVE="1")
+        r = subprocess.run([AI_BIN, b"list the caf\xe9 dir"], cwd=str(work), env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=90)
+        reqs = srv.requests()
+    err = r.stderr.decode("utf-8", "replace")
+    assert r.returncode == 0, err[-2000:]
+    assert len(reqs) == 2, err[-2000:]
+    tool = [m["content"] for m in reqs[1]["messages"] if m["role"] == "tool"][0]
+    assert "caf" in tool and ".txt" in tool
+    assert (home / ".cache" / "ai" / "sessions" / "last.json").exists()
+
+
+def test_background_job_survives_sigterm_mid_task(tmp_path, engine):
+    """A job detached by an earlier command (`nohup … &`) outlives the agent when it is
+    terminated during a later command (ai.c behaviour; the Python engine used to kill every child)."""
+    bg_pid = tmp_path / "bg.pid"
+    started = tmp_path / "second.started"
+    bg = "import os, time; open(%r, 'w').write(str(os.getpid())); time.sleep(120)" % str(bg_pid)
+    slow = "open(%r, 'w').close(); import time; time.sleep(60)" % str(started)
+    seq = [{"id": "b1", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps(
+               {"command": "nohup python3 -c \"%s\" > /dev/null 2>&1 &" % bg})}},
+           {"id": "b2", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps(
+               {"command": "python3 -c \"%s\"" % slow})}}]
+    home = tmp_path / "home"
+    home.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    os.symlink(os.path.join(REPO, "ai_mcp.py"), work / "ai_mcp.py")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+    pid = None
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        env.update(HOME=str(home), INFER_BASE_URL=srv.base_url, INFER_API_KEY="t", INFER_MODEL="mock",
+                   INFER_TOOL_CHOICE="auto", INFER_AUTO_APPROVE="1")
+        p = subprocess.Popen([AI_BIN, "go"], cwd=str(work), env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 30
+            while not (started.exists() and bg_pid.exists() and bg_pid.read_text()) and time.time() < deadline:
+                time.sleep(0.05)
+            assert started.exists() and bg_pid.exists()
+            pid = int(bg_pid.read_text())
+            p.send_signal(15)
+            p.wait(timeout=20)
+            time.sleep(0.5)
+            os.kill(pid, 0)  # raises ProcessLookupError if the background job was killed
+        finally:
+            if p.poll() is None:
+                p.kill()
+            if pid:
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass

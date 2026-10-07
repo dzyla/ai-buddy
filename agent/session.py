@@ -23,7 +23,7 @@ def _path(d, session_id):
 def _atomic_write(path, data):
     tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
-        with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
+        with open(tmp, "w", encoding="utf-8", errors="replace") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -104,7 +104,7 @@ def log_job(prompt, pipe_writer, response, interactive, session_id, private):
         rec = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()),
                "session_id": session_id or "unknown", "prompt": prompt or "",
                "pipe_writer": pipe_writer or "", "interactive": bool(interactive), "response": response or ""}
-        with open(os.path.join(d, "history.jsonl"), "a", encoding="utf-8", errors="surrogateescape") as f:
+        with open(os.path.join(d, "history.jsonl"), "a", encoding="utf-8", errors="replace") as f:
             f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
     except OSError:
         pass

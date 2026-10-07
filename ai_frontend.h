@@ -25,7 +25,7 @@ typedef struct {
     int  (*prompt_user_ok)(const char *title, const char *detail);   /* 1 yes, 0 no, -1 no tty */
     void (*redraw)(void);
     void (*add_turn_item)(int kind, const char *name, const char *status, const char *content,
-                          double elapsed, double tps);
+                          double elapsed, double tps, int turn, int tools);
     void (*jobs_status)(void);
     void (*copy_to_clipboard)(const char *text);
     int *hide_details;

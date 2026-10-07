@@ -15,6 +15,8 @@ import urllib.parse
 
 from .cli import Options
 
+RETRY_BASE = 1.0   # seconds before the first retry of a transient server failure (doubles each time)
+
 
 # ── payload ──────────────────────────────────────────────────────────────────
 def _c2(x):
@@ -270,7 +272,7 @@ class Client:
 
     def chat(self, messages, tools, stream=True, on_chunk=None, debug_tag=None):
         payload = build_payload(self.model, messages, tools, self.opts, stream=stream)
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
         if self.debug:
             self.log("[debug] Loop %s payload: %s\n" % (debug_tag, body.decode("utf-8", "replace")))
         self._interrupted = False
@@ -296,7 +298,7 @@ class Client:
                 if not local and isinstance(e, (ConnectionResetError, http.client.RemoteDisconnected)) \
                         and server_tries < 3:
                     server_tries += 1
-                    time.sleep(2 ** server_tries / 2)
+                    time.sleep(RETRY_BASE * 2 ** (server_tries - 1))
                     continue
                 return {"message": {"role": "assistant", "content": None}, "finish_reason": None,
                         "usage": {}, "error": str(e) or e.__class__.__name__, "connect_failed":
@@ -310,9 +312,9 @@ class Client:
                     self.log("\033[2m[ai] Local server model is loading, waiting...\033[0m\n")
                 time.sleep(0.5)
                 continue
-            if status >= 500 and server_tries < 3:
+            if status in (502, 503, 504) and server_tries < 3:   # transient gateway/overload only
                 server_tries += 1
-                time.sleep(2 ** server_tries / 2)
+                time.sleep(RETRY_BASE * 2 ** (server_tries - 1))
                 continue
             res = self._done(acc, stream)
             res["status"] = status

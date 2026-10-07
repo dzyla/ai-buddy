@@ -56,7 +56,7 @@ class Channel:
     def send(self, ev, **fields):
         msg = {"ev": ev}
         msg.update(fields)
-        data = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8", "surrogateescape")
+        data = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8", "replace")
         with self._wlock:
             try:
                 self.sock.sendall(data)

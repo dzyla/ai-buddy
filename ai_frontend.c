@@ -23,6 +23,7 @@ static pid_t g_engine = -1;
 static int   g_quiet = 0, g_active = 0;
 static int   g_hdr = 0, g_ftr = 0;      /* thinking header/footer printed for the current request */
 static int   g_read_count = 0;
+static int   g_turn = 0, g_tools = 0;  /* latest turn number / session tool count from the engine */
 static char *g_last = NULL;             /* last answer (markdown) for :copy */
 static struct termios g_saved;
 static int   g_raw = 0;
@@ -291,7 +292,7 @@ static void read_turn(cJSON *o) {
             continue;
         }
         if (line[0] && line[0] != ':') {
-            U->add_turn_item(FE_ITEM_USER, "User", NULL, line, 0, 0);
+            U->add_turn_item(FE_ITEM_USER, "User", NULL, line, 0, 0, g_turn, g_tools);
             U->print_user_message(line);
         }
         if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0 ||
@@ -435,7 +436,7 @@ static int on_event(cJSON *o, int *code) {
                 fflush(stderr);
             }
         } else if (s) {
-            U->add_turn_item(FE_ITEM_THINKING, "thinking", NULL, s, 0, 0);
+            U->add_turn_item(FE_ITEM_THINKING, "thinking", NULL, s, 0, 0, 0, 0);
             U->print_think_box(s);
             fflush(stdout);
         }
@@ -454,7 +455,7 @@ static int on_event(cJSON *o, int *code) {
                 fflush(stderr);
             }
             const char *rc = jstr(o, "reasoning");
-            if (rc && *rc) U->add_turn_item(FE_ITEM_THINKING, "thinking", NULL, rc, 0, 0);
+            if (rc && *rc) U->add_turn_item(FE_ITEM_THINKING, "thinking", NULL, rc, 0, 0, 0, 0);
         } else if (strcmp(s, "agent_start") == 0) {
             g_active = 1;
             raw_on();
@@ -467,8 +468,10 @@ static int on_event(cJSON *o, int *code) {
     } else if (strcmp(ev, "tool_end") == 0) {
         const char *name = jstr(o, "name"), *st = jstr(o, "status"), *pv = jstr(o, "preview");
         double el = jnum(o, "elapsed", 0);
+        g_turn = (int)jnum(o, "turn", g_turn);
+        g_tools = (int)jnum(o, "tools", g_tools);
         U->print_tool_box(name, st, pv, el);
-        U->add_turn_item(FE_ITEM_TOOL, name, st, pv, el, 0);
+        U->add_turn_item(FE_ITEM_TOOL, name, st, pv, el, 0, g_turn, g_tools);
         fflush(stdout);
     } else if (strcmp(ev, "approve") == 0) {
         on_approve(o);
@@ -476,8 +479,10 @@ static int on_event(cJSON *o, int *code) {
         const char *md = jstr(o, "markdown"), *rd = jstr(o, "rendered"), *model = jstr(o, "model");
         double el = jnum(o, "elapsed", 0), tps = jnum(o, "tps", 0);
         int turn = (int)jnum(o, "turn", 0), tools = (int)jnum(o, "tools", 0);
+        g_turn = turn;
+        g_tools = tools;
         fflush(stderr);
-        U->add_turn_item(FE_ITEM_ANSWER, model, NULL, md, el, tps);
+        U->add_turn_item(FE_ITEM_ANSWER, model, NULL, md, el, tps, turn, tools);
         if (rd && *rd) U->print_response_box(model, rd, turn, tools, el, tps, 1);
         else U->print_response_box(model, md, turn, tools, el, tps, 0);
         fflush(stdout);
@@ -491,7 +496,7 @@ static int on_event(cJSON *o, int *code) {
         if (s) { fputs(s, stderr); fflush(stderr); }
     } else if (strcmp(ev, "info") == 0) {
         const char *t = jstr(o, "title"), *b = jstr(o, "body");
-        U->add_turn_item(FE_ITEM_INFO, t, NULL, b, 0, 0);
+        U->add_turn_item(FE_ITEM_INFO, t, NULL, b, 0, 0, g_turn, g_tools);
         U->print_info_box(t, b);
         fflush(stdout);
     } else if (strcmp(ev, "read") == 0) {
@@ -522,7 +527,7 @@ int frontend_main(int argc, char **argv, const frontend_ui_t *ui) {
     }
     U = ui;
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
         perror("[ai] socketpair");
         return -1;
     }

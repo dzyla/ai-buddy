@@ -12,19 +12,56 @@ from .prompt_text import SYSTEM_PROMPT
 MEMORY_QUERY_MAX_BYTES = 1000
 
 
+# ── text hygiene ─────────────────────────────────────────────────────────────
+def clean(s):
+    """Valid UTF-8 text: undecodable bytes carried as surrogates (tool output decoded with
+    surrogateescape, non-UTF-8 argv/filenames) or lone surrogates from JSON become U+FFFD, so the
+    history can always be encoded, sent and saved (ai.c passes such bytes through raw)."""
+    if not isinstance(s, str):
+        return s
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+
+
+def clean_message(m):
+    """clean() every text field of an assistant message from the model."""
+    if not isinstance(m, dict):
+        return m
+    m = dict(m)
+    for k in ("content", "reasoning_content"):
+        m[k] = clean(m.get(k)) if k in m else None
+        if k == "reasoning_content" and m[k] is None:
+            m.pop(k)
+    if m.get("tool_calls"):
+        calls = []
+        for c in m["tool_calls"]:
+            fn = dict(c.get("function") or {})
+            fn["name"], fn["arguments"] = clean(fn.get("name")), clean(fn.get("arguments"))
+            calls.append(dict(c, id=clean(c.get("id")), function=fn))
+        m["tool_calls"] = calls
+    return m
+
+
 # ── sizes / trimming ─────────────────────────────────────────────────────────
 def size(messages):
     """Length of the history as ai.c measures it (strlen of the compact JSON, UTF-8 bytes)."""
-    return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace"))
 
 
-def trim(messages, max_bytes):
+def trim(messages, max_bytes, log=None):
     """aitools.sessions.trim_messages: keeps the system prompt, the first and latest real user turn
-    and whole assistant(tool_calls)+tool units; returns the input unchanged when under budget."""
+    and whole assistant(tool_calls)+tool units; returns the input unchanged when under budget or
+    when trimming fails (fail-open, reported through `log`)."""
     from aitools.sessions import trim_messages
     try:
         out = trim_messages(messages, max(2000, int(max_bytes)))
-    except Exception:
+    except Exception as e:
+        if log:
+            log("\033[33m[ai] warning: trimming the history failed (%s: %s); sending it untrimmed.\033[0m\n"
+                % (e.__class__.__name__, e))
         return messages
     return out if isinstance(out, list) and out else messages
 

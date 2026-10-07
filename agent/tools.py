@@ -12,6 +12,8 @@ import os
 import socket
 import time
 
+from .messages import clean
+
 TIMEOUT_WARNING = ("\n[SYSTEM WARNING: Command timed out after %d seconds. Process killed. Partial output above. "
                    "Evaluate if script is stuck in an infinite loop, waiting for user input, or just "
                    "intrinsically slow.]\n")
@@ -101,18 +103,23 @@ class ToolRunner:
         self._watch = w_sock
         if self.interrupted.is_set():
             w_sock.close()
+        from . import native
+        base = set(native._children(os.getpid()))
+        native.INFLIGHT_BASELINES.append(base)
         try:
             r = srv.run_forked(lambda: srv._child_invoke(server_name, tool, arguments), os.getcwd(),
                                dict(os.environ), timeout, watch=r_sock)
         finally:
+            native.INFLIGHT_BASELINES.remove(base)
             self._watch = None
             for s in (r_sock, w_sock):
                 try:
                     s.close()
                 except OSError:
                     pass
+        r["out"] = clean(r["out"])
         if r.get("err"):
-            self.log(r["err"])
+            self.log(clean(r["err"]))
         if r["timed_out"]:
             self.log("\n\033[1;31m[ai] Tool execution timed out after %ds.\033[0m\n" % timeout)
             return r["out"] + TIMEOUT_WARNING % timeout
@@ -138,7 +145,7 @@ class ToolRunner:
                                               environ=dict(os.environ))
             except TimeoutError as e:
                 result = {"error": str(e) or "MCP call timed out"}
-            text = "%s\n" % registry._tool_text(result)
+            text = clean("%s\n" % registry._tool_text(result))
         self._metric(tool, (time.monotonic() - t0) * 1000, text, False)
         return text
 

@@ -181,6 +181,20 @@ def _children(pid):
     return out
 
 
+# Process trees of the command / tool running right now (what a signal must take down — and
+# nothing else: background jobs started earlier in the session survive the engine, as under ai.c).
+INFLIGHT_PIDS = set()        # root pids (run_shell's /bin/sh)
+INFLIGHT_BASELINES = []      # child-pid snapshots taken before a forked tool call started
+
+
+def inflight_roots():
+    roots = set(INFLIGHT_PIDS)
+    now = set(_children(os.getpid()))
+    for base in list(INFLIGHT_BASELINES):
+        roots |= now - base
+    return roots
+
+
 def kill_tree(pid):
     for c in _children(pid):
         kill_tree(c)
@@ -192,21 +206,19 @@ def kill_tree(pid):
 
 def run_shell(cmd, timeout, interrupted, log):
     """run_shell_command_timeout(cmd): (output, exit_status). exit 124 on timeout (warning appended),
-    130 when `interrupted` (threading.Event) fires; the whole process tree is killed in both cases,
-    plus any process that got reparented to this engine (subreaper) while the command ran."""
-    before = set(_children(os.getpid()))
+    130 when `interrupted` (threading.Event) fires; the command's whole process tree is killed in
+    both cases (a job it detached with `nohup … &` has left the tree and survives, as under ai.c)."""
     try:
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=None, close_fds=True)
     except OSError:
         return "Error: failed to run command", -1
+    INFLIGHT_PIDS.add(p.pid)
     buf = bytearray()
     t0 = time.time()
     status = None
 
     def _kill():
         kill_tree(p.pid)
-        for c in set(_children(os.getpid())) - before:
-            kill_tree(c)
 
     fd = p.stdout.fileno()
     try:
@@ -234,6 +246,7 @@ def run_shell(cmd, timeout, interrupted, log):
         except OSError:
             pass
         rc = p.wait()
+        INFLIGHT_PIDS.discard(p.pid)
     if status is None:
         status = rc if rc >= 0 else -rc  # ai.c: WIFEXITED ? WEXITSTATUS : raw wait status
     return bytes(buf).replace(b"\0", b"").decode("utf-8", "replace"), status

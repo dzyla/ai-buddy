@@ -38,7 +38,7 @@ def _env_int(name, default):
 class Engine:
     def __init__(self, ch, argv):
         self.ch = ch
-        self.argv = list(argv)
+        self.argv = [M.clean(a) for a in argv]
         self.session_id = os.environ.get("INFER_SESSION_ID") or "sess_%d_%d" % (int(time.time()), os.getpid())
         self.messages = []
         self.system_message = None
@@ -48,6 +48,7 @@ class Engine:
         self.plan_note = None
         self.session_tokens = 0
         self.turn_count = 0
+        self.tool_count = 0             # tool calls this session (the answer footer / Ctrl-O redraw)
         self.si_failed = {}
         self.state_log = ""
         self.state_status = 0
@@ -211,19 +212,30 @@ class Engine:
         if cfg.interactive and not run_query:
             self.out("\033[1;35mai\033[0m \033[2m\u00b7 session %s \u00b7 type :help for commands\033[0m\n\n"
                      % self.session_id)
-        first = True
-        while True:
-            if cfg.interactive and (not run_query or not first):
-                run_query = self._interactive_turn()
-                if run_query is None:
+        first, code = True, 0
+        try:
+            while True:
+                if cfg.interactive and (not run_query or not first):
+                    run_query = self._interactive_turn()
+                    if run_query is None:
+                        break
+                first = False
+                if run_query:
+                    try:
+                        self._task()
+                    except Exception as e:
+                        # an engine bug must not lose the conversation: report, keep the session
+                        import traceback
+                        self.err("\n\033[1;31m[ai] internal error in the Python engine: %s: %s\033[0m\n%s"
+                                 % (e.__class__.__name__, e, traceback.format_exc()))
+                        code = 1
+                        if not cfg.interactive:
+                            break
+                if not cfg.interactive:
                     break
-            first = False
-            if run_query:
-                self._task()
-            if not cfg.interactive:
-                break
-        self._finish()
-        return 0
+        finally:
+            self._finish()
+        return code
 
     def _finish(self):
         session.save(self.messages, self.session_id, self.cfg.private)
@@ -271,7 +283,7 @@ class Engine:
         if target <= 0 or target >= before:
             target = before // 2
         target = max(target, 2000)
-        out = M.trim(self.messages, target)
+        out = M.trim(self.messages, target, self.err)
         if out is self.messages or M.size(out) >= before:
             self.err("\033[1;33m[ai] Compact: nothing could be removed (history already minimal).\033[0m\n")
             return False
@@ -520,7 +532,7 @@ class Engine:
         """One loop iteration. Returns (has_more, loop_count, length_nudges, stop_inner_loop)."""
         cfg = self.cfg
         if cfg.budget.trim > 0 and M.size(self.messages) > cfg.budget.trim:
-            self.messages = M.trim(self.messages, cfg.budget.trim * 6 // 10)
+            self.messages = M.trim(self.messages, cfg.budget.trim * 6 // 10, self.err)
         while not self.ch.btw.empty() and not self.esc.is_set():
             note = self.ch.btw.get()
             self.messages.append({"role": "user", "content": "[User note mid-task: %s]" % note})
@@ -546,7 +558,7 @@ class Engine:
         usage = res.get("usage") or {}
         if usage:
             self.session_tokens = usage.get("total_tokens", 0)
-        msg = res["message"]
+        msg = M.clean_message(res["message"])
         self.messages.append(msg)
         elapsed = res.get("elapsed", 0.0)
         completion_tokens = usage.get("completion_tokens", 0)
@@ -615,7 +627,7 @@ class Engine:
     def _final(self, text, elapsed, tps, fallback_model="ai"):
         rendered = render(text)
         self.ch.send("final", markdown=text, rendered=rendered, model=self.cfg.model or fallback_model,
-                     turn=self.turn_count, tools=0, elapsed=elapsed, tps=tps)
+                     turn=self.turn_count, tools=self.tool_count, elapsed=elapsed, tps=tps)
 
     # ── one tool call ──
     def _tool_call(self, call, turn_content, loop_count, completion_tokens):
@@ -634,6 +646,7 @@ class Engine:
             return False
         task_done = False
         output = None
+        self.tool_count += 1
         self.ch.send("tool_start", name=name, args=args)
 
         if self.last_tool == (name, args):
@@ -761,7 +774,7 @@ class Engine:
 
         shown = output + graph + hint
         self.ch.send("tool_end", name=name, ok=not is_err, status="error" if is_err else "ok", preview=shown,
-                     elapsed=time.monotonic() - t0)
+                     elapsed=time.monotonic() - t0, turn=self.turn_count, tools=self.tool_count)
         return "%s\n%s%s%s" % (name, output, graph, hint)
 
     def _self_improve(self, name, args, output, is_err):
@@ -1110,18 +1123,15 @@ def main(argv):
     # Every intentional byte of output goes through the channel; a stray print from imported code
     # must not reach the front-end's stdout.
     sys.stdout = sys.stderr
-    try:
-        import ctypes
-        ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER, like ai.c
-    except Exception:
-        pass
+    # Not a child subreaper (unlike ai.c, which is the front-end here and stays one): jobs a command
+    # detaches must not become this engine's children, or a signal handler could take them along.
     ch = Channel(fd) if fd is not None else Local()
     if fd is not None:
         threading.Thread(target=_watch_frontend, args=(ch,), daemon=True).start()
     # Ctrl-C during a task reaches the whole foreground group (front-end, engine, running command)
-    # like ai.c's exit-on-signal; SIGTERM comes from the front-end. Either way: take the running
-    # command / tool processes down with us. (A handler, not SIG_IGN: children must not inherit an
-    # ignored SIGINT.)
+    # like ai.c's exit-on-signal; SIGTERM comes from the front-end. Either way: take the command /
+    # tool running right now down with us, never anything else. (A handler, not SIG_IGN: children
+    # must not inherit an ignored SIGINT.)
     signal.signal(signal.SIGINT, lambda *a: _die(130))
     signal.signal(signal.SIGTERM, lambda *a: _die(143))
     code = 1
@@ -1143,7 +1153,7 @@ _FINISHED = threading.Event()
 
 
 def _die(code):
-    for pid in native._children(os.getpid()):
+    for pid in native.inflight_roots():
         native.kill_tree(pid)
     os._exit(code)
 

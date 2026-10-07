@@ -268,3 +268,74 @@ def test_engine_runs_headless_without_frontend(tmp_path):
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
     assert r.returncode == 0, r.stderr[-2000:]
     assert "HEADLESS_OK" in r.stdout
+
+
+# ── fix round 1: retries, trim failures, text hygiene ────────────────────────
+class _StatusServer:
+    def __init__(self, status, body):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        outer = self
+        self.hits = 0
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                outer.hits += 1
+                data = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d/v1/chat/completions" % self.srv.server_address[1]
+
+    def close(self):
+        self.srv.shutdown()
+
+
+@pytest.mark.parametrize("status,body,hits", [
+    (500, '{"error": {"message": "model output must contain output text or tool calls"}}', 1),
+    (400, '{"error": {"message": "bad request"}}', 1),
+    (503, '{"error": {"message": "loading"}}', 4),
+])
+def test_server_errors_retry_only_when_transient(monkeypatch, status, body, hits):
+    monkeypatch.setattr(llm, "RETRY_BASE", 0.01)
+    srv = _StatusServer(status, body)
+    try:
+        # a non-local hostname alias would hit DNS; use the loopback but force the remote retry policy
+        monkeypatch.setattr(llm, "_is_local", lambda url: False)
+        res = llm.Client(srv.url, "k", "m").chat([{"role": "user", "content": "x"}], None)
+    finally:
+        srv.close()
+    assert srv.hits == hits
+    assert res["status"] == status and res["error"]
+    if status == 500:
+        assert "model output must contain" in res["error"]
+
+
+def test_trim_failure_is_logged_and_fails_open(monkeypatch):
+    import aitools.sessions
+    def boom(*a, **k):
+        raise ValueError("bad history")
+    monkeypatch.setattr(aitools.sessions, "trim_messages", boom)
+    seen = []
+    msgs = [{"role": "system", "content": "s"}]
+    assert messages.trim(msgs, 10, seen.append) is msgs
+    assert seen and "bad history" in seen[0]
+
+
+def test_clean_makes_any_text_encodable():
+    raw = b"caf\xe9 \xff".decode("utf-8", "surrogateescape")
+    for s in (raw, "lone \ud800 surrogate", "plain ü"):
+        out = messages.clean(s)
+        out.encode("utf-8")
+    assert messages.clean("plain ü") == "plain ü"
+    m = messages.clean_message({"role": "assistant", "content": raw, "tool_calls": [
+        {"id": "a", "type": "function", "function": {"name": "x", "arguments": '{"p": "\ud800"}'}}]})
+    json.dumps(m, ensure_ascii=False).encode("utf-8")
+    assert messages.size([{"role": "user", "content": "\ud800"}]) > 0

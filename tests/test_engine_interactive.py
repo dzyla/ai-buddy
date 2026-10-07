@@ -58,7 +58,7 @@ class Pty:
             k = plain.find(text)
             if k >= 0:
                 self.buf = plain[k + len(text):]
-                return True
+                return plain[:k]  # the output before the match
             if not self._read(0.2) and self.exited():
                 break
         raise AssertionError("did not see %r; output so far:\n%s" % (text, ANSI.sub("", self.buf)[-3000:]))
@@ -250,3 +250,164 @@ def test_plan_mode_present_plan_approval_on_the_terminal(tmp_path):
     assert target.read_text() == "ok"
     tools = [m["content"] for m in reqs[-1]["messages"] if m["role"] == "tool"]
     assert any("PLAN APPROVED" in t for t in tools)
+
+
+def _slow_cmd(marker, seconds=3):
+    code = "open(%r, 'w').close(); import time; time.sleep(%d)" % (str(marker), seconds)
+    return "python3 -c \"%s\"" % code
+
+
+def _wait_file(p, path, timeout=30):
+    deadline = time.time() + timeout
+    while not path.exists() and time.time() < deadline:
+        p._read(0.1)
+    assert path.exists(), ANSI.sub("", p.buf)[-2000:]
+
+
+def test_ctrl_o_redraws_mid_task(tmp_path, engine):
+    if engine == "c":
+        pytest.skip("the C loop reads only ESC from the terminal while a command runs")
+    home = tmp_path / "home"
+    home.mkdir()
+    work = _work(tmp_path)
+    marker = tmp_path / "running"
+    seq = [{"id": "o1", "type": "function", "function": {"name": "execute_command",
+                                                          "arguments": json.dumps({"command": _slow_cmd(marker)})}}]
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq), MOCK_TASK_COMPLETE="REDRAW_DONE") as srv:
+        p = Pty(["-y", "slow job"], _env(home, srv.base_url, INFER_AUTO_APPROVE="1"), str(work))
+        _wait_file(p, marker)
+        p.send("\x0f")
+        p.expect("details: COLLAPSED (Ctrl+O to toggle)")
+        p.expect("REDRAW_DONE")
+        assert p.wait() == 0
+
+
+def test_shift_tab_mid_task_leaves_manual_mode(tmp_path, engine):
+    if engine == "c":
+        pytest.skip("the C loop treats ESC [ Z during a command as ESC (interrupt)")
+    home = tmp_path / "home"
+    home.mkdir()
+    work = _work(tmp_path)
+    marker, made = tmp_path / "running", tmp_path / "second.txt"
+    seq = [{"id": "t1", "type": "function", "function": {"name": "execute_command",
+                                                          "arguments": json.dumps({"command": _slow_cmd(marker)})}},
+           {"id": "t2", "type": "function", "function": {"name": "execute_command",
+                                                          "arguments": json.dumps({"command": "touch %s" % made})}}]
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq), MOCK_TASK_COMPLETE="MODE_DONE") as srv:
+        p = Pty(["--manual", "two commands"], _env(home, srv.base_url), str(work))
+        p.expect("Confirm? (b=background)")
+        p.send("y")
+        _wait_file(p, marker)
+        p.send("\x1b[Z")
+        p.expect("permission mode: auto")
+        between = p.expect("MODE_DONE")
+        assert "Confirm? (b=background)" not in between, "the second command was still prompted"
+        assert p.wait() == 0
+    assert made.exists()
+
+
+def test_background_approval(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    work = _work(tmp_path)
+    seq = [{"id": "g1", "type": "function", "function": {"name": "execute_command",
+                                                          "arguments": json.dumps({"command": "echo BG_OUTPUT"})}}]
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq), MOCK_TASK_COMPLETE="BG_DONE") as srv:
+        p = Pty(["--manual", "run it in the background"], _env(home, srv.base_url), str(work))
+        p.expect("Confirm? (b=background)")
+        p.send("b")
+        p.expect("BG_DONE")
+        assert p.wait() == 0
+        reqs = srv.requests()
+    tool = [m["content"] for m in reqs[1]["messages"] if m["role"] == "tool"][0]
+    assert "Command launched in background" in tool
+    logs = list((home / ".config" / "ai" / "logs").glob("bg_proc_*.log"))
+    assert logs
+    for _ in range(50):
+        if "BG_OUTPUT" in logs[0].read_text():
+            break
+        time.sleep(0.1)
+    assert "BG_OUTPUT" in logs[0].read_text()
+
+
+def test_step_limit_continue_prompt(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    work = _work(tmp_path)
+    seq = [{"id": "s%d" % i, "type": "function", "function": {"name": "list_directory",
+                                                               "arguments": json.dumps({"path": ".", "n": i})}}
+           for i in range(3)]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq), MOCK_TASK_COMPLETE="STEPS_DONE") as srv:
+        p = Pty(["-y", "walk"], _env(home, srv.base_url, INFER_AUTO_APPROVE="1", INFER_STEP_LIMIT="2"), str(work))
+        p.expect("2 steps completed. Continue for 30 more?")
+        p.send("y\r")
+        p.expect("STEPS_DONE")
+        assert p.wait() == 0
+        reqs = srv.requests()
+    assert len(reqs) >= 3
+
+
+def _git(repo, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo)] + list(args), capture_output=True, text=True, check=True).stdout
+
+
+def test_git_and_private_colon_commands(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.hooksPath", "/dev/null")
+    (repo / "tracked.txt").write_text("v1\n")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "init")
+    (repo / "tracked.txt").write_text("v2\n")
+    os.symlink(os.path.join(REPO, "ai_mcp.py"), repo / "ai_mcp.py")
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TASK_COMPLETE="PRIVATE_ANSWER") as srv:
+        p = Pty(["-i"], _env(home, srv.base_url), str(repo))
+        p.expect(PROMPT)
+        p.send(":commit\r")
+        p.expect("Git Committed")
+        p.expect(PROMPT)
+        assert _git(repo, "rev-list", "--count", "HEAD").strip() == "2"
+        p.send(":undo\r")
+        p.expect("Git Undo")
+        p.expect(PROMPT)
+        p.send(":private\r")
+        p.expect("Private Mode ON")
+        p.expect(PROMPT)
+        p.send("a private question\r")
+        p.expect("PRIVATE_ANSWER")
+        p.expect(PROMPT)
+        p.send(":quit\r")
+        assert p.wait() == 0
+    assert _git(repo, "rev-list", "--count", "HEAD").strip() == "1"
+    assert _git(repo, "diff", "--cached", "--name-only").split() == ["tracked.txt"]   # undo kept it staged
+    assert "user-commit" in _git(repo, "reflog")
+    assert not (home / ".cache" / "ai" / "history.jsonl").exists()
+    assert not (home / ".cache" / "ai" / "sessions").exists()
+
+
+def test_ctrl_o_redraw_keeps_turn_and_tool_counts(tmp_path, engine):
+    """The Ctrl-O redraw replays the answer box with its turn (and, on the Python engine, tool) count."""
+    home = tmp_path / "home"
+    home.mkdir()
+    work = _work(tmp_path)
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TASK_COMPLETE="COUNTED_ANSWER") as srv:
+        p = Pty(["-i"], _env(home, srv.base_url), str(work))
+        p.expect(PROMPT)
+        p.send("count me\r")
+        p.expect("COUNTED_ANSWER")
+        p.expect(PROMPT)
+        p.send("\x0f")
+        p.expect("details: COLLAPSED")
+        shown = p.expect(PROMPT)
+        assert "COUNTED_ANSWER" in shown and "turn 1" in shown, shown
+        if engine == "py":
+            assert "1 tools" in shown, shown
+        p.send(":quit\r")
+        assert p.wait() == 0

@@ -253,6 +253,8 @@ static void add_turn_item(turn_item_type_t type, const char *name, const char *s
     item->content = content ? strdup(content) : NULL;
     item->elapsed_sec = elapsed_sec;
     item->tokens_per_sec = tokens_per_sec;
+    item->turn_count = turn_count;      /* were never stored: the Ctrl-O redraw showed no counts */
+    item->tool_count = tool_count;
 }
 
 static void free_turn_items(void) {
@@ -4178,8 +4180,8 @@ static void fe_redraw(void) {
 }
 
 static void fe_add_turn_item(int kind, const char *name, const char *status, const char *content,
-                             double elapsed, double tps) {
-    add_turn_item((turn_item_type_t)kind, name, status, content, elapsed, tps, g_turn_count, total_tool_count);
+                             double elapsed, double tps, int turn, int tools) {
+    add_turn_item((turn_item_type_t)kind, name, status, content, elapsed, tps, turn, tools);
 }
 
 int main(int argc, char **argv) {
@@ -4367,9 +4369,12 @@ int main(int argc, char **argv) {
                 g_mcp_script = (home && access(fe_mcp, F_OK) == 0) ? fe_mcp : "/usr/local/bin/ai_mcp.py";
             }
             toolclient_set_script(g_mcp_script);
-            for (int i = 1; i < argc; i++)   /* print_response_box reads it in this process */
+            for (int i = 1; i < argc; i++) {  /* front-end-side flags (read in this process) */
                 if (strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "--raw-output") == 0)
                     setenv("INFER_RAW_OUTPUT", "1", 1);
+                else if (strcmp(argv[i], "--no-copy") == 0)
+                    g_copy_enabled = 0;
+            }
             int fe_code = frontend_main(argc, argv, &ui);
             if (fe_code >= 0) return fe_code;
         }
