@@ -1,0 +1,439 @@
+{
+ "description": "Synthetic retrieval eval for search_memory (no personal data). Each pair's target is the id of the item that answers the query; the other items are distractors.",
+ "items": [
+  {
+   "id": "m01",
+   "type": "memory",
+   "text": "User prefers answers formatted as short bullet lists"
+  },
+  {
+   "id": "m02",
+   "type": "memory",
+   "text": "The team standup happens every weekday at 9:30 in the small meeting room"
+  },
+  {
+   "id": "m03",
+   "type": "memory",
+   "text": "Default Python environment for analysis scripts is the conda env named analysis"
+  },
+  {
+   "id": "m04",
+   "type": "memory",
+   "text": "User's preferred plotting library is matplotlib with the seaborn whitegrid style"
+  },
+  {
+   "id": "m05",
+   "type": "memory",
+   "text": "Backups of the project share run nightly at 2am to the offsite storage bucket"
+  },
+  {
+   "id": "m06",
+   "type": "memory",
+   "text": "The shared GPU workstation is called workstation-a and needs a booking in the calendar"
+  },
+  {
+   "id": "m07",
+   "type": "memory",
+   "text": "User writes papers in LaTeX using Overleaf and keeps references in Zotero"
+  },
+  {
+   "id": "m08",
+   "type": "memory",
+   "text": "Vacation days must be requested two weeks ahead through the HR portal"
+  },
+  {
+   "id": "m09",
+   "type": "memory",
+   "text": "The lab coffee fund is collected on the first Monday of every month"
+  },
+  {
+   "id": "m10",
+   "type": "memory",
+   "text": "Use metric units and ISO 8601 dates in every report"
+  },
+  {
+   "id": "m11",
+   "type": "memory",
+   "text": "The printer on the second floor jams with heavy cardstock paper"
+  },
+  {
+   "id": "m12",
+   "type": "memory",
+   "text": "Grant reports are due at the end of each quarter"
+  },
+  {
+   "id": "l01",
+   "type": "lesson",
+   "text": "execute_command: rsync with a trailing slash copies the directory contents, not the directory itself"
+  },
+  {
+   "id": "l02",
+   "type": "lesson",
+   "text": "read_file: PDF files must be converted with pdftotext before reading their text"
+  },
+  {
+   "id": "l03",
+   "type": "lesson",
+   "text": "execute_command: pip install fails behind the proxy unless HTTPS_PROXY is exported"
+  },
+  {
+   "id": "l04",
+   "type": "lesson",
+   "text": "edit_file: the search text must match the file exactly including indentation"
+  },
+  {
+   "id": "l05",
+   "type": "lesson",
+   "text": "web_search: put exact error messages in quotes to find matching forum threads"
+  },
+  {
+   "id": "l06",
+   "type": "lesson",
+   "text": "execute_command: tar archives need the -z flag for gzip compression"
+  },
+  {
+   "id": "l07",
+   "type": "lesson",
+   "text": "execute_command: git push is rejected when the branch is behind, pull with rebase first"
+  },
+  {
+   "id": "l08",
+   "type": "lesson",
+   "text": "execute_command: docker containers lose their files on restart unless a volume is mounted"
+  },
+  {
+   "id": "l09",
+   "type": "lesson",
+   "text": "fetch_webpage: sites behind a login return the sign-in page instead of the content"
+  },
+  {
+   "id": "l10",
+   "type": "lesson",
+   "text": "execute_command: crontab entries need absolute paths because cron has a minimal PATH"
+  },
+  {
+   "id": "c01",
+   "type": "chat",
+   "text": "how do I convert a CSV file to Excel format\nUse pandas read_csv and then to_excel with openpyxl installed"
+  },
+  {
+   "id": "c02",
+   "type": "chat",
+   "text": "what is the weather tomorrow\nRain is expected in the afternoon, bring an umbrella"
+  },
+  {
+   "id": "c03",
+   "type": "chat",
+   "text": "remind me how to resize images in bulk\nUse ImageMagick mogrify -resize 50% on the folder"
+  },
+  {
+   "id": "c04",
+   "type": "chat",
+   "text": "which port does the local web dashboard use\nThe dashboard listens on port 8050"
+  },
+  {
+   "id": "c05",
+   "type": "chat",
+   "text": "how can I count lines of code in the repository\nRun cloc . or wc -l over the source files"
+  },
+  {
+   "id": "c06",
+   "type": "chat",
+   "text": "summarize the meeting notes from the planning session\nThe team agreed to ship the beta in March"
+  },
+  {
+   "id": "c07",
+   "type": "chat",
+   "text": "how do I find large files on the disk\nUse du -ah | sort -h | tail or the ncdu tool"
+  },
+  {
+   "id": "c08",
+   "type": "chat",
+   "text": "what is the wifi password for guests\nThe guest network uses the code printed on the router label"
+  },
+  {
+   "id": "c09",
+   "type": "chat",
+   "text": "how do I undo the last git commit but keep changes\nUse git reset --soft HEAD~1"
+  },
+  {
+   "id": "c10",
+   "type": "chat",
+   "text": "translate hello world into Spanish\nHola mundo"
+  },
+  {
+   "id": "n01",
+   "type": "note",
+   "text": "Recipe: sourdough bread needs a 12 hour cold fermentation for a tangy flavor"
+  },
+  {
+   "id": "n02",
+   "type": "note",
+   "text": "Bike maintenance: lubricate the chain every 300 kilometers"
+  },
+  {
+   "id": "n03",
+   "type": "note",
+   "text": "Reading list: Thinking Fast and Slow, The Pragmatic Programmer, Deep Work"
+  },
+  {
+   "id": "n04",
+   "type": "note",
+   "text": "Houseplants: water the fern twice a week and the cactus once a month"
+  },
+  {
+   "id": "n05",
+   "type": "note",
+   "text": "Conference travel: the poster tube must fit the airline carry-on limits"
+  },
+  {
+   "id": "n06",
+   "type": "note",
+   "text": "Car service is scheduled every 15000 kilometers or once a year"
+  },
+  {
+   "id": "n07",
+   "type": "note",
+   "text": "Keyboard shortcut to lock the screen is Super plus L"
+  },
+  {
+   "id": "n08",
+   "type": "note",
+   "text": "Favourite hiking trail is the ridge loop, about 14 kilometers with steep sections"
+  },
+  {
+   "id": "h01",
+   "type": "history",
+   "text": "USER: set up a python virtual environment for the new project\nASSISTANT: Created venv with python3 -m venv .venv and installed requirements"
+  },
+  {
+   "id": "h02",
+   "type": "history",
+   "text": "USER: why is my laptop fan so loud\nASSISTANT: A background indexing process used 100% CPU; it finished after ten minutes"
+  },
+  {
+   "id": "h03",
+   "type": "history",
+   "text": "USER: compress the old log files to save space\nASSISTANT: Gzipped 120 log files older than 30 days, freeing 4 GB"
+  },
+  {
+   "id": "h04",
+   "type": "history",
+   "text": "USER: make a bar chart of monthly expenses\nASSISTANT: Saved expenses_by_month.png with matplotlib"
+  },
+  {
+   "id": "h05",
+   "type": "history",
+   "text": "USER: check if the website certificate is about to expire\nASSISTANT: The TLS certificate is valid for another 21 days"
+  },
+  {
+   "id": "h06",
+   "type": "history",
+   "text": "USER: find duplicate photos in the pictures folder\nASSISTANT: fdupes found 37 duplicate images"
+  },
+  {
+   "id": "h07",
+   "type": "history",
+   "text": "USER: schedule a weekly cleanup of the downloads folder\nASSISTANT: Added a cron job every Sunday at 3am"
+  },
+  {
+   "id": "h08",
+   "type": "history",
+   "text": "USER: what version of the kernel is running\nASSISTANT: Linux 6.8 generic"
+  }
+ ],
+ "pairs": [
+  {
+   "query": "How should I format my replies for the user?",
+   "target": "m01"
+  },
+  {
+   "query": "When is the daily team meeting?",
+   "target": "m02"
+  },
+  {
+   "query": "Which conda environment do I activate for data analysis?",
+   "target": "m03"
+  },
+  {
+   "query": "What style should charts use?",
+   "target": "m04"
+  },
+  {
+   "query": "When do backups of the shared drive happen?",
+   "target": "m05"
+  },
+  {
+   "query": "Can I just use the GPU workstation without asking?",
+   "target": "m06"
+  },
+  {
+   "query": "Where are the bibliography references kept?",
+   "target": "m07"
+  },
+  {
+   "query": "How early do I have to ask for time off?",
+   "target": "m08"
+  },
+  {
+   "query": "When do I pay into the coffee kitty?",
+   "target": "m09"
+  },
+  {
+   "query": "Which date format should reports use?",
+   "target": "m10"
+  },
+  {
+   "query": "The printer keeps getting stuck with thick paper",
+   "target": "m11"
+  },
+  {
+   "query": "When are the funding progress reports due?",
+   "target": "m12"
+  },
+  {
+   "query": "rsync copied the folder contents instead of the folder",
+   "target": "l01"
+  },
+  {
+   "query": "How do I read text out of a PDF document?",
+   "target": "l02"
+  },
+  {
+   "query": "pip install times out on the network proxy",
+   "target": "l03"
+  },
+  {
+   "query": "my edit failed because the search string did not match",
+   "target": "l04"
+  },
+  {
+   "query": "how to search the web for an exact error message",
+   "target": "l05"
+  },
+  {
+   "query": "how to create a gzip compressed tar archive",
+   "target": "l06"
+  },
+  {
+   "query": "git push was rejected because the remote has new commits",
+   "target": "l07"
+  },
+  {
+   "query": "files inside my docker container disappeared after restarting it",
+   "target": "l08"
+  },
+  {
+   "query": "fetching the page only returned a login form",
+   "target": "l09"
+  },
+  {
+   "query": "my cron job cannot find the command it runs",
+   "target": "l10"
+  },
+  {
+   "query": "turn a csv spreadsheet into an xlsx workbook",
+   "target": "c01"
+  },
+  {
+   "query": "will it rain tomorrow",
+   "target": "c02"
+  },
+  {
+   "query": "shrink a whole folder of pictures at once",
+   "target": "c03"
+  },
+  {
+   "query": "what port is the dashboard served on",
+   "target": "c04"
+  },
+  {
+   "query": "how many lines of code does the repo have",
+   "target": "c05"
+  },
+  {
+   "query": "what did we decide in the planning meeting",
+   "target": "c06"
+  },
+  {
+   "query": "what is eating my disk space",
+   "target": "c07"
+  },
+  {
+   "query": "guest wifi access code",
+   "target": "c08"
+  },
+  {
+   "query": "undo my most recent commit without losing the edits",
+   "target": "c09"
+  },
+  {
+   "query": "how do you say hello world in Spanish",
+   "target": "c10"
+  },
+  {
+   "query": "how long should bread dough ferment in the fridge",
+   "target": "n01"
+  },
+  {
+   "query": "how often should I oil my bicycle chain",
+   "target": "n02"
+  },
+  {
+   "query": "which books did I want to read",
+   "target": "n03"
+  },
+  {
+   "query": "how often do I water the plants",
+   "target": "n04"
+  },
+  {
+   "query": "can I take the poster tube on the plane",
+   "target": "n05"
+  },
+  {
+   "query": "when is the car due for servicing",
+   "target": "n06"
+  },
+  {
+   "query": "keyboard shortcut to lock my computer",
+   "target": "n07"
+  },
+  {
+   "query": "which hiking route do I like",
+   "target": "n08"
+  },
+  {
+   "query": "how did we create the virtualenv for the project",
+   "target": "h01"
+  },
+  {
+   "query": "what was making the laptop fan noisy",
+   "target": "h02"
+  },
+  {
+   "query": "how much space did compressing the old logs free",
+   "target": "h03"
+  },
+  {
+   "query": "the monthly spending chart we made",
+   "target": "h04"
+  },
+  {
+   "query": "when does the TLS certificate expire",
+   "target": "h05"
+  },
+  {
+   "query": "did we find any duplicate photos",
+   "target": "h06"
+  },
+  {
+   "query": "is there an automatic cleanup of the downloads directory",
+   "target": "h07"
+  },
+  {
+   "query": "which linux kernel version is installed",
+   "target": "h08"
+  }
+ ]
+}

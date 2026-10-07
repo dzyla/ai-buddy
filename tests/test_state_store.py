@@ -167,7 +167,7 @@ def test_migrate_legacy_imports_renames_and_is_idempotent(tmp_path):
     assert recent[1]["prompt"] == "how is the gpu box"
 
     conn = state.connect()
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "1"
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(state.SCHEMA_VERSION)
     assert conn.execute("SELECT value FROM meta WHERE key='migrated_v1'").fetchone()[0]
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 1

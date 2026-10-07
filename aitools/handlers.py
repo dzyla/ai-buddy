@@ -316,8 +316,33 @@ def h_fetch_webpage_js(arguments):
 
 def h_save_memory(arguments):
     content = arguments.get("content", "")
-    result = save_memory(content, replace=bool(arguments.get("replace", False)))
+    result = save_memory(content, replace=_truthy(arguments.get("replace", False)),
+                         pinned=_truthy(arguments.get("pinned", False)))
     return result
+
+
+def _truthy(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def h_search_memory(arguments):
+    from . import search
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return "Error: search_memory needs a non-empty query."
+    try:
+        k = int(arguments.get("k") or 8)
+    except (TypeError, ValueError):
+        k = 8
+    try:
+        results, info = search.search(query, sources=arguments.get("sources"), since=arguments.get("since"), k=k)
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error searching memory: {e}"
+    return search.format_results(results, info["vector"])
 
 
 def h_remember(arguments):

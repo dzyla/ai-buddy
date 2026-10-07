@@ -595,7 +595,7 @@ SCHEMAS_PART1 = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Add key facts, user preferences, or context to persistent memory (appended; duplicates skipped; oldest lines evicted past 4 KB). This memory is automatically loaded in subsequent runs.",
+            "description": "Add key facts, user preferences, or context to persistent memory (appended; duplicates skipped; oldest lines evicted past 4 KB). Pinned lines are loaded into every later run; the rest are recalled when relevant to the request (and via search_memory).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -606,6 +606,10 @@ SCHEMAS_PART1 = [
                     "replace": {
                         "type": "boolean",
                         "description": "Rewrite the whole memory with content instead of appending (use only to clean up or correct it)."
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": "Core fact/preference to inject into EVERY prompt (keep pinned memory under 1 KB). Unpinned memories are recalled only when relevant."
                     }
                 },
                 "required": ["content"]

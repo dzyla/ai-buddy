@@ -22,6 +22,8 @@ when a scripted tool call returns an error, unless that step has "expect_error":
 step must then really error (recovery tasks prove their failure is real).
 
 Modes:
+  --retrieval  the search_memory retrieval eval (evals/retrieval/pairs.json): recall@1/@5 + MRR
+            against the real embedder when it is up, else (or with --fake) the fake one.
   --mock    start tests/mock_llm_server.py per task, scripted by the task's `mock` field. Offline
             and deterministic (CI): the tools really run, so file/tool checks are real. Exit 1 if
             any task fails, since a scripted run can only fail through a harness regression.
@@ -458,7 +460,19 @@ def main(argv=None):
     ap.add_argument("--min-pass", type=float, default=None,
                     help="exit 1 below this pass %% (default: 100 with --mock, 0 otherwise)")
     ap.add_argument("--keep", action="store_true", help="keep the temp workdirs")
+    ap.add_argument("--retrieval", action="store_true",
+                    help="run the search_memory retrieval eval (evals/retrieval/) instead of the agent tasks")
+    ap.add_argument("--fake", action="store_true",
+                    help="--retrieval: use the fake embedder even when the real one is up")
+    ap.add_argument("--embed-url", help="--retrieval: embedder base URL (default AI_EMBED_URL / :8091)")
     args = ap.parse_args(argv)
+
+    if args.retrieval:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "retrieval"))
+        import retrieval_eval
+        rep = retrieval_eval.run(fake=args.fake, embed_url=args.embed_url, json_path=args.json)
+        floor = (args.min_pass if args.min_pass is not None else 0.0) / 100.0
+        return 0 if rep["recall@5"] >= floor else 1
 
     if not os.access(AI_BIN, os.X_OK):
         print("ERROR: %s not found; run `make` first." % AI_BIN, file=sys.stderr)

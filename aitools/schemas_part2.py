@@ -756,6 +756,27 @@ SCHEMAS_PART2 = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": "Search everything you remember about the user and past work: saved memories, approved lessons, Zulip chats, conversation history and notes. Hybrid keyword + semantic search, so paraphrases match. Use it before asking the user something they may have told you before.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to look for, in natural language."},
+                    "sources": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["memory", "lesson", "chat", "history", "note"]},
+                        "description": "Restrict to these sources (default: all)."
+                    },
+                    "since": {"type": "string", "description": "Only items from this date on: ISO date (2026-09-01) or relative (7d, 12h, 2w)."},
+                    "k": {"type": "integer", "description": "Number of results (default 8, max 50)."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
 
     # 14. task_complete — last so model only sees it as exit
     {

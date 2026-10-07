@@ -77,6 +77,61 @@ char* read_memory_file(const char *mcp_script, int refresh) {
     return cache ? strdup(cache) : NULL;
 }
 
+/* Single-quote `s` for /bin/sh: 'it'\''s' (no other character is special inside quotes). */
+static char* sh_single_quote(const char *s) {
+    size_t n = strlen(s), extra = 0;
+    for (size_t i = 0; i < n; i++) if (s[i] == '\'') extra += 3;
+    char *out = malloc(n + extra + 3);
+    if (!out) return NULL;
+    char *p = out;
+    *p++ = '\'';
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\'') { memcpy(p, "'\\''", 4); p += 4; }
+        else *p++ = s[i];
+    }
+    *p++ = '\'';
+    *p = '\0';
+    return out;
+}
+
+/* Memory section of the system prompt. With a user request it runs
+   `ai_mcp.py state-export memory --query <request>`: auto-recall (pinned memories + the most
+   relevant memories/lessons/chats/history/notes, aitools/search.py). That command itself falls
+   back to the full memory render when recall is off (INFER_RECALL_K=0) or the embedder is down.
+   The query is cut to 1000 bytes (at a UTF-8 boundary) and single-quoted for the shell.
+   Without a request this is read_memory_file(). Returns malloc'd text or NULL. */
+char* read_memory_for_prompt(const char *mcp_script, const char *query) {
+    if (!mcp_script || !*mcp_script) return NULL;
+    if (!query || !*query) return read_memory_file(mcp_script, 0);
+    size_t n = strlen(query);
+    if (n > 1000) {
+        n = 1000;
+        while (n > 0 && (((unsigned char)query[n]) & 0xC0) == 0x80) n--;
+    }
+    char *q = malloc(n + 1);
+    if (!q) return NULL;
+    memcpy(q, query, n);
+    q[n] = '\0';
+    char *esc = sh_single_quote(q);
+    free(q);
+    if (!esc) return NULL;
+    size_t cl = strlen(mcp_script) + strlen(esc) + 96;
+    char *cmd = malloc(cl);
+    if (!cmd) { free(esc); return NULL; }
+    snprintf(cmd, cl, "python3 %s state-export memory --query %s 2>/dev/null", mcp_script, esc);
+    free(esc);
+    char *out = run_shell_command(cmd, NULL);
+    free(cmd);
+    if (!out) return NULL;
+    size_t m = strlen(out);
+    while (m > 0 && isspace((unsigned char)out[m - 1])) out[--m] = '\0';
+    char *p = out;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char *res = *p ? strdup(p) : NULL;
+    free(out);
+    return res;
+}
+
 char* load_system_prompt(void) {
     char path[1024];
     const char *override = getenv("INFER_SYSTEM_PROMPT_FILE");

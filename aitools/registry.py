@@ -26,7 +26,7 @@ def normalize_tool_arguments(tool_name, arguments):
             return {"command": arguments}
         elif tool_name in ("read_file", "write_file", "edit_file", "list_directory"):
             return {"path": arguments}
-        elif tool_name in ("web_search", "recall", "search_context", "arxiv_search"):
+        elif tool_name in ("web_search", "recall", "search_context", "arxiv_search", "search_memory"):
             return {"query": arguments}
         elif tool_name in ("fetch_webpage", "fetch_smart"):
             return {"url": arguments}
@@ -54,7 +54,8 @@ def normalize_tool_arguments(tool_name, arguments):
         "fetch_smart": ("url", ["uri", "link", "address", "u"]),
         "think": ("reasoning", ["thought", "thoughts", "plan", "reason"]),
         "task_complete": ("summary", ["text", "response", "result", "message", "final_answer", "answer"]),
-        "save_memory": ("content", ["memory", "text", "entry"])
+        "save_memory": ("content", ["memory", "text", "entry"]),
+        "search_memory": ("query", ["q", "search", "prompt", "term", "keywords", "text"]),
     }
 
     if tool_name in alias_map:
@@ -86,6 +87,7 @@ TOOL_REQUIRED_ARGS = {
     "save_memory":     ["content"],
     "remember":        ["content"],
     "recall":          ["query"],
+    "search_memory":   ["query"],
     "delegate_task":   ["tasks"],
     "parallel_fetch":  ["urls"],
     "think":           ["reasoning"],
@@ -197,7 +199,7 @@ def repair_json(s):
 CORE_TOOL_PROFILE = (
     "think", "execute_command", "read_file", "write_file", "edit_file",
     "list_directory", "search_files", "web_search", "fetch_webpage",
-    "save_memory", "load_skill", "todo", "present_plan",
+    "save_memory", "search_memory", "load_skill", "todo", "present_plan",
     "start_background_process", "check_process_status", "task_complete",
 )
 
@@ -221,6 +223,7 @@ HANDLERS = {
     "save_memory": handlers.h_save_memory,
     "remember": handlers.h_remember,
     "recall": handlers.h_recall,
+    "search_memory": handlers.h_search_memory,
     "execute_command": handlers.h_execute_command,
     "get_context_snippet": handlers.h_get_context_snippet,
     "search_context": handlers.h_search_context,

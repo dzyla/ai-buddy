@@ -28,7 +28,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: pinned memories, vectors + embed_queue, item_fts + triggers (Task 5b)
 BUSY_TIMEOUT_MS = 5000
 LEDGER_MAX_ROWS = 5000
 CHAT_AUDIT_RETENTION_DAYS = 90
@@ -38,7 +38,7 @@ _LOCK_RETRY_SECONDS = 60.0
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
     "CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY, text TEXT UNIQUE, created REAL, "
-    "last_used REAL)",
+    "last_used REAL, pinned INT DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY, kind TEXT, tool TEXT, signature TEXT, "
     "body TEXT, status TEXT DEFAULT 'approved', created REAL, last_seen REAL, hits INT DEFAULT 1, "
     "expires REAL NULL, UNIQUE(kind, tool, signature))",
@@ -57,14 +57,63 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS chat_audit(id INTEGER PRIMARY KEY, ts REAL, source TEXT, sender TEXT, "
     "prompt TEXT, reply TEXT, session_id TEXT, status TEXT, meta_json TEXT)",
     "CREATE INDEX IF NOT EXISTS chat_audit_ts ON chat_audit(ts)",
+    # Semantic memory (aitools/search.py). Embeddings as float16 blobs, each L2-normalised at its
+    # own dim (Matryoshka 128-d prefix for the coarse pass, full 768-d for the rerank). hash
+    # (content+model, decides re-embedding) and source_ts (the item's own date, for `since`)
+    # extend the brief's columns. A document longer than one chunk has rows <id>, <id>#1, ...
+    "CREATE TABLE IF NOT EXISTS vectors(item_type TEXT, item_id TEXT, model TEXT, dim INT, v128 BLOB, "
+    "v768 BLOB, updated REAL, hash TEXT, source_ts REAL, PRIMARY KEY(item_type, item_id))",
+    # Items written since the last index pass (filled by the triggers below and by the notes
+    # writers in aitools/memory.py); drained by `ai_mcp.py embed-backfill`, never at ai startup.
+    "CREATE TABLE IF NOT EXISTS embed_queue(item_type TEXT, item_id TEXT, enqueued REAL, "
+    "PRIMARY KEY(item_type, item_id))",
 )
+_NOW_SQL = "((julianday('now') - 2440587.5) * 86400.0)"
 # The former ~/.config/ai/memory.db tables (remember/recall FTS and the vault note index). They
 # hold long free-text documents searched by FTS, which the 4 KB always-injected `memory` table
 # cannot hold, so they move over as-is.
 _FTS_SCHEMA = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(content, metadata)",
     "CREATE VIRTUAL TABLE IF NOT EXISTS vault_fts USING fts5(title, content)",
+    # Keyword side of search_memory for the plain tables (memory, lessons, chat_audit). Kept in
+    # sync by triggers, so every writer (learning.py's raw SQL included) maintains it for free.
+    # rowid = id * 4 + {memory: 1, lesson: 2, chat: 3}.
+    "CREATE VIRTUAL TABLE IF NOT EXISTS item_fts USING fts5(text, item_type UNINDEXED, item_id UNINDEXED)",
 )
+# (item_type, table, rowid code, SQL text expression over NEW/OLD as {r}, columns whose update
+# changes the text)
+_INDEXED = (
+    ("memory", "memory", 1, "{r}.text", "text"),
+    ("lesson", "lessons", 2, "{r}.kind || ' ' || coalesce({r}.tool, '') || ': ' || coalesce({r}.body, '')",
+     "kind, tool, body"),
+    ("chat", "chat_audit", 3, "coalesce({r}.prompt, '') || char(10) || coalesce({r}.reply, '')",
+     "prompt, reply"),
+)
+
+
+def _trigger_sql():
+    out = []
+    for typ, table, code, expr, cols in _INDEXED:
+        ins = ("INSERT OR REPLACE INTO item_fts(rowid, text, item_type, item_id) VALUES "
+               "(new.id * 4 + %d, %s, '%s', new.id); INSERT OR REPLACE INTO embed_queue VALUES "
+               "('%s', new.id, %s);" % (code, expr.format(r="new"), typ, typ, _NOW_SQL))
+        out.append("CREATE TRIGGER IF NOT EXISTS %s_fts_ai AFTER INSERT ON %s BEGIN %s END" % (table, table, ins))
+        out.append("CREATE TRIGGER IF NOT EXISTS %s_fts_au AFTER UPDATE OF %s ON %s BEGIN %s END"
+                   % (table, cols, table, ins))
+        out.append("CREATE TRIGGER IF NOT EXISTS %s_fts_ad AFTER DELETE ON %s BEGIN "
+                   "DELETE FROM item_fts WHERE rowid = old.id * 4 + %d; "
+                   "DELETE FROM vectors WHERE item_type = '%s' AND (item_id = CAST(old.id AS TEXT) "
+                   "OR item_id LIKE old.id || '#%%'); "
+                   "DELETE FROM embed_queue WHERE item_type = '%s' AND item_id = CAST(old.id AS TEXT); END"
+                   % (table, table, code, typ, typ))
+    return out
+
+
+def _item_fts_fill(conn):
+    """(Re)build item_fts rows for every existing memory/lesson/chat row (idempotent)."""
+    for typ, table, code, expr, _ in _INDEXED:
+        conn.execute("INSERT OR REPLACE INTO item_fts(rowid, text, item_type, item_id) SELECT id * 4 + %d, %s, "
+                     "'%s', id FROM %s r" % (code, expr.format(r="r"), typ, table))
 
 _ready = set()            # (path, dev, inode) whose schema is known to exist in this process
 _migrate_tried = set()    # db paths the lazy migration already ran (or failed) for
@@ -206,7 +255,19 @@ def _schema_current(conn):
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     except sqlite3.OperationalError:
         return False
-    return bool(row) and row[0] == str(SCHEMA_VERSION)
+    try:
+        return bool(row) and int(row[0]) >= SCHEMA_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
+def _schema_any(conn):
+    """Plain read: does a schema (any version) exist? Lets a read path use an older schema when it
+    cannot take the write lock to upgrade it."""
+    try:
+        return conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
 
 
 def _init_schema(conn, path):
@@ -225,11 +286,20 @@ def _init_schema(conn, path):
     with _tx(conn):
         for stmt in _SCHEMA:
             conn.execute(stmt)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
+        if "pinned" not in cols:  # v1 -> v2
+            conn.execute("ALTER TABLE memory ADD COLUMN pinned INT DEFAULT 0")
         for stmt in _FTS_SCHEMA:
             try:
                 conn.execute(stmt)
             except sqlite3.OperationalError:  # pragma: no cover - sqlite built without FTS5
                 pass
+        try:
+            for stmt in _trigger_sql():
+                conn.execute(stmt)
+            _item_fts_fill(conn)
+        except sqlite3.OperationalError:  # pragma: no cover - sqlite built without FTS5
+            pass
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
                      (str(SCHEMA_VERSION),))
     if key is not None:
@@ -255,7 +325,7 @@ def connect(path=None, migrate=True, read=False):
     try:
         _init_schema(conn, path)
     except Exception:
-        if not (read and _schema_current(conn)):
+        if not (read and _schema_any(conn)):
             conn.close()
             raise
     if migrate and not explicit:
@@ -298,8 +368,10 @@ def _meta_set(conn, key, value):
 
 
 # ── memory (the always-injected persistent memory) ───────────────────────────
-def memory_add(text, conn=None):
-    """Add one memory entry. Returns 'added', 'duplicate' (case/whitespace-insensitive) or 'empty'."""
+def memory_add(text, pinned=False, conn=None):
+    """Add one memory entry. Returns 'added', 'duplicate' (case/whitespace-insensitive) or 'empty'.
+    pinned=True marks it (also an existing duplicate) as a core memory that auto-recall always
+    injects (see memory_pinned)."""
     t = str(text or "").strip()
     if not t:
         return "empty"
@@ -308,10 +380,23 @@ def memory_add(text, conn=None):
     with _conn(conn) as c, _tx(c):
         for row in c.execute("SELECT id, text FROM memory"):
             if (row["text"] or "").strip().lower() == key:
-                c.execute("UPDATE memory SET last_used=? WHERE id=?", (now, row["id"]))
+                if pinned:
+                    c.execute("UPDATE memory SET last_used=?, pinned=1 WHERE id=?", (now, row["id"]))
+                else:
+                    c.execute("UPDATE memory SET last_used=? WHERE id=?", (now, row["id"]))
                 return "duplicate"
-        c.execute("INSERT INTO memory(text, created, last_used) VALUES (?, ?, ?)", (t, now, now))
+        c.execute("INSERT INTO memory(text, created, last_used, pinned) VALUES (?, ?, ?, ?)",
+                  (t, now, now, 1 if pinned else 0))
     return "added"
+
+
+def memory_pinned(conn=None):
+    """Pinned (core) memory entries, oldest first."""
+    with _conn(conn, read=True) as c:
+        try:
+            return [r[0] for r in c.execute("SELECT text FROM memory WHERE pinned=1 ORDER BY id")]
+        except sqlite3.OperationalError:  # v1 schema a read path could not upgrade
+            return []
 
 
 def memory_list(conn=None):
@@ -642,9 +727,17 @@ def chat_audit_prune(now=None, force=False, days=CHAT_AUDIT_RETENTION_DAYS, conn
     return n
 
 
+# ── semantic-index queue ─────────────────────────────────────────────────────
+def embed_enqueue(item_type, item_id, conn=None):
+    """Queue one item for (re-)embedding; memory/lessons/chat_audit rows are queued by triggers."""
+    with _conn(conn) as c, _tx(c):
+        c.execute("INSERT OR REPLACE INTO embed_queue(item_type, item_id, enqueued) VALUES (?, ?, ?)",
+                  (str(item_type), str(item_id), time.time()))
+
+
 # ── stats / export ───────────────────────────────────────────────────────────
 _TABLES = ("memory", "lessons", "ledger", "sessions", "scheduled_tasks", "chat_audit", "memories",
-           "vault_fts")
+           "vault_fts", "vectors", "embed_queue")
 
 
 def stats(conn=None):

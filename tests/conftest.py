@@ -51,3 +51,14 @@ def auto_approve_lessons(monkeypatch):
     """Capture/recall tests predate the review queue; keep them on the old auto-approve behaviour.
     tests/test_learning_queue.py deletes this variable to exercise the human-review default."""
     monkeypatch.setenv("INFER_LEARNING_AUTO_APPROVE", "1")
+
+
+@pytest.fixture(autouse=True)
+def isolate_embedder(monkeypatch):
+    """Never reach a real embedder (aitools/embed.py) from a test: AI_EMBED_URL points at a port
+    nothing listens on (connection refused at once); tests/test_semantic_search.py starts a fake
+    one. No background queue drains spawned by `state-export memory --query` either."""
+    monkeypatch.setenv("AI_EMBED_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("INFER_EMBED_AUTODRAIN", "0")
+    monkeypatch.delenv("INFER_RECALL_K", raising=False)
+    yield

@@ -6,6 +6,9 @@
 #   ./install.sh --update-llama Pull latest llama.cpp and rebuild llama-server + llama-cli
 #   ./install.sh llama         Also set up a local llama.cpp inference server
 #   ./install.sh snap          Also detect and configure an installed AI snap
+#   ./install.sh embed         Set up the local embedder for semantic memory: build a separate
+#                              CPU-only llama-server in ~/.local/share/ai/llama.cpp-embed (if missing),
+#                              download EmbeddingGemma-2 (if missing), install ai-embed.service
 #   ./install.sh uninstall     Uninstall the CLI, systemd services, and wrapper scripts
 #
 # The llama build compiles llama-server (serving) and llama-cli (interactive) by
@@ -28,6 +31,57 @@ SKILLS_DST="${HOME}/.config/ai/skills"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=8080
 
+# ── Semantic-memory embedder (aitools/embed.py) ───────────────────────────────
+# A SEPARATE, CPU-only llama.cpp build: the main build in ${LLAMA_SRC} and its llama-server are
+# never touched (it may be too old for the gemma-embedding2 architecture, and it owns the GPU).
+EMBED_SRC="${DATA_DIR}/llama.cpp-embed"
+EMBED_BIN="${EMBED_SRC}/build/bin/llama-server"
+EMBED_MODEL_DIR="${MODEL_DIR}/embedding"
+EMBED_MODEL="${EMBED_MODEL_DIR}/embeddinggemma-2-UD-Q4_K_XL.gguf"
+EMBED_MODEL_URL="${AI_EMBED_MODEL_URL:-https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-UD-Q4_K_XL.gguf}"
+EMBED_REPO_URL="${AI_EMBED_LLAMA_REPO:-https://github.com/ggml-org/llama.cpp}"
+
+install_embed_unit() {
+    # Installed (and daemon-reloaded) only; enable it yourself: systemctl --user enable --now ai-embed
+    if [ -f "${SCRIPT_DIR}/services/ai-embed.service" ] && command -v systemctl &>/dev/null; then
+        mkdir -p "${SYSTEMD_DIR}"
+        cp "${SCRIPT_DIR}/services/ai-embed.service" "${SYSTEMD_DIR}/ai-embed.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "==> Installed ${SYSTEMD_DIR}/ai-embed.service (not enabled: systemctl --user enable --now ai-embed)"
+    fi
+}
+
+setup_embedder() {
+    if [ -x "${EMBED_BIN}" ]; then
+        echo "==> Embedder llama-server present: ${EMBED_BIN}"
+    else
+        for cmd in git cmake; do
+            command -v "$cmd" &>/dev/null || { echo "ERROR: ${cmd} is required to build the embedder" >&2; exit 1; }
+        done
+        if [ ! -f "${EMBED_SRC}/CMakeLists.txt" ]; then
+            echo "==> Cloning llama.cpp (embedder build) into ${EMBED_SRC}..."
+            mkdir -p "$(dirname "${EMBED_SRC}")"
+            git clone --depth 1 "${EMBED_REPO_URL}" "${EMBED_SRC}"
+        fi
+        echo "==> Building CPU-only llama-server for the embedder (this takes a few minutes)..."
+        cmake -S "${EMBED_SRC}" -B "${EMBED_SRC}/build" -DGGML_CUDA=OFF -DLLAMA_CURL=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+        cmake --build "${EMBED_SRC}/build" --target llama-server -j "$(nproc 2>/dev/null || echo 4)"
+        [ -x "${EMBED_BIN}" ] || { echo "ERROR: build did not produce ${EMBED_BIN}" >&2; exit 1; }
+    fi
+    if [ -s "${EMBED_MODEL}" ]; then
+        echo "==> Embedding model present: ${EMBED_MODEL}"
+    else
+        echo "==> Downloading the embedding model to ${EMBED_MODEL}..."
+        mkdir -p "${EMBED_MODEL_DIR}"
+        curl -fL --retry 3 -o "${EMBED_MODEL}.part" "${EMBED_MODEL_URL}"
+        mv "${EMBED_MODEL}.part" "${EMBED_MODEL}"
+    fi
+    install_embed_unit
+    echo "==> Embedder ready. Start it: systemctl --user enable --now ai-embed  (or: ai-backend embed start)"
+    echo "    Then index existing memories/lessons/chats/history/notes: ai_mcp.py embed-backfill"
+}
+
 # ── Subcommand: uninstall ─────────────────────────────────────────────────────
 if [ "${1:-}" = "uninstall" ]; then
     echo "==> Uninstalling ai CLI and llama-server..."
@@ -40,6 +94,13 @@ if [ "${1:-}" = "uninstall" ]; then
     if systemctl --user is-active llama-server.service &>/dev/null || systemctl --user is-failed llama-server.service &>/dev/null; then
         echo "--> Stopping llama-server.service..."
         systemctl --user stop llama-server.service || true
+    fi
+
+    if [ -f "${SYSTEMD_DIR}/ai-embed.service" ]; then
+        echo "--> Stopping and removing ai-embed.service..."
+        systemctl --user disable --now ai-embed.service 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/ai-embed.service"
+        systemctl --user daemon-reload 2>/dev/null || true
     fi
 
     if [ -f "${SYSTEMD_DIR}/zulip-ai-bridge.service" ]; then
@@ -77,6 +138,12 @@ if [ "${1:-}" = "uninstall" ]; then
     echo "To remove them manually, run:"
     echo "  rm -rf ${DATA_DIR} ~/.config/ai"
     echo "Also, remember to remove any 'config/ai/env' sourcing lines from your ~/.bashrc or ~/.zshrc."
+    exit 0
+fi
+
+# ── Subcommand: embed — semantic-memory embedder only ─────────────────────────
+if [ "${1:-}" = "embed" ]; then
+    setup_embedder
     exit 0
 fi
 
@@ -342,6 +409,13 @@ if [ -f "${SCRIPT_DIR}/services/robinhood-trader.service" ] && command -v system
     else
         echo "==> Skipped robinhood-trader.service: no deployed release yet (run: bash trader/deploy.sh)"
     fi
+fi
+
+# ── 8. Semantic-memory embedder unit (refreshed only when the embedder is set up) ──
+if [ -x "${EMBED_BIN}" ] && [ -s "${EMBED_MODEL}" ]; then
+    install_embed_unit
+else
+    echo "==> Semantic memory: run ./install.sh embed to set up the local embedder (CPU, ~170 MB model)"
 fi
 
 # Configuration is loaded directly by the ai binary from ~/.local/share/ai/env

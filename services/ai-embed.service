@@ -1,0 +1,24 @@
+[Unit]
+Description=Local embedding server for ai semantic memory (EmbeddingGemma-2, llama.cpp, CPU only)
+Documentation=file://%h/ai-buddy/CLAUDE.md
+After=default.target
+
+[Service]
+Type=simple
+# CPU only: never compete with the main llama-server for the GPU. Threads = min(12, nproc/2).
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional AI_EMBED_URL / AI_EMBED_MODEL / AI_EMBED_BIN overrides (plain KEY=value lines only).
+EnvironmentFile=-%h/.local/share/ai/env
+# Runs %h/.local/share/ai/llama.cpp-embed/build/bin/llama-server --embeddings --pooling mean
+# -c 8192 on 127.0.0.1:8091 (see `ai-backend embed serve --dry-run`).
+ExecStart=%h/.local/bin/ai-backend embed serve
+Nice=10
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 
 char* read_memory_file(const char *mcp_script, int refresh);
+char* read_memory_for_prompt(const char *mcp_script, const char *query);
 char* load_system_prompt(void);
 void save_session(const char *messages_json);
 char* resume_session(const char *session_file);

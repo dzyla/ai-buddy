@@ -9,6 +9,7 @@ import re
 import json
 import time
 import signal
+import shlex
 import shutil
 import platform
 import functools
@@ -2518,6 +2519,136 @@ def sync_ctx_to_systemd(ctx_size):
     except Exception as e:
         print(f"Warning syncing systemd service: {e}", file=sys.stderr)
 
+# ── Embedding server (semantic memory, aitools/embed.py) ─────────────────────
+# A separate, CPU-only llama.cpp build (~/.local/share/ai/llama.cpp-embed, made by
+# `./install.sh embed`) serves EmbeddingGemma-2 on 127.0.0.1:8091. It never touches the main
+# llama-server build, port or GPU.
+EMBED_DEFAULT_URL = "http://127.0.0.1:8091"
+EMBED_MODEL_FILE = "embeddinggemma-2-UD-Q4_K_XL.gguf"
+EMBED_UNIT = "ai-embed.service"
+
+
+def _embed_paths():
+    home = Path(os.environ.get("HOME") or Path.home())
+    data = home / ".local" / "share" / "ai"
+    url = (os.environ.get("AI_EMBED_URL", "").strip() or EMBED_DEFAULT_URL).rstrip("/")
+    binary = Path(os.path.expanduser(os.environ.get("AI_EMBED_BIN", "").strip()
+                                     or str(data / "llama.cpp-embed" / "build" / "bin" / "llama-server")))
+    model = Path(os.path.expanduser(os.environ.get("AI_EMBED_MODEL", "").strip()
+                                    or str(data / "models" / "embedding" / EMBED_MODEL_FILE)))
+    unit = home / ".config" / "systemd" / "user" / EMBED_UNIT
+    pidfile = home / ".cache" / "ai" / "ai-embed.pid"
+    return url, binary, model, unit, pidfile
+
+
+def _embed_threads():
+    return min(12, max(1, (os.cpu_count() or 2) // 2))
+
+
+def _embed_argv():
+    import urllib.parse
+    url, binary, model, _, _ = _embed_paths()
+    u = urllib.parse.urlsplit(url)
+    return [str(binary), "-m", str(model), "--embeddings", "--pooling", "mean",
+            "-c", "8192", "-ub", "8192", "-b", "8192",
+            "--host", u.hostname or "127.0.0.1", "--port", str(u.port or 8091),
+            "-t", str(_embed_threads()), "-np", "4", "-ngl", "0"]
+
+
+def _embed_health(url, timeout=1.0):
+    try:
+        with urllib.request.urlopen(url + "/health", timeout=timeout) as r:
+            return json.loads(r.read() or b"{}").get("status") == "ok"
+    except Exception:
+        return False
+
+
+def _embed_unit_active():
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", EMBED_UNIT], capture_output=True, text=True,
+                           timeout=5)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def _embed_pid(pidfile):
+    try:
+        pid = int(pidfile.read_text().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    return pid if any(a.endswith(b"llama-server") for a in argv) and b"--embeddings" in argv else None
+
+
+def cmd_embed(args):
+    """ai-backend embed status|start|stop|serve [--dry-run]"""
+    sub = args[0] if args else "status"
+    url, binary, model, unit, pidfile = _embed_paths()
+    if sub == "serve":
+        argv = _embed_argv()
+        if "--dry-run" in args:
+            print("CUDA_VISIBLE_DEVICES= " + " ".join(shlex.quote(a) for a in argv))
+            return
+        missing = [str(p) for p in (binary, model) if not p.exists()]
+        if missing:
+            print("ai-backend embed: missing " + ", ".join(missing) + " (run ./install.sh embed)", file=sys.stderr)
+            sys.exit(1)
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+        env["LD_LIBRARY_PATH"] = str(binary.parent) + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        os.execve(str(binary), argv, env)
+    elif sub == "status":
+        up = _embed_health(url)
+        print(f"Embedder:  {url}  {'up' if up else 'down'}")
+        print(f"Binary:    {binary}  {'(present)' if binary.exists() else '(missing: ./install.sh embed)'}")
+        print(f"Model:     {model}  {'(present)' if model.exists() else '(missing: ./install.sh embed)'}")
+        state = "not installed"
+        if unit.exists():
+            state = "active" if _embed_unit_active() else "installed, inactive"
+        print(f"Unit:      {EMBED_UNIT}  ({state})")
+        pid = _embed_pid(pidfile)
+        if pid:
+            print(f"Process:   pid {pid} (started by ai-backend embed start)")
+        print(f"Threads:   {_embed_threads()} (CPU only)")
+    elif sub == "start":
+        if _embed_health(url):
+            print(f"Embedder already up at {url}")
+            return
+        if unit.exists() and shutil.which("systemctl"):
+            subprocess.run(["systemctl", "--user", "start", EMBED_UNIT], check=False)
+        else:
+            pidfile.parent.mkdir(parents=True, exist_ok=True)
+            log = open(pidfile.with_suffix(".log"), "ab")
+            proc = subprocess.Popen([sys.executable, os.path.abspath(sys.argv[0]), "embed", "serve"],
+                                    stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+            pidfile.write_text(str(proc.pid))
+        for _ in range(60):
+            if _embed_health(url):
+                print(f"Embedder up at {url}")
+                return
+            time.sleep(0.5)
+        print(f"Embedder not answering at {url} yet (see `ai-backend embed status`)", file=sys.stderr)
+        sys.exit(1)
+    elif sub == "stop":
+        stopped = False
+        if unit.exists() and _embed_unit_active():
+            subprocess.run(["systemctl", "--user", "stop", EMBED_UNIT], check=False)
+            stopped = True
+        pid = _embed_pid(pidfile)
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+        try:
+            pidfile.unlink()
+        except OSError:
+            pass
+        print("Embedder stopped." if stopped else "Embedder was not running (from the unit or embed start).")
+    else:
+        print("Usage: ai-backend embed status|start|stop|serve [--dry-run]", file=sys.stderr)
+        sys.exit(1)
+
+
 def print_usage():
     print("""ai-backend — single tool for LLM model deployment and configuration
 
@@ -2542,6 +2673,7 @@ Usage:
   ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
   ai-backend gpus [all|<devs>|auto|split <p>]   Select GPUs (single vs multi-GPU split)
   ai-backend serve                      Run llama-server with auto context sizing
+  ai-backend embed status|start|stop    Local embedding server (semantic memory, CPU, :8091)
 
 Examples:
   ai-backend tune                       # auto-tune active model for hardware & max speed
@@ -2574,6 +2706,8 @@ def main():
         return
     elif cmd in ("status", "info"):
         cmd_status()
+    elif cmd == "embed":
+        cmd_embed(args[1:])
     elif cmd in ("list", "ls", "models"):
         cmd_list()
     elif cmd in ("stop", "kill", "down"):

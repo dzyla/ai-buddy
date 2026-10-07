@@ -69,12 +69,13 @@ def _state_conn():
     return state.connect()
 
 
-def save_memory(content, replace=False):
+def save_memory(content, replace=False, pinned=False):
     """Add facts to persistent memory (injected into every system prompt).
 
     Appends by default. Lines already present (case-insensitive) are not duplicated; when the
     4 KB cap is exceeded the OLDEST whole lines are evicted (never a mid-line cut) and the result
-    says so. replace=True rewrites. Stored in the state db's `memory` table."""
+    says so. replace=True rewrites. pinned=True marks the lines (new or already present) as core
+    memories that auto-recall always injects. Stored in the state db's `memory` table."""
     try:
         new_lines = [l.rstrip() for l in str(content or "").splitlines() if l.strip()]
         if not new_lines:
@@ -84,21 +85,33 @@ def save_memory(content, replace=False):
             with state.transaction(conn):
                 if replace:
                     state.memory_clear(conn=conn)
-                added = [l for l in new_lines if state.memory_add(l, conn=conn) == "added"]
+                added = [l for l in new_lines if state.memory_add(l, pinned=pinned, conn=conn) == "added"]
                 evicted = state.memory_evict(MEMORY_CAP, conn=conn)
                 lines = state.memory_list(conn=conn)
         finally:
             conn.close()
         if not added and not replace:
+            if pinned:
+                return "Memory already contains that; now pinned (always injected)."
             return "Memory already contains that (no duplicate added)."
         msg = "Memory updated successfully (%d line(s) added, %d/%d chars used)." % (
             len(added) if not replace else len(lines), len("\n".join(lines)), MEMORY_CAP)
+        if pinned:
+            msg += " Pinned (always injected)."
         if evicted:
             msg += " Memory was full: evicted %d oldest line(s): %s" % (
                 len(evicted), " | ".join(e[:60] for e in evicted[:3]))
         return msg
     except Exception as e:
         return f"Error saving memory: {e}"
+
+def _enqueue(conn, note_id):
+    """Queue a note for the semantic index (aitools/search.py); never fails the write."""
+    try:
+        state.embed_enqueue("note", note_id, conn=conn)
+    except Exception:
+        pass
+
 
 def _ensure_memories_schema(conn):
     """Ensure the memories FTS5 table has a metadata column.
@@ -157,6 +170,7 @@ def vault_write(title, content, links=""):
         conn.execute("DELETE FROM vault_fts WHERE title = ?", (title,))
         conn.execute("INSERT INTO vault_fts(title, content) VALUES (?, ?)", (title, full_content))
         conn.commit()
+        _enqueue(conn, "v:" + title)
         conn.close()
         return f"Successfully wrote note '{title}' to vault."
     except Exception as e:
@@ -248,11 +262,12 @@ def remember(content, metadata=""):
             content = content[-4000:]
         if metadata:
             metadata = str(metadata)[:200]
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO memories(content, metadata) VALUES (?, ?)",
             (content, metadata),
         )
         conn.commit()
+        _enqueue(conn, "r%d" % cur.lastrowid)
         conn.close()
         return f"Remembered: {content[:80]}{'...' if len(content) > 80 else ''}"
     except Exception as e:

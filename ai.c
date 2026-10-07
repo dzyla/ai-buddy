@@ -4766,7 +4766,10 @@ int main(int argc, char **argv) {
     strcpy(messages_json, "[]");
 
     // Add System Prompt, Context, Memory & Skills
-    char *memory = read_memory_file(mcp_script, 0);
+    /* Auto-recall: the memory section is chosen for this request (stdin when the prompt is only
+       the generic placeholder); no request (bare interactive start) keeps the full render. */
+    char *memory = read_memory_for_prompt(mcp_script,
+        (pipe_in && *pipe_in && strcmp(prompt, "Answer or help with the following:") == 0) ? pipe_in : prompt);
     char *sys_ctx = get_system_context();
     char *triggers = load_critical_triggers();
 
