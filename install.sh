@@ -42,6 +42,13 @@ if [ "${1:-}" = "uninstall" ]; then
         systemctl --user stop llama-server.service || true
     fi
 
+    if [ -f "${SYSTEMD_DIR}/zulip-ai-bridge.service" ]; then
+        echo "--> Stopping and removing zulip-ai-bridge.service..."
+        systemctl --user disable --now zulip-ai-bridge.service 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/zulip-ai-bridge.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+
     # 2. Remove systemd unit files
     if [ -f "${SYSTEMD_DIR}/llama-server.service" ] || [ -f "${SYSTEMD_DIR}/llama-server.socket" ]; then
         echo "--> Removing systemd unit files..."
@@ -253,6 +260,20 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "${REPO_DIR}/.git" ] && [ -f "${REPO_DIR}/.githooks/pre-commit" ]; then
     git -C "$REPO_DIR" config core.hooksPath .githooks
     echo "==> Privacy pre-commit hook enabled (personal denylist: ~/.config/ai/private_patterns.txt)"
+fi
+
+# ── 6. Zulip bridge user unit (installed only; never enabled automatically) ──
+# Rendered with this checkout's path and the python3 currently on PATH (the one
+# that needs `pip install zulip`). See docs/zulip_setup.md to enable it.
+if [ -f "${SCRIPT_DIR}/services/zulip-ai-bridge.service" ] && command -v systemctl &>/dev/null; then
+    PY_BIN="$(command -v python3)"
+    PY_DIR="$(dirname "$PY_BIN")"
+    sed -e "s#%h/ai-buddy#${SCRIPT_DIR}#g" \
+        -e "s#^ExecStart=/usr/bin/env python3 #ExecStart=${PY_BIN} #" \
+        -e "s#^Environment=PATH=%h/.local/bin:#Environment=PATH=%h/.local/bin:${PY_DIR}:#" \
+        "${SCRIPT_DIR}/services/zulip-ai-bridge.service" > "${SYSTEMD_DIR}/zulip-ai-bridge.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "==> Installed ${SYSTEMD_DIR}/zulip-ai-bridge.service (not enabled; python: ${PY_BIN})"
 fi
 
 # Configuration is loaded directly by the ai binary from ~/.local/share/ai/env

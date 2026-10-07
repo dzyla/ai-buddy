@@ -1243,3 +1243,188 @@ def test_mcp_get_messages_does_not_fall_back_to_unfiltered_query():
         out = zms.do_get_messages({})
     assert out.startswith("Error")
     client.get_messages.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# --check / doctor mode (offline: the Zulip client is always mocked)
+# ---------------------------------------------------------------------------
+
+import types
+
+
+class _CheckClient(_OwnerClient):
+    """Mocked zulip.Client for run_check; records whether the server was hit."""
+
+    def __init__(self, pm_senders=(), bot_owner_id=None, profile_ok=True):
+        super().__init__(list(pm_senders), bot_owner_id=bot_owner_id)
+        self.base_url = "https://example.zulipchat.com/api/"
+        self.profile_ok = profile_ok
+        self.contacted = False
+
+    def get_profile(self):
+        self.contacted = True
+        if not self.profile_ok:
+            return {"result": "error", "msg": "Invalid API key"}
+        res = super().get_profile()
+        res["is_bot"] = True
+        return res
+
+
+@pytest.fixture
+def check_env(_isolated_home, monkeypatch, tmp_path):
+    """Home with a valid 0600 zuliprc, a stub zulip package and an ai binary."""
+    import zulip_ai_bridge as zb
+    rc = _isolated_home / ".zuliprc"
+    rc.write_text("[api]\nemail=ai-bot@example.zulipchat.com\nkey=abc123\n"
+                  "site=https://example.zulipchat.com\n")
+    rc.chmod(0o600)
+    ai_bin = tmp_path / "ai"
+    ai_bin.write_text("#!/bin/sh\n")
+    ai_bin.chmod(0o755)
+    monkeypatch.setenv("INFER_BIN_PATH", str(ai_bin))
+    for k in ("ZULIP_CONFIG", "ZULIP_EMAIL", "ZULIP_API_KEY", "ZULIP_SITE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(zb, "zulip", types.SimpleNamespace(Client=object, __version__="9.9"))
+    return rc
+
+
+def _run_check(client=None, **kw):
+    import zulip_ai_bridge as zb
+    lines = []
+    rc = zb.run_check(client_factory=(lambda: client) if client else None,
+                      out=lines.append, **kw)
+    return rc, "\n".join(lines)
+
+
+def test_check_offline_ok_does_not_contact_server(check_env, monkeypatch):
+    monkeypatch.setenv("ZULIP_USER", "42")
+    client = _CheckClient()
+    rc, out = _run_check(client)
+    assert rc == 0, out
+    assert "zuliprc found" in out and "0o600" in out
+    assert "ai-bot@example.zulipchat.com" in out
+    assert "Effective owner: 42 (from ZULIP_USER)" in out
+    assert "numeric user id" in out
+    assert client.contacted is False
+
+
+def test_check_missing_package(check_env, monkeypatch):
+    import zulip_ai_bridge as zb
+    monkeypatch.setattr(zb, "zulip", types.SimpleNamespace(Client=None))
+    rc, out = _run_check(_CheckClient())
+    assert rc == 1
+    assert "-m pip install zulip" in out
+
+
+def test_check_missing_zuliprc_hints_mcp_path(check_env):
+    check_env.unlink()
+    alt = check_env.parent / ".config" / "zulip"
+    alt.mkdir(parents=True)
+    (alt / "zuliprc").write_text("[api]\n")
+    rc, out = _run_check(_CheckClient())
+    assert rc == 1
+    assert ".zuliprc does not exist" in out
+    assert "ZULIP_CONFIG=" in out
+
+
+def test_check_zuliprc_from_zulip_config_env(check_env, monkeypatch, tmp_path):
+    other = tmp_path / "bot.zuliprc"
+    other.write_text(check_env.read_text())
+    other.chmod(0o600)
+    check_env.unlink()
+    monkeypatch.setenv("ZULIP_CONFIG", str(other))
+    rc, out = _run_check(_CheckClient())
+    assert rc == 0, out
+    assert str(other) in out
+
+
+def test_check_warns_on_world_readable_zuliprc(check_env):
+    check_env.chmod(0o644)
+    rc, out = _run_check(_CheckClient())
+    assert rc == 0
+    assert "[WARN]" in out and f"chmod 600 {check_env}" in out
+
+
+def test_check_incomplete_zuliprc_fails(check_env):
+    check_env.write_text("[api]\nemail=ai-bot@example.zulipchat.com\nkey=abc\n")
+    rc, out = _run_check(_CheckClient())
+    assert rc == 1
+    assert "missing site" in out
+
+
+def test_check_online_resolves_bot_owner(check_env):
+    client = _CheckClient(pm_senders=["attacker@example.org"], bot_owner_id=3)
+    rc, out = _run_check(client, online=True)
+    assert rc == 0, out
+    assert client.contacted
+    assert "bot_owner_id=3" in out
+    assert "Effective owner: owner@example.com (from bot_owner_id)" in out
+
+
+def test_check_online_without_owner_fails_closed(check_env):
+    client = _CheckClient(pm_senders=["a@example.com", "b@example.com"])
+    rc, out = _run_check(client, online=True)
+    assert rc == 1
+    assert "ignore EVERY message" in out
+
+
+def test_check_online_warns_when_zulip_user_differs_from_owner(check_env, monkeypatch):
+    monkeypatch.setenv("ZULIP_USER", "someone@example.com")
+    rc, out = _run_check(_CheckClient(bot_owner_id=3), online=True)
+    assert rc == 0
+    assert "Effective owner: someone@example.com (from ZULIP_USER)" in out
+    assert "ZULIP_USER=3" in out
+
+
+def test_check_online_bad_api_key(check_env):
+    rc, out = _run_check(_CheckClient(profile_ok=False), online=True)
+    assert rc == 1
+    assert "Invalid API key" in out
+
+
+def test_check_ai_binary_missing(check_env, monkeypatch):
+    import zulip_ai_bridge as zb
+    monkeypatch.setattr(zb, "resolve_ai_bin", lambda: "ai")
+    monkeypatch.setenv("PATH", "")
+    rc, out = _run_check(_CheckClient())
+    assert rc == 1
+    assert "ai binary not found" in out
+
+
+def test_apply_env_file_defaults_does_not_override(_isolated_home, monkeypatch):
+    import zulip_ai_bridge as zb
+    envf = _isolated_home / ".local" / "share" / "ai" / "env"
+    envf.parent.mkdir(parents=True)
+    envf.write_text('# managed\nexport ZULIP_USER="42"\nexport BRIDGE_AI_MODE="plan"\n')
+    monkeypatch.setenv("BRIDGE_AI_MODE", "manual")
+    monkeypatch.delenv("ZULIP_USER", raising=False)
+    applied = zb.apply_env_file_defaults()
+    assert os.environ["ZULIP_USER"] == "42"
+    assert os.environ["BRIDGE_AI_MODE"] == "manual"
+    assert applied == ["ZULIP_USER"]
+    monkeypatch.delenv("ZULIP_USER")
+
+
+def test_main_check_flag_and_doctor_alias(monkeypatch):
+    import zulip_ai_bridge as zb
+    calls = []
+    monkeypatch.setattr(zb, "apply_env_file_defaults", lambda: [])
+    monkeypatch.setattr(zb, "run_check", lambda online=False, env_applied=None: calls.append(online) or 0)
+    monkeypatch.setattr(zb, "ZulipAiBridge", lambda: pytest.fail("listener must not start"))
+    assert zb.main(["--check"]) == 0
+    assert zb.main(["doctor", "--online"]) == 0
+    assert calls == [False, True]
+
+
+def test_bridge_without_zulip_package_explains_install(monkeypatch):
+    import zulip_ai_bridge as zb
+    monkeypatch.setattr(zb, "zulip", types.SimpleNamespace(Client=None))
+    with pytest.raises(RuntimeError, match="pip install zulip"):
+        zb.ZulipAiBridge()
+
+
+def test_effective_owner_sources(monkeypatch):
+    bridge = _bridge(_OwnerClient([], bot_owner_id=3))
+    assert bridge.effective_owner() == ("owner@example.com", "bot_owner_id")
+    monkeypatch.setenv("ZULIP_USER", "42")
+    assert bridge.effective_owner() == ("42", "ZULIP_USER")

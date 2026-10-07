@@ -165,6 +165,44 @@ def test_bear_regime_exits_sleeve_and_buys_nothing(broker, monkeypatch):
     assert state["targets"] == [] and state["done"]
 
 
+def test_rank_buffer_keeps_held_name_ranked_just_outside_top_n(broker, monkeypatch):
+    # AMD ranks 4th (eligible): with the default buffer (2) a held AMD stays and takes PLTR's slot.
+    broker.positions["AMD"] = {"quantity": 0.13, "average_buy_price": 480}
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    state = json.load(open(rt._rebalance_flag_path("2026-09")))
+    assert state["rank_buffer"] == MS.SLEEVE_RANK_BUFFER >= 1
+    assert state["targets"] == ["NVDA", "TSM", "AMD"]
+    assert "AMD" in state["incumbents"]
+    assert "AMD" not in {o[0] for o in broker.orders if o[1] == "sell"}
+
+
+def test_rank_buffer_zero_in_config_restores_strict_rotation(broker, monkeypatch, tmp_path):
+    cfg = tmp_path / "trader.json"
+    cfg.write_text(json.dumps({"strategy": {"sleeve_rank_buffer": 0}}))
+    monkeypatch.setenv("RH_TRADER_CONFIG", str(cfg))
+    broker.positions["AMD"] = {"quantity": 0.13, "average_buy_price": 480}
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    state = json.load(open(rt._rebalance_flag_path("2026-09")))
+    assert state["targets"] == ["NVDA", "PLTR", "TSM"]
+    assert "AMD" in {o[0] for o in broker.orders if o[1] == "sell"}
+
+
+def test_existing_month_flag_is_not_replanned_after_upgrade(broker, monkeypatch):
+    # A flag written by the previous code (no rank-buffer fields) for the current month: the new ranking
+    # must not trigger an unscheduled rebalance mid-month; only the daily core top-up may run.
+    broker.positions["AMD"] = {"quantity": 0.13, "average_buy_price": 480}
+    os.makedirs(rt.RISK_MONITOR_FLAGS, exist_ok=True)
+    with open(rt._rebalance_flag_path("2026-09"), "w") as fh:
+        json.dump({"month": "2026-09", "date": "2026-09-01", "dry_run": False, "targets": ["NVDA", "PLTR", "TSM"],
+                   "sells_pending": [], "buys_pending": [], "sells_done": [], "buys_done": [], "done": True}, fh)
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5, day=22))
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert not any(o[1] == "sell" for o in broker.orders)
+    assert {o[0] for o in broker.orders} <= set(MS.CORE_SYMBOLS)
+
+
 def test_rebalance_runs_once_per_month(broker, monkeypatch):
     monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5, day=8))
     _momentum_rebalance_pulse(ACC, dry_run=True)

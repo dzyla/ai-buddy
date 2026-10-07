@@ -172,3 +172,41 @@ class TestCircuitBreaker:
         assert tier == 0 and "Within risk limits" in msg
         data = json.load(open(rt.CIRCUIT_BREAKER_FILE))
         assert data[f"ACC_{today}"]["baseline"] == 1000.0
+
+
+class TestRankBuffer:
+    RANKED = [{"symbol": s, "eligible": True} for s in ["A", "B", "C", "D", "E", "F"]] + [{"symbol": "X", "eligible": False}]
+
+    def test_no_buffer_is_strict_top_n(self):
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["E"], buffer=0) == ["A", "B", "C"]
+        assert MS.select_sleeve(self.RANKED, "BULL") == ["A", "B", "C"]
+
+    def test_incumbent_within_buffer_is_kept_in_rank_order(self):
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["E"], buffer=2) == ["A", "B", "E"]
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["D", "E"], buffer=2) == ["A", "D", "E"]
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["d"], buffer=1) == ["A", "B", "D"]
+
+    def test_incumbent_outside_buffer_or_ineligible_rotates_out(self):
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["F"], buffer=2) == ["A", "B", "C"]
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["X"], buffer=5) == ["A", "B", "C"]
+        assert MS.select_sleeve(self.RANKED, "BEAR", incumbents=["A"], buffer=2) == []
+
+    def test_more_incumbents_than_slots_keeps_best_ranked(self):
+        assert MS.select_sleeve(self.RANKED, "BULL", incumbents=["B", "C", "D", "E"], buffer=2) == ["B", "C", "D"]
+
+    def test_sleeve_incumbents_excludes_core_hold_and_empty(self):
+        pos = {"VTI": {"quantity": 1}, "QQQ": {"quantity": 1}, "nvda": {"quantity": 0.5},
+               "LLY": {"quantity": 0.1}, "OLD": {"quantity": 0}}
+        assert MS.sleeve_incumbents(pos, hold={"lly"}) == ["NVDA"]
+
+    def test_rank_buffer_config(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "trader.json"
+        monkeypatch.setenv("RH_TRADER_CONFIG", str(cfg))
+        assert MS.rank_buffer() == MS.SLEEVE_RANK_BUFFER          # missing file -> default
+        cfg.write_text(json.dumps({"strategy": {"sleeve_rank_buffer": 0}}))
+        assert MS.rank_buffer() == 0
+        for bad in ("x", -1, 99, True, None):
+            cfg.write_text(json.dumps({"strategy": {"sleeve_rank_buffer": bad}}))
+            assert MS.rank_buffer() == MS.SLEEVE_RANK_BUFFER
+        cfg.write_text("not json")
+        assert MS.rank_buffer() == MS.SLEEVE_RANK_BUFFER

@@ -577,6 +577,287 @@ def load_env_file():
     return loaded
 
 
+def apply_env_file_defaults():
+    """Fill os.environ from ~/.local/share/ai/env without overriding.
+
+    The env file is written by ai-backend as `export KEY="value"` lines, which
+    systemd's EnvironmentFile= silently ignores, so the bridge loads it itself
+    (like the `ai` binary does). Variables already set in the process
+    environment win. Returns the list of keys that were applied.
+    """
+    applied = []
+    for k, v in load_env_file().items():
+        if k and k not in os.environ:
+            os.environ[k] = v
+            applied.append(k)
+    return applied
+
+
+def resolve_ai_bin():
+    """Locate the ai binary: $INFER_BIN_PATH, ./ai next to this script,
+    ~/.local/bin/ai, else plain "ai" (resolved through PATH at run time)."""
+    if "INFER_BIN_PATH" in os.environ and os.path.isfile(os.environ["INFER_BIN_PATH"]):
+        return os.environ["INFER_BIN_PATH"]
+    repo_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai")
+    if os.path.isfile(repo_bin) and os.access(repo_bin, os.X_OK):
+        return repo_bin
+    local_bin = os.path.expanduser("~/.local/bin/ai")
+    if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
+        return local_bin
+    return "ai"
+
+
+def lookup_bot_owner(client, bot_user_id):
+    """Return (bot_owner_id, owner_email) for a bot account, or (None, None).
+
+    The email is the one the bot sees in `sender_email` (on realms that hide
+    emails this is the `user<id>@<realm>` form, not the real address)."""
+    if not bot_user_id or not hasattr(client, "get_user_by_id"):
+        return None, None
+    res = client.get_user_by_id(bot_user_id)
+    owner_id = (res.get("user") or {}).get("bot_owner_id") if isinstance(res, dict) else None
+    if not owner_id:
+        return None, None
+    ores = client.get_user_by_id(owner_id)
+    email = (ores.get("user") or {}).get("email") if isinstance(ores, dict) else None
+    return owner_id, email
+
+
+def detect_owner(client, bot_email, bot_user_id, log=print):
+    """Detect the owner's Zulip email. Returns (email, source) or (None, None).
+
+    Prefers the authoritative `bot_owner_id` of the bot account. Falls back
+    to recent private-message history only when it is unambiguous (exactly
+    one non-bot sender): otherwise whoever DMed the bot last before a
+    restart would silently become the owner. Set ZULIP_USER to be explicit.
+    """
+    try:
+        _owner_id, email = lookup_bot_owner(client, bot_user_id)
+        if email:
+            log(f"Detected owner from bot_owner_id: {email}")
+            return email, "bot_owner_id"
+    except Exception as e:
+        logger.debug(f"Could not resolve bot owner: {e}")
+    try:
+        payload = {
+            "anchor": "newest",
+            "num_before": 20,
+            "num_after": 0,
+            "narrow": [{"operator": "is", "operand": "private"}],
+            "apply_markdown": False
+        }
+        res = client.get_messages(payload)
+        if res.get("result") == "success":
+            senders = {
+                m.get("sender_email") for m in res.get("messages", [])
+                if m.get("sender_email") and m.get("sender_email") != bot_email
+            }
+            if len(senders) == 1:
+                owner = senders.pop()
+                log(f"Detected owner from past private messages: {owner}")
+                return owner, "dm_history"
+            if senders:
+                log("⚠️ Multiple users have DMed the bot; refusing to guess the owner. Set ZULIP_USER.")
+    except Exception as e:
+        log(f"Error detecting owner from messages: {e}")
+    return None, None
+
+
+def describe_owner_value(value):
+    """Explain how a ZULIP_USER value is matched against senders."""
+    v = (value or "").strip().lower()
+    if not v:
+        return "empty: nobody is allowed"
+    if v.isdigit():
+        return f"numeric user id: matches sender_id == {v} (or a sender email user{v}@...)"
+    if "@" in v:
+        return "email: exact, case-insensitive match on the sender's email as the bot sees it"
+    return "bare username: matches the part before '@' of the sender's email (prefer an email or user id)"
+
+
+def zuliprc_path():
+    """The config file the zulip library reads: $ZULIP_CONFIG, else ~/.zuliprc."""
+    cfg = os.environ.get("ZULIP_CONFIG")
+    if cfg:
+        return os.path.abspath(os.path.expanduser(cfg))
+    home = os.environ.get("HOME")
+    return os.path.join(home, ".zuliprc") if home else None
+
+
+def run_check(online=False, client_factory=None, env_applied=None, out=print):
+    """Validate the bridge configuration without starting the listener.
+
+    Offline by default: nothing is sent to the Zulip server. With
+    online=True it also calls get_profile and resolves the owner exactly as
+    the running bridge would. Returns a process exit code (0 = no problems).
+    """
+    problems = 0
+    env_applied = set(env_applied or ())
+
+    def ok(m):
+        out(f"[ OK ] {m}")
+
+    def info(m):
+        out(f"[INFO] {m}")
+
+    def warn(m):
+        out(f"[WARN] {m}")
+
+    def fail(m):
+        nonlocal problems
+        problems += 1
+        out(f"[FAIL] {m}")
+
+    info(f"Python interpreter: {sys.executable} ({sys.version.split()[0]})")
+
+    env_file = os.path.expanduser("~/.local/share/ai/env")
+    if os.path.isfile(env_file):
+        ok(f"Env file found: {env_file}")
+    else:
+        info(f"No env file at {env_file} (optional)")
+
+    # 1. zulip package
+    pkg_ok = getattr(zulip, "Client", None) is not None
+    if pkg_ok:
+        ok(f"zulip package importable (version {getattr(zulip, '__version__', 'unknown')})")
+    else:
+        fail(f"zulip package not importable by this interpreter. Install it with: "
+             f"{sys.executable} -m pip install zulip")
+
+    # 2. credentials: same lookup order as zulip.Client()
+    env_creds = [k for k in ("ZULIP_EMAIL", "ZULIP_API_KEY", "ZULIP_SITE") if os.environ.get(k)]
+    cfg = zuliprc_path()
+    cfg_ok = False
+    if cfg and os.path.isfile(cfg):
+        if not os.access(cfg, os.R_OK):
+            fail(f"{cfg} exists but is not readable by this user")
+        else:
+            mode = os.stat(cfg).st_mode & 0o777
+            if mode & 0o077:
+                warn(f"{cfg} has permissions {oct(mode)}; it holds an API key. Run: chmod 600 {cfg}")
+            else:
+                ok(f"zuliprc found: {cfg} (permissions {oct(mode)})")
+            import configparser
+            parser = configparser.ConfigParser()
+            try:
+                with open(cfg) as f:
+                    parser.read_file(f)
+                missing = [k for k in ("email", "key", "site")
+                           if not (parser.has_option("api", k) and parser.get("api", k).strip())
+                           and f"ZULIP_{'API_KEY' if k == 'key' else k.upper()}" not in env_creds]
+                if missing:
+                    fail(f"{cfg}: missing {', '.join(missing)} in the [api] section")
+                else:
+                    cfg_ok = True
+                    email = os.environ.get("ZULIP_EMAIL") or parser.get("api", "email", fallback="")
+                    site = os.environ.get("ZULIP_SITE") or parser.get("api", "site", fallback="")
+                    ok(f"Credentials: bot email {email} on {site}")
+            except Exception as e:
+                fail(f"Could not parse {cfg}: {e}")
+    elif "ZULIP_EMAIL" in env_creds and "ZULIP_API_KEY" in env_creds:
+        if "ZULIP_SITE" in env_creds:
+            cfg_ok = True
+            ok(f"Credentials from environment: {os.environ['ZULIP_EMAIL']} on {os.environ['ZULIP_SITE']}")
+        else:
+            fail("ZULIP_EMAIL/ZULIP_API_KEY are set but ZULIP_SITE is missing")
+    else:
+        fail(f"No Zulip credentials: {cfg or '~/.zuliprc'} does not exist. Download the bot's "
+             f"zuliprc and save it there (chmod 600), or set ZULIP_CONFIG=/path/to/zuliprc.")
+        alt = os.path.expanduser("~/.config/zulip/zuliprc")
+        if os.path.isfile(alt):
+            info(f"Found {alt}: only the MCP server/reminders look there. For the bridge, "
+                 f"set ZULIP_CONFIG={alt} or copy it to ~/.zuliprc.")
+    if "ZULIP_API_KEY" in env_creds:
+        warn("ZULIP_API_KEY is set in the environment; it gets copied into scheduled-task files "
+             "(~/.config/ai/scheduled_tasks). Prefer keeping the key only in the zuliprc file.")
+
+    # 3. construct the client (no network traffic)
+    client = None
+    if pkg_ok and cfg_ok:
+        try:
+            client = (client_factory or zulip.Client)()
+            ok(f"Client constructed: {getattr(client, 'email', '?')} -> {getattr(client, 'base_url', '?')}")
+        except Exception as e:
+            fail(f"Could not construct zulip.Client(): {e}")
+
+    # 4. owner
+    zuser = (os.environ.get("ZULIP_USER") or "").strip()
+    if zuser:
+        where = " (from ~/.local/share/ai/env)" if "ZULIP_USER" in env_applied else ""
+        ok(f"ZULIP_USER={zuser}{where}: {describe_owner_value(zuser)}")
+    else:
+        info("ZULIP_USER not set: the owner is auto-detected at startup "
+             "(bot_owner_id, else a single unique DM partner)")
+
+    if not online:
+        if zuser:
+            ok(f"Effective owner: {zuser} (from ZULIP_USER)")
+        else:
+            info("Effective owner: resolved at startup; run with --online to see it")
+        info("Offline check: the server was not contacted. Add --online to verify "
+             "the API key and resolve the owner.")
+    elif client is not None:
+        try:
+            prof = client.get_profile()
+        except Exception as e:
+            prof = {"result": "error", "msg": str(e)}
+        if not isinstance(prof, dict) or prof.get("result") != "success":
+            msg = prof.get("msg") if isinstance(prof, dict) else prof
+            fail(f"get_profile failed: {msg} (wrong API key/site, deactivated bot, or no network)")
+        else:
+            bot_uid = prof.get("user_id")
+            bot_email = prof.get("email") or getattr(client, "email", None)
+            ok(f"Authenticated as {prof.get('full_name')} <{bot_email}> (user_id {bot_uid}, "
+               f"is_bot={prof.get('is_bot')})")
+            if prof.get("is_bot") is False:
+                warn("This is a regular user account, not a bot: bot_owner_id is unavailable, and "
+                     "messages you send from this same account are ignored. Use a separate bot.")
+            owner_id = owner_email = None
+            try:
+                owner_id, owner_email = lookup_bot_owner(client, bot_uid)
+            except Exception as e:
+                warn(f"Could not look up bot_owner_id: {e}")
+            if owner_id:
+                ok(f"bot_owner_id={owner_id}, owner email as the bot sees it: {owner_email}")
+            if zuser:
+                eff, src = zuser, "ZULIP_USER"
+            else:
+                eff, src = detect_owner(client, bot_email, bot_uid, log=lambda m: None)
+            if eff:
+                ok(f"Effective owner: {eff} (from {src})")
+                zl = zuser.lower()
+                if zuser and owner_id and zl.isdigit() and zl != str(owner_id):
+                    warn(f"ZULIP_USER ({zuser}) is not the bot owner's id ({owner_id}); ZULIP_USER wins")
+                elif zuser and owner_email and "@" in zl and zl != owner_email.lower():
+                    warn(f"ZULIP_USER ({zuser}) differs from the bot owner's email as the bot sees it "
+                         f"({owner_email}); ZULIP_USER wins. If you meant yourself, use "
+                         f"ZULIP_USER={owner_id or 'your numeric user id'}.")
+            else:
+                fail("No owner could be resolved: the bridge will ignore EVERY message. "
+                     "Set ZULIP_USER to your numeric user id or email.")
+    else:
+        info("Skipping online checks: no client could be constructed")
+
+    # 5. ai binary
+    ai_bin = resolve_ai_bin()
+    if ai_bin == "ai":
+        found = shutil.which("ai")
+        if found:
+            ok(f"ai binary: {found} (via PATH)")
+        else:
+            fail("ai binary not found (checked $INFER_BIN_PATH, ./ai, ~/.local/bin/ai, PATH). "
+                 "Run ./install.sh or set INFER_BIN_PATH.")
+    else:
+        ok(f"ai binary: {ai_bin}")
+
+    out("")
+    if problems:
+        out(f"{problems} problem(s) found.")
+        return 1
+    out("All checks passed." + ("" if online else " (offline; add --online to test the server)"))
+    return 0
+
+
 def normalize_text(text):
     """Normalize soft-wrapped prose paragraphs while strictly preserving code blocks."""
     if not text:
@@ -874,8 +1155,10 @@ def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr="", 
 
 class ZulipAiBridge:
     def __init__(self, client=None):
-        if zulip is None and client is None:
-            raise RuntimeError("The 'zulip' Python package is required. Install it via `pip install zulip`.")
+        if getattr(zulip, "Client", None) is None and client is None:
+            raise RuntimeError(
+                "The 'zulip' Python package is required. Install it for this interpreter: "
+                f"{sys.executable} -m pip install zulip")
         # Allow dependency injection for testing / alternative backends
         self.client = client if client is not None else zulip.Client()
         self.bot_email = getattr(self.client, 'email', None)
@@ -889,12 +1172,21 @@ class ZulipAiBridge:
                 res = self.client.get_profile()
                 if isinstance(res, dict) and res.get("result") == "success":
                     self.bot_profile = res
+                elif isinstance(res, dict):
+                    print(f"⚠️ get_profile failed: {res.get('msg')} (check the API key/site in your zuliprc)")
             except Exception as e:
                 logger.debug(f"Could not retrieve bot profile: {e}")
         self.bot_user_id = self.bot_profile.get("user_id")
         self.bot_name = self.bot_profile.get("full_name") or (self.bot_email.split('@')[0] if self.bot_email else "AI bot")
 
+        self.owner_source = None
         self.detected_owner = self._detect_owner()
+        owner, source = self.effective_owner()
+        if owner:
+            print(f"Allowed user: {owner} (from {source})")
+        else:
+            print("⚠️ No owner configured or detected: ALL messages will be ignored. "
+                  "Set ZULIP_USER (see docs/zulip_setup.md).")
         # Initialize the file parser for processing uploaded documents
         self._file_parser = FileParser(self.client, base_url)
         print("File parser initialized — will extract content from uploaded documents.")
@@ -1087,48 +1379,22 @@ class ZulipAiBridge:
         return self._file_parser._download_file(url, dest_path)
 
     def _detect_owner(self):
-        """Detect the owner's Zulip email.
+        """Detect the owner's Zulip email (see module-level detect_owner)."""
+        owner, source = detect_owner(self.client, self.bot_email, self.bot_user_id)
+        self.owner_source = source
+        return owner
 
-        Prefers the authoritative `bot_owner_id` of the bot account. Falls back
-        to recent private-message history only when it is unambiguous (exactly
-        one non-bot sender): otherwise whoever DMed the bot last before a
-        restart would silently become the owner. Set ZULIP_USER to be explicit.
-        """
-        try:
-            if self.bot_user_id and hasattr(self.client, "get_user_by_id"):
-                res = self.client.get_user_by_id(self.bot_user_id)
-                owner_id = (res.get("user") or {}).get("bot_owner_id") if isinstance(res, dict) else None
-                if owner_id:
-                    ores = self.client.get_user_by_id(owner_id)
-                    email = (ores.get("user") or {}).get("email") if isinstance(ores, dict) else None
-                    if email:
-                        print(f"Detected owner from bot_owner_id: {email}")
-                        return email
-        except Exception as e:
-            logger.debug(f"Could not resolve bot owner: {e}")
-        try:
-            payload = {
-                "anchor": "newest",
-                "num_before": 20,
-                "num_after": 0,
-                "narrow": [{"operator": "is", "operand": "private"}],
-                "apply_markdown": False
-            }
-            res = self.client.get_messages(payload)
-            if res.get("result") == "success":
-                senders = {
-                    m.get("sender_email") for m in res.get("messages", [])
-                    if m.get("sender_email") and m.get("sender_email") != self.bot_email
-                }
-                if len(senders) == 1:
-                    owner = senders.pop()
-                    print(f"Detected owner from past private messages: {owner}")
-                    return owner
-                if senders:
-                    print("⚠️ Multiple users have DMed the bot; refusing to guess the owner. Set ZULIP_USER.")
-        except Exception as e:
-            print(f"Error detecting owner from messages: {e}")
-        return None
+    def effective_owner(self):
+        """Return (allowed_user, source) exactly as handle_message applies it.
+
+        ZULIP_USER wins; otherwise the auto-detected owner. ("", None) means
+        nobody is allowed (fail closed)."""
+        env_user = (os.environ.get("ZULIP_USER") or "").strip()
+        if env_user:
+            return env_user, "ZULIP_USER"
+        if self.detected_owner:
+            return self.detected_owner, getattr(self, "owner_source", None) or "auto-detected"
+        return "", None
 
     def _send_reply(self, msg, content):
         """Send a reply to the same stream/topic or private thread.
@@ -1247,15 +1513,7 @@ class ZulipAiBridge:
 
     def _resolve_ai_bin(self):
         """Locate the ai binary on the host system."""
-        if "INFER_BIN_PATH" in os.environ and os.path.isfile(os.environ["INFER_BIN_PATH"]):
-            return os.environ["INFER_BIN_PATH"]
-        repo_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai")
-        if os.path.isfile(repo_bin) and os.access(repo_bin, os.X_OK):
-            return repo_bin
-        local_bin = os.path.expanduser("~/.local/bin/ai")
-        if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
-            return local_bin
-        return "ai"
+        return resolve_ai_bin()
 
     def _truncate_reply(self, text, max_chars=9000):
         """Truncate a reply to fit Zulip's per-message size limit."""
@@ -1565,7 +1823,7 @@ class ZulipAiBridge:
         # numeric Zulip user id. Display names are never trusted: any user can
         # set theirs to the owner's name or email. With no owner configured or
         # detected, nobody is allowed (fail closed).
-        allowed_user = os.environ.get("ZULIP_USER") or self.detected_owner or ""
+        allowed_user, _source = self.effective_owner()
 
         # Normalize values for case-insensitive comparison
         allowed_user_clean = allowed_user.strip().lower()
@@ -1929,10 +2187,33 @@ class ContextWindowManager:
         
         return "\n".join(context_lines)
 
-if __name__ == "__main__":
+def main(argv=None):
+    import argparse
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("doctor", "check"):
+        argv[0] = "--check"
+    parser = argparse.ArgumentParser(
+        description="Zulip <-> local `ai` agent bridge. Without options, starts the listener.")
+    parser.add_argument("--check", "--doctor", action="store_true",
+                        help="validate the configuration and exit (does not start the listener)")
+    parser.add_argument("--online", action="store_true",
+                        help="with --check: also contact the Zulip server (get_profile, owner lookup)")
+    args = parser.parse_args(argv)
+
+    applied = apply_env_file_defaults()
+    if args.check or args.online:
+        return run_check(online=args.online, env_applied=applied)
     try:
         bridge = ZulipAiBridge()
         bridge.run()
+    except KeyboardInterrupt:
+        print("Stopped.")
+        return 0
     except Exception as e:
         print(f"Error starting bridge: {e}")
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

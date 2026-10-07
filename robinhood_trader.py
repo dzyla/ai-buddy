@@ -2010,6 +2010,7 @@ class TradingStrategyEngine:
             staged_plan["momentum_sleeve"] = {
                 "regime": regime,
                 "targets": MomentumStrategy.select_sleeve(ranked, regime["regime"]),
+                "note": "strict top-N view; the monthly rebalance also keeps held names ranked within top N + rank buffer",
                 "top": ranked[:8],
             }
         except Exception as exc:  # noqa: BLE001
@@ -2200,6 +2201,10 @@ class MomentumStrategy:
     SLEEVE_TARGET_PCT = 0.30
     CASH_BUFFER_PCT = 0.10
     SLEEVE_TOP_N = 3
+    # Rank hysteresis: a held sleeve name stays while ranked within top N + buffer (and still eligible).
+    # dev/backtest_momentum.py (2005-2026, 3 universes): turnover -20..-28%, Sharpe/max DD unchanged within noise.
+    # 0 = the original strict top-N rotation. Override: trader.json {"strategy": {"sleeve_rank_buffer": n}}.
+    SLEEVE_RANK_BUFFER = 2
     LOOKBACK_BARS = 126        # ~6 months of trading days
     REGIME_SMA_BARS = 200
     DISASTER_STOP_PCT = 20.0
@@ -2285,11 +2290,37 @@ class MomentumStrategy:
         return rows
 
     @classmethod
-    def select_sleeve(cls, ranked: List[Dict[str, Any]], regime: str, top_n: Optional[int] = None) -> List[str]:
+    def rank_buffer(cls) -> int:
+        """Rank hysteresis for the sleeve: `strategy.sleeve_rank_buffer` in trader.json (0-10), else the default."""
+        try:
+            val = (load_trader_config().get("strategy") or {}).get("sleeve_rank_buffer")
+            if val is not None and not isinstance(val, bool) and 0 <= int(val) <= 10:
+                return int(val)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return cls.SLEEVE_RANK_BUFFER
+
+    @classmethod
+    def select_sleeve(cls, ranked: List[Dict[str, Any]], regime: str, top_n: Optional[int] = None,
+                      incumbents: Optional[List[str]] = None, buffer: int = 0) -> List[str]:
+        """Top-N eligible names. With `buffer` > 0, a name already held (`incumbents`) is kept while it is
+        still eligible and ranked within top_n + buffer; the remaining slots go to the best-ranked others."""
         if regime != "BULL":
             return []
         n = top_n or cls.SLEEVE_TOP_N
-        return [r["symbol"] for r in ranked if r["eligible"]][:n]
+        eligible = [r["symbol"] for r in ranked if r["eligible"]]
+        held = {s.upper() for s in (incumbents or [])}
+        keep = [s for s in eligible[:n + max(0, int(buffer))] if s in held][:n] if buffer and held else []
+        chosen = set(keep + [s for s in eligible if s not in keep][:n - len(keep)])
+        return [s for s in eligible if s in chosen]   # rank order (buys are placed in this order)
+
+    @classmethod
+    def sleeve_incumbents(cls, positions: Dict[str, Any], hold: Optional[set] = None) -> List[str]:
+        """Currently held sleeve names: everything except the core ETFs and hold-listed symbols."""
+        hold = {h.upper() for h in (hold or set())}
+        return sorted(s.upper() for s, p in positions.items()
+                      if s.upper() not in cls.CORE_SYMBOLS and s.upper() not in hold
+                      and float((p or {}).get("quantity", 0) or 0) > 0)
 
     @classmethod
     def load_hold_list(cls) -> set:
@@ -3938,12 +3969,15 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
             return
         regime = MomentumStrategy.regime(spy_bars)
         ranked = MomentumStrategy.rank(bars)
-        targets = MomentumStrategy.select_sleeve(ranked, regime["regime"])
+        incumbents = MomentumStrategy.sleeve_incumbents(pos_map, hold)
+        rank_buffer = MomentumStrategy.rank_buffer()
+        targets = MomentumStrategy.select_sleeve(ranked, regime["regime"], incumbents=incumbents, buffer=rank_buffer)
         plan = MomentumStrategy.plan_rebalance(equity, cash, pos_map, targets, hold)
         state = {
             "month": month, "date": today, "dry_run": dry_run,
             "equity": round(equity, 2), "cash": round(cash, 2),
             "regime": regime, "targets": targets, "hold": sorted(hold),
+            "incumbents": incumbents, "rank_buffer": rank_buffer,
             "ranking": ranked[:10],
             "sells_pending": plan["sells"], "buys_pending": plan["buys"],
             "sells_done": [], "buys_done": [], "done": False,
@@ -4289,7 +4323,9 @@ def run_backtest(years: int = 5, start: Optional[str] = None, start_cash: float 
             as_of = {s: idx[s][d] for s in syms if d in idx[s]}
             regime = MomentumStrategy.regime(bars["SPY"], as_of=idx["SPY"][d])
             ranked = MomentumStrategy.rank({s: bars[s] for s in as_of}, as_of=as_of)
-            targets = MomentumStrategy.select_sleeve(ranked, regime["regime"], top_n) if sleeve else []
+            incumbents = [s for s in pos if s not in core]
+            targets = (MomentumStrategy.select_sleeve(ranked, regime["regime"], top_n, incumbents=incumbents,
+                                                      buffer=MomentumStrategy.rank_buffer()) if sleeve else [])
             pos_map = {s: {"quantity": p["qty"], "price": prices.get(s, p["entry"])} for s, p in pos.items()}
             plan = MomentumStrategy.plan_rebalance(eq, cash, pos_map, targets)
             for sl in plan["sells"]:

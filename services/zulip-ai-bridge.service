@@ -1,0 +1,33 @@
+[Unit]
+Description=Zulip <-> local ai agent bridge
+Documentation=file://%h/ai-buddy/docs/zulip_setup.md
+After=network-online.target
+Wants=network-online.target
+# Never stop retrying; RestartSteps/RestartMaxDelaySec below provide the backoff.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ai-buddy
+# ~/.local/bin must be on PATH so the bridge (and the agent it spawns) find `ai`.
+# install.sh prepends the directory of the python3 it pins below, if needed.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=BROWSER=none
+# Optional. systemd only reads plain KEY=value lines here; the `export KEY=...`
+# lines that ai-backend writes are ignored by systemd. That is fine: the bridge
+# loads ~/.local/share/ai/env itself at startup (process environment wins).
+EnvironmentFile=-%h/.local/share/ai/env
+# The interpreter must have the `zulip` package installed. install.sh replaces
+# `/usr/bin/env python3` with the absolute path of the python3 on your PATH.
+ExecStart=/usr/bin/env python3 %h/ai-buddy/zulip_ai_bridge.py
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
