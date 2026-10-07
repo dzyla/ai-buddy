@@ -156,3 +156,4 @@ dev/ai_backend_envscan*.py
 dev/triplescan.py
 dev/generate_*_report.py
 dev/test_zulip_send.py
+.superpowers/
