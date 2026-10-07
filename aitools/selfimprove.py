@@ -513,15 +513,49 @@ def _metrics_lesson_sync(min_fails=3):
                 counts[(t, sig, err[:160])] = counts.get((t, sig, err[:160]), 0) + 1
     except Exception:
         return []
-    created = []
+    # Aggregate per (tool, signature); keep one representative error text.
+    agg = {}
     for (t, sig, err), n in counts.items():
-        if n < min_fails:
-            continue
-        body = ("Metric-detected recurring failure (%dx so far): `%s` failed with:\n"                "> %s\n"                "This tool is flaky for this error — check '## FIX' lessons and "\
-                "show-metrics before retrying the same call." % (n, t or "?", err))
-        res = _append_lesson("PITFALL", t, sig, body)
-        if res is None:
-            break  # db locked/unwritable: don't wait once per lesson (session-recap is on ai's startup path)
+        e = agg.setdefault((t, sig), {"n": 0, "err": err, "best": 0})
+        e["n"] += n
+        if n > e["best"]:
+            e["best"], e["err"] = n, err
+    # Reinforce only on NEW evidence: a per-signature high-water mark of the metric failure count
+    # lives in state meta. Unchanged metrics => read-only (this runs on ai's startup path, so it
+    # must not take a write lock when nothing changed).
+    created = []
+    try:
+        with state._conn(read=True) as rc:
+            marks = {}
+            for (t, sig), e in agg.items():
+                if e["n"] < min_fails:
+                    continue
+                m = state._meta_get(rc, "metrics_hw:%s|%s" % (t, sig))
+                row = rc.execute("SELECT 1 FROM lessons WHERE kind='PITFALL' AND tool=? AND signature=?",
+                                 (t, sig)).fetchone()
+                marks[(t, sig)] = (int(m) if m is not None and str(m).isdigit() else None, row is not None)
+    except Exception:
+        return []
+    for (t, sig), (mark, exists) in marks.items():
+        e = agg[(t, sig)]
+        n = e["n"]
+        if exists and mark is not None and n <= mark:
+            continue  # nothing new
+        body = ("Metric-detected recurring failure (%dx so far): `%s` failed with:\n"
+                "> %s\n"
+                "This tool is flaky for this error — check '## FIX' lessons and "
+                "show-metrics before retrying the same call." % (n, t or "?", e["err"]))
+        if exists and mark is None:
+            res = False  # lesson predates the mark: record the mark, don't count old evidence again
+        else:
+            res = _append_lesson("PITFALL", t, sig, body)
+            if res is None:
+                break  # db locked/unwritable: don't wait once per lesson
+        try:
+            with state._conn() as wc, state._tx(wc):
+                state._meta_set(wc, "metrics_hw:%s|%s" % (t, sig), n)
+        except Exception:
+            break
         if res:
             created.append(sig)
     return created

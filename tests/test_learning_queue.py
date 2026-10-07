@@ -244,16 +244,68 @@ def _metrics(tmp_path, monkeypatch):
             f.write(json.dumps({"tool": "flaky", "success": False, "error": "boom happened"}) + "\n")
 
 
-def test_metrics_sync_proposes_then_reinforces(tmp_path, monkeypatch):
+def _append_metrics(tmp_path, n):
+    import json
+    with open(tmp_path / ".cache" / "ai" / "metrics.jsonl", "a") as f:
+        for _ in range(n):
+            f.write(json.dumps({"tool": "flaky", "success": False, "error": "boom happened"}) + "\n")
+
+
+def _changes():
+    c = state.connect(read=True)
+    try:
+        return c.execute("SELECT (SELECT count(*) FROM lessons), (SELECT sum(hits) FROM lessons), "
+                         "(SELECT group_concat(key||value) FROM meta)").fetchone()[:]
+    finally:
+        c.close()
+
+
+def test_metrics_sync_reinforces_only_on_new_evidence(tmp_path, monkeypatch):
     _metrics(tmp_path, monkeypatch)
     assert len(selfimprove._metrics_lesson_sync(min_fails=3)) == 1
     row = _row("PITFALL", "flaky")
     assert row["status"] == "proposed" and state.lessons_render() == ""
     learning.approve(row["id"], ttl_days=5)
     before = _status(row["id"])
-    assert selfimprove._metrics_lesson_sync(min_fails=3) == []  # nothing new, but reinforced
+    snap = _changes()
+    for _ in range(3):  # unchanged metrics: nothing happens
+        assert selfimprove._metrics_lesson_sync(min_fails=3) == []
+    after = _status(row["id"])
+    assert (after["hits"], after["expires"]) == (before["hits"], before["expires"])
+    assert _changes() == snap
+    _append_metrics(tmp_path, 2)  # new evidence: reinforce exactly once
+    assert selfimprove._metrics_lesson_sync(min_fails=3) == []
+    assert selfimprove._metrics_lesson_sync(min_fails=3) == []
     after = _status(row["id"])
     assert after["hits"] == before["hits"] + 1 and after["expires"] > before["expires"]
+
+
+def test_metrics_sync_unchanged_takes_no_write_lock(tmp_path, monkeypatch):
+    _metrics(tmp_path, monkeypatch)
+    selfimprove._metrics_lesson_sync(min_fails=3)
+    holder = state.connect()
+    holder.execute("BEGIN IMMEDIATE")  # another process holds the write lock
+    try:
+        t0 = time.monotonic()
+        with state.lock_budget(0.3):
+            assert selfimprove._metrics_lesson_sync(min_fails=3) == []
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_expired_metric_lesson_requeued_only_after_new_evidence(tmp_path, monkeypatch):
+    _metrics(tmp_path, monkeypatch)
+    selfimprove._metrics_lesson_sync(min_fails=3)
+    lid = _row("PITFALL", "flaky")["id"]
+    learning.approve(lid, ttl_days=1, now=time.time() - 5 * DAY)
+    learning.expire()
+    selfimprove._metrics_lesson_sync(min_fails=3)
+    assert _status(lid)["status"] == "expired"
+    _append_metrics(tmp_path, 1)
+    selfimprove._metrics_lesson_sync(min_fails=3)
+    assert _status(lid)["status"] == "proposed"
 
 
 def test_legacy_null_expiry_backfilled_on_touch_and_prune():
