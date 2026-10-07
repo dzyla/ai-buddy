@@ -120,7 +120,7 @@ def tool_result_is_error(content):
 # ── environment ──────────────────────────────────────────────────────────────
 def agent_env(home, base_url, model, api_key, engine=None, extra=None):
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("INFER_", "MOCK_")) and k not in SCRUB}
+           if not (k.startswith(("INFER_", "MOCK_")) and k != "INFER_TOOL_SERVER") and k not in SCRUB}
     env.update({
         "HOME": home,
         "INFER_BASE_URL": base_url,

@@ -81,7 +81,7 @@ def _run_cmd_in(repo, tmp_path, args, extra_env=None):
     home.mkdir(exist_ok=True)
     with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq),
                     MOCK_TASK_COMPLETE="done") as srv:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_")}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
         env.update(HOME=str(home), INFER_BASE_URL=srv.base_url, INFER_API_KEY="t",
                    INFER_MODEL="mock", INFER_TOOL_CHOICE="auto", INFER_AUTO_APPROVE="1")
         env.update(extra_env or {})

@@ -10,4 +10,7 @@ def suppress_browser_and_remote_auth():
     os.environ["CI"] = "1"
     os.environ["DISPLAY"] = ""
     os.environ["INFER_TEST_MODE"] = "1"
+    # Never reach/spawn the persistent tool server from a test (module/session-scoped fixtures run
+    # before tests/conftest.py's per-test setting); tests/test_tool_server.py opts in explicitly.
+    os.environ["INFER_TOOL_SERVER"] = "0"
     os.environ.pop("WSL_DISTRO_NAME", None)

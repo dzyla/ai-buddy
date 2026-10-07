@@ -67,7 +67,7 @@ def isolate_embedder(monkeypatch):
 @pytest.fixture(autouse=True)
 def no_tool_server(monkeypatch):
     """Never let a test's `ai` run reach (or spawn) the persistent tool server in the real runtime
-    dir: INFER_TOOL_SERVER=0 for every test. Helpers that scrub INFER_* still inherit
-    PYTEST_CURRENT_TEST, which the C client also treats as "off" unless INFER_TOOL_SERVER=1.
+    dir: INFER_TOOL_SERVER=0 for every test (the root conftest.py also sets it session-wide, for
+    module-scoped fixtures). Helpers that scrub INFER_* keep INFER_TOOL_SERVER.
     tests/test_tool_server.py opts in with a private XDG_RUNTIME_DIR and HOME."""
     monkeypatch.setenv("INFER_TOOL_SERVER", "0")

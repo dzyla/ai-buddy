@@ -65,7 +65,7 @@ def mock_run(tmp_path_factory):
     if not os.path.exists(os.path.join(REPO, "ai")):
         pytest.skip("ai binary not built")
     out = tmp_path_factory.mktemp("evals") / "out.json"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
     r = subprocess.run([sys.executable, RUNNER, "--mock", "--json", str(out)], cwd="/",
                        env=env, capture_output=True, text=True, timeout=600)
     return r, out
@@ -172,7 +172,7 @@ def test_mock_sequence_conversion(rev):
 def test_engine_py_refused_until_python_engine_exists(rev, tmp_path):
     if os.path.isdir(os.path.join(REPO, "agent")):
         pytest.skip("Python engine present (Task 8)")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
     r = subprocess.run([sys.executable, RUNNER, "--mock", "--engine", "py"], cwd="/", env=env,
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 2
@@ -196,7 +196,7 @@ def _run_custom(tmp_path, tasks):
     for i, t in enumerate(tasks, 1):
         (tdir / f"{i:02d}_{t['id']}.json").write_text(json.dumps(t))
     out = tmp_path / "out.json"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
     r = subprocess.run([sys.executable, RUNNER, "--mock", "--tasks-dir", str(tdir),
                         "--json", str(out)], cwd="/", env=env, capture_output=True, text=True,
                        timeout=300)

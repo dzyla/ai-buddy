@@ -45,8 +45,6 @@ static int tc_enabled(void)
 {
     const char *v = getenv("INFER_TOOL_SERVER");
     if (v && strcmp(v, "0") == 0) return 0;
-    /* Test runs never reach a real per-user server unless they opt in explicitly. */
-    if (getenv("PYTEST_CURRENT_TEST") && !(v && strcmp(v, "1") == 0)) return 0;
     return g_script[0] != '\0';
 }
 
@@ -99,11 +97,47 @@ static int tc_connect(const char *path)
     return fd;
 }
 
-/* Start `python3 <script> serve` fully detached: double fork + setsid, stdio on /dev/null
- * (stderr appended to server.log next to the socket), cwd /. The intermediate child is reaped
- * here, so no zombie is left; the server is reparented to init. */
-static void tc_spawn(const char *sock_path)
+/* systemd-run on PATH and a reachable systemd user instance ($XDG_RUNTIME_DIR/bus or
+ * .../systemd/private)? Then the server is started in its own transient scope, so it does not die
+ * with the cgroup of whatever spawned it (zulip-ai-bridge.service restart, a oneshot unit ending).
+ * INFER_TOOL_SERVER_SCOPE=0 disables this. Writes systemd-run's path to `out`. */
+static int tc_scope_available(char *out, size_t n)
 {
+    const char *v = getenv("INFER_TOOL_SERVER_SCOPE");
+    if (v && strcmp(v, "0") == 0) return 0;
+    const char *xdg = getenv("XDG_RUNTIME_DIR");
+    char probe[PATH_MAX];
+    if (!xdg || !*xdg) return 0;
+    snprintf(probe, sizeof(probe), "%s/bus", xdg);
+    if (access(probe, F_OK) != 0) {
+        snprintf(probe, sizeof(probe), "%s/systemd/private", xdg);
+        if (access(probe, F_OK) != 0) return 0;
+    }
+    const char *path = getenv("PATH");
+    if (!path) return 0;
+    const char *p = path;
+    while (*p) {
+        const char *c = strchr(p, ':');
+        size_t len = c ? (size_t)(c - p) : strlen(p);
+        if (len > 0 && len < n - 16) {
+            snprintf(out, n, "%.*s/systemd-run", (int)len, p);
+            if (access(out, X_OK) == 0) return 1;
+        }
+        if (!c) break;
+        p = c + 1;
+    }
+    return 0;
+}
+
+/* Start `python3 <script> serve` fully detached: double fork + setsid, stdio on /dev/null
+ * (stderr appended to server.log next to the socket), cwd /. With `scope`, the grandchild execs
+ * `systemd-run --user --scope --collect --quiet --unit=ai-tools-<uid>-<ts>-<pid> -- python3 ...`,
+ * which moves itself into a new transient scope and then execs the server. The intermediate
+ * child is reaped here, so no zombie is left; the server is reparented to init. */
+static void tc_spawn(const char *sock_path, const char *scope)
+{
+    char unit[96];
+    snprintf(unit, sizeof(unit), "--unit=ai-tools-%u-%ld-%d", (unsigned)getuid(), (long)time(NULL), (int)getpid());
     char dir[PATH_MAX], logp[PATH_MAX + 16];
     snprintf(dir, sizeof(dir), "%s", sock_path);
     char *slash = strrchr(dir, '/');
@@ -141,7 +175,11 @@ static void tc_spawn(const char *sock_path)
         if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
         for (int fd = 3; fd < maxfd; fd++) close(fd);
         if (chdir("/") != 0) { /* ignore */ }
-        execlp("python3", "python3", g_script, "serve", (char *)NULL);
+        if (scope)
+            execl(scope, "systemd-run", "--user", "--scope", "--collect", "--quiet", unit, "--",
+                  "python3", g_script, "serve", (char *)NULL);
+        else
+            execlp("python3", "python3", g_script, "serve", (char *)NULL);
         _exit(127);
     }
     while (waitpid(p, NULL, 0) < 0 && errno == EINTR) {}
@@ -192,33 +230,28 @@ static char *tc_build_request(const char *op, const char *server, const char *to
     return s;
 }
 
-static int tc_send_all(int fd, const char *buf, size_t len)
-{
-    while (len > 0) {
-        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        buf += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
+enum { EX_OK = 0, EX_NOT_SENT = 1, EX_LOST = 2, EX_INTERRUPTED = 3, EX_DEADLINE = 4 };
 
-enum { EX_OK = 0, EX_IO = 1, EX_INTERRUPTED = 2, EX_DEADLINE = 3 };
-
-/* Send one request line and read one response line. Closes fd. */
+/* Send one request line (one buffer, so a request is never delivered without its newline; the
+ * server ignores an unterminated line) and read one response line. Closes fd.
+ * EX_NOT_SENT: the server cannot have run it: the send failed (the final "\n" never left us), or
+ * the connection was reset before any answer byte. On AF_UNIX a reset means the server closed
+ * with our request still unread in its receive queue (a dying listener's backlog, or a server
+ * killed before reading); a server that read the line and then died gives EOF instead.
+ * EX_LOST: the request was consumed and no answer came: the call may have run. */
 static int tc_exchange(int fd, const char *req, int timeout_s, char **line)
 {
     *line = NULL;
-    if (tc_send_all(fd, req, strlen(req)) != 0 || tc_send_all(fd, "\n", 1) != 0) {
-        close(fd);
-        return EX_IO;
+    size_t rl = strlen(req), sent = 0;
+    while (sent < rl) {
+        ssize_t n = send(fd, req + sent, rl - sent, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return EX_NOT_SENT; }
+        sent += (size_t)n;
     }
     size_t cap = 65536, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { close(fd); return EX_IO; }
+    if (!buf) { close(fd); return EX_LOST; }
     double deadline = tc_now() + (timeout_s > 0 ? timeout_s : 120) + 15;
     for (;;) {
         if (g_interrupt && g_interrupt()) { free(buf); close(fd); return EX_INTERRUPTED; }
@@ -226,17 +259,18 @@ static int tc_exchange(int fd, const char *req, int timeout_s, char **line)
         struct pollfd pfd = {fd, POLLIN, 0};
         int r = poll(&pfd, 1, 100);
         if (r < 0 && errno == EINTR) continue;
-        if (r < 0) { free(buf); close(fd); return EX_IO; }
+        if (r < 0) { free(buf); close(fd); return EX_LOST; }
         if (r == 0) continue;
         if (len + 65536 + 1 > cap) {
             cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); close(fd); return EX_IO; }
+            if (!nb) { free(buf); close(fd); return EX_LOST; }
             buf = nb;
         }
         ssize_t n = recv(fd, buf + len, cap - len - 1, 0);
         if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (n <= 0) { free(buf); close(fd); return EX_IO; }
+        if (n < 0 && errno == ECONNRESET && len == 0) { free(buf); close(fd); return EX_NOT_SENT; }
+        if (n <= 0) { free(buf); close(fd); return EX_LOST; }
         len += (size_t)n;
         buf[len] = '\0';
         if (memchr(buf + len - n, '\n', (size_t)n)) break;
@@ -252,6 +286,29 @@ static const char *tc_str(cJSON *o, const char *k)
     return cJSON_IsString(v) ? v->valuestring : NULL;
 }
 
+/* Answers the server gives BEFORE running anything (aitools/server.py REFUSALS): only these,
+ * a failed connect and an unsent request may fall back to popen. */
+static int tc_refusal(const char *err)
+{
+    static const char *refusals[] = {"stale", "mismatch", "unsupported", "bad request"};
+    for (size_t i = 0; err && i < sizeof(refusals) / sizeof(refusals[0]); i++)
+        if (strcmp(err, refusals[i]) == 0) return 1;
+    return 0;
+}
+
+static int tc_start(const char *path)
+{
+    char sr[PATH_MAX];
+    if (tc_scope_available(sr, sizeof(sr))) {
+        tc_spawn(path, sr);
+        int fd = tc_wait_connect(path, TC_SPAWN_WAIT_MS);
+        if (fd >= 0) return fd;
+        /* systemd-run refused (no session bus, unit clash...): plain detached spawn */
+    }
+    tc_spawn(path, NULL);
+    return tc_wait_connect(path, TC_SPAWN_WAIT_MS);
+}
+
 int toolclient_call(const char *op, const char *server, const char *tool,
                     const char *args_json, int timeout_s, char **out)
 {
@@ -259,8 +316,15 @@ int toolclient_call(const char *op, const char *server, const char *tool,
     if (!op || !tc_enabled()) return TOOLCLIENT_UNAVAILABLE;
     char path[PATH_MAX];
     if (tc_socket_path(path, sizeof(path)) != 0) return TOOLCLIENT_UNAVAILABLE;
-    char *req = tc_build_request(op, server, tool, args_json, timeout_s);
-    if (!req) return TOOLCLIENT_UNAVAILABLE;
+    char *body = tc_build_request(op, server, tool, args_json, timeout_s);
+    if (!body) return TOOLCLIENT_UNAVAILABLE;
+    size_t bl = strlen(body);
+    char *req = malloc(bl + 2);
+    if (!req) { free(body); return TOOLCLIENT_UNAVAILABLE; }
+    memcpy(req, body, bl);
+    req[bl] = '\n';
+    req[bl + 1] = '\0';
+    free(body);
 
     int rc = TOOLCLIENT_UNAVAILABLE;
     int spawned = 0;
@@ -272,38 +336,39 @@ int toolclient_call(const char *op, const char *server, const char *tool,
             if (spawned || g_spawn_failed || g_spawns >= TC_MAX_SPAWNS) break;
             spawned = 1;
             g_spawns++;
-            tc_spawn(path);
-            fd = tc_wait_connect(path, TC_SPAWN_WAIT_MS);
+            fd = tc_start(path);
             if (fd < 0) { g_spawn_failed = 1; break; }
         }
         char *line = NULL;
         int ex = tc_exchange(fd, req, timeout_s, &line);
+        if (ex == EX_NOT_SENT) continue; /* nothing ran: like a failed connect (respawn once) */
         if (ex == EX_INTERRUPTED) { rc = TOOLCLIENT_INTERRUPTED; break; }
         if (ex == EX_DEADLINE) { *out = strdup(""); rc = TOOLCLIENT_TIMEOUT; break; }
-        if (ex != EX_OK) break; /* connection lost before an answer: popen fallback */
+        if (ex != EX_OK) { rc = TOOLCLIENT_LOST; break; }
         cJSON *resp = cJSON_Parse(line);
         free(line);
-        if (!resp) break;
+        if (!resp) { rc = TOOLCLIENT_LOST; break; }
         cJSON *ok = cJSON_GetObjectItemCaseSensitive(resp, "ok");
         const char *err = tc_str(resp, "error");
         const char *res = tc_str(resp, "result");
         const char *serr = tc_str(resp, "stderr");
-        if (cJSON_IsTrue(ok) || (err && strcmp(err, "timeout") == 0)) {
-            if (serr && *serr && strcmp(op, "render") != 0) {
-                fputs(serr, stderr);
-                fflush(stderr);
-            }
-            *out = strdup(res ? res : "");
-            rc = cJSON_IsTrue(ok) ? TOOLCLIENT_OK : TOOLCLIENT_TIMEOUT;
+        if (!cJSON_IsTrue(ok) && tc_refusal(err)) {
+            int stale = strcmp(err, "stale") == 0;
             cJSON_Delete(resp);
-            break;
+            if (!stale) break; /* mismatch / unsupported / bad request: nothing ran, popen */
+            continue;          /* the old server already unlinked its socket: respawn */
         }
-        int stale = err && strcmp(err, "stale") == 0;
-        int interrupted = err && strcmp(err, "interrupted") == 0;
+        if (serr && *serr && strcmp(op, "render") != 0) {
+            fputs(serr, stderr);
+            fflush(stderr);
+        }
+        *out = strdup(res ? res : "");
+        if (cJSON_IsTrue(ok)) rc = TOOLCLIENT_OK;
+        else if (err && strcmp(err, "timeout") == 0) rc = TOOLCLIENT_TIMEOUT;
+        else if (err && strcmp(err, "interrupted") == 0) rc = TOOLCLIENT_INTERRUPTED;
+        else rc = TOOLCLIENT_LOST; /* e.g. "server error": the call may have run */
         cJSON_Delete(resp);
-        if (interrupted) { rc = TOOLCLIENT_INTERRUPTED; break; }
-        if (!stale) break; /* mismatch / unsupported / bad request: popen */
-        /* stale: the old server already unlinked its socket; the next attempt respawns. */
+        break;
     }
     free(req);
     return rc;

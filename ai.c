@@ -2877,7 +2877,8 @@ static int tool_command_timeout(void) {
 
 /* `ai_mcp.py call-tool <server> <tool> <args>` through the tool server. Returns the tool's stdout
  * (malloc'd), or NULL when the server is unavailable and nothing ran (caller uses popen). A call
- * that times out or is interrupted is NOT re-run: it gets the same text the popen path gives. */
+ * that times out, is interrupted, or whose connection was lost after the request was delivered is
+ * NOT re-run: it gets the popen path's text, or a model-visible "connection lost" error. */
 static char *tool_server_call_tool(const char *server, const char *tool, const char *args) {
     int started_raw = 0;
     if (!raw_mode_active && isatty(STDIN_FILENO)) {
@@ -2905,9 +2906,16 @@ static char *tool_server_call_tool(const char *server, const char *tool, const c
         return res ? res : strdup(msg);
     }
     if (rc == TOOLCLIENT_INTERRUPTED) {
-        free(out);
+        /* Keep the partial output, like the popen path. */
         fprintf(stderr, "\n\033[1;31m[ai] Tool execution interrupted by ESC key.\033[0m\n");
-        return strdup("");
+        return out ? out : strdup("");
+    }
+    if (rc == TOOLCLIENT_LOST) {
+        /* The request reached the server: re-running it via popen could repeat side effects. */
+        free(out);
+        fprintf(stderr, "\n\033[1;31m[ai] Tool server connection lost during %s.\033[0m\n", tool);
+        return strdup("Error: tool server connection lost; the tool may or may not have run "
+                      "\xe2\x80\x94 check before retrying.");
     }
     free(out);
     return NULL;

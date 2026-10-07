@@ -112,7 +112,7 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     # ~/.local/share/ai/env, so they can't override the mock URL below and hang
     # offline tests. Then apply the variables we explicitly control.
     for k in list(env):
-        if k.startswith("INFER_") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
+        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
                                            "LD_LIBRARY_PATH", "LLAMA_CTX_SIZE",
                                            "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
             env.pop(k, None)
@@ -453,7 +453,7 @@ def _sandbox_run(tmp_path, base_url, args, extra_env=None, timeout=120):
             os.symlink(os.path.join(REPO, f), work / f)
     env = os.environ.copy()
     for k in list(env):
-        if k.startswith("INFER_") or k in ("LLAMA_CTX_SIZE",):
+        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("LLAMA_CTX_SIZE",):
             env.pop(k, None)
     env.update({"HOME": str(home), "INFER_BASE_URL": base_url, "INFER_API_KEY": "t",
                 "INFER_MODEL": "mock", "INFER_TOOL_CHOICE": "auto", "INFER_AUTO_APPROVE": "1"})

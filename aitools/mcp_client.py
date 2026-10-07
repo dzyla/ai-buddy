@@ -342,6 +342,10 @@ def call_tool(server_name, cfg, tool_name, arguments):
 
 
 # ── Persistent sessions (the tool server keeps one stdio session per MCP server) ──
+class McpSendError(ConnectionError):
+    """The request could not be written: the MCP server never received it (safe to retry)."""
+
+
 class McpSession:
     """One running MCP server with a reader thread that routes responses by JSON-RPC id, so
     concurrent callers can share it and a dead server is noticed at once (EOF)."""
@@ -349,6 +353,8 @@ class McpSession:
     def __init__(self, name, cfg, environ=None, init_timeout=15.0):
         self.name = name
         self.cfg_key = json.dumps(cfg, sort_keys=True)
+        self.inflight = 0      # McpPool bookkeeping (guarded by the pool lock)
+        self.retired = False   # replaced in the pool; closed when the last in-flight call ends
         self.proc = start_server(cfg, environ)
         if not self.proc:
             raise ConnectionError("Failed to start server")
@@ -390,9 +396,11 @@ class McpSession:
                 self.proc.stdin.flush()
             except (OSError, ValueError) as e:
                 self.dead = True
-                raise ConnectionError(f"Failed to send request to MCP server: {e}")
+                raise McpSendError(f"Failed to send request to MCP server: {e}")
 
     def request(self, method, params, timeout):
+        """Send one request and wait for its response. McpSendError = never delivered;
+        ConnectionError (EOF) / TimeoutError = delivered, outcome unknown."""
         with self._wlock:
             rid = self._next
             self._next += 1
@@ -422,51 +430,75 @@ class McpSession:
 
 class McpPool:
     """Server name -> McpSession. A session is (re)started on first use, when its process died
-    (EOF) or timed out, or when the server's config changed. Disabled servers never reach here
-    (load_config drops them)."""
+    (EOF) or timed out, or when the server's config changed. A session that still has calls in
+    flight is never closed under them: a replaced one is retired and closed by its last caller.
+    Starting a session (initialize, up to 15 s) holds only that server name's lock, so a slow
+    server never blocks calls to the others. Disabled servers never reach here (load_config
+    drops them)."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._sessions = {}
+        self._name_locks = {}
 
-    def _get(self, name, cfg, environ):
+    def _acquire(self, name, cfg, environ):
+        """(session, fresh) with session.inflight incremented."""
         key = json.dumps(cfg, sort_keys=True)
         with self._lock:
-            sess = self._sessions.get(name)
-            if sess is not None and (not sess.alive() or sess.cfg_key != key):
-                sess.close()
-                sess = None
-            if sess is None:
-                sess = McpSession(name, cfg, environ)
-                self._sessions[name] = sess
-                return sess, True
-            return sess, False
+            nlock = self._name_locks.setdefault(name, threading.Lock())
+        with nlock:
+            with self._lock:
+                sess = self._sessions.get(name)
+                if sess is not None and sess.alive() and sess.cfg_key == key:
+                    sess.inflight += 1
+                    return sess, False
+                if sess is not None:
+                    self._retire_locked(name, sess)
+            new = McpSession(name, cfg, environ)  # outside the pool lock
+            with self._lock:
+                new.inflight += 1
+                self._sessions[name] = new
+            return new, True
 
-    def _drop(self, name, sess):
+    def _retire_locked(self, name, sess):
+        if self._sessions.get(name) is sess:
+            del self._sessions[name]
+        sess.retired = True
+        if sess.inflight == 0:
+            sess.close()
+
+    def _release(self, sess, drop=False):
         with self._lock:
-            if self._sessions.get(name) is sess:
-                del self._sessions[name]
-        sess.close()
+            sess.inflight -= 1
+            if drop:
+                self._retire_locked(sess.name, sess)
+            elif sess.retired and sess.inflight == 0:
+                sess.close()
 
     def call_tool(self, name, cfg, tool_name, arguments, timeout=60.0, environ=None):
         """Like call_tool(): the MCP result dict, or {"error": ...}. Raises TimeoutError (the
-        session is restarted on the next call). A reused session that died before answering is
-        restarted and the call retried once."""
+        session is restarted on the next call). Retried once on a fresh session ONLY when the
+        request could not be written (McpSendError: the server never saw it); a server that died
+        after receiving it is never asked twice."""
         for attempt in (0, 1):
             try:
-                sess, fresh = self._get(name, cfg, environ)
+                sess, fresh = self._acquire(name, cfg, environ)
             except Exception as e:
                 return {"error": str(e)}
             try:
                 resp = sess.request("tools/call", {"name": tool_name, "arguments": arguments}, timeout)
             except TimeoutError:
-                self._drop(name, sess)
+                self._release(sess, drop=True)
                 raise
-            except ConnectionError as e:
-                self._drop(name, sess)
+            except McpSendError as e:
+                self._release(sess, drop=True)
                 if attempt == 0 and not fresh:
                     continue
                 return {"error": str(e)}
+            except ConnectionError as e:
+                self._release(sess, drop=True)
+                return {"error": str(e)}
+            self._release(sess)
             if "error" in resp:
                 return {"error": str(resp["error"])}
             return resp.get("result", {})

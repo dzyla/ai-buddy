@@ -89,7 +89,7 @@ CLI_CASES = [
 
 
 def _env(home):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
     env.update(HOME=str(home), INFER_NO_MCP="1", PYTHONDONTWRITEBYTECODE="1")
     return env
 

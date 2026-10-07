@@ -354,8 +354,10 @@ def test_embed_queue_drained_when_idle(tmp_path):
         assert c.execute("SELECT count(*) FROM embed_queue").fetchone()[0] == 1
         c.close()
         s = Srv(tmp_path, extra_args=("--drain-idle", "1"),
-                extra_env={"INFER_EMBED_AUTODRAIN": "1", "AI_EMBED_URL": emb.url})
+                extra_env={"INFER_EMBED_AUTODRAIN": "0", "AI_EMBED_URL": "http://127.0.0.1:9"})
         try:
+            # Drain settings come from the callers' requests, not from the server's own env.
+            assert s.req("hello", env=dict(s.env, INFER_EMBED_AUTODRAIN="1", AI_EMBED_URL=emb.url))["ok"]
             deadline = time.time() + 20
             n = 0
             while time.time() < deadline:
@@ -380,8 +382,13 @@ def test_no_drain_when_disabled(tmp_path):
     try:
         state.memory_add("Something to embed")
         s = Srv(tmp_path, extra_args=("--drain-idle", "1"),
-                extra_env={"INFER_EMBED_AUTODRAIN": "0", "AI_EMBED_URL": emb.url})
+                extra_env={"INFER_EMBED_AUTODRAIN": "1", "AI_EMBED_URL": emb.url})
         try:
+            time.sleep(2)  # no request yet: no drain settings, no drain
+            c = state.connect(read=True)
+            assert c.execute("SELECT count(*) FROM vectors").fetchone()[0] == 0
+            c.close()
+            assert s.req("hello", env=dict(s.env, INFER_EMBED_AUTODRAIN="0", AI_EMBED_URL=emb.url))["ok"]
             time.sleep(3)
             c = state.connect(read=True)
             assert c.execute("SELECT count(*) FROM vectors").fetchone()[0] == 0
@@ -495,7 +502,7 @@ def test_binary_uses_server_and_survives_server_kill(sandbox, tmp_path):
         reqs = m.requests()
     assert r.returncode == 0, r.stderr[-2000:]
     tools = _tool_msgs(reqs)
-    assert any("ALPHA" in t for t in tools) and any("BRAVO" in t for t in tools)
+    assert any("ALPHA" in t for t in tools) and any("BRAVO" in t for t in tools), (tools, r.stderr[-1500:])
     pid = _server_pid(home)  # respawned after the kill
     assert pid and os.path.exists(os.path.join(run, "ai", "tools.sock"))
 
@@ -592,3 +599,127 @@ def test_binary_replaces_a_stale_server(sandbox, tmp_path):
         if old.poll() is None:
             old.kill()
             old.wait()
+
+
+# ── fix round 1: no double execution, pool safety, scope spawn ──────────────
+def test_unterminated_request_is_not_executed(srv, tmp_path):
+    s = srv()
+    target = tmp_path / "written.txt"
+    req = {"id": 1, "op": "call", "server": "write_file", "tool": "write_file", "cwd": str(tmp_path),
+           "env": s.env, "args": json.dumps({"path": str(target), "content": "x"})}
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.connect(s.sock)
+    c.sendall(json.dumps(req).encode())  # no newline: a client that died mid-send
+    c.shutdown(socket.SHUT_WR)
+    c.settimeout(5)
+    assert c.recv(100) == b""
+    c.close()
+    time.sleep(0.3)
+    assert not target.exists()
+
+
+def test_mcp_call_not_resent_after_server_died_mid_call(srv, tmp_path):
+    pidfile, effect = tmp_path / "pids", tmp_path / "effect"
+    s = srv()
+    _write_mcp_config(s.home, pidfile)
+    assert s.call("fake", "echo", {"text": "warm"})["result"] == "warm\n"  # the session is reused below
+    r = s.call("fake", "crash", {"file": str(effect)})
+    assert r["ok"] and r["result"].startswith("Error:")
+    assert effect.read_text() == "ran\n"  # executed exactly once, never re-sent
+    assert s.call("fake", "echo", {"text": "after"})["result"] == "after\n"
+
+
+def _two_configs(tmp_path, s):
+    envs = []
+    for tag in ("a", "b"):
+        cfg = tmp_path / ("mcp_%s.json" % tag)
+        cfg.write_text(json.dumps({"mcpServers": {"fake": {
+            "command": sys.executable, "args": [FAKE_MCP],
+            "env": {"FAKE_MCP_PIDFILE": str(tmp_path / ("pids_" + tag))}}}}))
+        envs.append(dict(s.env, INFER_MCP_CONFIG=str(cfg)))
+    return envs
+
+
+def test_config_change_never_closes_a_session_under_a_call(srv, tmp_path):
+    s = srv()
+    env_a, env_b = _two_configs(tmp_path, s)
+    out = {}
+    t = threading.Thread(target=lambda: out.update(a=s.call("fake", "sleep", {"seconds": 2}, env=env_a)))
+    t.start()
+    time.sleep(0.8)  # A's call is in flight on config A's session
+    assert s.call("fake", "echo", {"text": "b"}, env=env_b)["result"] == "b\n"  # replaces the session
+    t.join()
+    assert out["a"]["ok"] and out["a"]["result"] == "slept\n"
+
+
+def test_slow_mcp_start_does_not_block_other_servers(srv, tmp_path):
+    s = srv()
+    cfg = s.home / ".config" / "ai"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "mcp.json").write_text(json.dumps({"mcpServers": {
+        "slow": {"command": sys.executable, "args": [FAKE_MCP], "env": {"FAKE_MCP_START_DELAY": "3"}},
+        "fast": {"command": sys.executable, "args": [FAKE_MCP]}}}))
+    assert s.call("fast", "echo", {"text": "warm"})["result"] == "warm\n"
+    out = {}
+    t = threading.Thread(target=lambda: out.update(slow=s.call("slow", "echo", {"text": "s"})))
+    t.start()
+    time.sleep(0.3)
+    t0 = time.time()
+    assert s.call("fast", "echo", {"text": "f"})["result"] == "f\n"
+    assert time.time() - t0 < 1.0
+    t.join()
+    assert out["slow"]["result"] == "s\n"
+
+
+def test_binary_never_reruns_a_call_whose_server_died(sandbox, tmp_path):
+    """C1: the server is SIGKILLed while a side-effecting call runs; the model sees the
+    "connection lost" error and the call is not re-run through popen."""
+    home, work, run = sandbox
+    effect = tmp_path / "effect.txt"
+    code = "open(%r, 'a').write('ran\\n')\nimport time\ntime.sleep(6)" % str(effect)
+    seq = [{"id": "p1", "type": "function",
+            "function": {"name": "python_playground", "arguments": json.dumps({"code": code})}}]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as m:
+        p = subprocess.Popen([AI_BIN, "-q", "go"], cwd=str(work), stdin=subprocess.DEVNULL,
+                             env=_bin_env(home, run, m.base_url, INFER_TOOL_SERVER="1"),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 30
+        while time.time() < deadline and not (effect.exists() and effect.read_text()):
+            time.sleep(0.05)
+        os.kill(_server_pid(home), signal.SIGKILL)
+        _, err = p.communicate(timeout=60)
+        reqs = m.requests()
+    assert p.returncode == 0, err[-2000:]
+    time.sleep(1)
+    assert effect.read_text() == "ran\n"
+    assert any("tool server connection lost" in t for t in _tool_msgs(reqs))
+
+
+def test_binary_spawns_server_in_systemd_scope(sandbox, tmp_path):
+    """I2: with a systemd user instance reachable, the server is started via
+    `systemd-run --user --scope --collect --unit=ai-tools-<uid>-...` (stubbed here)."""
+    home, work, run = sandbox
+    open(os.path.join(run, "bus"), "w").close()  # "a user bus is reachable"
+    stub_dir = tmp_path / "stubbin"
+    stub_dir.mkdir()
+    log = tmp_path / "systemd-run.log"
+    stub = stub_dir / "systemd-run"
+    stub.write_text('#!/bin/sh\nprintf "%%s\\n" "$@" > %s\n'
+                    'while [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n' % log)
+    stub.chmod(0o755)
+    (work / "a.txt").write_text("ALPHA\n")
+    env = _bin_env(home, run, "", INFER_TOOL_SERVER="1")
+    env["PATH"] = "%s:%s" % (stub_dir, env["PATH"])
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps([_read_call(1, "a.txt")])) as m:
+        env["INFER_BASE_URL"] = m.base_url
+        r = _run_ai(work, env)
+        reqs = m.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert any("ALPHA" in t for t in _tool_msgs(reqs))
+    args = log.read_text().split("\n")
+    assert args[:4] == ["--user", "--scope", "--collect", "--quiet"]
+    assert args[4].startswith("--unit=ai-tools-%d-" % os.getuid())
+    assert args[5:8] == ["--", "python3", os.path.realpath(SHIM)] and args[8] == "serve"
+    assert _server_pid(home)

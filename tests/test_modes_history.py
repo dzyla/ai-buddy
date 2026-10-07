@@ -93,7 +93,7 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     # Scrub inherited INFER_*/CUDA config so a developer's sourced backend can't
     # override the mock URL and hang offline tests.
     for k in list(env):
-        if k.startswith("INFER_") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
+        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
                                            "LD_LIBRARY_PATH", "LLAMA_CTX_SIZE",
                                            "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
             env.pop(k, None)

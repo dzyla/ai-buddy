@@ -2,8 +2,9 @@
 """Tiny stdio JSON-RPC MCP server for offline tool-server tests.
 
 Tools: `echo` (returns its `text` argument), `pid` (returns this process's PID), `sleep` (sleeps
-`seconds`, then returns "slept"). On start it appends its PID to $FAKE_MCP_PIDFILE (one per line),
-so a test can count how many times the pool started it.
+`seconds`, then returns "slept"), `crash` (appends a line to `file`, then dies without answering).
+On start it appends its PID to $FAKE_MCP_PIDFILE (one per line), so a test can count how many
+times the pool started it, then sleeps $FAKE_MCP_START_DELAY seconds (a slow start).
 """
 import json
 import os
@@ -17,6 +18,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "sleep", "description": "Sleep for `seconds`.",
      "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number"}}}},
+    {"name": "crash", "description": "Append a line to `file`, then exit without answering.",
+     "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}}},
 ]
 
 
@@ -34,6 +37,7 @@ def main():
     if pidfile:
         with open(pidfile, "a") as f:
             f.write("%d\n" % os.getpid())
+    time.sleep(float(os.environ.get("FAKE_MCP_START_DELAY") or 0))
     for line in sys.stdin:
         try:
             req = json.loads(line)
@@ -54,6 +58,10 @@ def main():
                 _reply(rid, _text(str(args.get("text", ""))))
             elif name == "pid":
                 _reply(rid, _text(str(os.getpid())))
+            elif name == "crash":
+                with open(args["file"], "a") as f:
+                    f.write("ran\n")
+                os._exit(3)
             elif name == "sleep":
                 time.sleep(float(args.get("seconds", 1)))
                 _reply(rid, _text("slept"))

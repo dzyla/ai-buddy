@@ -59,15 +59,26 @@ DEFAULT_IDLE_EXIT = 900
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_DRAIN_IDLE = 20.0
 DEFAULT_DRAIN_LIMIT = 16
-MCP_CALL_TIMEOUT = 60.0  # call-tool's tools/call wait (mcp_client.call_tool)
+MCP_CALL_TIMEOUT = 60.0
+# Caller variables that steer the idle embed drain (taken from the latest request).
+DRAIN_ENV_KEYS = ("INFER_EMBED_AUTODRAIN", "AI_STATE_DB", "AI_EMBED_URL", "AI_EMBED_MODEL", "AI_EMBED_BIN",
+                  "HOME", "PATH", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME")
+# Errors answered BEFORE anything ran; the client may fall back to the subprocess path only on these.
+REFUSALS = ("stale", "mismatch", "unsupported", "bad request")  # call-tool's tools/call wait (mcp_client.call_tool)
 PKG_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # Ops the C binary keeps native; refused so a confused client falls back instead.
 C_NATIVE = ("execute_command",)
 
-# Python 3.12 warns on fork() in a multi-threaded process. The children here only run aitools code
-# with fresh stdio objects and exit with os._exit; the server's threads hold no locks the tool code
-# needs (MCP pipes, sockets), and the embed drain also runs in a child, so no sqlite state crosses.
+# Python 3.12 warns on fork() in a multi-threaded process: a child inherits every lock in the state
+# another thread held at fork time. CPython re-initialises the GIL/import lock and the children use
+# fresh stdio objects and exit with os._exit, and main() pre-imports every module the parent threads
+# import lazily (load_config, repair_json, metrics' datetime, MCP Popen/select/signal). The parent
+# threads still do real work concurrently (config/metrics file I/O, JSON parsing, MCP Popen and
+# reader threads), so a residual risk remains that a child inherits some library-internal lock
+# (e.g. a buffered file object's) mid-use and blocks on it; such a child is bounded by the per-call
+# timeout, which kills it, and the server itself is unaffected. The embed drain runs in a child too,
+# so the parent never holds sqlite state.
 warnings.filterwarnings("ignore", message=r".*use of fork\(\) may lead to deadlocks.*",
                         category=DeprecationWarning)
 
@@ -381,6 +392,8 @@ class _Handler(socketserver.StreamRequestHandler):
         if not app.peer_ok(self.connection):
             return
         for line in iter(self.rfile.readline, b""):
+            if not line.endswith(b"\n"):
+                return  # a request cut off by a dying client is never executed
             try:
                 req = json.loads(line.decode("utf-8", "surrogateescape"))
                 if not isinstance(req, dict):
@@ -413,7 +426,9 @@ class ToolServer:
         self.idle_exit = idle_exit
         self.drain_idle = drain_idle
         self.drain_limit = drain_limit
-        self.autodrain = os.environ.get("INFER_EMBED_AUTODRAIN", "1") != "0"
+        # Idle-drain settings come from the most recent request (each carries its caller's env),
+        # not from whichever process happened to spawn the server; no drain before a request.
+        self.drain_env = None
         self.home = os.path.realpath(_home())
         self.fp = fingerprint()
         self.version = code_version()
@@ -453,7 +468,9 @@ class ToolServer:
             return {"id": rid, "ok": True, "result": "", "_shutdown": True}
         err = self.check(req)
         if err:
-            return {"id": rid, "ok": False, "error": err}
+            return {"id": rid, "ok": False, "error": err}  # refused: nothing ran
+        if isinstance(req.get("env"), dict):
+            self.drain_env = {k: v for k, v in req["env"].items() if k in DRAIN_ENV_KEYS}
         if op == "hello":
             return {"id": rid, "ok": True, "result": "", "version": self.version, "pid": os.getpid()}
         env = req.get("env") if isinstance(req.get("env"), dict) else None
@@ -619,7 +636,9 @@ class ToolServer:
             if not busy and idle >= self.idle_exit:
                 self.begin_shutdown()
                 return
-            if self.autodrain and not busy and idle >= self.drain_idle:
+            env = self.drain_env
+            if (env is not None and env.get("INFER_EMBED_AUTODRAIN", "1") != "0"
+                    and not busy and idle >= self.drain_idle):
                 self._maybe_drain()
 
     def _maybe_drain(self):
@@ -629,7 +648,9 @@ class ToolServer:
             return
 
         def drain():
-            r = run_forked(lambda: _child_drain(self.drain_limit), "/", None, 300)
+            env = dict(os.environ)
+            env.update(self.drain_env or {})
+            r = run_forked(lambda: _child_drain(self.drain_limit), "/", env, 300)
             try:
                 stats = json.loads(r["out"].strip().splitlines()[-1])
             except (ValueError, IndexError):
@@ -685,8 +706,10 @@ def main(argv):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)  # a vanished client is an OSError, not death
     # The server's own environment only drives idle work; each request carries the caller's.
     os.environ.pop("INFER_PRIVATE_MODE", None)
-    # Pre-import what the forked children use, so no call pays for imports.
+    # Pre-import what the forked children use (no call pays for imports) and everything the parent
+    # threads would import lazily (fork safety, see the warnings filter above).
     from . import cli, render, search  # noqa: F401
+    import datetime, fcntl, select as _select, subprocess  # noqa: F401,E401
     srv = ToolServer(socket_path(), **opts)
     if not srv.bind():
         return 0
