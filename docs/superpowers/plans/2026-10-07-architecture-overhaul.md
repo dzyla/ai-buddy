@@ -168,6 +168,28 @@ evals/                       # Task 4 – agent task set + runner
 - [ ] **Step 2:** Implement; wire selfimprove; add `ai lessons` passthrough in `ai.c` with an offline test running `./ai lessons list` under isolated HOME. PASS. Full suite PASS.
 - [ ] **Step 3:** Commit `feat(learning): human-reviewed lesson queue with expiry`.
 
+### Task 5b: semantic memory — local embedder, hybrid search, auto-recall
+
+**Files:**
+- Create: `aitools/embed.py` (embedder client), `aitools/search.py` (hybrid search + auto-recall), `services/ai-embed.service`, `tests/test_semantic_search.py`, `tests/fixtures/fake_embedder.py`, `evals/retrieval/` (offline retrieval set)
+- Modify: `aitools/state.py` (vectors table + hooks on writes), `aitools/schemas_part*.py` + `aitools/registry.py` (new `search_memory` tool), system-prompt memory injection (wherever Task 5 left it: `state-export memory` consumer in `ai.c`/`ai_session.c`), `install.sh` (build `~/.local/share/ai/llama.cpp-embed` CPU-only from upstream if missing, download model, install unit — never touch the main llama-server build), `ai-backend` (`ai-backend embed status|start|stop`), `CLAUDE.md`
+
+**Interfaces:**
+- Embedder: llama.cpp `llama-server --embeddings --pooling mean -c 8192` on `127.0.0.1:8091` (`$AI_EMBED_URL` override), model `~/.local/share/ai/models/embedding/embeddinggemma-2-UD-Q4_K_XL.gguf` (`$AI_EMBED_MODEL`), CPU only (`-ngl 0`, `CUDA_VISIBLE_DEVICES=`), threads = min(12, nproc/2). Measured on the user's data: 12 ms/query, 151 ms per 2 KB doc; Q4 ≈ Q8 quality.
+- Prompt prefixes (model card): query `task: search result | query: {q}`; document `title: {title or "none"} | text: {content}`. Mean pooling + L2 normalisation; Matryoshka truncation re-normalises.
+- `embed.embed(texts: list[str], kind: "query"|"document") -> list[list[float]] | None` — None when the embedder is unreachable (short connect timeout 0.5 s; never raises to callers).
+- State: table `vectors(item_type TEXT, item_id TEXT, model TEXT, dim INT, v128 BLOB, v768 BLOB, updated REAL, PRIMARY KEY(item_type, item_id))`; blobs are float16 (`array('e')`), L2-normalised per dim. Item types: `memory`, `lesson`, `chat`, `history_chunk`, `note`. Content changes re-embed (hash check).
+- Indexing: writes enqueue rows in `embed_queue(item_type, item_id, enqueued)`; `ai_mcp.py embed-backfill [--limit N]` drains it and indexes all legacy items; the tool server (Task 7) drains it in the background when idle. No embedding on the hot path of `ai` startup.
+- Search: `search.search_memory(query, sources=None, since=None, k=8) -> list[dict(item_type,item_id,text,score,source_ts)]` = reciprocal-rank fusion of (a) SQLite FTS5 BM25 over the same items and (b) vector search: coarse cosine on v128 over all candidates, rerank top 50 with v768. Pure Python (stdlib `array`), numpy optional fast path if importable. Falls back to FTS only when the embedder is down.
+- Tool `search_memory(query, sources?, since?, k?)` added to the registry (core profile too).
+- Auto-recall: system-prompt memory section = pinned core memories (≤ 1 KB, `memory_add(..., pinned=True)`) + top-k (default 6, `INFER_RECALL_K`, 0 disables) results of `search_memory(<user request>)` rendered compactly with source/date; replaces the whole 4 KB memory dump. Must add < 150 ms to startup when the embedder is up, and fall back to the old full-memory render when it is down.
+
+- [ ] **Step 1:** `tests/fixtures/fake_embedder.py`: tiny OpenAI-compatible `/v1/embeddings` server returning deterministic hashed bag-of-words vectors (768-d) so semantic tests are offline. `tests/test_semantic_search.py`: (a) vectors stored as float16, 128/768 both L2-normalised; (b) `search_memory` ranks a paraphrase-free exact keyword hit via FTS and a word-overlap hit via vectors, fused; (c) embedder down → FTS-only results, no exception, no delay > 0.6 s; (d) content change re-embeds, unchanged content doesn't; (e) backfill indexes legacy memory/lessons/chats/history; (f) auto-recall output ≤ budget, contains pinned memory + relevant items, and falls back to full render when embedder is down; (g) `search_memory` tool registered and dispatchable. FAIL.
+- [ ] **Step 2:** Implement `embed.py`, vectors/queue tables, `search.py`, tool, auto-recall hook, backfill CLI. PASS.
+- [ ] **Step 3:** `services/ai-embed.service` (Restart=on-failure, `Nice=10`, `CPUQuota` not set), `install.sh` build/download/install steps (tested with HOME=tmp and stubbed git/cmake/curl), `ai-backend embed …`. `evals/retrieval/`: ≥ 40 synthetic query→item pairs (no personal data) + `run_evals.py --retrieval` reporting R@1/R@5/MRR against the real embedder when available, fake embedder in CI. Full suite PASS.
+- [ ] **Step 4:** Commit `feat(memory): local EmbeddingGemma-2 embedder, hybrid search_memory, auto-recall`.
+- [ ] **Step 5 (lead):** `systemctl --user enable --now ai-embed`, `ai_mcp.py embed-backfill`, spot-check `search_memory` on real data.
+
 ### Task 7: persistent tool server
 
 **Files:**
@@ -226,7 +248,7 @@ evals/                       # Task 4 – agent task set + runner
 |---|---|---|
 | 0 | 1 | Live money first: after Step 7 the daemon runs from a frozen release, so later refactors cannot affect it. |
 | 1 | 2 ∥ 3 ∥ 4 | Disjoint files; pure refactors + templates/CI. Task 4's `load_config` edit coordinates with Task 2 as described. |
-| 2 | 5 → 6, ∥ 7 | 6 needs the store; 7 touches `server.py`/`mcp_client.py`/`ai_toolclient.c` and only the call sites in `ai.c`, disjoint from 5/6's `ai.c` read sites. |
+| 2 | 5 → 6 → 5b, ∥ 7 | 6 needs the store; 7 touches `server.py`/`mcp_client.py`/`ai_toolclient.c` and only the call sites in `ai.c`, disjoint from 5/6's `ai.c` read sites. |
 | 3 | 8 → 9 | Engine needs `aitools` dispatch, state store, learning render and benefits from the tool server's pool. |
 
 Each wave ends with the lead running `make && python3 -m pytest tests/ -q`, `python3 scripts/privacy_check.py --all`, and a commit; then a fresh reviewer checks the wave's diff before the next wave starts.
