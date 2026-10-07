@@ -15,14 +15,20 @@ Package lookup order: the directory holding this file (a checkout or a deployed 
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# Resolve symlinks: run as ~/.local/share/ai-trader/current/robinhood_trader.py, the package must be
+# bound to the release directory itself. Through the `current` symlink, a later deploy that repoints it
+# would make lazy imports in this running process load another release's modules.
+_HERE = os.path.dirname(os.path.realpath(__file__))
 _LIB = os.path.expanduser("~/.local/share/ai/lib")
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+sys.path[:] = [p for p in sys.path if not p or os.path.realpath(p) != _HERE or p == _HERE]
+if _HERE in sys.path:
+    sys.path.remove(_HERE)
+sys.path.insert(0, _HERE)
 if _LIB not in sys.path:
     sys.path.append(_LIB)
 
 if __name__ == "__main__":
+    import trader.legacy  # noqa: F401 - load every module now, while this release is the one on disk
     from trader.cli import main
     sys.exit(main())
 else:

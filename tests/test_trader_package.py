@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 import robinhood_trader as rt
 import trader
 from trader import cli, config, daemon, legacy, strategy
@@ -75,7 +77,8 @@ def test_script_entry_point_still_works():
     assert r.returncode == 0 and "risk-monitor" in r.stdout
 
 
-def test_package_path_pulse_with_finished_month_and_topup_plans_nothing(monkeypatch):
+@pytest.mark.parametrize("month_done", [True, False])
+def test_package_path_pulse_with_finished_month_and_topup_plans_nothing(monkeypatch, month_done):
     """Mid-session switch to the deployed package must not repeat the month's rebalance or today's top-up."""
     orders = []
     E = rt.RobinhoodExecutor
@@ -84,16 +87,23 @@ def test_package_path_pulse_with_finished_month_and_topup_plans_nothing(monkeypa
                                                               {"symbol": "NVDA", "quantity": "0.5", "average_buy_price": "200"}])
     monkeypatch.setattr(E, "get_equity_quotes", lambda s: {x: {"last_trade_price": "200"} for x in s})
     monkeypatch.setattr(E, "execute_market_order", lambda *a, **k: orders.append((a, k)) or {"ok": True})
-    monkeypatch.setattr(rt.FinancialData, "fetch_historical", lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-plan")))
+    fetches = []
+    bars = [{"datetime": f"d{i}", "open": 100 + i, "high": 100 + i, "low": 100 + i, "close": 100.0 + i,
+             "volume": 1_000_000} for i in range(260)]
+    monkeypatch.setattr(rt.FinancialData, "fetch_historical", lambda sym, *a, **k: fetches.append(sym) or list(bars))
     monkeypatch.setattr(rt.MarketHours, "now_et", lambda: datetime.datetime(2026, 9, 22, 10, 5, tzinfo=rt.ET_ZONE))
     os.makedirs(rt.RISK_MONITOR_FLAGS, exist_ok=True)
-    with open(rt._rebalance_flag_path("2026-09"), "w") as fh:
-        json.dump({"month": "2026-09", "date": "2026-09-01", "dry_run": False, "targets": ["NVDA"], "sells_pending": [],
-                   "buys_pending": [], "sells_done": [], "buys_done": [], "done": True}, fh)
+    if month_done:
+        with open(rt._rebalance_flag_path("2026-09"), "w") as fh:
+            json.dump({"month": "2026-09", "date": "2026-09-01", "dry_run": False, "targets": ["NVDA"], "sells_pending": [],
+                       "buys_pending": [], "sells_done": [], "buys_done": [], "done": True}, fh)
     with open(os.path.join(rt.RISK_MONITOR_FLAGS, "core_topup_2026-09-22.flag"), "w") as fh:
         json.dump({"ts": "2026-09-22T10:01:00-04:00", "symbol": "VTI", "dollar_amount": 10.0}, fh)
     daemon._momentum_rebalance_pulse("ACC1", dry_run=False)
-    assert orders == []
+    if month_done:
+        assert orders == [] and fetches == []
+    else:   # control: the same data without the done flag plans and trades the month
+        assert orders and fetches
 
 
 def test_installed_lib_dir_is_on_the_shim_path():

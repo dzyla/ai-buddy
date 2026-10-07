@@ -17,7 +17,7 @@ from .portfolio import PortfolioAuditor, TradingDataManager
 from .daemon import run_backtest, run_market_monitor, run_risk_monitor, run_scheduled_trading_lifecycle
 
 # Checkout (or release) root: the directory holding robinhood_trader.py and this package.
-CHECKOUT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHECKOUT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 DEPLOYED_CURRENT = os.path.expanduser("~/.local/share/ai-trader/current")
 
 

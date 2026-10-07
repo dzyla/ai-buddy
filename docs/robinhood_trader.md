@@ -154,9 +154,13 @@ journalctl --user -u robinhood-trader -f                       # confirm two cle
 
 `deploy.sh` builds `~/.local/share/ai-trader/releases/<UTC-timestamp>-<shortsha>/` from the committed
 tree (`trader/`, `robinhood_trader.py`, `VERSION` with the commit), atomically repoints the `current`
-symlink, keeps the newest five releases and prints the release path. `--dry-run` skips the test gate and
-exists for the deploy tests only. Rollback: `ln -sfn releases/<older> ~/.local/share/ai-trader/current`
-and restart the unit.
+symlink, keeps the newest five releases plus the one `current` pointed at before (the running daemon
+may still be executing it) and prints the release path. The shim resolves the symlink at start-up and
+loads every module eagerly, so repointing `current` never changes the code of a running daemon; only a
+restart picks up the new release. `AI_TRADER_HOME` overrides the base directory. `--skip-tests` skips
+the test gate; it exists for the deploy tests only and is refused unless `AI_TRADER_HOME` points to a
+non-default directory. Rollback: `ln -sfn releases/<older> ~/.local/share/ai-trader/current` and restart
+the unit.
 
 The release reads exactly the same state as before (`~/.config/ai/trader.json`,
 `~/.config/ai/.monitor_flags/`, `~/.cache/ai/trading/`), so switching mid-session or mid-month repeats

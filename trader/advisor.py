@@ -194,7 +194,7 @@ class NewsSentimentEngine:
 def find_ai_binary() -> str:
     """Locates the compiled ai CLI binary."""
     candidates = [
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ai"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "ai"),
         os.path.expanduser("~/.local/bin/ai"),
         "/usr/local/bin/ai",
         "ai"

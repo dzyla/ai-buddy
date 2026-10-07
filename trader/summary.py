@@ -201,7 +201,7 @@ def _load_zulip_sender() -> Any:
         return zulip_mcp_server
     except ImportError:
         pass
-    candidates = [os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.path.expanduser("~/.local/bin")]
+    candidates = [os.path.dirname(os.path.dirname(os.path.realpath(__file__))), os.path.expanduser("~/.local/bin")]
     for d in candidates:
         path = os.path.join(d, "zulip_mcp_server.py")
         if os.path.isfile(path):
