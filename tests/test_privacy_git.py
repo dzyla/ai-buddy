@@ -81,7 +81,7 @@ def _run_cmd_in(repo, tmp_path, args, extra_env=None):
     home.mkdir(exist_ok=True)
     with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TOOL_SEQ=json.dumps(seq),
                     MOCK_TASK_COMPLETE="done") as srv:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
         env.update(HOME=str(home), INFER_BASE_URL=srv.base_url, INFER_API_KEY="t",
                    INFER_MODEL="mock", INFER_TOOL_CHOICE="auto", INFER_AUTO_APPROVE="1")
         env.update(extra_env or {})
@@ -96,13 +96,13 @@ def _commits(repo):
     return int(_git(repo, "rev-list", "--count", "HEAD").strip())
 
 
-def test_no_auto_commit_by_default(repo, tmp_path):
+def test_no_auto_commit_by_default(repo, tmp_path, engine):
     _run_cmd_in(repo, tmp_path, [])
     assert _commits(repo) == 1
     assert _git(repo, "diff", "--cached", "--name-only").strip() == ""
 
 
-def test_opt_in_commits_tracked_files_only(repo, tmp_path):
+def test_opt_in_commits_tracked_files_only(repo, tmp_path, engine):
     _run_cmd_in(repo, tmp_path, ["--git"])
     assert _commits(repo) == 2
     files = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
@@ -110,12 +110,12 @@ def test_opt_in_commits_tracked_files_only(repo, tmp_path):
     assert "untracked_notes.txt" in _git(repo, "status", "--porcelain")
 
 
-def test_env_opt_in_and_no_git_override(repo, tmp_path):
+def test_env_opt_in_and_no_git_override(repo, tmp_path, engine):
     _run_cmd_in(repo, tmp_path, ["--no-git"], {"INFER_AUTO_COMMIT": "1"})
     assert _commits(repo) == 1
 
 
-def test_blocked_commit_restores_index(repo, tmp_path):
+def test_blocked_commit_restores_index(repo, tmp_path, engine):
     hooks = tmp_path / "hooks"
     hooks.mkdir()
     (hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n")

@@ -93,7 +93,7 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     # Scrub inherited INFER_*/CUDA config so a developer's sourced backend can't
     # override the mock URL and hang offline tests.
     for k in list(env):
-        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
+        if (k.startswith("INFER_") and k not in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")) or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
                                            "LD_LIBRARY_PATH", "LLAMA_CTX_SIZE",
                                            "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
             env.pop(k, None)
@@ -116,7 +116,7 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     (["--auto"], "PERMISSION MODE: FULL AUTONOMY"),
     ([], "PERMISSION MODE: FULL AUTONOMY"),  # default
 ])
-def test_mode_injected_into_system_prompt(tmp_path, flag, marker):
+def test_mode_injected_into_system_prompt(tmp_path, flag, marker, engine):
     cap = str(tmp_path / "cap.jsonl")
     with MockServer(cap) as srv:
         args = list(flag) + ["do something"]
@@ -137,7 +137,7 @@ def test_mode_injected_into_system_prompt(tmp_path, flag, marker):
     ("manual", "PERMISSION MODE: MANUAL"),
     ("auto", "PERMISSION MODE: FULL AUTONOMY"),
 ])
-def test_mode_env_var(tmp_path, val, marker):
+def test_mode_env_var(tmp_path, val, marker, engine):
     cap = str(tmp_path / "cap.jsonl")
     with MockServer(cap) as srv:
         res = run_binary(str(tmp_path), srv.base_url, ["do something"],
@@ -162,7 +162,7 @@ def test_new_tools_registered():
 
 
 # ── mutation gating: write_file blocked in PLAN mode, allowed in AUTO ─────────
-def test_plan_mode_blocks_mutating_tool(tmp_path):
+def test_plan_mode_blocks_mutating_tool(tmp_path, engine):
     cap = str(tmp_path / "cap.jsonl")
     target = str(tmp_path / "should_not_exist.txt")
     tool_call = {
@@ -201,7 +201,7 @@ def test_plan_mode_blocks_mutating_tool(tmp_path):
 
 
 # ── non-tty AUTO runs get a FINITE step budget (no infinite autonomy) ────────
-def test_non_tty_auto_step_budget_is_finite(tmp_path):
+def test_non_tty_auto_step_budget_is_finite(tmp_path, engine):
     cap = str(tmp_path / "cap.jsonl")
     # Force a high step limit so a normal run completes, then assert the binary
     # would re-read INFER_STEP_LIMIT when set to a tiny value.
@@ -217,7 +217,7 @@ def test_non_tty_auto_step_budget_is_finite(tmp_path):
 
 
 # ── system prompt documents the bounded plan step budget ─────────────────────
-def test_plan_budget_mentioned_in_system_prompt(tmp_path):
+def test_plan_budget_mentioned_in_system_prompt(tmp_path, engine):
     cap = str(tmp_path / "cap.jsonl")
     with MockServer(cap) as srv:
         res = run_binary(str(tmp_path), srv.base_url, ["--plan", "propose"],
@@ -230,7 +230,7 @@ def test_plan_budget_mentioned_in_system_prompt(tmp_path):
 
 
 # ── plan approval arms the budget: after N mutations the agent must re-present ─
-def test_plan_budget_limits_mutations_between_approvals(tmp_path):
+def test_plan_budget_limits_mutations_between_approvals(tmp_path, engine):
     # With INFER_PLAN_STEP_BUDGET=2, a single approval covers only 2 mutating
     # actions before the harness forces a re-presentation. Drive a deterministic
     # tool sequence: present_plan (auto-approved) -> write recovered -> 2x write
@@ -284,7 +284,7 @@ def test_plan_budget_limits_mutations_between_approvals(tmp_path):
 
 
 # ── deny-by-default: unknown MCP tools are gated in PLAN, read-only stay free ─
-def test_plan_mode_deny_by_default_unknown_tool(tmp_path):
+def test_plan_mode_deny_by_default_unknown_tool(tmp_path, engine):
     cap = str(tmp_path / "cap.jsonl")
     tool_call = {"type": "function",
                  "function": {"name": "mystery_tool", "arguments": "{}"}}
@@ -304,7 +304,7 @@ def test_plan_mode_deny_by_default_unknown_tool(tmp_path):
                          "(deny-by-default)")
 
 
-def test_plan_mode_readonly_tool_allowed(tmp_path):
+def test_plan_mode_readonly_tool_allowed(tmp_path, engine):
     f = tmp_path / "r.txt"
     f.write_text("hello content")
     cap = str(tmp_path / "cap.jsonl")

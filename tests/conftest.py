@@ -71,3 +71,15 @@ def no_tool_server(monkeypatch):
     module-scoped fixtures). Helpers that scrub INFER_* keep INFER_TOOL_SERVER.
     tests/test_tool_server.py opts in with a private XDG_RUNTIME_DIR and HOME."""
     monkeypatch.setenv("INFER_TOOL_SERVER", "0")
+
+
+@pytest.fixture(params=["c", "py"])
+def engine(request, monkeypatch):
+    """Run a binary-driving test once per agent engine: the C loop (`INFER_ENGINE=c`) and the
+    Python engine behind the C front-end (`INFER_ENGINE=py`, agent/ package). Subprocesses inherit
+    the variables; every test env scrubber keeps INFER_ENGINE and INFER_ENGINE_STRICT (like
+    INFER_TOOL_SERVER)."""
+    monkeypatch.setenv("INFER_ENGINE", request.param)
+    # never let a py variant silently fall back to the C loop when agent/ is not found
+    monkeypatch.setenv("INFER_ENGINE_STRICT", "1")
+    return request.param

@@ -38,7 +38,7 @@ def build():
         if not os.path.exists(AI_BIN):
             return True
         return any(os.path.getmtime(os.path.join(REPO, s)) > os.path.getmtime(AI_BIN)
-                   for s in ("ai.c", "ai_git.c", "ai_terminal.c", "ai_session.c", "ai_toolclient.c", "Makefile")
+                   for s in ("ai.c", "ai_git.c", "ai_terminal.c", "ai_session.c", "ai_toolclient.c", "ai_frontend.c", "Makefile")
                    if os.path.exists(os.path.join(REPO, s)))
     if stale():
         res = subprocess.run(["make"], cwd=REPO, capture_output=True, text=True)
@@ -93,7 +93,7 @@ def _make_seq(missing, ok):
     ]
 
 
-def test_binary_learns_from_tool_error_across_sessions():
+def test_binary_learns_from_tool_error_across_sessions(engine):
     home = tempfile.mkdtemp(prefix="ai-si-e2e-")
     ok_file = os.path.join(home, "data.txt")
     missing = os.path.join(home, "nope_missing.txt")

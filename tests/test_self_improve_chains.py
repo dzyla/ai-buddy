@@ -48,7 +48,7 @@ def build():
         if not os.path.exists(AI_BIN):
             return True
         return any(os.path.getmtime(os.path.join(REPO, s)) > os.path.getmtime(AI_BIN)
-                   for s in ("ai.c", "ai_git.c", "ai_terminal.c", "ai_session.c", "ai_toolclient.c", "Makefile")
+                   for s in ("ai.c", "ai_git.c", "ai_terminal.c", "ai_session.c", "ai_toolclient.c", "ai_frontend.c", "Makefile")
                    if os.path.exists(os.path.join(REPO, s)))
     if stale():
         res = subprocess.run(["make"], cwd=REPO, capture_output=True, text=True)
@@ -279,7 +279,7 @@ def _run_agent(home, seq, extra_env=None, capture=None):
             server.kill()
 
 
-def test_binary_links_failure_and_recovery_into_one_chain():
+def test_binary_links_failure_and_recovery_into_one_chain(engine):
     home = tempfile.mkdtemp(prefix="ai-chain-e2e-")
     ok_file = os.path.join(home, "data.txt")
     missing = os.path.join(home, "nope_missing.txt")
@@ -306,7 +306,7 @@ def test_binary_links_failure_and_recovery_into_one_chain():
     shutil.rmtree(home, ignore_errors=True)
 
 
-def test_binary_injects_session_recap_into_model_context():
+def test_binary_injects_session_recap_into_model_context(engine):
     home = tempfile.mkdtemp(prefix="ai-recap-e2e-")
     ok_file = os.path.join(home, "data.txt")
     missing = os.path.join(home, "nope_missing.txt")
@@ -345,7 +345,7 @@ def test_binary_injects_session_recap_into_model_context():
     shutil.rmtree(home, ignore_errors=True)
 
 
-def test_binary_session_recap_disabled_with_env():
+def test_binary_session_recap_disabled_with_env(engine):
     home = tempfile.mkdtemp(prefix="ai-recap-off-")
     ok_file = os.path.join(home, "data.txt")
     with open(ok_file, "w") as f:

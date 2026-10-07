@@ -26,7 +26,7 @@ ai_mcp = importlib.import_module("ai_mcp")
 @pytest.fixture(scope="module", autouse=True)
 def build_binary():
     binp = os.path.join(REPO, "ai")
-    srcs = ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "ai_toolclient.c", "Makefile")
+    srcs = ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "ai_toolclient.c", "ai_frontend.c", "Makefile")
     stale = not os.path.exists(binp)
     if not stale:
         bm = os.path.getmtime(binp)
@@ -234,7 +234,7 @@ class MockServer:
 def run_binary(home, base_url, args, extra_env=None, timeout=90):
     env = os.environ.copy()
     for k in list(env):
-        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in (
+        if (k.startswith("INFER_") and k not in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")) or k in (
                 "CUDA_VISIBLE_DEVICES", "CUDA_PATH", "LD_LIBRARY_PATH",
                 "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
             env.pop(k, None)
@@ -251,7 +251,7 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
 
 
 # ── C: --resume falls back to the persistent mirror when the cache is cleared
-def test_resume_falls_back_to_persistent_mirror(tmp_path):
+def test_resume_falls_back_to_persistent_mirror(tmp_path, engine):
     home = tmp_path / "home"; home.mkdir()
     cap = str(tmp_path / "cap.jsonl")
     # Turn 1: establish context. The binary writes the session to BOTH the

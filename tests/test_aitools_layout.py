@@ -89,7 +89,7 @@ CLI_CASES = [
 
 
 def _env(home):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
     env.update(HOME=str(home), INFER_NO_MCP="1", PYTHONDONTWRITEBYTECODE="1")
     return env
 
@@ -232,6 +232,9 @@ def test_install_layout(tmp_path):
     lib = home / ".local" / "share" / "ai" / "lib" / "aitools"
     assert (lib / "__init__.py").exists() and (lib / "registry.py").exists()
     assert not list(lib.glob("__pycache__"))
+    agent = home / ".local" / "share" / "ai" / "lib" / "agent"   # Task 8: the Python engine
+    assert (agent / "__main__.py").exists() and (agent / "loop.py").exists()
+    assert not list(agent.glob("__pycache__"))
     installed = home / ".local" / "bin" / "ai_mcp.py"
     r = subprocess.run([sys.executable, str(installed), "list-tools"], cwd="/", env=_env(home),
                        capture_output=True, text=True, timeout=120)
@@ -244,6 +247,23 @@ def test_install_layout(tmp_path):
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip().startswith(str(lib)), r.stdout
+    # The installed engine runs from cwd=/ and imports aitools from the installed lib (headless run
+    # against the mock LLM; the C front-end execs exactly `python3 <lib>/agent --frontend-fd 3 ...`).
+    sys.path.insert(0, os.path.join(REPO, "tests"))
+    from test_offline import MockServer
+    probe = ("import runpy, sys; sys.argv = [%r]; runpy.run_path(%r, run_name='not_main'); "
+             "import aitools; print(aitools.__file__)" % (str(agent), str(agent / "__main__.py")))
+    r = subprocess.run([sys.executable, "-c", probe], cwd="/", env=_env(home), capture_output=True, text=True,
+                       timeout=120)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().startswith(str(lib)), r.stdout   # the engine's aitools = the installed copy
+    with MockServer(str(tmp_path / "cap.jsonl"), MOCK_TASK_COMPLETE="INSTALLED_ENGINE_OK") as srv:
+        env = dict(_env(home), INFER_BASE_URL=srv.base_url, INFER_API_KEY="k", INFER_MODEL="mock",
+                   INFER_TOOL_CHOICE="auto")
+        r = subprocess.run([sys.executable, str(agent), "say ok"], cwd="/", env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "INSTALLED_ENGINE_OK" in r.stdout
     shutil.rmtree(home, ignore_errors=True)
 
 

@@ -37,7 +37,7 @@ def build_binary():
         if not os.path.exists(binp):
             return True
         bin_mtime = os.path.getmtime(binp)
-        for src in ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "ai_toolclient.c", "Makefile"):
+        for src in ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "ai_toolclient.c", "ai_frontend.c", "Makefile"):
             p = os.path.join(REPO, src)
             try:
                 if os.path.getmtime(p) > bin_mtime:
@@ -106,13 +106,15 @@ class MockServer:
             return [json.loads(line) for line in f if line.strip()]
 
 
-def run_binary(home, base_url, args, extra_env=None, timeout=90):
+def run_binary(home, base_url, args, extra_env=None, timeout=90, engine=None):
+    """Run ./ai against the mock. `engine` ("c"/"py") sets INFER_ENGINE; by default the value
+    the `engine` fixture (tests/conftest.py) put in the environment is kept."""
     env = os.environ.copy()
     # Scrub any INFER_*/CUDA vars the developer may have sourced from
     # ~/.local/share/ai/env, so they can't override the mock URL below and hang
     # offline tests. Then apply the variables we explicitly control.
     for k in list(env):
-        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
+        if (k.startswith("INFER_") and k not in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")) or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
                                            "LD_LIBRARY_PATH", "LLAMA_CTX_SIZE",
                                            "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
             env.pop(k, None)
@@ -123,6 +125,8 @@ def run_binary(home, base_url, args, extra_env=None, timeout=90):
     env["INFER_API_KEY"] = "test"
     env["INFER_MODEL"] = "mock"
     env["INFER_TOOL_CHOICE"] = "auto"
+    if engine:
+        env["INFER_ENGINE"] = engine
     if extra_env:
         env.update(extra_env)
     return subprocess.run([AI_BIN] + args, cwd=REPO, env=env,
@@ -231,7 +235,7 @@ def test_transcript_empty_file(tmp_path):
 
 
 # ── binary integration: system prompt externalization ─────────────────────────
-def test_custom_system_prompt(tmp_path):
+def test_custom_system_prompt(tmp_path, engine):
     home = str(tmp_path / "home")
     os.makedirs(os.path.join(home, ".config", "ai"))
     with open(os.path.join(home, ".config", "ai", "system_prompt.md"), "w") as f:
@@ -245,7 +249,7 @@ def test_custom_system_prompt(tmp_path):
     assert "fully autonomous CLI agent" not in sysmsg
 
 
-def test_default_system_prompt_without_file(tmp_path):
+def test_default_system_prompt_without_file(tmp_path, engine):
     home = str(tmp_path / "home")
     os.makedirs(home)
     cap = str(tmp_path / "cap.jsonl")
@@ -257,7 +261,7 @@ def test_default_system_prompt_without_file(tmp_path):
 
 
 # ── binary integration: session resume ────────────────────────────────────────
-def test_session_resume_roundtrip(tmp_path):
+def test_session_resume_roundtrip(tmp_path, engine):
     home = str(tmp_path / "home")
     os.makedirs(home)
     cap = str(tmp_path / "cap.jsonl")
@@ -279,7 +283,7 @@ def test_session_resume_roundtrip(tmp_path):
     assert msgs[3]["content"] == "What was the codeword?"
 
 
-def test_no_resume_starts_fresh(tmp_path):
+def test_no_resume_starts_fresh(tmp_path, engine):
     home = str(tmp_path / "home")
     os.makedirs(home)
     cap = str(tmp_path / "cap.jsonl")
@@ -293,7 +297,7 @@ def test_no_resume_starts_fresh(tmp_path):
     assert roles == ["system", "user"]  # no prior context leaked in
 
 
-def test_goal_mission_board(tmp_path):
+def test_goal_mission_board(tmp_path, engine):
     """--goal / -g flag must inject MISSION BOARD into system prompt."""
     home = str(tmp_path / "home")
     os.makedirs(home)
@@ -336,7 +340,7 @@ def test_invalid_arg_type():
     assert "Invalid argument type for 'path'" in res.stdout
 
 
-def test_command_denylist(tmp_path):
+def test_command_denylist(tmp_path, engine):
     """Dangerous commands matching denylist must be intercepted in C."""
     home = str(tmp_path / "home")
     os.makedirs(home)
@@ -354,7 +358,7 @@ def test_command_denylist(tmp_path):
         assert "INFER_COMMAND_DENYLIST" in tool_msg
 
 
-def test_hide_details_flag(tmp_path):
+def test_hide_details_flag(tmp_path, engine):
     """Setting INFER_HIDE_DETAILS=1 suppresses thinking and tool box headers in output."""
     home = str(tmp_path / "home")
     os.makedirs(home)
@@ -407,7 +411,7 @@ def test_execute_command_argument_aliases():
     assert "hello_raw" in res.stdout
 
 
-def test_execute_command_alias_in_c(tmp_path):
+def test_execute_command_alias_in_c(tmp_path, engine):
     """C agent binary must accept 'cmd' argument alias in execute_command."""
     home = str(tmp_path / "home")
     os.makedirs(home)
@@ -425,7 +429,7 @@ def test_execute_command_alias_in_c(tmp_path):
 
 
 
-def test_background_process_system_prompt_guidance(tmp_path):
+def test_background_process_system_prompt_guidance(tmp_path, engine):
     """Verify that the system prompt explicitly advises using start_background_process."""
     cap = tmp_path / "cap.jsonl"
     with MockServer(str(cap), MOCK_LLM_RESPONSE='{"choices":[{"delta":{"content":"done"}}]}') as s:
@@ -453,7 +457,7 @@ def _sandbox_run(tmp_path, base_url, args, extra_env=None, timeout=120):
             os.symlink(os.path.join(REPO, f), work / f)
     env = os.environ.copy()
     for k in list(env):
-        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("LLAMA_CTX_SIZE",):
+        if (k.startswith("INFER_") and k not in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")) or k in ("LLAMA_CTX_SIZE",):
             env.pop(k, None)
     env.update({"HOME": str(home), "INFER_BASE_URL": base_url, "INFER_API_KEY": "t",
                 "INFER_MODEL": "mock", "INFER_TOOL_CHOICE": "auto", "INFER_AUTO_APPROVE": "1"})
@@ -521,7 +525,7 @@ def test_trim_keeps_latest_user_turn_and_never_orphans_tools(tmp_path):
     assert out[-1]["tool_call_id"] == msgs[-1]["tool_call_id"]
 
 
-def test_binary_trim_threshold_respected_and_protocol_valid(tmp_path):
+def test_binary_trim_threshold_respected_and_protocol_valid(tmp_path, engine):
     """E2E: with a small INFER_TRIM_THRESHOLD and parallel tool calls producing
     big outputs, every request must keep the system prompt + the user's task,
     contain no orphaned tool messages, and stay bounded."""
@@ -547,7 +551,7 @@ def test_binary_trim_threshold_respected_and_protocol_valid(tmp_path):
     assert len(json.dumps(reqs[-1]["messages"])) < 30000 + sys_len
 
 
-def test_resumed_session_keeps_new_prompt_after_many_tool_calls(tmp_path):
+def test_resumed_session_keeps_new_prompt_after_many_tool_calls(tmp_path, engine):
     """-r splices old turns in front of the new prompt; the old count-based trim
     then kept the OLDEST user turn and dropped the new task after ~10 calls."""
     home = tmp_path / "home"
@@ -574,7 +578,7 @@ def test_resumed_session_keeps_new_prompt_after_many_tool_calls(tmp_path):
         assert _orphan_tool_ids(q["messages"]) == []
 
 
-def test_small_ctx_detected_from_props_uses_core_tools(tmp_path):
+def test_small_ctx_detected_from_props_uses_core_tools(tmp_path, engine):
     """A 16k-ctx server (n_ctx from /props) must not be sent the ~45 KB full
     catalog (≈12k tokens, before any message)."""
     cap = str(tmp_path / "cap.jsonl")
@@ -588,7 +592,7 @@ def test_small_ctx_detected_from_props_uses_core_tools(tmp_path):
     assert len(json.dumps(reqs[0]["tools"])) < 15000
 
 
-def test_large_ctx_keeps_full_catalog(tmp_path):
+def test_large_ctx_keeps_full_catalog(tmp_path, engine):
     cap = str(tmp_path / "cap.jsonl")
     with MockServer(cap, MOCK_TASK_COMPLETE="ok", MOCK_N_CTX="131072") as srv:
         r = _sandbox_run(tmp_path, srv.base_url, ["hi"])
@@ -597,7 +601,7 @@ def test_large_ctx_keeps_full_catalog(tmp_path):
     assert len(reqs[0]["tools"]) > len(ai_mcp.CORE_TOOL_PROFILE) + 10
 
 
-def test_small_ctx_caps_tool_output(tmp_path):
+def test_small_ctx_caps_tool_output(tmp_path, engine):
     """max_tool_output defaults to 64 KB (~20k tokens) — bigger than a 16k model's
     whole window. With a known small window it must be derived from it."""
     big = tmp_path / "huge.txt"
@@ -686,7 +690,7 @@ def test_cli_passes_chain_id_through(si_home):
     assert ai_mcp._read_ledger()[-1]["chain_id"] == "chain_FROM_C"
 
 
-def test_binary_loop_guard_does_not_poison_lessons(tmp_path):
+def test_binary_loop_guard_does_not_poison_lessons(tmp_path, engine):
     """E2E repro: identical list_directory calls trip the loop guard; the old
     harness saved PITFALL + a bogus FIX ('stuck in a loop' -> same args)."""
     seq = [{"id": "c%d" % i, "type": "function",
@@ -700,7 +704,7 @@ def test_binary_loop_guard_does_not_poison_lessons(tmp_path):
     assert "stuck in a loop" not in state.lessons_render(status=None, limit=None)
 
 
-def test_binary_records_failure_with_huge_output(tmp_path):
+def test_binary_records_failure_with_huge_output(tmp_path, engine):
     """An escaped 20 KB error overflowed the 9 KB payload buffer; the truncated
     JSON made record-failure crash and the failure was never learned."""
     cmd = "python3 -c \"print('E'*20000); raise SystemExit(3)\""
@@ -714,7 +718,7 @@ def test_binary_records_failure_with_huge_output(tmp_path):
     assert "execute_command" in {r["tool"] for r in state.ledger_rows()}
 
 
-def test_task_timeout_forces_exactly_one_more_iteration(tmp_path):
+def test_task_timeout_forces_exactly_one_more_iteration(tmp_path, engine):
     """The timeout/stall paths set loop_count = 28 ("one more iteration"), which
     only holds for a 30-step limit: non-tty runs (limit 60) got 32 more steps and
     --continue (limit 999999) never stopped."""
@@ -730,7 +734,7 @@ def test_task_timeout_forces_exactly_one_more_iteration(tmp_path):
     assert len(reqs) <= 4, "timeout did not stop the loop (%d requests)" % len(reqs)
 
 
-def test_agents_md_injection_is_capped(tmp_path):
+def test_agents_md_injection_is_capped(tmp_path, engine):
     """AGENTS.md (up to 100 KB) was injected whole into every request."""
     work = tmp_path / "work"
     work.mkdir()
@@ -744,3 +748,86 @@ def test_agents_md_injection_is_capped(tmp_path):
     assert "# Project rules" in sysm
     assert "AGENTS.md truncated" in sysm
     assert sysm.count("rule line") < 1500
+
+
+def test_history_log_and_private_mode(tmp_path, engine):
+    """Every answered job is appended to ~/.cache/ai/history.jsonl and the session is saved
+    (cache + persistent mirror, <id>.json + last.json); --private writes none of it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TASK_COMPLETE="LOGGED_ANSWER") as srv:
+        r = run_binary(str(home), srv.base_url, ["log this job"])
+    assert r.returncode == 0, r.stderr[-2000:]
+    recs = [json.loads(l) for l in (home / ".cache" / "ai" / "history.jsonl").read_text().splitlines()]
+    assert len(recs) == 1
+    rec = recs[0]
+    assert list(rec) == ["timestamp", "session_id", "prompt", "pipe_writer", "interactive", "response"]
+    assert rec["prompt"] == "log this job" and rec["response"] == "LOGGED_ANSWER" and rec["interactive"] is False
+    sid = rec["session_id"]
+    for d in (home / ".cache" / "ai" / "sessions", home / ".local" / "share" / "ai" / "sessions"):
+        for name in (sid + ".json", "last.json"):
+            saved = json.loads((d / name).read_text())
+            assert saved[-1]["role"] == "tool" and saved[1]["content"] == "log this job"
+
+    home2 = tmp_path / "home2"
+    home2.mkdir()
+    with MockServer(str(tmp_path / "cap2.jsonl"), MOCK_TASK_COMPLETE="SECRET_ANSWER") as srv:
+        r = run_binary(str(home2), srv.base_url, ["--private", "secret job"])
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "SECRET_ANSWER" in r.stdout
+    assert not (home2 / ".cache" / "ai" / "history.jsonl").exists()
+    assert not (home2 / ".cache" / "ai" / "sessions").exists()
+    assert not (home2 / ".local" / "share" / "ai" / "sessions").exists()
+
+
+def test_usage_and_missing_env_errors(tmp_path, engine):
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run_binary(str(home), "http://127.0.0.1:9/v1/", [])
+    assert r.returncode == 1 and "Usage:" in r.stderr
+    r = run_binary(str(home), "", ["hi"], extra_env={"INFER_MODEL": ""})
+    assert r.returncode == 1
+    assert "INFER_BASE_URL" in r.stderr and "INFER_MODEL" in r.stderr
+
+
+def test_tool_metrics_recorded(tmp_path, engine):
+    """Each aitools tool call lands in ~/.cache/ai/metrics.jsonl with its real success/error (the C
+    engine through `call-tool`, the Python engine through aitools.metrics.record_tool_metric)."""
+    ok = tmp_path / "present.txt"
+    ok.write_text("x")
+    seq = [{"id": "m1", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": str(ok)})}},
+           {"id": "m2", "type": "function", "function": {"name": "read_file",
+                                                          "arguments": json.dumps({"path": str(tmp_path / "absent.txt")})}}]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["read"])
+    assert r.returncode == 0, r.stderr[-2000:]
+    rows = [json.loads(l) for l in (tmp_path / "home" / ".cache" / "ai" / "metrics.jsonl").read_text().splitlines()]
+    reads = [x for x in rows if x["tool"] == "read_file"]
+    assert [x["success"] for x in reads] == [True, False], rows
+    assert reads[1]["error"]
+
+
+def test_mcp_tool_call_routes_to_server(tmp_path, engine):
+    """`<server>__<tool>` calls reach the MCP server from the cwd's mcp.json (C: `call-tool` per call;
+    Python engine: one pooled in-process session, so the server starts once for both calls)."""
+    fake = os.path.join(REPO, "tests", "fixtures", "fake_mcp.py")
+    pids = tmp_path / "mcp.pids"
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "mcp.json").write_text(json.dumps({"mcpServers": {"fake": {
+        "command": sys.executable, "args": [fake], "env": {"FAKE_MCP_PIDFILE": str(pids)}}}}))
+    seq = [{"id": "e%d" % i, "type": "function",
+            "function": {"name": "fake__echo", "arguments": json.dumps({"text": "MCP_HELLO_%d" % i})}}
+           for i in (1, 2)]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["echo twice"])
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    tools_seen = [m["content"] for m in reqs[-1]["messages"] if m["role"] == "tool"]
+    assert any("MCP_HELLO_1" in t for t in tools_seen) and any("MCP_HELLO_2" in t for t in tools_seen), tools_seen
+    starts = len(pids.read_text().split())
+    # list-tools starts it once (catalog), then: C one start per call, Python engine one pooled session
+    assert starts == (3 if engine == "c" else 2), starts

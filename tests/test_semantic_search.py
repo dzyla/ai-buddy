@@ -526,7 +526,7 @@ def _system_prompt(tmp_path, prompt, embed_url):
     return reqs[0]["messages"][0]["content"]
 
 
-def test_ai_binary_adds_recall_to_full_memory(fake, tmp_path):
+def test_ai_binary_adds_recall_to_full_memory(fake, tmp_path, engine):
     if not os.path.exists(AI_BIN):
         pytest.skip("ai binary not built")
     _recall_corpus()
@@ -541,8 +541,44 @@ def test_ai_binary_adds_recall_to_full_memory(fake, tmp_path):
     assert any("gpu box" in t for t in fake.texts())
 
 
+def test_py_engine_recall_follows_each_interactive_turn(fake, tmp_path, monkeypatch):
+    """Controller Ruling 19: in an interactive Python-engine session the auto-recall block is
+    recomputed for every user turn (not frozen at the first prompt): turn 1 ("hi") recalls
+    nothing, turn 2 asks about the gpu box and its request carries the relevant chat."""
+    sys.path.insert(0, os.path.join(REPO, "tests"))
+    from test_offline import MockServer
+    from test_engine_interactive import PROMPT, Pty, _env, _work
+    monkeypatch.setenv("INFER_ENGINE", "py")
+    _recall_corpus()
+    search.index_items()
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    work = _work(tmp_path)
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TASK_COMPLETE="RECALL_TURN_OK") as srv:
+        p = Pty(["-i"], _env(home, srv.base_url, AI_EMBED_URL=fake.url, INFER_SESSION_RECAP="0",
+                             INFER_ENGINE="py", INFER_ENGINE_STRICT="1"), str(work))
+        p.expect(PROMPT)
+        p.send("hi\r")
+        p.expect("RECALL_TURN_OK")
+        p.expect(PROMPT)
+        p.send("how do I ssh to the gpu box from home?\r")
+        p.expect("RECALL_TURN_OK")
+        p.expect(PROMPT)
+        p.send(":quit\r")
+        assert p.wait() == 0
+        reqs = srv.requests()
+    first, second = reqs[0]["messages"][0]["content"], reqs[1]["messages"][0]["content"]
+    for sysmsg in (first, second):
+        assert "Persistent Memory/Preferences:" in sysmsg and sysmsg.count("tomatoes") == 40
+    assert "Recalled for this request" not in first
+    assert "Recalled for this request" in second and "jump host" in second
+    # only the memory section changed: the rest of the system prompt is the same text
+    assert first.split("Persistent Memory/Preferences:")[0] == second.split("Persistent Memory/Preferences:")[0]
+
+
 @pytest.mark.parametrize("prompt,embedder", [("ssh to the gpu box", "down"), ("hi", "up")])
-def test_ai_binary_memory_section_present_without_recall(fake, tmp_path, prompt, embedder):
+def test_ai_binary_memory_section_present_without_recall(fake, tmp_path, prompt, embedder, engine):
     if not os.path.exists(AI_BIN):
         pytest.skip("ai binary not built")
     _recall_corpus()

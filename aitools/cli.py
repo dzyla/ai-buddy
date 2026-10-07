@@ -306,7 +306,9 @@ def _main(argv):
         _call_tool(argv, mcp_servers)
 
 
-def _list_tools(mcp_servers):
+def tool_catalog(mcp_servers):
+    """The `list-tools` catalog as a list: native schemas + (cached) MCP tools, INFER_TOOL_PROFILE=core
+    filtered. Shared by `list-tools` and the Python engine (agent/tools.py)."""
     openai_tools = list(TOOL_SCHEMAS)
 
     if os.environ.get("INFER_NO_MCP") not in ("1", "true") and mcp_servers:
@@ -361,7 +363,11 @@ def _list_tools(mcp_servers):
         openai_tools = [t for t in openai_tools
                         if t.get("function", {}).get("name") in keep]
 
-    print(json.dumps(openai_tools))
+    return openai_tools
+
+
+def _list_tools(mcp_servers):
+    print(json.dumps(tool_catalog(mcp_servers)))
 
 
 def parse_args_json(args_json):

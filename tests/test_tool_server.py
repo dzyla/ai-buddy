@@ -438,7 +438,8 @@ def test_forked_runner_isolates_misbehaving_tools(tmp_path):
 def _bin_env(home, run, base_url, **extra):
     env = _base_env(home, run)
     env.update(INFER_BASE_URL=base_url, INFER_API_KEY="t", INFER_MODEL="mock", INFER_TOOL_CHOICE="auto",
-               INFER_AUTO_APPROVE="1", INFER_STATE_CONTEXT="0")
+               INFER_AUTO_APPROVE="1", INFER_STATE_CONTEXT="0",
+               INFER_ENGINE="c")  # the tool server is the C engine's client (agent/ runs tools in-process)
     env.update(extra)
     return env
 

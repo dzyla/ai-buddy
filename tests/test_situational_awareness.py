@@ -26,6 +26,8 @@ import time
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("engine")  # every test here drives the binary
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MOCK = os.path.join(REPO, "tests", "mock_llm_server.py")
 AI_BIN = os.path.join(REPO, "ai")
@@ -90,7 +92,7 @@ class MockServer:
 def run_binary(home, base_url, args, extra_env=None, timeout=90):
     env = os.environ.copy()
     for k in list(env):
-        if (k.startswith("INFER_") and k != "INFER_TOOL_SERVER") or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
+        if (k.startswith("INFER_") and k not in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")) or k in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH",
                                            "LD_LIBRARY_PATH", "LLAMA_CTX_SIZE",
                                            "LLAMA_N_GPU_LAYERS", "LLAMA_MODEL_PATH"):
             env.pop(k, None)

@@ -127,8 +127,8 @@ if [ "${1:-}" = "uninstall" ]; then
         rm -f "${BIN_DIR}/$f"
     done
 
-    # 3b. Remove the installed trader, aitools and zulip_bridge packages (deployed releases in ~/.local/share/ai-trader are kept)
-    rm -rf "${DATA_DIR}/lib/trader" "${DATA_DIR}/lib/aitools" "${DATA_DIR}/lib/zulip_bridge"
+    # 3b. Remove the installed trader, aitools, zulip_bridge and agent packages (deployed releases in ~/.local/share/ai-trader are kept)
+    rm -rf "${DATA_DIR}/lib/trader" "${DATA_DIR}/lib/aitools" "${DATA_DIR}/lib/zulip_bridge" "${DATA_DIR}/lib/agent"
 
     # 4. Remove custom skills
     if [ -d "${SKILLS_DST}" ]; then
@@ -337,6 +337,12 @@ rm -rf "${AITOOLS_LIB}/zulip_bridge"
 cp -r "${SCRIPT_DIR}/zulip_bridge" "${AITOOLS_LIB}/zulip_bridge"
 find "${AITOOLS_LIB}/zulip_bridge" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 echo "==> Installed zulip_bridge package to ${AITOOLS_LIB}/zulip_bridge"
+# The Python agent engine (INFER_ENGINE=py): the installed ~/.local/bin/ai runs
+# `python3 ~/.local/share/ai/lib/agent --frontend-fd 3 ...`, which imports aitools from the same lib dir.
+rm -rf "${AITOOLS_LIB}/agent"
+cp -r "${SCRIPT_DIR}/agent" "${AITOOLS_LIB}/agent"
+find "${AITOOLS_LIB}/agent" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+echo "==> Installed agent engine to ${AITOOLS_LIB}/agent"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."

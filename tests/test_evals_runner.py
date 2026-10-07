@@ -65,7 +65,7 @@ def mock_run(tmp_path_factory):
     if not os.path.exists(os.path.join(REPO, "ai")):
         pytest.skip("ai binary not built")
     out = tmp_path_factory.mktemp("evals") / "out.json"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
     r = subprocess.run([sys.executable, RUNNER, "--mock", "--json", str(out)], cwd="/",
                        env=env, capture_output=True, text=True, timeout=600)
     return r, out
@@ -169,20 +169,25 @@ def test_mock_sequence_conversion(rev):
     assert len(set(ids)) == 3
 
 
-def test_engine_py_refused_until_python_engine_exists(rev, tmp_path):
-    if os.path.isdir(os.path.join(REPO, "agent")):
-        pytest.skip("Python engine present (Task 8)")
+def test_mock_run_python_engine(tmp_path):
+    """Task 8: `--mock --engine py` runs every task through the Python engine behind the C
+    front-end (INFER_ENGINE_STRICT: a missing agent/ fails instead of falling back to C)."""
+    if not os.path.exists(os.path.join(REPO, "ai")):
+        pytest.skip("ai binary not built")
+    out = tmp_path / "out.json"
     env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
-    r = subprocess.run([sys.executable, RUNNER, "--mock", "--engine", "py"], cwd="/", env=env,
-                       capture_output=True, text=True, timeout=60)
-    assert r.returncode == 2
-    assert "Python engine" in r.stderr
+    r = subprocess.run([sys.executable, RUNNER, "--mock", "--engine", "py", "--json", str(out)], cwd="/",
+                       env=env, capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    rep = json.loads(out.read_text())
+    assert rep["engine"] == "py" and rep["passed"] == rep["total"] == len(_tasks())
 
 
 def test_engine_flag_sets_env(rev):
     env = rev.agent_env(home="/tmp/h", base_url="http://x/v1/", model="m", api_key="k",
                         engine="py", extra={"FOO": "1"})
     assert env["INFER_ENGINE"] == "py" and env["HOME"] == "/tmp/h" and env["FOO"] == "1"
+    assert env["INFER_ENGINE_STRICT"] == "1"
     assert env["INFER_BASE_URL"] == "http://x/v1/" and env["INFER_MODEL"] == "m"
     env = rev.agent_env(home="/tmp/h", base_url="u", model="m", api_key="k", engine="c")
     assert env["INFER_ENGINE"] == "c"
@@ -196,7 +201,7 @@ def _run_custom(tmp_path, tasks):
     for i, t in enumerate(tasks, 1):
         (tdir / f"{i:02d}_{t['id']}.json").write_text(json.dumps(t))
     out = tmp_path / "out.json"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
     r = subprocess.run([sys.executable, RUNNER, "--mock", "--tasks-dir", str(tdir),
                         "--json", str(out)], cwd="/", env=env, capture_output=True, text=True,
                        timeout=300)

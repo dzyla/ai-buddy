@@ -140,6 +140,8 @@ def agent_env(home, base_url, model, api_key, engine=None, extra=None):
     })
     if engine:
         env["INFER_ENGINE"] = engine
+        # --engine py must really run agent/: no silent fallback to the C loop when it is missing
+        env["INFER_ENGINE_STRICT"] = "1"
     env.update(extra or {})
     return env
 
@@ -419,15 +421,6 @@ def run_task(task, endpoint, engine, keep=False):
             shutil.rmtree(root, ignore_errors=True)
 
 
-def python_engine_available():
-    """True once the checkout has the Python engine (`import agent` works from the repo)."""
-    if not os.path.isdir(os.path.join(REPO, "agent")):
-        return False
-    r = subprocess.run([sys.executable, "-c", "import agent"], cwd=REPO,
-                       capture_output=True, text=True, timeout=60)
-    return r.returncode == 0
-
-
 # ── reporting ────────────────────────────────────────────────────────────────
 def print_table(results):
     w = max([len("task")] + [len(r["id"]) for r in results])
@@ -476,10 +469,6 @@ def main(argv=None):
 
     if not os.access(AI_BIN, os.X_OK):
         print("ERROR: %s not found; run `make` first." % AI_BIN, file=sys.stderr)
-        return 2
-    if args.engine == "py" and not python_engine_available():
-        print("ERROR: --engine py: the Python engine (agent/ package, Task 8) is not in this "
-              "checkout yet; use --engine c or omit --engine.", file=sys.stderr)
         return 2
     endpoint = None
     if not args.mock:

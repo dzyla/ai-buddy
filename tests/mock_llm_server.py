@@ -10,7 +10,9 @@ The reply is controlled by env vars:
   MOCK_REPLY_CONTENT  — assistant text to return (default: "MOCK_OK")
   MOCK_CAPTURE        — file to append each request body to (JSON per line)
   MOCK_TOOL_SEQ       — JSON list of tool calls, one per request (an item may
-                        itself be a list = parallel tool calls in one turn)
+                        itself be a list = parallel tool calls in one turn; an
+                        object without "function", e.g. {"content": "...",
+                        "finish_reason": "length"}, is a plain text reply)
   MOCK_N_CTX          — if set, GET /props reports this n_ctx
   MOCK_TIMES          — file to append each request's arrival time (epoch secs) to
 
@@ -74,6 +76,29 @@ class Handler(BaseHTTPRequestHandler):
                 Handler._seq_idx += 1
         elif tool_call_env and not last_is_tool:
             tc = json.loads(tool_call_env)
+
+        if isinstance(tc, dict) and "function" not in tc:
+            # A scripted plain reply (e.g. a truncated answer with finish_reason "length").
+            text, finish = tc.get("content", ""), tc.get("finish_reason", "stop")
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self._sse({"role": "assistant", "content": ""})
+                self._sse({"content": text})
+                self._sse({}, finish=finish)
+                self.wfile.write(b"data: [DONE]\n\n")
+            else:
+                resp = {"id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                                     "finish_reason": finish}]}
+                payload = json.dumps(resp).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            return
 
         if tc is not None:
             # A MOCK_TOOL_SEQ item may be a list -> parallel tool calls in one turn.

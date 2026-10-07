@@ -24,6 +24,7 @@
 #endif
 #include "remote_harness.h"
 #include "ai_toolclient.h"
+#include "ai_frontend.h"
 
 /* ── Remote Server State ───────────────────────────────────────────────────── */
 static remote_server_t *g_remote_server = NULL;
@@ -583,6 +584,7 @@ static void print_user_message(const char *message) {
 static void print_markdown_table(const char *content);
 
 /* ── Print Assistant Response (Borderless & Copy-Paste Friendly) ────────── */
+static int g_response_prerendered = 0;  /* front-end mode: the engine already rendered the content */
 static void print_response_box(const char *model_name, const char *content,
                                int turn_count, int tool_count,
                                double elapsed_sec, double tokens_per_sec,
@@ -601,7 +603,7 @@ static void print_response_box(const char *model_name, const char *content,
     printf("\n\n\033[1;32m🤖 %s (Answer)\033[0m\n\n", mname);
     if (content && *content) {
         char *rendered = NULL;
-        int is_pre_rendered = (strstr(content, "\033[") != NULL);
+        int is_pre_rendered = g_response_prerendered || (strstr(content, "\033[") != NULL);
         if (!is_pre_rendered) {
             rendered = render_markdown(content);
         }
@@ -1333,8 +1335,9 @@ static void log_job(const char *prompt, const char *pipe_writer, const char *res
     char *home = getenv("HOME");
     if (!home) return;
     char dir_path[1024];
+    snprintf(dir_path, sizeof(dir_path), "%s/.cache", home);
+    mkdir(dir_path, 0755);   /* a fresh HOME has no ~/.cache yet: the log was silently skipped */
     snprintf(dir_path, sizeof(dir_path), "%s/.cache/ai", home);
-    
     mkdir(dir_path, 0755);
     
     char file_path[2048];
@@ -2215,10 +2218,15 @@ static void lineed_init(void) {
     char *home = getenv("HOME");
     if (!home) return;
     char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.cache", home);
+    mkdir(dir, 0755);
     snprintf(dir, sizeof(dir), "%s/.cache/ai", home);
     mkdir(dir, 0755);
     snprintf(lineed_history_path, sizeof(lineed_history_path),
              "%s/input_history", dir);
+    /* Registered even when no history file exists yet (it used to be registered only after a
+       successful read, so a first session's history was never written). */
+    atexit(lineed_save_history);
     FILE *f = fopen(lineed_history_path, "r");
     if (!f) return;
     static char buf[LINEED_MAX_LINE];
@@ -2228,7 +2236,6 @@ static void lineed_init(void) {
         if (l > 0) lineed_add_history(buf);
     }
     fclose(f);
-    atexit(lineed_save_history);
 }
 
 /* Count visible (non-ANSI-escape) display columns in a string. */
@@ -3569,16 +3576,17 @@ static char* base64_encode(const unsigned char *data, size_t input_length) {
     if (!encoded_data) return NULL;
     
     for (size_t i = 0, j = 0; i < input_length;) {
-        uint32_t octet_a = i < input_length ? data[i++] : 0;
-        uint32_t octet_b = i < input_length ? data[i++] : 0;
-        uint32_t octet_c = i < input_length ? data[i++] : 0;
-        
+        size_t left = input_length - i;   /* bytes in this group: 1, 2 or >= 3 */
+        uint32_t octet_a = data[i++];
+        uint32_t octet_b = left > 1 ? data[i++] : 0;
+        uint32_t octet_c = left > 2 ? data[i++] : 0;
+
         uint32_t triple = (octet_a << 16) + (octet_b << 8) + octet_c;
-        
+
         encoded_data[j++] = b64chars[(triple >> 18) & 0x3F];
         encoded_data[j++] = b64chars[(triple >> 12) & 0x3F];
-        encoded_data[j++] = i > input_length + 1 ? '=' : b64chars[(triple >> 6) & 0x3F];
-        encoded_data[j++] = i > input_length ? '=' : b64chars[triple & 0x3F];
+        encoded_data[j++] = left > 1 ? b64chars[(triple >> 6) & 0x3F] : '=';   /* was never padded */
+        encoded_data[j++] = left > 2 ? b64chars[triple & 0x3F] : '=';
     }
     encoded_data[output_length] = '\0';
     return encoded_data;
@@ -4157,6 +4165,23 @@ static void print_mode_current(void) {
     printf("  presets: xhigh (deep) · normal (medium) · low (fast) · instruct (no CoT)\n");
 }
 
+/* ── Front-end mode (INFER_ENGINE=py) adapters over the static UI helpers above ── */
+static void fe_print_response_box(const char *model_name, const char *content, int turn_count,
+                                  int tool_count, double elapsed_sec, double tokens_per_sec, int prerendered) {
+    g_response_prerendered = prerendered;
+    print_response_box(model_name, content, turn_count, tool_count, elapsed_sec, tokens_per_sec, 0);
+    g_response_prerendered = 0;
+}
+
+static void fe_redraw(void) {
+    redraw_turn_history(current_session_id);
+}
+
+static void fe_add_turn_item(int kind, const char *name, const char *status, const char *content,
+                             double elapsed, double tps) {
+    add_turn_item((turn_item_type_t)kind, name, status, content, elapsed, tps, g_turn_count, total_tool_count);
+}
+
 int main(int argc, char **argv) {
     int git_flag_explicit = 0;  /* --git/--no-git given: overrides INFER_AUTO_COMMIT */
 #ifdef __linux__
@@ -4320,6 +4345,33 @@ int main(int argc, char **argv) {
             printf("  ai -y \"backup ~/.bashrc\"\n");
             printf("  ai deep-research \"quantum computing\"  # deep multi-source research report\n");
             return 0;
+        }
+    }
+
+    /* INFER_ENGINE=py: run the agent loop in the Python engine (agent/) behind this front-end
+       (ai_frontend.c); falls through to the C engine when agent/ cannot be found. */
+    {
+        const char *engine_env = getenv("INFER_ENGINE");
+        if (engine_env && strcmp(engine_env, "py") == 0) {
+            frontend_ui_t ui = {
+                print_tool_box, print_think_box, fe_print_response_box, print_info_box,
+                print_user_message, read_line_interactive, lineed_init, lineed_add_history,
+                prompt_user_ok, fe_redraw, fe_add_turn_item, print_jobs_and_tasks_status,
+                copy_to_clipboard, &g_hide_details, &g_permission_mode
+            };
+            g_mcp_script = access("./ai_mcp.py", F_OK) == 0 ? "./ai_mcp.py" : NULL;
+            if (!g_mcp_script) {
+                static char fe_mcp[1024];
+                const char *home = getenv("HOME");
+                snprintf(fe_mcp, sizeof(fe_mcp), "%s/.local/bin/ai_mcp.py", home ? home : "");
+                g_mcp_script = (home && access(fe_mcp, F_OK) == 0) ? fe_mcp : "/usr/local/bin/ai_mcp.py";
+            }
+            toolclient_set_script(g_mcp_script);
+            for (int i = 1; i < argc; i++)   /* print_response_box reads it in this process */
+                if (strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "--raw-output") == 0)
+                    setenv("INFER_RAW_OUTPUT", "1", 1);
+            int fe_code = frontend_main(argc, argv, &ui);
+            if (fe_code >= 0) return fe_code;
         }
     }
 

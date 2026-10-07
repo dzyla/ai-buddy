@@ -177,7 +177,7 @@ def _install(tmp_path, home):
     if not fake.exists():
         # No rebuild, no pip, no apt, no systemd, no git config: only the copy steps run.
         _fake_bin(fake, ["make", "pip", "sudo", "systemctl", "git", "apt-get"])
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k == "INFER_TOOL_SERVER"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
     env.update(HOME=str(home), PATH=f"{fake}:{os.environ.get('PATH', '')}")
     r = subprocess.run(["bash", os.path.join(REPO, "install.sh")], cwd=str(tmp_path), env=env,
                        capture_output=True, text=True, timeout=300)
