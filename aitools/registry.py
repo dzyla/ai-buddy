@@ -319,16 +319,16 @@ def _tool_text(res):
     return res
 
 
-def invoke(server_name, tool_name, arguments, mcp_servers=None):
-    """Run one prepared tool call. Returns (stdout_text, exit_code) exactly as `call-tool`
-    printed/exited: handler output + newline; unknown MCP server -> error JSON, exit 1."""
+def native_handler(server_name, tool_name):
+    """The HANDLERS entry a call routes to (tool name or server name matches), else None (MCP)."""
     for name, handler in HANDLERS.items():
         if tool_name == name or server_name == name:
-            return f"{handler(arguments)}\n", 0
+            return handler
+    return None
 
-    # Route to MCP server
-    if mcp_servers is None:
-        mcp_servers = load_config()
+
+def mcp_config_for(server_name, mcp_servers):
+    """The MCP config entry for `server_name` (exact, then its cleaned `[A-Za-z0-9_]` form)."""
     cfg = mcp_servers.get(server_name)
     if not cfg:
         # Try matching clean server name
@@ -337,9 +337,26 @@ def invoke(server_name, tool_name, arguments, mcp_servers=None):
             if clean_k == server_name:
                 cfg = mcp_servers[k]
                 break
+    return cfg
 
+
+def mcp_not_found(server_name):
+    return json.dumps({"error": f"MCP server '{server_name}' not found in config"}) + "\n"
+
+
+def invoke(server_name, tool_name, arguments, mcp_servers=None):
+    """Run one prepared tool call. Returns (stdout_text, exit_code) exactly as `call-tool`
+    printed/exited: handler output + newline; unknown MCP server -> error JSON, exit 1."""
+    handler = native_handler(server_name, tool_name)
+    if handler is not None:
+        return f"{handler(arguments)}\n", 0
+
+    # Route to MCP server
+    if mcp_servers is None:
+        mcp_servers = load_config()
+    cfg = mcp_config_for(server_name, mcp_servers)
     if not cfg:
-        return json.dumps({"error": f"MCP server '{server_name}' not found in config"}) + "\n", 1
+        return mcp_not_found(server_name), 1
 
     result = call_tool(server_name, cfg, tool_name, arguments)
     return f"{_tool_text(result)}\n", 0

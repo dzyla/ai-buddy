@@ -12,12 +12,14 @@ The reply is controlled by env vars:
   MOCK_TOOL_SEQ       — JSON list of tool calls, one per request (an item may
                         itself be a list = parallel tool calls in one turn)
   MOCK_N_CTX          — if set, GET /props reports this n_ctx
+  MOCK_TIMES          — file to append each request's arrival time (epoch secs) to
 
 Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 """
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -42,6 +44,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        if os.environ.get("MOCK_TIMES"):
+            with open(os.environ["MOCK_TIMES"], "a") as f:
+                f.write("%.6f\n" % time.time())
         self._capture(raw)
         try:
             body = json.loads(raw)

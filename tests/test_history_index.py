@@ -26,7 +26,7 @@ ai_mcp = importlib.import_module("ai_mcp")
 @pytest.fixture(scope="module", autouse=True)
 def build_binary():
     binp = os.path.join(REPO, "ai")
-    srcs = ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "Makefile")
+    srcs = ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "ai_toolclient.c", "Makefile")
     stale = not os.path.exists(binp)
     if not stale:
         bm = os.path.getmtime(binp)

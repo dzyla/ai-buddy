@@ -3,24 +3,32 @@ import sys
 import os
 import json
 import subprocess
+import threading
 import time
 
-def config_paths():
+def config_paths(cwd=None, environ=None):
     """MCP config search order (first non-empty file wins), resolved at call time so HOME/cwd/env
     changes are honoured: $INFER_MCP_CONFIG, the user's ~/.config/ai (seeded by install.sh from
     config/mcp.example.json), then ./mcp.json for development (no longer tracked), then the
-    legacy locations of other tools."""
+    legacy locations of other tools. `cwd`/`environ` resolve for another process (the tool
+    server answers for its callers); the default is this process's."""
+    environ = os.environ if environ is None else environ
+    cwd = os.getcwd() if cwd is None else cwd
+    home = environ.get("HOME") or os.path.expanduser("~")
+
+    def user(p):
+        return os.path.join(home, p[2:]) if p.startswith("~/") else os.path.expanduser(p)
     paths = []
-    override = os.environ.get("INFER_MCP_CONFIG")
+    override = environ.get("INFER_MCP_CONFIG")
     if override:
-        paths.append(os.path.expanduser(override))
+        paths.append(user(override))
     paths += [
-        os.path.expanduser("~/.config/ai/mcp.json"),
-        os.path.expanduser("~/.config/ai/mcp_config.json"),
-        os.path.join(os.getcwd(), "mcp.json"),
-        os.path.join(os.getcwd(), "mcp_config.json"),
-        os.path.expanduser("~/.gemini/config/mcp_config.json"),
-        os.path.expanduser("~/.lmstudio/mcp.json"),
+        user("~/.config/ai/mcp.json"),
+        user("~/.config/ai/mcp_config.json"),
+        os.path.join(cwd, "mcp.json"),
+        os.path.join(cwd, "mcp_config.json"),
+        user("~/.gemini/config/mcp_config.json"),
+        user("~/.lmstudio/mcp.json"),
     ]
     return paths
 
@@ -37,8 +45,8 @@ def _enabled(servers):
             if not (isinstance(cfg, dict) and cfg.get("disabled") is True)}
 
 
-def load_config():
-    for path in config_paths():
+def load_config(cwd=None, environ=None):
+    for path in config_paths(cwd, environ):
         if os.path.exists(path) and os.path.getsize(path) > 0:
             try:
                 with open(path, "r") as f:
@@ -146,7 +154,9 @@ def _sync_mcp_auth_tokens():
     except Exception:
         pass
 
-def start_server(cfg):
+def start_server(cfg, environ=None):
+    """Start one stdio MCP server process (own session/process group). `environ` is the caller's
+    environment (default: this process's)."""
     _sync_mcp_auth_tokens()
     cmd = []
     if "command" in cfg:
@@ -162,11 +172,12 @@ def start_server(cfg):
         return None
 
     # In test environments or when headless, block remote MCP servers that open interactive auth browsers
-    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
+    base = os.environ if environ is None else environ
+    if base.get("PYTEST_CURRENT_TEST") or base.get("INFER_TEST_MODE"):
         if any("agent.robinhood.com" in str(x) or "mcp-remote" in str(x) for x in cmd):
             return None
 
-    env = os.environ.copy()
+    env = dict(base)
     env["BROWSER"] = ":"
     env["NO_BROWSER"] = "1"
     env["CI"] = "1"
@@ -328,3 +339,141 @@ def call_tool(server_name, cfg, tool_name, arguments):
         return {"error": str(e)}
     finally:
         _cleanup_proc(proc)
+
+
+# ── Persistent sessions (the tool server keeps one stdio session per MCP server) ──
+class McpSession:
+    """One running MCP server with a reader thread that routes responses by JSON-RPC id, so
+    concurrent callers can share it and a dead server is noticed at once (EOF)."""
+
+    def __init__(self, name, cfg, environ=None, init_timeout=15.0):
+        self.name = name
+        self.cfg_key = json.dumps(cfg, sort_keys=True)
+        self.proc = start_server(cfg, environ)
+        if not self.proc:
+            raise ConnectionError("Failed to start server")
+        self._wlock = threading.Lock()
+        self._cv = threading.Condition()
+        self._results = {}
+        self._next = 1
+        self.dead = False
+        threading.Thread(target=self._read, name="mcp-%s" % name, daemon=True).start()
+        try:
+            self.request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                        "clientInfo": {"name": "ai", "version": "1.0"}}, init_timeout)
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            self.close()
+            raise
+
+    def _read(self):
+        try:
+            for line in self.proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and "id" in msg and ("result" in msg or "error" in msg):
+                    with self._cv:
+                        self._results[msg["id"]] = msg
+                        self._cv.notify_all()
+        except (OSError, ValueError):
+            pass
+        with self._cv:
+            self.dead = True
+            self._cv.notify_all()
+
+    def _send(self, obj):
+        with self._wlock:
+            try:
+                self.proc.stdin.write(json.dumps(obj) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError) as e:
+                self.dead = True
+                raise ConnectionError(f"Failed to send request to MCP server: {e}")
+
+    def request(self, method, params, timeout):
+        with self._wlock:
+            rid = self._next
+            self._next += 1
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        deadline = time.time() + timeout
+        with self._cv:
+            while rid not in self._results:
+                if self.dead:
+                    raise ConnectionError("Connection closed by server")
+                left = deadline - time.time()
+                if left <= 0:
+                    raise TimeoutError(f"Timed out after {timeout}s waiting for MCP response to {method}")
+                self._cv.wait(min(left, 0.5))
+            return self._results.pop(rid)
+
+    def alive(self):
+        return not self.dead and self.proc.poll() is None
+
+    def close(self):
+        self.dead = True
+        _cleanup_proc(self.proc)
+        try:
+            self.proc.wait(timeout=2)  # reap: the tool server is long-lived, no zombies
+        except Exception:
+            pass
+
+
+class McpPool:
+    """Server name -> McpSession. A session is (re)started on first use, when its process died
+    (EOF) or timed out, or when the server's config changed. Disabled servers never reach here
+    (load_config drops them)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = {}
+
+    def _get(self, name, cfg, environ):
+        key = json.dumps(cfg, sort_keys=True)
+        with self._lock:
+            sess = self._sessions.get(name)
+            if sess is not None and (not sess.alive() or sess.cfg_key != key):
+                sess.close()
+                sess = None
+            if sess is None:
+                sess = McpSession(name, cfg, environ)
+                self._sessions[name] = sess
+                return sess, True
+            return sess, False
+
+    def _drop(self, name, sess):
+        with self._lock:
+            if self._sessions.get(name) is sess:
+                del self._sessions[name]
+        sess.close()
+
+    def call_tool(self, name, cfg, tool_name, arguments, timeout=60.0, environ=None):
+        """Like call_tool(): the MCP result dict, or {"error": ...}. Raises TimeoutError (the
+        session is restarted on the next call). A reused session that died before answering is
+        restarted and the call retried once."""
+        for attempt in (0, 1):
+            try:
+                sess, fresh = self._get(name, cfg, environ)
+            except Exception as e:
+                return {"error": str(e)}
+            try:
+                resp = sess.request("tools/call", {"name": tool_name, "arguments": arguments}, timeout)
+            except TimeoutError:
+                self._drop(name, sess)
+                raise
+            except ConnectionError as e:
+                self._drop(name, sess)
+                if attempt == 0 and not fresh:
+                    continue
+                return {"error": str(e)}
+            if "error" in resp:
+                return {"error": str(resp["error"])}
+            return resp.get("result", {})
+        return {"error": "MCP call failed"}
+
+    def close(self):
+        with self._lock:
+            sessions, self._sessions = list(self._sessions.values()), {}
+        for s in sessions:
+            s.close()

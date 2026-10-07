@@ -65,6 +65,10 @@ def _main(argv):
         sys.exit(1)
 
     action = argv[1]
+    if action == "serve":
+        # serve [--idle-exit 900] [--drain-idle 20]: the persistent per-user tool server.
+        from .server import main as serve_main
+        sys.exit(serve_main(argv[2:]))
     mcp_servers = load_config()
 
     if action == "browser-daemon":
@@ -360,6 +364,18 @@ def _list_tools(mcp_servers):
     print(json.dumps(openai_tools))
 
 
+def parse_args_json(args_json):
+    """`call-tool`'s argument parsing: (arguments, None), or (None, error line) when the JSON
+    cannot be parsed even after repair_json."""
+    try:
+        return json.loads(args_json), None
+    except Exception:
+        try:
+            return json.loads(repair_json(args_json)), None
+        except Exception as e:
+            return None, json.dumps({"error": f"Failed to parse arguments JSON even after repair: {e}"})
+
+
 def _call_tool(argv, mcp_servers):
     if len(argv) < 5:
         print("Usage: ai_mcp.py call-tool <server_name> <tool_name> <arguments_json>", file=sys.stderr)
@@ -373,14 +389,10 @@ def _call_tool(argv, mcp_servers):
         print(EMPTY_TOOL_NAME_ERROR)
         sys.exit(0)
 
-    try:
-        arguments = json.loads(args_json)
-    except Exception:
-        try:
-            arguments = json.loads(repair_json(args_json))
-        except Exception as e:
-            print(json.dumps({"error": f"Failed to parse arguments JSON even after repair: {e}"}))
-            sys.exit(0)
+    arguments, error = parse_args_json(args_json)
+    if error is not None:
+        print(error)
+        sys.exit(0)
 
     arguments, error = prepare(tool_name, arguments)
     if error is not None:

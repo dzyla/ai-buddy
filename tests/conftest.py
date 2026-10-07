@@ -57,8 +57,17 @@ def auto_approve_lessons(monkeypatch):
 def isolate_embedder(monkeypatch):
     """Never reach a real embedder (aitools/embed.py) from a test: AI_EMBED_URL points at a port
     nothing listens on (connection refused at once); tests/test_semantic_search.py starts a fake
-    one. INFER_EMBED_AUTODRAIN=0: reserved for the (future) tool server's idle-time queue drain."""
+    one. INFER_EMBED_AUTODRAIN=0: no idle-time queue drain by a tool server a test starts."""
     monkeypatch.setenv("AI_EMBED_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("INFER_EMBED_AUTODRAIN", "0")
     monkeypatch.delenv("INFER_RECALL_K", raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def no_tool_server(monkeypatch):
+    """Never let a test's `ai` run reach (or spawn) the persistent tool server in the real runtime
+    dir: INFER_TOOL_SERVER=0 for every test. Helpers that scrub INFER_* still inherit
+    PYTEST_CURRENT_TEST, which the C client also treats as "off" unless INFER_TOOL_SERVER=1.
+    tests/test_tool_server.py opts in with a private XDG_RUNTIME_DIR and HOME."""
+    monkeypatch.setenv("INFER_TOOL_SERVER", "0")

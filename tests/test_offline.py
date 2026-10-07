@@ -37,7 +37,7 @@ def build_binary():
         if not os.path.exists(binp):
             return True
         bin_mtime = os.path.getmtime(binp)
-        for src in ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "Makefile"):
+        for src in ("ai.c", "ai_session.c", "ai_git.c", "ai_terminal.c", "ai_toolclient.c", "Makefile"):
             p = os.path.join(REPO, src)
             try:
                 if os.path.getmtime(p) > bin_mtime:

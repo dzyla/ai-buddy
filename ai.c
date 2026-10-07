@@ -23,6 +23,7 @@
 #include <sys/prctl.h>
 #endif
 #include "remote_harness.h"
+#include "ai_toolclient.h"
 
 /* ── Remote Server State ───────────────────────────────────────────────────── */
 static remote_server_t *g_remote_server = NULL;
@@ -170,6 +171,12 @@ static char *render_markdown(const char *text)
     else
         snprintf(script, sizeof(script), "%s/.local/bin/ai_mcp.py",
                  home ? home : "~");
+
+    /* Persistent tool server first (no interpreter start); popen fallback. */
+    char *served = NULL;
+    if (toolclient_call("render", NULL, NULL, text, 30, &served) == TOOLCLIENT_OK)
+        return served;
+    free(served);
 
     char *safe_text = shell_escape(text);
     if (!safe_text) return NULL;
@@ -2851,6 +2858,71 @@ char* run_shell_command(const char *cmd, int *exit_status) {
     return run_shell_command_timeout(cmd, exit_status, timeout_sec);
 }
 
+/* ── Persistent tool server (ai_toolclient.c) with the popen path as fallback ── */
+
+/* ESC on the terminal aborts a tool-server call, like run_shell_command_timeout. */
+static int tool_server_esc_pressed(void) {
+    if (!raw_mode_active) return 0;
+    struct pollfd p = {STDIN_FILENO, POLLIN, 0};
+    if (poll(&p, 1, 0) <= 0) return 0;
+    char c;
+    return read(STDIN_FILENO, &c, 1) == 1 && c == 27;
+}
+
+static int tool_command_timeout(void) {
+    const char *env_timeout = getenv("INFER_COMMAND_TIMEOUT");
+    int v = (env_timeout && *env_timeout) ? atoi(env_timeout) : 0;
+    return v > 0 ? v : 120;
+}
+
+/* `ai_mcp.py call-tool <server> <tool> <args>` through the tool server. Returns the tool's stdout
+ * (malloc'd), or NULL when the server is unavailable and nothing ran (caller uses popen). A call
+ * that times out or is interrupted is NOT re-run: it gets the same text the popen path gives. */
+static char *tool_server_call_tool(const char *server, const char *tool, const char *args) {
+    int started_raw = 0;
+    if (!raw_mode_active && isatty(STDIN_FILENO)) {
+        enable_raw_mode();
+        started_raw = 1;
+    }
+    int timeout_sec = tool_command_timeout();
+    char *out = NULL;
+    toolclient_set_interrupt(tool_server_esc_pressed);
+    int rc = toolclient_call("call", server, tool, args, timeout_sec, &out);
+    toolclient_set_interrupt(NULL);
+    if (started_raw) disable_raw_mode();
+    if (rc == TOOLCLIENT_OK) return out;
+    if (rc == TOOLCLIENT_TIMEOUT) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "\n[SYSTEM WARNING: Command timed out after %d seconds. Process killed. Partial output above. Evaluate if script is stuck in an infinite loop, waiting for user input, or just intrinsically slow.]\n", timeout_sec);
+        size_t ol = out ? strlen(out) : 0;
+        char *res = malloc(ol + strlen(msg) + 1);
+        if (res) {
+            memcpy(res, out ? out : "", ol);
+            strcpy(res + ol, msg);
+        }
+        free(out);
+        fprintf(stderr, "\n\033[1;31m[ai] Tool execution timed out after %ds.\033[0m\n", timeout_sec);
+        return res ? res : strdup(msg);
+    }
+    if (rc == TOOLCLIENT_INTERRUPTED) {
+        free(out);
+        fprintf(stderr, "\n\033[1;31m[ai] Tool execution interrupted by ESC key.\033[0m\n");
+        return strdup("");
+    }
+    free(out);
+    return NULL;
+}
+
+/* The tool catalog (`ai_mcp.py list-tools`), via the tool server when available. */
+static char *list_tools_json(const char *mcp_script) {
+    char *out = NULL;
+    if (toolclient_call("list_tools", NULL, NULL, NULL, 120, &out) == TOOLCLIENT_OK) return out;
+    free(out);
+    char tools_cmd[2048];
+    snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
+    return run_shell_command(tools_cmd, NULL);
+}
+
 /* Extract the string value of a key from a flat JSON object string. */
 static char* json_get_string(const char *json_str, const char *key) {
     if (!json_str || !key) return NULL;
@@ -4552,15 +4624,14 @@ int main(int argc, char **argv) {
         }
     }
     g_mcp_script = mcp_script;
+    toolclient_set_script(mcp_script);
 
     char *tools_json = NULL;
     /* Small known context window -> lean tool catalog (see apply_context_budget). */
     if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE"))
         setenv("INFER_TOOL_PROFILE", "core", 1);
     if (!no_tools_mode) {
-        char tools_cmd[2048];
-        snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
-        tools_json = run_shell_command(tools_cmd, NULL);
+        tools_json = list_tools_json(mcp_script);
         if (tools_json && (strncmp(tools_json, "Error", 5) == 0 || strlen(tools_json) < 5)) {
             free(tools_json);
             tools_json = NULL;
@@ -4968,9 +5039,7 @@ int main(int argc, char **argv) {
         if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE")
             && !no_tools_mode && tools_json) {
             setenv("INFER_TOOL_PROFILE", "core", 1);
-            char tools_cmd[2048];
-            snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
-            char *lean = run_shell_command(tools_cmd, NULL);
+            char *lean = list_tools_json(mcp_script);
             if (lean && lean[0] == '[' && strlen(lean) > 5) { free(tools_json); tools_json = lean; }
             else if (lean) free(lean);
         }
@@ -6654,9 +6723,12 @@ step_limit_check:
                                       tool_output = strdup(cached_res);
                                   } else {
                                       char *escaped_args_shell = shell_escape(unescaped_args);
-                                      char call_cmd[4096 + strlen(escaped_args_shell)];
-                                      snprintf(call_cmd, sizeof(call_cmd), "python3 %s call-tool %s %s %s", mcp_script, server_name, mcp_tool_name, escaped_args_shell);
-                                      tool_output = run_shell_command(call_cmd, NULL);
+                                      tool_output = tool_server_call_tool(server_name, mcp_tool_name, unescaped_args);
+                                      if (!tool_output) {
+                                          char call_cmd[4096 + strlen(escaped_args_shell)];
+                                          snprintf(call_cmd, sizeof(call_cmd), "python3 %s call-tool %s %s %s", mcp_script, server_name, mcp_tool_name, escaped_args_shell);
+                                          tool_output = run_shell_command(call_cmd, NULL);
+                                      }
                                       if (tool_output && strncmp(tool_output, "Error", 5) != 0) {
                                           if (tool_is_mutating(mcp_tool_name)) {
                                               invalidate_tool_cache_files();

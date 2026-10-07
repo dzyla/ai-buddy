@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -O2 -Wall -Wextra -fPIC
 LDFLAGS = -lcurl -lssl -lcrypto -lpthread -lm
 
-SRCS = ai.c ai_git.c ai_terminal.c ai_session.c cJSON.c
+SRCS = ai.c ai_git.c ai_terminal.c ai_session.c ai_toolclient.c cJSON.c
 TARGET = ai
 SHARED_LIB = libremote_harness.so
 

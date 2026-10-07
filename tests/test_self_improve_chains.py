@@ -48,7 +48,7 @@ def build():
         if not os.path.exists(AI_BIN):
             return True
         return any(os.path.getmtime(os.path.join(REPO, s)) > os.path.getmtime(AI_BIN)
-                   for s in ("ai.c", "ai_git.c", "ai_terminal.c", "ai_session.c", "Makefile")
+                   for s in ("ai.c", "ai_git.c", "ai_terminal.c", "ai_session.c", "ai_toolclient.c", "Makefile")
                    if os.path.exists(os.path.join(REPO, s)))
     if stale():
         res = subprocess.run(["make"], cwd=REPO, capture_output=True, text=True)
