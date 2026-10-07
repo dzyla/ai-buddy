@@ -23,7 +23,7 @@ from .scheduler import run_scheduler_loop
 from .selfimprove import (lessons_for, metrics_lesson_sync, record_failure, record_recovery, self_improve_status,
                           session_recap)
 from .sessions import session_transcript, trim_messages
-from . import state
+from . import learning, state
 
 
 _FAST_SUBCOMMANDS = ("state-export", "session-recap", "lessons-for", "rag-memories")
@@ -77,6 +77,9 @@ def _main(argv):
         task_id = argv[2]
         run_scheduler_loop(task_id)
         sys.exit(0)
+
+    if action == "lessons":
+        sys.exit(learning.cli(argv[2:]))
 
     if action == "render-markdown":
         if len(argv) < 3:

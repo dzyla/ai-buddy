@@ -4147,6 +4147,27 @@ int main(int argc, char **argv) {
         return system(cmd);
     }
 
+    /* lessons sub-command: human-reviewed learning queue (ai lessons list|review|approve|reject|prune) */
+    if (argc >= 2 && strcmp(argv[1], "lessons") == 0) {
+        static char lessons_script[1024];
+        if (access("./ai_mcp.py", R_OK) == 0) {
+            snprintf(lessons_script, sizeof(lessons_script), "./ai_mcp.py");
+        } else {
+            const char *home = getenv("HOME");
+            snprintf(lessons_script, sizeof(lessons_script), "%s/.local/bin/ai_mcp.py", home ? home : "~");
+            if (access(lessons_script, R_OK) != 0)
+                snprintf(lessons_script, sizeof(lessons_script), "/usr/local/bin/ai_mcp.py");
+        }
+        char **largv = calloc((size_t)argc + 2, sizeof(char *));
+        if (!largv) return 1;
+        largv[0] = "python3";
+        largv[1] = lessons_script;
+        for (int i = 1; i < argc; i++) largv[i + 1] = argv[i];
+        execvp("python3", largv);
+        perror("ai lessons: exec python3");
+        return 1;
+    }
+
     /* metrics sub-command */
     if (argc >= 2 && strcmp(argv[1], "metrics") == 0) {
         char script[1024];

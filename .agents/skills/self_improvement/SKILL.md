@@ -19,6 +19,12 @@ chain has been recovered ≥ INFER_CHAIN_MASTERED times (default 2) and hasn't f
 it is promoted to a MASTER lesson. A new failure on a mastered chain de-masters it until
 it is recovered again.
 
+**Lessons are reviewed by a human before they reach you.** New automatic lessons are stored
+as `proposed`; only `approved`, unexpired lessons are injected (approval lasts 60 days and is
+extended whenever the lesson is reinforced). The user manages the queue with `ai lessons list
+[--status S]`, `review`, `approve ID…`, `reject ID…`, `prune`. Don't expect a fresh pitfall/fix
+to appear until approved; set `INFER_LEARNING_AUTO_APPROVE=1` to skip review.
+
 Two ways past learning reaches you:
 1. **On error**: the harness injects matching lessons into the failing tool result as
    "[REMEMBERED FROM PAST SESSIONS (self-improvement)]".

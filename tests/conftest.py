@@ -44,3 +44,10 @@ def isolate_state_db(tmp_path, monkeypatch):
     import from (or rename files in) the real HOME. Subprocesses inherit the variable."""
     monkeypatch.setenv("AI_STATE_DB", str(tmp_path / "state.db"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def auto_approve_lessons(monkeypatch):
+    """Capture/recall tests predate the review queue; keep them on the old auto-approve behaviour.
+    tests/test_learning_queue.py deletes this variable to exercise the human-review default."""
+    monkeypatch.setenv("INFER_LEARNING_AUTO_APPROVE", "1")

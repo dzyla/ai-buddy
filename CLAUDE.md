@@ -58,6 +58,7 @@ Optional environment variables:
 - `INFER_SYSTEM_PROMPT_FILE` — path to a system-prompt override file. Defaults to `~/.config/ai/system_prompt.md` if that exists; otherwise the compiled-in `SYSTEM_PROMPT` is used. Lets you tune agent behavior without recompiling.
 - `INFER_AUTO_COMMIT=1` — opt into git auto-commit after successful commands (same as `--git`; `--no-git` wins). Off by default; it only stages files git already tracks (`git add -u`) and restores the index if the commit is blocked.
 - `INFER_FETCH_BASIC=1` — force `fetch_webpage` to use the plain urllib+trafilatura path instead of the default robust `fetch_smart` cascade (curl_cffi TLS impersonation → Playwright+stealth → urllib).
+- `INFER_LEARNING_AUTO_APPROVE=1` — store new self-improvement lessons as `approved` immediately (default `0`: they are `proposed` and need `ai lessons approve|review`). Only approved, unexpired lessons reach the system prompt.
 
 ## Architecture: two cooperating processes
 
@@ -125,6 +126,10 @@ A native tool needs, kept in sync:
 `ai.c` auto-loads `SKILL.md` files into the system prompt from `./.agents/skills/*/` (per-project) and `~/.config/ai/skills/*/` (global). These are plain markdown guidance for the model, not executable. The `.agents/skills/` dir in this repo is the project's own skill set (e.g. `karpathy_guidelines`, `autonomous_troubleshooting`).
 
 `compile_and_install.sh` copies the entire `.agents/skills/` tree to `~/.config/ai/skills/` on every install, so skills are always found regardless of the working directory when `ai` is invoked. Re-run the script (or manually `cp -r .agents/skills/. ~/.config/ai/skills/`) after adding or editing a skill.
+
+## Learning queue
+
+`aitools/learning.py`: lessons go `proposed` -> `approved` (60-day expiry, extended on reinforcement) or `rejected`; `expired` after `expires`. Read paths filter by expiry in the query (no startup writes); `ai lessons list|review|approve|reject|prune` (ai.c execs `ai_mcp.py lessons ...`) manages them. `prune` expires and deletes rejected lessons older than 30 days.
 
 ## Runtime state locations
 

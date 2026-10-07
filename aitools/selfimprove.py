@@ -3,7 +3,7 @@ import os
 import json
 import time
 import sqlite3
-from . import state
+from . import learning, state
 from .history import (  # noqa: F401
     HISTORY_DB,
     _ensure_history_schema,
@@ -214,9 +214,9 @@ def _ledger_append(rec):
                         max_rows=_SI_LEDGER_MAX_LINES)
 
 def _append_lesson(kind, tool, signature, body):
-    """Best-effort lesson write; returns False when the state db refused it."""
+    """Best-effort lesson proposal (stored `proposed` until a human approves; see aitools/learning.py); returns False when the state db refused it."""
     try:
-        state.lesson_upsert(kind, tool or "", signature or "", body)
+        learning.propose(kind, tool or "", signature or "", body)
         return True
     except Exception:
         return False  # learning is best-effort; never break the tool call that triggered it
@@ -590,7 +590,7 @@ def self_improve_status():
         else:
             st["recovered"] += 1
     try:
-        lessons = state.lessons_render(status=None, limit=None)
+        lessons = state.lessons_render(status="approved", limit=None)
     except Exception:
         lessons = ""
     lines = ["Self-improvement state (%s):" % state.db_path(),
