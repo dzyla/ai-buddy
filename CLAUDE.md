@@ -129,7 +129,7 @@ A native tool needs, kept in sync:
 
 ## Learning queue
 
-`aitools/learning.py`: lessons go `proposed` -> `approved` (60-day expiry, extended on reinforcement) or `rejected`; `expired` after `expires`. Read paths filter by expiry in the query (no startup writes); `ai lessons list|review|approve|reject|prune` (ai.c execs `ai_mcp.py lessons ...`) manages them. `prune` expires and deletes rejected lessons older than 30 days.
+`aitools/learning.py`: lessons go `proposed` -> `approved` (60-day expiry for every approved lesson, auto-approved and migrated ones included; each recurrence of the same kind+tool+signature bumps `hits` and extends it; a recurrence after expiry re-queues the lesson as `proposed`) or `rejected`; `expired` after `expires`. Read paths filter by expiry in the query (no startup writes); `ai lessons list|review|approve|reject|prune` (ai.c execs `ai_mcp.py lessons ...` only for no subcommand or list/review/approve/reject/prune; `ai lessons learned X` is a normal prompt) manages them. `prune` expires and deletes rejected lessons older than 30 days.
 
 ## Runtime state locations
 

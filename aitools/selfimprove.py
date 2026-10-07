@@ -214,12 +214,13 @@ def _ledger_append(rec):
                         max_rows=_SI_LEDGER_MAX_LINES)
 
 def _append_lesson(kind, tool, signature, body):
-    """Best-effort lesson proposal (stored `proposed` until a human approves; see aitools/learning.py); returns False when the state db refused it."""
+    """Best-effort lesson proposal (stored `proposed` until a human approves; see aitools/learning.py).
+    A repeat reinforces the existing row (hits, expiry) instead of adding one. Returns True when a new
+    row was created, False when an existing one was reinforced, None when the state db refused it."""
     try:
-        learning.propose(kind, tool or "", signature or "", body)
-        return True
+        return learning.propose_ex(kind, tool or "", signature or "", body)[1]
     except Exception:
-        return False  # learning is best-effort; never break the tool call that triggered it
+        return None  # learning is best-effort; never break the tool call that triggered it
 
 def _chain_id(tool, error):
     """Stable id for an ERROR CHAIN: the same mistake, however many times it
@@ -258,14 +259,14 @@ def record_failure(tool="", args="", error="", phase="execution", chain_id=None)
         return False, "Error writing failure ledger: %s" % e
     n = _ledger_signature_count(sig)
     thresh = _si_recurrence_threshold()
-    if n >= thresh and not _has_lesson("PITFALL", tool, sig):
+    if n >= thresh:
         body = ("Recurring pitfall (%dx and counting): `%s` failed with:\n"
                 "> %s\n"
                 "Before retrying the identical call, look up the '## FIX' "
                 "lessons for this tool and change your approach."
                 % (n, tool or "?", (error or "?")[:160]))
-        _append_lesson("PITFALL", tool, sig, body)
-        return True, "[RECURRING FAILURE] " + body
+        if _append_lesson("PITFALL", tool, sig, body):  # new row only; repeats just reinforce it
+            return True, "[RECURRING FAILURE] " + body
     return False, ""
 
 def record_recovery(tool="", args="", prior_error="", phase="execution", chain_id=None,
@@ -301,15 +302,14 @@ def record_recovery(tool="", args="", prior_error="", phase="execution", chain_i
         return "Error writing recovery ledger: %s" % e
     lesson_text = ("`%s` failed (%s) then succeeded with approach: `%s`."
                    % (tool or "?", (prior_error or "?")[:160], args[:200]))
-    if not _has_lesson("FIX", tool, sig):
-        _append_lesson("FIX", tool, sig, lesson_text)
-    if _chain_is_mastered(cid) and not _has_lesson("MASTER", tool, cid):
+    _append_lesson("FIX", tool, sig, lesson_text)
+    if _chain_is_mastered(cid):
         body = ("`%s` error chain resolved %dx and never broke again: %s. "
                 "When this error appears, apply the recorded approach first."
                 % (tool or "?", _chain_stats(cid)["recovered"],
                    (prior_error or "?")[:160]))
-        _append_lesson("MASTER", tool, cid, body)
-        _master_skill_note(tool, cid, prior_error, args)
+        if _append_lesson("MASTER", tool, cid, body):
+            _master_skill_note(tool, cid, prior_error, args)
     return lesson_text
 
 def _master_skill_note(tool, chain_id, prior_error, approach):
@@ -517,13 +517,13 @@ def _metrics_lesson_sync(min_fails=3):
     for (t, sig, err), n in counts.items():
         if n < min_fails:
             continue
-        if _has_lesson("PITFALL", t, sig):
-            continue
         body = ("Metric-detected recurring failure (%dx so far): `%s` failed with:\n"                "> %s\n"                "This tool is flaky for this error — check '## FIX' lessons and "\
                 "show-metrics before retrying the same call." % (n, t or "?", err))
-        if not _append_lesson("PITFALL", t, sig, body):
+        res = _append_lesson("PITFALL", t, sig, body)
+        if res is None:
             break  # db locked/unwritable: don't wait once per lesson (session-recap is on ai's startup path)
-        created.append(sig)
+        if res:
+            created.append(sig)
     return created
 
 def metrics_lesson_sync(min_fails=3):

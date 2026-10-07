@@ -21,7 +21,7 @@ it is recovered again.
 
 **Lessons are reviewed by a human before they reach you.** New automatic lessons are stored
 as `proposed`; only `approved`, unexpired lessons are injected (approval lasts 60 days and is
-extended whenever the lesson is reinforced). The user manages the queue with `ai lessons list
+extended whenever the same mistake recurs; if it recurs after expiry it returns to the review queue). The user manages the queue with `ai lessons list
 [--status S]`, `review`, `approve ID…`, `reject ID…`, `prune`. Don't expect a fresh pitfall/fix
 to appear until approved; set `INFER_LEARNING_AUTO_APPROVE=1` to skip review.
 

@@ -4148,7 +4148,10 @@ int main(int argc, char **argv) {
     }
 
     /* lessons sub-command: human-reviewed learning queue (ai lessons list|review|approve|reject|prune) */
-    if (argc >= 2 && strcmp(argv[1], "lessons") == 0) {
+    if (argc >= 2 && strcmp(argv[1], "lessons") == 0 &&
+        (argc == 2 || strcmp(argv[2], "list") == 0 || strcmp(argv[2], "review") == 0 ||
+         strcmp(argv[2], "approve") == 0 || strcmp(argv[2], "reject") == 0 ||
+         strcmp(argv[2], "prune") == 0)) {
         static char lessons_script[1024];
         if (access("./ai_mcp.py", R_OK) == 0) {
             snprintf(lessons_script, sizeof(lessons_script), "./ai_mcp.py");

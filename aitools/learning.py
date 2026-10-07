@@ -8,6 +8,7 @@ Only `approved` (and unexpired) lessons are injected into the system prompt; the
 Set INFER_LEARNING_AUTO_APPROVE=1 for the old behaviour (new lessons stored approved).
 """
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,29 +31,42 @@ def _norm(kind, tool, signature):
     return (str(kind or "NOTE").strip().upper(), str(tool or "").strip(), str(signature or "").strip())
 
 
-def propose(kind, tool, signature, body, now=None, ttl_days=DEFAULT_TTL_DAYS):
-    """Record a lesson as `proposed` (or `approved` under auto_policy). A repeat of the same
-    kind+tool+signature stores no new row: it bumps hits/last_seen, pushes out the expiry of an
-    approved lesson, and puts an expired one back in the review queue. Returns the lesson id."""
+def propose_ex(kind, tool, signature, body, now=None, ttl_days=DEFAULT_TTL_DAYS):
+    """Like propose() but returns (id, created). A repeat of the same kind+tool+signature stores no
+    new row: it bumps hits/last_seen; an approved lesson's expiry is pushed out to now+ttl (also
+    filling a missing expiry on legacy rows); an expired (or lapsed) one goes back to the review
+    queue as `proposed` (or straight to `approved` under auto_policy). A rejected one stays
+    rejected. `created` is True only when a new row was inserted."""
     kind, tool, signature = _norm(kind, tool, signature)
     ts = time.time() if now is None else float(now)
+    auto = auto_policy()
+    new_exp = ts + ttl_days * DAY
     with state._conn() as c, state._tx(c):
         row = c.execute("SELECT id, status, expires FROM lessons WHERE kind=? AND tool=? AND signature=?",
                         (kind, tool, signature)).fetchone()
         if row:
             c.execute("UPDATE lessons SET hits=hits+1, last_seen=max(coalesce(last_seen, 0), ?) WHERE id=?",
                       (ts, row["id"]))
-            if row["status"] == "approved" and row["expires"] is not None and row["expires"] > ts:
-                c.execute("UPDATE lessons SET expires=max(expires, ?) WHERE id=?",
-                          (ts + ttl_days * DAY, row["id"]))
-            elif row["status"] == "expired":
-                c.execute("UPDATE lessons SET status='proposed', expires=NULL WHERE id=?", (row["id"],))
-            return row["id"]
+            lapsed = row["status"] == "expired" or (row["status"] == "approved" and row["expires"] is not None
+                                                    and row["expires"] <= ts)
+            if row["status"] == "approved" and not lapsed:
+                c.execute("UPDATE lessons SET expires=max(coalesce(expires, 0), ?) WHERE id=?", (new_exp, row["id"]))
+            elif lapsed:
+                if auto:
+                    c.execute("UPDATE lessons SET status='approved', expires=? WHERE id=?", (new_exp, row["id"]))
+                else:
+                    c.execute("UPDATE lessons SET status='proposed', expires=NULL WHERE id=?", (row["id"],))
+            return row["id"], False
         cur = c.execute("INSERT INTO lessons(kind, tool, signature, body, status, created, last_seen, hits, "
-                        "expires) VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL)",
-                        (kind, tool, signature, str(body or ""),
-                         "approved" if auto_policy() else "proposed", ts, ts))
-        return cur.lastrowid
+                        "expires) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                        (kind, tool, signature, str(body or ""), "approved" if auto else "proposed", ts, ts,
+                         new_exp if auto else None))
+        return cur.lastrowid, True
+
+
+def propose(kind, tool, signature, body, now=None, ttl_days=DEFAULT_TTL_DAYS):
+    """Record a lesson as `proposed` (or `approved` under auto_policy); returns the lesson id."""
+    return propose_ex(kind, tool, signature, body, now=now, ttl_days=ttl_days)[0]
 
 
 def _set_status(lesson_id, status, expires=None):
@@ -83,6 +97,10 @@ def expire(now=None):
 def prune(now=None):
     """expire() plus deletion of rejected lessons not seen for REJECTED_RETENTION_DAYS."""
     ts = time.time() if now is None else float(now)
+    with state._conn() as c, state._tx(c):
+        # legacy/auto-approved rows from before expiry applied uniformly: start their ttl now
+        c.execute("UPDATE lessons SET expires=? WHERE status='approved' AND expires IS NULL",
+                  (ts + DEFAULT_TTL_DAYS * DAY,))
     n_exp = expire(ts)
     with state._conn() as c, state._tx(c):
         cur = c.execute("DELETE FROM lessons WHERE status='rejected' AND coalesce(last_seen, created, 0) < ?",
@@ -96,17 +114,19 @@ def _set_body(lesson_id, body):
 
 
 def edit_in_editor(body):
-    """Open `body` in $EDITOR (default vi); returns the edited text (unchanged on failure)."""
+    """Open `body` in $VISUAL/$EDITOR (default vi). Returns the edited text, or None when the editor
+    could not be launched, exited non-zero, or left the file empty (callers must not approve)."""
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
     with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as f:
         f.write(body)
         path = f.name
     try:
-        subprocess.call(editor.split() + [path])
+        if subprocess.call(shlex.split(editor) + [path]) != 0:
+            return None
         with open(path) as f:
-            return f.read().strip() or body
-    except Exception:
-        return body
+            return f.read().strip() or None
+    except (OSError, ValueError):
+        return None
     finally:
         try:
             os.unlink(path)
@@ -142,7 +162,11 @@ def review(interactive=True, decide=None, input_fn=input, out=sys.stdout, ttl_da
         choice = (choice or "s").strip().lower()[:1]
         if choice == "e":
             new_body = new_body if new_body is not None else edit_in_editor(r["body"] or "")
-            choice = "a"
+            if new_body is None:
+                print("editor failed or produced an empty lesson; skipping #%d" % r["id"], file=out)
+                choice = "s"
+            else:
+                choice = "a"
         if choice == "a":
             if new_body is not None:
                 _set_body(r["id"], new_body)
@@ -187,7 +211,11 @@ def cli(args, input_fn=input, out=sys.stdout):
         print(format_table(rows) if rows else "No lessons.", file=out)
         return 0
     if sub == "review":
-        res = review(interactive=True, input_fn=input_fn, out=out)
+        try:
+            res = review(interactive=True, input_fn=input_fn, out=out)
+        except KeyboardInterrupt:
+            print("\ninterrupted; remaining lessons stay proposed", file=out)
+            return 130
         print("approved=%(approved)d rejected=%(rejected)d pending=%(pending)d" % res, file=out)
         return 0
     if sub in ("approve", "reject"):

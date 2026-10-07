@@ -790,7 +790,8 @@ def _mig_lessons(c, home, counts, renames):
     for kind, tool, sig, body, created in parsed:
         if not sig:
             sig = "manual:" + hashlib.sha1(("%s|%s|%s" % (kind, tool, body)).encode()).hexdigest()[:12]
-        if lesson_upsert(kind, tool, sig, body, ts=created, conn=c):
+        # approved on migration with the standard 60-day ttl so expiry applies uniformly
+        if lesson_upsert(kind, tool, sig, body, ts=created, expires=time.time() + 60 * 86400.0, conn=c):
             counts["lessons"] += 1
     renames.append(path)
 
