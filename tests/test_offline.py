@@ -437,3 +437,308 @@ def test_background_process_system_prompt_guidance(tmp_path):
     assert "start_background_process" in sys_msg
     assert "execute_command" in sys_msg
     assert "blocks the main thread" in sys_msg
+
+
+# ═══════════════ Context management & self-learning regressions ═══════════════
+# These run the binary from a throwaway cwd (with ai_mcp.py symlinked in) so the
+# repo's AGENTS.md / mcp.json are not loaded and auto-commit can't touch the repo.
+
+def _sandbox_run(tmp_path, base_url, args, extra_env=None, timeout=120):
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home.mkdir(exist_ok=True)
+    work.mkdir(exist_ok=True)
+    for f in ("ai_mcp.py", "deep_research.py"):
+        if not (work / f).exists():
+            os.symlink(os.path.join(REPO, f), work / f)
+    env = os.environ.copy()
+    for k in list(env):
+        if k.startswith("INFER_") or k in ("LLAMA_CTX_SIZE",):
+            env.pop(k, None)
+    env.update({"HOME": str(home), "INFER_BASE_URL": base_url, "INFER_API_KEY": "t",
+                "INFER_MODEL": "mock", "INFER_TOOL_CHOICE": "auto", "INFER_AUTO_APPROVE": "1"})
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run([AI_BIN] + args, cwd=str(work), env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def _orphan_tool_ids(msgs):
+    seen, orphans = set(), []
+    for m in msgs:
+        for c in (m.get("tool_calls") or []):
+            seen.add(c.get("id"))
+        if m.get("role") == "tool" and m.get("tool_call_id") not in seen:
+            orphans.append(m.get("tool_call_id"))
+    return orphans
+
+
+def _trim_cli(messages, tmp_path, max_bytes):
+    f = tmp_path / "msgs.json"
+    f.write_text(json.dumps(messages))
+    r = subprocess.run([sys.executable, os.path.join(REPO, "ai_mcp.py"), "trim-messages",
+                        str(f), str(max_bytes)], capture_output=True, text=True, timeout=60)
+    return json.loads(r.stdout)
+
+
+def _history(n_units, parallel=2, payload="x" * 50):
+    msgs = [{"role": "system", "content": "SYS"},
+            {"role": "user", "content": "first task"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "CURRENT TASK"}]
+    for i in range(n_units):
+        calls = [{"id": "c%d_%d" % (i, j), "type": "function",
+                  "function": {"name": "read_file", "arguments": "{}"}} for j in range(parallel)]
+        msgs.append({"role": "assistant", "content": None, "tool_calls": calls})
+        for c in calls:
+            msgs.append({"role": "tool", "tool_call_id": c["id"], "content": payload})
+    return msgs
+
+
+def test_trim_is_noop_under_budget(tmp_path):
+    """Old trim cut to 'first 2 + last 20 messages' on EVERY iteration regardless
+    of size; a 3 KB history must come back unchanged."""
+    msgs = _history(9)
+    assert _trim_cli(msgs, tmp_path, 100000) == msgs
+
+
+def test_trim_keeps_latest_user_turn_and_never_orphans_tools(tmp_path):
+    msgs = _history(40, parallel=2, payload="y" * 3000)
+    out = _trim_cli(msgs, tmp_path, 30000)
+    assert len(json.dumps(out)) <= 30000 * 1.05
+    assert out[0]["role"] == "system"
+    contents = [m.get("content") for m in out]
+    assert "CURRENT TASK" in contents, "latest user turn was dropped"
+    assert "first task" in contents
+    assert _orphan_tool_ids(out) == []
+    # every kept assistant tool_call still has all of its replies
+    replies = {m["tool_call_id"] for m in out if m["role"] == "tool"}
+    for m in out:
+        for c in (m.get("tool_calls") or []):
+            assert c["id"] in replies
+    # the newest unit is intact
+    assert out[-1]["tool_call_id"] == msgs[-1]["tool_call_id"]
+
+
+def test_binary_trim_threshold_respected_and_protocol_valid(tmp_path):
+    """E2E: with a small INFER_TRIM_THRESHOLD and parallel tool calls producing
+    big outputs, every request must keep the system prompt + the user's task,
+    contain no orphaned tool messages, and stay bounded."""
+    big = tmp_path / "big.txt"
+    big.write_text("Z" * 6000)
+    seq = [[{"id": "r%d_%d" % (i, j), "type": "function",
+             "function": {"name": "read_file",
+                          "arguments": json.dumps({"path": str(big), "offset": i * 10 + j})}}
+            for j in range(2)] for i in range(10)]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["TASK_MARKER_42 read the file"],
+                         {"INFER_TRIM_THRESHOLD": "30000", "INFER_STATE_CONTEXT": "0"})
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert len(reqs) >= 8
+    for q in reqs:
+        msgs = q["messages"]
+        assert msgs[0]["role"] == "system"
+        assert any("TASK_MARKER_42" in str(m.get("content")) for m in msgs if m["role"] == "user")
+        assert _orphan_tool_ids(msgs) == []
+    sys_len = len(json.dumps(reqs[-1]["messages"][0]))
+    assert len(json.dumps(reqs[-1]["messages"])) < 30000 + sys_len
+
+
+def test_resumed_session_keeps_new_prompt_after_many_tool_calls(tmp_path):
+    """-r splices old turns in front of the new prompt; the old count-based trim
+    then kept the OLDEST user turn and dropped the new task after ~10 calls."""
+    home = tmp_path / "home"
+    sess = home / ".cache" / "ai" / "sessions"
+    sess.mkdir(parents=True)
+    old = [{"role": "system", "content": "S"}]
+    for i in range(12):
+        old += [{"role": "user", "content": "old question %d" % i},
+                {"role": "assistant", "content": "old answer %d " % i + "w" * 2000}]
+    (sess / "last.json").write_text(json.dumps(old))
+    seq = [{"id": "l%d" % i, "type": "function",
+            "function": {"name": "list_directory", "arguments": json.dumps({"path": "/tmp", "n": i})}}
+           for i in range(14)]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["-r", "NEW_TASK_77"],
+                         {"INFER_TRIM_THRESHOLD": "25000"})
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert len(reqs) >= 10
+    for q in reqs:
+        assert any(m["role"] == "user" and "NEW_TASK_77" in str(m.get("content"))
+                   for m in q["messages"]), "current prompt lost from context"
+        assert _orphan_tool_ids(q["messages"]) == []
+
+
+def test_small_ctx_detected_from_props_uses_core_tools(tmp_path):
+    """A 16k-ctx server (n_ctx from /props) must not be sent the ~45 KB full
+    catalog (≈12k tokens, before any message)."""
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TASK_COMPLETE="ok", MOCK_N_CTX="16384") as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["hi"])
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    names = {t["function"]["name"] for t in reqs[0]["tools"]}
+    assert names <= set(ai_mcp.CORE_TOOL_PROFILE), names - set(ai_mcp.CORE_TOOL_PROFILE)
+    assert {"execute_command", "read_file", "task_complete"} <= names
+    assert len(json.dumps(reqs[0]["tools"])) < 15000
+
+
+def test_large_ctx_keeps_full_catalog(tmp_path):
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TASK_COMPLETE="ok", MOCK_N_CTX="131072") as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["hi"])
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert len(reqs[0]["tools"]) > len(ai_mcp.CORE_TOOL_PROFILE) + 10
+
+
+def test_small_ctx_caps_tool_output(tmp_path):
+    """max_tool_output defaults to 64 KB (~20k tokens) — bigger than a 16k model's
+    whole window. With a known small window it must be derived from it."""
+    big = tmp_path / "huge.txt"
+    big.write_text("Q" * 40000)
+    seq = [{"id": "h1", "type": "function",
+            "function": {"name": "read_file", "arguments": json.dumps({"path": str(big)})}}]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq), MOCK_N_CTX="16384") as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["read it"])
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    tool_msg = next(m["content"] for m in reqs[1]["messages"] if m["role"] == "tool")
+    assert len(tool_msg) < 16000
+
+
+# ── save_memory ──
+def test_save_memory_appends_dedups_and_evicts(tmp_path, monkeypatch):
+    mem = tmp_path / "memory.txt"
+    monkeypatch.setattr(ai_mcp, "MEMORY_PATH", str(mem))
+    ai_mcp.save_memory("User prefers metric units")
+    ai_mcp.save_memory("Lab server is gpu-box")
+    text = mem.read_text()
+    assert "metric units" in text and "gpu-box" in text, "second save erased the first"
+    r = ai_mcp.save_memory("user prefers metric units")
+    assert "no duplicate" in r
+    assert mem.read_text().lower().count("metric units") == 1
+    for i in range(80):
+        ai_mcp.save_memory("fact number %03d " % i + "p" * 60)
+    text = mem.read_text()
+    assert len(text) <= ai_mcp.MEMORY_CAP + 1
+    assert "fact number 079" in text            # newest kept
+    assert "metric units" not in text            # oldest whole lines evicted
+    for line in text.splitlines():               # never a mid-line cut
+        assert line.startswith("fact number") or line == ""
+    ai_mcp.save_memory("only this", replace=True)
+    assert mem.read_text().strip() == "only this"
+
+
+# ── self-improvement ──
+@pytest.fixture
+def si_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("INFER_PRIVATE_MODE", raising=False)
+    return tmp_path
+
+
+def test_second_distinct_fix_for_same_tool_is_learned(si_home):
+    """_has_lesson matched 'any FIX block exists' + 'tool: X anywhere', so after
+    the first lesson for a tool every later distinct lesson was dropped."""
+    ai_mcp.record_failure("read_file", "{}", "Error: file /a/x.txt does not exist")
+    ai_mcp.record_recovery("read_file", '{"path":"/b/x.txt"}', "Error: file /a/x.txt does not exist")
+    ai_mcp.record_failure("read_file", "{}", "Error: binary file rejected, use pdftotext")
+    ai_mcp.record_recovery("read_file", '{"path":"x.txt"}', "Error: binary file rejected, use pdftotext")
+    blocks = [b for b in ai_mcp._lesson_blocks() if b.startswith("## FIX")]
+    assert len(blocks) == 2, blocks
+    # and a repeat of the same lesson is still deduplicated
+    ai_mcp.record_recovery("read_file", '{"path":"/c"}', "Error: binary file rejected, use pdftotext")
+    assert len([b for b in ai_mcp._lesson_blocks() if b.startswith("## FIX")]) == 2
+
+
+def test_harness_guard_errors_are_not_learned(si_home):
+    err = ("Error: You are stuck in a loop calling the exact same tool with the exact "
+           "same arguments. Stop and try a different approach, or call task_complete.")
+    for _ in range(3):
+        ai_mcp.record_failure("list_directory", '{"path":"."}', err)
+    assert ai_mcp.record_recovery("list_directory", '{"path":"."}', err) == ""
+    assert ai_mcp._lesson_blocks() == []
+    assert ai_mcp._read_ledger() == []
+
+
+def test_identical_args_recovery_is_not_a_fix(si_home):
+    e = "Error: connection reset by peer"
+    ai_mcp.record_failure("web_search", '{"q":"a"}', e)
+    assert ai_mcp.record_recovery("web_search", '{"q":"a"}', e, failed_args='{"q":"a"}') == ""
+    assert not [b for b in ai_mcp._lesson_blocks() if b.startswith("## FIX")]
+
+
+def test_cli_passes_chain_id_through(si_home):
+    env = dict(os.environ, HOME=str(si_home))
+    pay = {"tool": "read_file", "args": "{}", "error": "Error: boom 1", "chain_id": "chain_FROM_C"}
+    subprocess.run([sys.executable, os.path.join(REPO, "ai_mcp.py"), "record-failure",
+                    json.dumps(pay)], env=env, check=True, timeout=60)
+    assert ai_mcp._read_ledger()[-1]["chain_id"] == "chain_FROM_C"
+
+
+def test_binary_loop_guard_does_not_poison_lessons(tmp_path):
+    """E2E repro: identical list_directory calls trip the loop guard; the old
+    harness saved PITFALL + a bogus FIX ('stuck in a loop' -> same args)."""
+    seq = [{"id": "c%d" % i, "type": "function",
+            "function": {"name": "list_directory", "arguments": json.dumps({"path": "/tmp"})}}
+           for i in range(8)]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["list"])
+    assert r.returncode == 0, r.stderr[-2000:]
+    lessons = tmp_path / "home" / ".config" / "ai" / "self_improve" / "lessons.md"
+    text = lessons.read_text() if lessons.exists() else ""
+    assert "stuck in a loop" not in text
+
+
+def test_binary_records_failure_with_huge_output(tmp_path):
+    """An escaped 20 KB error overflowed the 9 KB payload buffer; the truncated
+    JSON made record-failure crash and the failure was never learned."""
+    cmd = "python3 -c \"print('E'*20000); raise SystemExit(3)\""
+    seq = [{"id": "x1", "type": "function",
+            "function": {"name": "execute_command", "arguments": json.dumps({"command": cmd})}}]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["run it"])
+    assert r.returncode == 0, r.stderr[-2000:]
+    ledger = tmp_path / "home" / ".config" / "ai" / "self_improve" / "ledger.jsonl"
+    assert ledger.exists() and '"execute_command"' in ledger.read_text()
+
+
+def test_task_timeout_forces_exactly_one_more_iteration(tmp_path):
+    """The timeout/stall paths set loop_count = 28 ("one more iteration"), which
+    only holds for a 30-step limit: non-tty runs (limit 60) got 32 more steps and
+    --continue (limit 999999) never stopped."""
+    seq = [{"id": "s0", "type": "function", "function": {"name": "execute_command",
+            "arguments": json.dumps({"command": "python3 -c 'import time; time.sleep(1.5)'"})}}]
+    seq += [{"id": "l%d" % i, "type": "function", "function": {"name": "list_directory",
+             "arguments": json.dumps({"path": "/tmp", "i": i})}} for i in range(15)]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["go"], {"INFER_TASK_TIMEOUT": "1"})
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert len(reqs) <= 4, "timeout did not stop the loop (%d requests)" % len(reqs)
+
+
+def test_agents_md_injection_is_capped(tmp_path):
+    """AGENTS.md (up to 100 KB) was injected whole into every request."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "AGENTS.md").write_text("# Project rules\n" + ("rule line " * 9 + "\n") * 400)
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TASK_COMPLETE="ok") as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["hi"])
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-2000:]
+    sysm = reqs[0]["messages"][0]["content"]
+    assert "# Project rules" in sysm
+    assert "AGENTS.md truncated" in sysm
+    assert sysm.count("rule line") < 1500

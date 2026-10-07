@@ -22,8 +22,8 @@ from urllib.parse import parse_qs
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-CRED = "~/.config/ai/gcal_credentials.json"
-TOKEN = "~/.config/ai/gcal_token.json"
+CRED = os.path.expanduser("~/.config/ai/gcal_credentials.json")
+TOKEN = os.path.expanduser("~/.config/ai/gcal_token.json")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -47,6 +47,9 @@ class Handler(BaseHTTPRequestHandler):
                      b"attempt). Open the most recently opened browser tab "
                      b"and approve there.\n")
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
         self.wfile.write(body)
 
     def log_message(self, *args):  # silence per-request logging
@@ -54,6 +57,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if not os.path.exists(CRED):
+        print("Credentials file not found at %s. Download your OAuth 'Desktop app' "
+              "client JSON from Google Cloud Console and save it there." % CRED, file=sys.stderr)
+        sys.exit(1)
     flow = InstalledAppFlow.from_client_secrets_file(CRED, SCOPES)
 
     # Bind first so we know the real port to use as redirect_uri.
@@ -92,15 +99,19 @@ def main():
         print("Timed out waiting for authorization.", file=sys.stderr)
         sys.exit(1)
 
-    # Mirror run_local_server exactly (oauthlib insists on the https scheme).
+    # Mirror run_local_server: it passes the FULL callback URL with the scheme
+    # rewritten to https (oauthlib rejects a bare path / http as insecure).
     flow.fetch_token(
-        authorization_response=srv.ctx["result_path"].replace("http", "https"),
+        authorization_response="https://localhost:%d%s" % (port, srv.ctx["result_path"]),
         audience=None,
     )
     creds = flow.credentials
     os.makedirs(os.path.dirname(TOKEN), exist_ok=True)
-    with open(TOKEN, "w") as token_file:
+    tmp = TOKEN + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as token_file:
         token_file.write(creds.to_json())
+    os.replace(tmp, TOKEN)
     print("Token saved to %s" % TOKEN, file=sys.stderr)
 
 

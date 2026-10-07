@@ -81,7 +81,7 @@ Verified output (top pairs = barnase/barstar interfaces, correct):
 ```
 B-E 541 contacts, A-D 518, C-F 403   (1brs.pdb, cutoff 4.5 Å)
 ```
-Artifact: `~/Code/ai-buddy/pdbtool/` (`main.go`, `main_test.go`, `pdbtool`,
+Artifact: `./pdbtool/` (`main.go`, `main_test.go`, `pdbtool`,
 `go.mod`, `go.sum`; prior hand-written version kept as `main_reinvent.go`).
 
 During the run the harness's own self-improvement surfaced a past

@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import datetime
+import time
 from robinhood_trader import (
     MarketHours,
     TechnicalIndicators,
@@ -229,6 +230,8 @@ class TestRobinhoodExecutor:
             return {}
 
         monkeypatch.setattr(RobinhoodExecutor, "call_mcp_tool", fake_mcp_call)
+        for var in ("RH_AGENTIC_ACCOUNT", "RH_PRIMARY_ACCOUNT", "RH_ROTH_ACCOUNT", "RH_TRADER_CONFIG"):
+            monkeypatch.delenv(var, raising=False)
 
         port = RobinhoodExecutor.get_live_portfolio("000000002")
         assert float(port["total_value"]) == pytest.approx(8230.28)
@@ -589,3 +592,235 @@ class TestAgentAdvisorWealthGuard:
 
 
 
+
+
+# ------------------------------------------------------------------------------
+# Account resolution (no hardcoded account numbers; fail closed) and order guard
+# ------------------------------------------------------------------------------
+
+FAKE_AGENTIC, FAKE_PRIMARY, FAKE_ROTH = "000000001", "000000002", "000000003"
+
+
+@pytest.fixture
+def fake_accounts(monkeypatch):
+    """Patch get_accounts with a mutable list and clear any real RH_* env overrides."""
+    import robinhood_trader as rt
+    for var in ("RH_AGENTIC_ACCOUNT", "RH_PRIMARY_ACCOUNT", "RH_ROTH_ACCOUNT", "RH_TRADER_CONFIG"):
+        monkeypatch.delenv(var, raising=False)
+    accounts = [
+        {"account_number": FAKE_PRIMARY, "is_default": True, "agentic_allowed": False},
+        {"account_number": FAKE_AGENTIC, "nickname": "Agentic", "agentic_allowed": True},
+        {"account_number": FAKE_ROTH, "agentic_allowed": False},
+    ]
+    monkeypatch.setattr(rt.RobinhoodExecutor, "get_accounts", classmethod(lambda cls: list(accounts)))
+    return accounts
+
+
+class TestAccountResolution:
+    def test_config_file_maps_aliases(self, fake_accounts):
+        import robinhood_trader as rt
+        with open(rt.trader_config_path(), "w") as fh:
+            json.dump({"accounts": {"agentic": FAKE_AGENTIC, "primary": FAKE_PRIMARY, "roth": FAKE_ROTH}}, fh)
+        R = rt.RobinhoodExecutor
+        assert R.resolve_account("agentic") == FAKE_AGENTIC
+        assert R.resolve_account("primary") == FAKE_PRIMARY
+        assert R.resolve_account(None) == FAKE_PRIMARY
+        assert R.resolve_account("roth") == FAKE_ROTH
+        assert R.resolve_account("123") == "123"
+
+    def test_env_overrides_config(self, fake_accounts, monkeypatch):
+        import robinhood_trader as rt
+        with open(rt.trader_config_path(), "w") as fh:
+            json.dump({"accounts": {"agentic": "999"}}, fh)
+        monkeypatch.setenv("RH_AGENTIC_ACCOUNT", FAKE_AGENTIC)
+        assert rt.RobinhoodExecutor.get_agentic_account_number() == FAKE_AGENTIC
+
+    def test_discovery_uses_agentic_allowed_flag_only(self, fake_accounts):
+        import robinhood_trader as rt
+        assert rt.RobinhoodExecutor.get_agentic_account_number() == FAKE_AGENTIC
+        # nickname alone must not make an account agentic
+        fake_accounts[1]["agentic_allowed"] = False
+        assert rt.RobinhoodExecutor.get_agentic_account() is None
+
+    def test_fails_closed_without_agentic_account(self, fake_accounts):
+        """Previously fell back to accounts[0] (the primary margin account) or a hardcoded number."""
+        import robinhood_trader as rt
+        fake_accounts[1]["agentic_allowed"] = False
+        with pytest.raises(rt.AccountResolutionError):
+            rt.RobinhoodExecutor.get_agentic_account_number()
+        fake_accounts.clear()      # MCP down / not authenticated
+        with pytest.raises(rt.AccountResolutionError):
+            rt.RobinhoodExecutor.get_agentic_account_number()
+
+    def test_ambiguous_agentic_accounts_fail_closed(self, fake_accounts):
+        import robinhood_trader as rt
+        fake_accounts[2]["agentic_allowed"] = True
+        with pytest.raises(rt.AccountResolutionError):
+            rt.RobinhoodExecutor.get_agentic_account_number()
+
+    def test_configured_non_agentic_account_is_rejected(self, fake_accounts, monkeypatch):
+        import robinhood_trader as rt
+        monkeypatch.setenv("RH_AGENTIC_ACCOUNT", FAKE_PRIMARY)
+        assert rt.RobinhoodExecutor.get_agentic_account() is None
+
+
+class TestOrderGuard:
+    def _capture(self, monkeypatch, result):
+        import robinhood_trader as rt
+        calls = []
+
+        def fake_call(tool_name, arguments, timeout=15, max_retries=2):
+            calls.append((tool_name, arguments))
+            return result
+        monkeypatch.setattr(rt.RobinhoodExecutor, "call_mcp_tool", fake_call)
+        return calls
+
+    def test_refuses_non_agentic_account(self, fake_accounts, monkeypatch):
+        import robinhood_trader as rt
+        calls = self._capture(monkeypatch, {"content": [{"text": "{}"}]})
+        with pytest.raises(PermissionError):
+            rt.RobinhoodExecutor.execute_market_order(FAKE_PRIMARY, "VTI", "buy", dollar_amount="10")
+        fake_accounts.clear()      # account list unavailable -> refuse, even for the agentic number
+        with pytest.raises(PermissionError):
+            rt.RobinhoodExecutor.execute_market_order(FAKE_AGENTIC, "VTI", "buy", dollar_amount="10")
+        assert calls == []
+
+    def test_places_on_agentic_and_reports_failures(self, fake_accounts, monkeypatch):
+        import robinhood_trader as rt
+        calls = self._capture(monkeypatch, {"content": [{"text": "{}"}]})
+        rt.RobinhoodExecutor.execute_market_order(FAKE_AGENTIC, "vti", "buy", dollar_amount="10")
+        assert calls == [("place_equity_order", {"account_number": FAKE_AGENTIC, "symbol": "VTI", "side": "buy",
+                                                 "type": "market", "dollar_amount": "10"})]
+        self._capture(monkeypatch, {})                       # no reply: outcome unknown
+        with pytest.raises(rt.OrderNotConfirmed):
+            rt.RobinhoodExecutor.execute_market_order(FAKE_AGENTIC, "VTI", "buy", dollar_amount="10")
+        self._capture(monkeypatch, {"isError": True, "content": [{"text": "insufficient buying power"}]})
+        with pytest.raises(RuntimeError, match="rejected"):
+            rt.RobinhoodExecutor.execute_market_order(FAKE_AGENTIC, "VTI", "buy", dollar_amount="10")
+
+    def test_rebalance_cli_guard_exists(self):
+        import robinhood_trader as rt
+        assert callable(getattr(rt.RobinhoodExecutor, "is_agentic_account", None))
+
+
+class FakeMCPProc:
+    """Stands in for the mcp-remote subprocess: answers initialize, never answers tools/call."""
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        r, w = os.pipe()
+        self._r, self._w = r, w
+        self.pid = 2 ** 22 + 12345          # no such process: killpg fails and kill() is used
+        self.tool_calls = []
+        outer = self
+
+        class _Stdin:
+            def write(self, text):
+                msg = json.loads(text)
+                if msg.get("method") == "initialize":
+                    os.write(outer._w, b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+                elif msg.get("method") == "tools/call":
+                    outer.tool_calls.append(msg["params"]["name"])
+                    os.write(outer._w, b'{"jsonrpc":"2.0","id":2,"res')   # partial line, then silence
+
+            def flush(self):
+                pass
+
+        class _Stdout:
+            def fileno(self):
+                return outer._r
+
+        self.stdin, self.stdout = _Stdin(), _Stdout()
+        FakeMCPProc.instances.append(self)
+
+    def kill(self):
+        for fd in (self._r, self._w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    terminate = kill
+
+
+class TestMCPCall:
+    @pytest.fixture
+    def fake_proc(self, monkeypatch):
+        import robinhood_trader as rt
+        FakeMCPProc.instances = []
+        monkeypatch.delenv("INFER_TEST_MODE", raising=False)
+        monkeypatch.setattr(rt.RobinhoodExecutor, "_sync_mcp_auth_tokens", classmethod(lambda cls: None))
+        monkeypatch.setattr(rt.subprocess, "Popen", FakeMCPProc)
+        monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+        return FakeMCPProc
+
+    def test_order_is_never_resent_after_lost_reply(self, fake_proc, monkeypatch):
+        """Previously a timed-out place_equity_order was retried twice: up to three real orders."""
+        import robinhood_trader as rt
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)   # pytest re-sets it per phase
+        t0 = time.time()
+        res = rt.RobinhoodExecutor.call_mcp_tool("place_equity_order", {"symbol": "VTI"}, timeout=0.3, max_retries=2)
+        assert res == {}
+        assert sum(len(p.tool_calls) for p in fake_proc.instances) == 1
+        assert time.time() - t0 < 3.0          # bounded despite the partial line
+
+    def test_read_only_tool_is_still_retried(self, fake_proc, monkeypatch):
+        import robinhood_trader as rt
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        rt.RobinhoodExecutor.call_mcp_tool("get_portfolio", {}, timeout=0.2, max_retries=2)
+        assert sum(len(p.tool_calls) for p in fake_proc.instances) == 3
+
+    def test_reader_does_not_block_on_partial_line(self):
+        import robinhood_trader as rt
+        r, w = os.pipe()
+        try:
+            os.write(w, b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n{"id":2,"res')
+            buf = bytearray()
+            assert rt.RobinhoodExecutor._read_jsonrpc_response(r, 1, 1.0, buf)["result"] == {"ok": True}
+            t0 = time.time()
+            assert rt.RobinhoodExecutor._read_jsonrpc_response(r, 2, 0.3, buf) is None
+            assert time.time() - t0 < 1.5
+        finally:
+            os.close(r)
+            os.close(w)
+
+
+class TestMarketHoursEdgeCases:
+    def test_early_close_days(self):
+        assert MarketHours.market_close_time(datetime.date(2026, 11, 27)) == datetime.time(13, 0)   # day after Thanksgiving
+        assert MarketHours.market_close_time(datetime.date(2026, 12, 24)) == datetime.time(13, 0)
+        assert MarketHours.market_close_time(datetime.date(2026, 12, 23)) == datetime.time(16, 0)
+        half = datetime.datetime(2026, 11, 27, 14, 0, tzinfo=ET_ZONE)
+        assert MarketHours.get_market_session(half) == "AFTER_HOURS"
+        assert MarketHours.is_market_open(datetime.datetime(2026, 11, 27, 12, 0, tzinfo=ET_ZONE))
+        assert MarketHours.seconds_until_close(datetime.datetime(2026, 11, 27, 12, 0, tzinfo=ET_ZONE)) == 3600
+
+    def test_mountain_time_input_is_converted(self):
+        import zoneinfo
+        mt = zoneinfo.ZoneInfo("America/Denver")
+        # 08:00 MT == 10:00 ET (open); 15:00 MT == 17:00 ET (after hours) - both DST and standard time
+        assert MarketHours.get_market_session(datetime.datetime(2026, 7, 14, 8, 0, tzinfo=mt)) == "REGULAR"
+        assert MarketHours.get_market_session(datetime.datetime(2026, 1, 13, 8, 0, tzinfo=mt)) == "REGULAR"
+        assert MarketHours.get_market_session(datetime.datetime(2026, 7, 14, 15, 0, tzinfo=mt)) == "AFTER_HOURS"
+
+
+class TestDaemonLoopResilience:
+    def test_premarket_briefing_error_does_not_crash_loop(self, monkeypatch):
+        import robinhood_trader as rt
+
+        class Stop(Exception):
+            pass
+        monkeypatch.setattr(rt.MarketHours, "now_et", lambda: datetime.datetime(2026, 9, 8, 9, 25, tzinfo=ET_ZONE))
+
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+        monkeypatch.setattr(rt.TradingStrategyEngine, "generate_premarket_briefing", boom)
+
+        def stop_sleep(s):
+            raise Stop()
+        monkeypatch.setattr(rt.time, "sleep", stop_sleep)
+        with pytest.raises(Stop):
+            rt.run_scheduled_trading_lifecycle(interval_seconds=60, auto_trade=False, dry_run=True)

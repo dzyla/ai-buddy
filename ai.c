@@ -821,6 +821,31 @@ static int   task_timeout_sec = 1800; /* set via INFER_TASK_TIMEOUT; 0 = no time
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
 static int   trim_threshold   = 100000;/* set via INFER_TRIM_THRESHOLD; default 100000 */
 static int   stub_threshold   = 250000;/* set via INFER_STUB_THRESHOLD; default 250000 */
+static int   g_trim_explicit = 0, g_stub_explicit = 0, g_maxtool_explicit = 0;
+
+/* The thresholds above are JSON *characters*, but the model's limit is
+   n_ctx *tokens* and the request also carries the tool catalog. A 100 KB /
+   250 KB / 64 KB default silently overflows a 16-32k local model, so when the
+   context window is known (INFER_CONTEXT_WINDOW / LLAMA_CTX_SIZE, or detected
+   from /props or /v1/models) derive tighter limits — never looser than the
+   defaults, and never overriding a value the user set explicitly.
+   ~3 chars/token is a conservative ratio for mixed prose/code/JSON. */
+static void apply_context_budget(size_t tools_len) {
+    if (context_window <= 0) return;
+    long ctx_chars  = (long)context_window * 3;
+    long reserve    = (long)(context_window / 4 < 8192 ? context_window / 4 : 8192) * 3; /* reply */
+    long budget     = ctx_chars - (long)tools_len - reserve;
+    if (budget < 8000) budget = 8000;
+    if (!g_trim_explicit && budget * 8 / 10 < trim_threshold)   trim_threshold  = (int)(budget * 8 / 10);
+    if (!g_stub_explicit && budget * 95 / 100 < stub_threshold) stub_threshold  = (int)(budget * 95 / 100);
+    if (!g_maxtool_explicit) {
+        long per_tool = budget / 4 < 4000 ? 4000 : budget / 4;
+        if (per_tool < max_tool_output) max_tool_output = (int)per_tool;
+    }
+    if ((long)tools_len > ctx_chars / 2)
+        fprintf(stderr, "\033[33m[ai] warning: the tool catalog (%zu KB) uses over half of the %d-token context window; "
+                        "use --short-ctx or INFER_TOOL_PROFILE=core.\033[0m\n", tools_len / 1024, context_window);
+}
 static char  *g_goal_text     = NULL; /* -g/--goal flag */
 
 typedef struct ToolCacheNode {
@@ -905,9 +930,9 @@ static void clear_tool_cache(void) {
 
 static int g_dry_run = 0; /* --dry-run flag */
 
-/* ── Git integration (auto-commit after successful commands) ── */
-static int g_git_commit_enabled = 1;   /* 1 = auto-commit on success */
-static char *g_git_commit_msg = NULL;  /* custom commit message from user */
+/* ── Git integration (auto-commit after successful commands) ──
+   g_git_commit_enabled / g_git_commit_msg live in ai_git.c (see ai_git.h).
+   Auto-commit is opt-in (--git or INFER_AUTO_COMMIT=1). */
 
 /* ── OS notifications ── */
 static int g_notifications_enabled = 0;
@@ -1524,11 +1549,20 @@ static char* load_agents_md(void) {
             long fsize = ftell(f);
             fseek(f, 0, SEEK_SET);
             if (fsize > 0 && fsize < 100000) {
-                g_agents_content = malloc(fsize + 1);
-                fread(g_agents_content, 1, fsize, f);
-                g_agents_content[fsize] = '\0';
+                /* AGENTS.md is re-sent in the system prompt of EVERY request; an
+                   uncapped 23-100 KB file (this repo's is 23 KB) cost 6-30k tokens
+                   per call. Inject the head and point the model at the rest. */
+                long cap = (g_short_ctx || (context_window > 0 && context_window <= 32768)) ? 3000 : 12000;
+                long take = fsize < cap ? fsize : cap;
+                static const char more_fmt[] = "\n\n[... AGENTS.md truncated at %ld of %ld bytes to save context; read_file('%s') for the rest.]";
+                g_agents_content = malloc(take + sizeof(more_fmt) + 128);
+                size_t got = fread(g_agents_content, 1, take, f);
+                g_agents_content[got] = '\0';
+                if (take < fsize)
+                    snprintf(g_agents_content + got, sizeof(more_fmt) + 128, more_fmt, take, fsize, candidates[i]);
                 fclose(f);
-                fprintf(stderr, "\033[2m[ai] loaded AGENTS.md from %s\033[0m\n", candidates[i]);
+                fprintf(stderr, "\033[2m[ai] loaded AGENTS.md from %s%s\033[0m\n", candidates[i],
+                        take < fsize ? " (truncated)" : "");
                 return g_agents_content;
             }
             fclose(f);
@@ -4078,6 +4112,7 @@ static void print_mode_current(void) {
 }
 
 int main(int argc, char **argv) {
+    int git_flag_explicit = 0;  /* --git/--no-git given: overrides INFER_AUTO_COMMIT */
 #ifdef __linux__
     prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 #endif
@@ -4191,7 +4226,9 @@ int main(int argc, char **argv) {
             printf("                       R: optional HuggingFace repo (e.g. unsloth/gemma-4-12b-it-GGUF).\n");
             printf("  -h, --help           Display this help screen.\n\n");
             printf("Advanced options:\n");
-            printf("  --no-git             Disable auto-git commit after successful commands.\n");
+            printf("  --git                Auto-commit tracked-file changes after successful commands\n"
+                   "                       (opt-in; also INFER_AUTO_COMMIT=1).\n");
+            printf("  --no-git             Disable auto-git commit (default).\n");
             printf("  --notify             Enable OS desktop notifications on task complete.\n");
             printf("  --no-notifications   Disable OS notifications.\n");
             printf("  --no-agents          Disable automatic AGENTS.md loading.\n");
@@ -4289,6 +4326,10 @@ int main(int argc, char **argv) {
             g_dry_run = 1;
         } else if (strcmp(argv[i], "--no-git") == 0) {
             g_git_commit_enabled = 0;
+            git_flag_explicit = 1;
+        } else if (strcmp(argv[i], "--git") == 0) {
+            g_git_commit_enabled = 1;
+            git_flag_explicit = 1;
         } else if (strcmp(argv[i], "--notify") == 0) {
             g_notifications_enabled = 1;
         } else if (strcmp(argv[i], "--no-notifications") == 0) {
@@ -4317,10 +4358,12 @@ int main(int argc, char **argv) {
             setenv("INFER_SESSION_RECAP", "0", 1);
             if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
                 trim_threshold = atoi(argv[i+1]);
+                g_trim_explicit = 1;
                 i++;
             }
         } else if (strcmp(argv[i], "--trim-threshold") == 0 && i + 1 < argc) {
             trim_threshold = atoi(argv[i+1]);
+            g_trim_explicit = 1;
             i++;
         } else if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) {
             setenv("INFER_TOKENIZER", argv[i+1], 1);
@@ -4462,11 +4505,14 @@ int main(int argc, char **argv) {
     char *env_timeout = getenv("INFER_TASK_TIMEOUT");
     if (env_timeout && *env_timeout) task_timeout_sec = atoi(env_timeout);
     char *env_max_tool = getenv("INFER_MAX_TOOL_OUTPUT");
-    if (env_max_tool && *env_max_tool) max_tool_output = atoi(env_max_tool);
+    if (env_max_tool && *env_max_tool) { max_tool_output = atoi(env_max_tool); g_maxtool_explicit = 1; }
     char *env_trim = getenv("INFER_TRIM_THRESHOLD");
-    if (env_trim && *env_trim) trim_threshold = atoi(env_trim);
+    if (env_trim && *env_trim) { trim_threshold = atoi(env_trim); g_trim_explicit = 1; }
+    char *env_git = getenv("INFER_AUTO_COMMIT");
+    if (env_git && !git_flag_explicit)
+        g_git_commit_enabled = (strcmp(env_git, "1") == 0 || strcasecmp(env_git, "true") == 0);
     char *env_stub = getenv("INFER_STUB_THRESHOLD");
-    if (env_stub && *env_stub) stub_threshold = atoi(env_stub);
+    if (env_stub && *env_stub) { stub_threshold = atoi(env_stub); g_stub_explicit = 1; }
     char *env_priv = getenv("INFER_PRIVATE_MODE");
     if (env_priv && (strcmp(env_priv, "1") == 0 || strcasecmp(env_priv, "true") == 0)) {
         g_private_mode = 1;
@@ -4475,9 +4521,11 @@ int main(int argc, char **argv) {
     char *env_short = getenv("INFER_SHORT_CTX");
     if (env_short && (strcmp(env_short, "1") == 0 || strcasecmp(env_short, "true") == 0)) {
         g_short_ctx = 1;
-        trim_threshold = 16000;
-        max_tool_output = 4000;
+        if (!g_trim_explicit) trim_threshold = 16000;
+        if (!g_maxtool_explicit) max_tool_output = 4000;
+        g_trim_explicit = g_maxtool_explicit = 1;
         setenv("INFER_SESSION_RECAP", "0", 1);
+        if (!getenv("INFER_TOOL_PROFILE")) setenv("INFER_TOOL_PROFILE", "core", 1);
     }
     const char *tool_choice_val = "required";
     char *env_tool_choice = getenv("INFER_TOOL_CHOICE");
@@ -4515,6 +4563,9 @@ int main(int argc, char **argv) {
     }
     
     char *tools_json = NULL;
+    /* Small known context window -> lean tool catalog (see apply_context_budget). */
+    if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE"))
+        setenv("INFER_TOOL_PROFILE", "core", 1);
     if (!no_tools_mode) {
         char tools_cmd[2048];
         snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
@@ -4919,7 +4970,18 @@ int main(int argc, char **argv) {
 
     if (context_window == 0) {
         context_window = detect_context_window(c, api_url);
+        /* Detected a small window only now: re-list with the lean catalog. */
+        if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE")
+            && !no_tools_mode && tools_json) {
+            setenv("INFER_TOOL_PROFILE", "core", 1);
+            char tools_cmd[2048];
+            snprintf(tools_cmd, sizeof(tools_cmd), "python3 %s list-tools", mcp_script);
+            char *lean = run_shell_command(tools_cmd, NULL);
+            if (lean && lean[0] == '[' && strlen(lean) > 5) { free(tools_json); tools_json = lean; }
+            else if (lean) free(lean);
+        }
     }
+    apply_context_budget(tools_json ? strlen(tools_json) : 0);
 
     int debug_mode = getenv("INFER_DEBUG") != NULL;
     int keep_going = 1;
@@ -4939,7 +5001,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr,
                     "\033[2m[ai] Context is large (%zu KB). Auto-compacting...\033[0m\n",
                     strlen(messages_json) / 1024);
-                messages_json = compact_session(messages_json, mcp_script, c, model, NULL);
+                messages_json = compact_session(messages_json, mcp_script, c, model, NULL, trim_threshold * 6 / 10);
             }
 
             g_turn_count++;
@@ -5014,9 +5076,9 @@ int main(int argc, char **argv) {
                 }
                 if (strcmp(user_input, ":compact") == 0) {
                     int compact_ok = 0;
-                    messages_json = compact_session(messages_json, mcp_script, c, model, &compact_ok);
+                    messages_json = compact_session(messages_json, mcp_script, c, model, &compact_ok, trim_threshold / 3);
                     if (compact_ok)
-                        print_info_box("Context Compacted", "Conversation summarized — continuing with reduced context.");
+                        print_info_box("Context Compacted", "Older messages trimmed (system prompt and latest request kept) — continuing with reduced context.");
                     run_query_this_turn = 0;
                     continue;
                 }
@@ -5129,7 +5191,10 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (strcmp(user_input, ":commit") == 0) {
+                    int prev_git = g_git_commit_enabled;
+                    g_git_commit_enabled = 1;   /* explicit request, even if auto-commit is off */
                     git_commit("user-commit");
+                    g_git_commit_enabled = prev_git;
                     print_info_box("Git Committed", "Changes staged and committed to git.");
                     run_query_this_turn = 0;
                     continue;
@@ -5310,6 +5375,7 @@ int main(int argc, char **argv) {
             else step_limit = (step_env_val > 0) ? step_env_val : 30;
             int think_count = 0;
             for (int _si = 0; _si < SI_MAX_TRACKED; _si++) g_si_failed[_si].used = 0; /* reset failure-learning map per task */
+            clear_tool_cache();         /* files may have changed between turns (interactive / resumed runs) */
             g_state_log[0] = '\0';      /* reset situational state log per task */
             g_state_status = 0;
             g_plan_approved = 0;
@@ -5319,6 +5385,7 @@ int main(int argc, char **argv) {
             char *last_tool_args = NULL;
             int same_tool_count = 0;
             int length_nudge_count = 0;   /* consecutive token-limit nudges; force completion if model never progresses */
+            int timeout_fired = 0;        /* INFER_TASK_TIMEOUT grace iteration already granted */
             int force_complete_after = 5; /* INFER_NUDGE_CAP: bail out and force task_complete after this many stalled nudges */
             struct timespec task_start;
             clock_gettime(CLOCK_MONOTONIC, &task_start);
@@ -5327,7 +5394,11 @@ step_limit_check:
             while (has_more && loop_count < step_limit) {
                 loop_count++;
 
-                messages_json = maybe_trim_messages(messages_json, mcp_script);
+                /* Size-gated trim with hysteresis: only when the history exceeds
+                   trim_threshold, and then down to ~60% of it, so the server's
+                   prompt-cache prefix stays stable between iterations. */
+                if (trim_threshold > 0 && strlen(messages_json) > (size_t)trim_threshold)
+                    messages_json = maybe_trim_messages(messages_json, mcp_script, trim_threshold * 6 / 10);
 
                 /* Inject any :btw note typed by the user during the previous iteration */
                 if (g_btw_available && !g_esc_requested) {
@@ -6457,9 +6528,10 @@ step_limit_check:
                                                       tool_output = strdup("Error: failed to run command");
                                                   }
 
-                                                  /* Auto-commit and cache invalidation on successful command execution */
+                                                  /* A failed command can still have modified files: always invalidate. */
+                                                  invalidate_tool_cache_files();
+                                                  /* Auto-commit on successful command execution */
                                                   if (exit_code == 0) {
-                                                      invalidate_tool_cache_files();
                                                       if (g_git_commit_enabled && (g_permission_mode == 0 || g_plan_approved)) {
                                                           git_commit("command");
                                                       }
@@ -6681,8 +6753,14 @@ step_limit_check:
                                              chain (same mistake across sessions); the
                                              later success reuses the stored id. */
                                           char *si_cid = si_chain_id(si_name, tool_output);
-                                          char *ej_args = json_escape(unescaped_args ? unescaped_args : "");
-                                          char *ej_err  = json_escape(tool_output);
+                                          /* Bound what goes into the JSON payload: an escaped
+                                             64 KB error used to overflow si_pay, snprintf cut the
+                                             JSON mid-string and record-failure silently dropped it. */
+                                          char si_err_head[1000], si_args_head[400];
+                                          snprintf(si_err_head, sizeof(si_err_head), "%s", tool_output);
+                                          snprintf(si_args_head, sizeof(si_args_head), "%s", unescaped_args ? unescaped_args : "");
+                                          char *ej_args = json_escape(si_args_head);
+                                          char *ej_err  = json_escape(si_err_head);
                                           char si_pay[9200];
                                           if (si_cid)
                                               snprintf(si_pay, sizeof(si_pay),
@@ -6695,9 +6773,11 @@ step_limit_check:
                                           free(ej_args); free(ej_err);
                                           {
                                               char si_cmd[10000];
+                                              char *_sq = shell_escape(si_pay);
                                               snprintf(si_cmd, sizeof(si_cmd),
                                                        "python3 %s record-failure %s 2>/dev/null",
-                                                       mcp_script, shell_escape(si_pay));
+                                                       mcp_script, _sq ? _sq : "'{}'");
+                                              free(_sq);
                                               char *_o = run_shell_command(si_cmd, NULL);
                                               if (_o) free(_o);
                                           }
@@ -6721,14 +6801,16 @@ step_limit_check:
                                           free(si_cid);
                                           /* surface any past lesson for this exact mistake (cross-session memory) */
                                           {
-                                              char *ej_err2 = json_escape(tool_output);
+                                              char *ej_err2 = json_escape(si_err_head);
                                               char si_lpay[9000];
                                               snprintf(si_lpay, sizeof(si_lpay), "{\"tool\":\"%s\",\"error\":\"%s\"}", si_name, ej_err2);
                                               free(ej_err2);
                                               char si_lcmd[10000];
+                                              char *_lq = shell_escape(si_lpay);
                                               snprintf(si_lcmd, sizeof(si_lcmd),
                                                        "python3 %s lessons-for %s 2>/dev/null",
-                                                       mcp_script, shell_escape(si_lpay));
+                                                       mcp_script, _lq ? _lq : "'{}'");
+                                              free(_lq);
                                               char *_less = run_shell_command(si_lcmd, NULL);
                                               if (_less && *_less) {
                                                   size_t _nl = strlen(_less) + strlen(tool_output) + 96;
@@ -6748,23 +6830,25 @@ step_limit_check:
                                           for (int _i = 0; _i < SI_MAX_TRACKED; _i++)
                                               if (g_si_failed[_i].used && strcmp(g_si_failed[_i].tool, si_name) == 0) { _slot = _i; break; }
                                           if (_slot >= 0) {
-                                              char *ej_args = json_escape(unescaped_args ? unescaped_args : "");
+                                              char si_args_head[400];
+                                              snprintf(si_args_head, sizeof(si_args_head), "%s", unescaped_args ? unescaped_args : "");
+                                              char *ej_args = json_escape(si_args_head);
                                               char *ej_prev = json_escape(g_si_failed[_slot].error);
+                                              /* failed_args lets the backend skip "recoveries" that
+                                                 are the identical call (no change of approach). */
+                                              char *ej_fargs = json_escape(g_si_failed[_slot].args);
                                               char si_rpay[9200];
-                                              if (g_si_failed[_slot].chain_id[0])
-                                                  snprintf(si_rpay, sizeof(si_rpay),
-                                                           "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\",\"chain_id\":\"%s\"}",
-                                                           si_name, ej_args, ej_prev, g_si_failed[_slot].chain_id);
-                                              else
-                                                  snprintf(si_rpay, sizeof(si_rpay),
-                                                           "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\"}",
-                                                           si_name, ej_args, ej_prev);
-                                              free(ej_args); free(ej_prev);
+                                              snprintf(si_rpay, sizeof(si_rpay),
+                                                       "{\"tool\":\"%s\",\"args\":\"%s\",\"prior_error\":\"%s\",\"phase\":\"execution\",\"failed_args\":\"%s\",\"chain_id\":\"%s\"}",
+                                                       si_name, ej_args, ej_prev, ej_fargs, g_si_failed[_slot].chain_id);
+                                              free(ej_args); free(ej_prev); free(ej_fargs);
                                               {
                                                   char si_rcmd[10000];
+                                                  char *_rq = shell_escape(si_rpay);
                                                   snprintf(si_rcmd, sizeof(si_rcmd),
                                                            "python3 %s record-recovery %s 2>/dev/null",
-                                                           mcp_script, shell_escape(si_rpay));
+                                                           mcp_script, _rq ? _rq : "'{}'");
+                                                  free(_rq);
                                                   char *_o = run_shell_command(si_rcmd, NULL);
                                                   if (_o) {
                                                       fprintf(stderr, "\033[1;36m[ai] learned fix for '%s': %s\033[0m\n", si_name, _o);
@@ -6969,7 +7053,7 @@ step_limit_check:
                                                         "token limit without any progress and without calling task_complete. "
                                                         "STOP taking additional actions. Call task_complete NOW with your best "
                                                         "summary of work done so far. Do not call any more tools.\"}");
-                                                    loop_count = 28; /* allow exactly one more iteration */
+                                                    loop_count = step_limit - 1; /* allow exactly one more iteration (was hard-coded 28: with the non-tty limit of 60 that granted 32 more) */
                                                     length_nudge_count = 0;
                                                     has_more = 1;
                                                 } else {
@@ -7114,13 +7198,19 @@ step_limit_check:
                       clock_gettime(CLOCK_MONOTONIC, &t_now);
                       double task_elapsed = (t_now.tv_sec  - task_start.tv_sec) +
                                             (t_now.tv_nsec - task_start.tv_nsec) * 1e-9;
-                      if (task_elapsed > (double)task_timeout_sec) {
+                      if (task_elapsed > (double)task_timeout_sec && timeout_fired) {
+                          /* The one grace iteration is used up and the model still did not
+                             finish: stop. (Re-arming every iteration made this endless.) */
+                          fprintf(stderr, "\033[1;33m[ai] task timeout: no task_complete after the final iteration; stopping.\033[0m\n");
+                          has_more = 0;
+                      } else if (task_elapsed > (double)task_timeout_sec) {
                           fprintf(stderr,
                               "\033[1;33m[ai] task timeout (%.0fs / %ds limit). Forcing task_complete.\033[0m\n",
                               task_elapsed, task_timeout_sec);
                           messages_json = append_message(messages_json,
                               "{\"role\":\"user\",\"content\":\"[TIMEOUT] Maximum task duration reached. You MUST call task_complete NOW with your current best answer. No more tool calls.\"}");
-                          loop_count = 28; /* allow exactly one more iteration */
+                          loop_count = step_limit - 1; /* exactly one more iteration (was hard-coded 28: with the non-tty limit of 60 that granted 32 more) */
+                          timeout_fired = 1;
                       }
                   }
 

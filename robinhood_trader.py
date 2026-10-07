@@ -409,6 +409,25 @@ class MarketHours:
         return not cls.is_market_holiday(date_obj)
 
     @classmethod
+    def market_close_time(cls, date_obj: datetime.date) -> datetime.time:
+        """Regular-session close in ET: 13:00 on NYSE early-close days, else 16:00.
+
+        Early closes: the day after Thanksgiving, and Christmas Eve / July 3 when they are trading days."""
+        if cls.is_trading_day(date_obj):
+            nov1 = datetime.date(date_obj.year, 11, 1)
+            thanksgiving = nov1 + datetime.timedelta(days=(3 - nov1.weekday() + 7) % 7, weeks=3)
+            if date_obj == thanksgiving + datetime.timedelta(days=1):
+                return datetime.time(13, 0)
+            if (date_obj.month, date_obj.day) in ((12, 24), (7, 3)):
+                return datetime.time(13, 0)
+        return datetime.time(16, 0)
+
+    @staticmethod
+    def _to_et(dt: datetime.datetime) -> datetime.datetime:
+        """Aware datetimes in any zone (e.g. Mountain Time) are converted to ET; naive ones are taken as ET."""
+        return dt.astimezone(ET_ZONE) if dt.tzinfo is not None else dt.replace(tzinfo=ET_ZONE)
+
+    @classmethod
     def get_market_session(cls, dt: Optional[datetime.datetime] = None) -> str:
         """
         Returns the current market session:
@@ -417,7 +436,7 @@ class MarketHours:
         - 'AFTER_HOURS': 16:00 - 20:00 ET
         - 'CLOSED': Nights, Weekends, Holidays
         """
-        dt = dt or cls.now_et()
+        dt = cls._to_et(dt or cls.now_et())
         date_obj = dt.date()
 
         if not cls.is_trading_day(date_obj):
@@ -426,8 +445,8 @@ class MarketHours:
         current_time = dt.time()
         t_pre = datetime.time(4, 0)
         t_open = datetime.time(9, 30)
-        t_close = datetime.time(16, 0)
-        t_post = datetime.time(20, 0)
+        t_close = cls.market_close_time(date_obj)
+        t_post = datetime.time(17, 0) if t_close < datetime.time(16, 0) else datetime.time(20, 0)
 
         if t_open <= current_time < t_close:
             return "REGULAR"
@@ -491,10 +510,10 @@ class MarketHours:
 
     @classmethod
     def seconds_until_close(cls, dt: Optional[datetime.datetime] = None) -> float:
-        dt = dt or cls.now_et()
+        dt = cls._to_et(dt or cls.now_et())
         if not cls.is_market_open(dt):
             return 0.0
-        close_time = datetime.datetime.combine(dt.date(), datetime.time(16, 0), tzinfo=ET_ZONE)
+        close_time = datetime.datetime.combine(dt.date(), cls.market_close_time(dt.date()), tzinfo=ET_ZONE)
         return max(0.0, (close_time - dt).total_seconds())
 
     @staticmethod
@@ -2041,7 +2060,7 @@ class TradingStrategyEngine:
                 journal = []
 
         # Collect portfolio & account data safely
-        account_number = "000000001"
+        account_number = ""
         portfolio_data = {}
         positions_list = []
         try:
@@ -2164,6 +2183,17 @@ class TradingStrategyEngine:
 #   Cash   10%  buffer, never breached by buys.
 #   Risk        disaster stop -20% from average cost on sleeve names, checked every pulse.
 #
+def _floor_qty(qty: float, places: int = 6) -> float:
+    """Round a share quantity DOWN to `places` decimals (never sell more than is held)."""
+    scale = 10 ** places
+    return math.floor(float(qty) * scale + 1e-6) / scale
+
+
+def _fmt_qty(qty: float) -> str:
+    """Order quantity string: floored to 6 decimals, no float artefacts or exponent notation."""
+    return (f"{_floor_qty(qty):.6f}".rstrip("0").rstrip(".")) or "0"
+
+
 class MomentumStrategy:
     CORE_SYMBOLS: Tuple[str, ...] = ("VTI", "QQQ")
     CORE_TARGET_PCT = 0.60
@@ -2288,7 +2318,7 @@ class MomentumStrategy:
             price = float(pos.get("price", 0) or 0)
             if qty <= 0 or s in cls.CORE_SYMBOLS or s in hold or s in targets:
                 continue
-            sells.append({"symbol": s, "quantity": round(qty, 6),
+            sells.append({"symbol": s, "quantity": _floor_qty(qty),
                           "reason": "REGIME_EXIT" if not targets else "ROTATE_OUT"})
             projected_cash += qty * price
         if targets:
@@ -2384,6 +2414,29 @@ def authenticate_robinhood_mcp():
     os.system(cmd)
 
 
+class AccountResolutionError(RuntimeError):
+    """The account to act on could not be determined; callers must not fall back to another account."""
+
+
+class OrderNotConfirmed(RuntimeError):
+    """An order request was sent but no response arrived: it may or may not have been placed."""
+
+
+def trader_config_path() -> str:
+    """Local, untracked trader config (account mapping). Override with RH_TRADER_CONFIG."""
+    return os.environ.get("RH_TRADER_CONFIG") or os.path.join(CONFIG_DIR, "trader.json")
+
+
+def load_trader_config() -> Dict[str, Any]:
+    """{"accounts": {"agentic": "...", "primary": "...", "roth": "..."}}; {} if missing or unreadable."""
+    try:
+        with open(trader_config_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 class RobinhoodExecutor:
     """Direct, high-speed execution bridge for Robinhood Agentic MCP (sub-second order placement)."""
 
@@ -2456,9 +2509,46 @@ class RobinhoodExecutor:
         except Exception:
             pass
 
+    # Tools that change broker state: never re-sent after the request went out (a lost reply
+    # does not mean the order was not placed).
+    MUTATING_TOOLS = frozenset({"place_equity_order", "cancel_equity_order", "replace_equity_order"})
+
+    @staticmethod
+    def _read_jsonrpc_response(fd: int, want_id: int, timeout: float, buf: bytearray) -> Optional[Dict[str, Any]]:
+        """Read newline-delimited JSON-RPC messages from a raw fd until one has id == want_id.
+
+        Uses select + os.read on the fd (not file.readline, which blocks forever on a partial
+        line), so the whole wait is bounded by `timeout`. Returns None on timeout or EOF."""
+        import select
+        deadline = time.time() + timeout
+        while True:
+            while b"\n" in buf:
+                idx = buf.index(b"\n")
+                line = bytes(buf[:idx])
+                del buf[:idx + 1]
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and msg.get("id") == want_id:
+                    return msg
+            rem = deadline - time.time()
+            if rem <= 0:
+                return None
+            r, _, _ = select.select([fd], [], [], rem)
+            if not r:
+                return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return None
+            buf.extend(chunk)
+
     @classmethod
     def call_mcp_tool(cls, tool_name: str, arguments: Dict[str, Any], timeout: int = 15, max_retries: int = 2) -> Dict[str, Any]:
-        """Calls any Robinhood MCP tool in sub-second time without browser prompts."""
+        """Calls any Robinhood MCP tool in sub-second time without browser prompts.
+
+        Returns {} on failure. Read-only tools are retried; MUTATING_TOOLS are retried only if the
+        tool request was never written (e.g. initialize failed), so an order is sent at most once."""
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("INFER_TEST_MODE"):
             return {}
 
@@ -2471,12 +2561,11 @@ class RobinhoodExecutor:
         env['DISPLAY'] = ''
         env.pop('WSL_DISTRO_NAME', None)
 
-        import select
-
         remote_cmd = ['mcp-remote', 'https://agent.robinhood.com/mcp/trading'] if shutil.which('mcp-remote') else ['npx', '-y', 'mcp-remote@0.2.5', 'https://agent.robinhood.com/mcp/trading']
 
         for attempt in range(max_retries + 1):
             proc = None
+            request_sent = False
             try:
                 proc = subprocess.Popen(
                     remote_cmd,
@@ -2497,26 +2586,9 @@ class RobinhoodExecutor:
                 proc.stdin.write(json.dumps(req_init) + '\n')
                 proc.stdin.flush()
 
-                # Read init with select timeout
-                init_ok = False
-                start_t = time.time()
-                while time.time() - start_t < timeout:
-                    rem = max(0.1, timeout - (time.time() - start_t))
-                    r, _, _ = select.select([proc.stdout], [], [], rem)
-                    if not r:
-                        break
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
-                    try:
-                        resp = json.loads(line)
-                        if resp.get('id') == 1:
-                            init_ok = True
-                            break
-                    except Exception:
-                        pass
-
-                if not init_ok:
+                fd = proc.stdout.fileno()
+                buf = bytearray()
+                if cls._read_jsonrpc_response(fd, 1, timeout, buf) is None:
                     if attempt < max_retries:
                         time.sleep(0.5)
                         continue
@@ -2531,28 +2603,15 @@ class RobinhoodExecutor:
                     'method': 'tools/call',
                     'params': {'name': tool_name, 'arguments': arguments}
                 }
+                request_sent = True
                 proc.stdin.write(json.dumps(req_tool) + '\n')
                 proc.stdin.flush()
-                
-                tool_start = time.time()
-                while time.time() - tool_start < timeout:
-                    rem = max(0.1, timeout - (time.time() - tool_start))
-                    r, _, _ = select.select([proc.stdout], [], [], rem)
-                    if not r:
-                        break
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
-                    try:
-                        data = json.loads(line)
-                        if data.get('id') == 2:
-                            return data.get('result', {})
-                    except Exception:
-                        pass
+
+                data = cls._read_jsonrpc_response(fd, 2, timeout, buf)
+                if data is not None:
+                    return data.get('result', {}) or {}
             except Exception:
-                if attempt < max_retries:
-                    time.sleep(0.5)
-                    continue
+                pass
             finally:
                 if proc:
                     try:
@@ -2561,9 +2620,14 @@ class RobinhoodExecutor:
                         proc.wait(timeout=0.5)
                     except Exception:
                         try:
-                            proc.terminate()
+                            proc.kill()
+                            proc.wait(timeout=0.5)
                         except Exception:
                             pass
+            if request_sent and tool_name in cls.MUTATING_TOOLS:
+                return {}  # outcome unknown: never re-send a state-changing request
+            if attempt < max_retries:
+                time.sleep(0.5)
         return {}
 
     @classmethod
@@ -2576,35 +2640,77 @@ class RobinhoodExecutor:
         return []
 
     @classmethod
+    def configured_account(cls, role: str) -> Optional[str]:
+        """Account number for a role ('agentic', 'primary', 'roth') from env or the trader config.
+
+        Env var RH_<ROLE>_ACCOUNT wins; otherwise {"accounts": {role: number}} in
+        trader_config_path(). Numbers are never hardcoded in this file (public repo)."""
+        env_val = os.environ.get(f"RH_{role.upper()}_ACCOUNT", "").strip()
+        if env_val:
+            return env_val
+        val = (load_trader_config().get("accounts") or {}).get(role)
+        return str(val).strip() if val not in (None, "") else None
+
+    @classmethod
     def get_agentic_account(cls) -> Optional[Dict[str, Any]]:
-        """Finds the dedicated Agentic Sandbox account with agentic_allowed=True."""
+        """The account with agentic_allowed=True: the configured one if set, else the only one listed.
+
+        Fails closed: returns None when the configured account is not agentic_allowed, when several
+        accounts are agentic_allowed and none is configured, or when the account list is unavailable."""
         accounts = cls.get_accounts()
-        for a in accounts:
-            if a.get("agentic_allowed") is True or str(a.get("nickname", "")).lower() == "agentic":
-                return a
-        return accounts[0] if accounts else None
+        configured = cls.configured_account("agentic")
+        if configured:
+            for a in accounts:
+                if str(a.get("account_number")) == configured:
+                    return a if a.get("agentic_allowed") is True else None
+            return None
+        agentic = [a for a in accounts if a.get("agentic_allowed") is True]
+        return agentic[0] if len(agentic) == 1 else None
 
     @classmethod
     def get_agentic_account_number(cls) -> str:
-        """Returns the account number of the agentic account (or fallback)."""
+        """Account number automated orders go to. Raises AccountResolutionError if it cannot be determined
+        (never falls back to another account); execute_market_order re-verifies agentic_allowed per order."""
+        configured = cls.configured_account("agentic")
+        if configured:
+            return configured
         acc = cls.get_agentic_account()
-        return str(acc.get("account_number", "000000001")) if acc else "000000001"
+        if acc and acc.get("account_number"):
+            return str(acc["account_number"])
+        raise AccountResolutionError(
+            "agentic account unknown: set RH_AGENTIC_ACCOUNT or accounts.agentic in "
+            f"{trader_config_path()}, or ensure exactly one account has agentic_allowed=true")
+
+    @classmethod
+    def is_agentic_account(cls, account_number: str) -> bool:
+        """True only if the live account list marks this account agentic_allowed (False on any failure)."""
+        try:
+            for a in cls.get_accounts():
+                if str(a.get("account_number")) == str(account_number):
+                    return a.get("agentic_allowed") is True
+        except Exception:
+            pass
+        return False
 
     @classmethod
     def get_default_account_number(cls) -> str:
-        """Returns default account number or first active account."""
+        """Configured primary account, else the broker's default, else the first listed account."""
+        configured = cls.configured_account("primary")
+        if configured:
+            return configured
         accounts = cls.get_accounts()
         for a in accounts:
-            if a.get("is_default"):
-                return str(a.get("account_number", "000000002"))
-        for a in accounts:
-            if a.get("agentic_allowed"):
-                return str(a.get("account_number", "000000001"))
-        return accounts[0]["account_number"] if accounts else "000000002"
+            if a.get("is_default") and a.get("account_number"):
+                return str(a["account_number"])
+        if accounts and accounts[0].get("account_number"):
+            return str(accounts[0]["account_number"])
+        raise AccountResolutionError(
+            "default account unknown: set RH_PRIMARY_ACCOUNT or accounts.primary in "
+            f"{trader_config_path()}, or check MCP authentication")
 
     @classmethod
     def resolve_account(cls, account_input: Optional[str] = None) -> str:
-        """Resolves an account alias or number (e.g. 'agentic' -> '000000001')."""
+        """Resolves an account alias or number (e.g. 'agentic' -> the configured agentic account)."""
         if not account_input:
             return cls.get_default_account_number()
         inp = str(account_input).strip().lower()
@@ -2612,6 +2718,11 @@ class RobinhoodExecutor:
             return cls.get_agentic_account_number()
         if inp in ("default", "primary", "manual"):
             return cls.get_default_account_number()
+        if inp in ("roth", "ira", "roth_ira"):
+            roth = cls.configured_account("roth")
+            if roth:
+                return roth
+            raise AccountResolutionError(f"roth account unknown: set RH_ROTH_ACCOUNT or accounts.roth in {trader_config_path()}")
         return str(account_input).strip()
 
     @classmethod
@@ -2719,7 +2830,13 @@ class RobinhoodExecutor:
     def execute_market_order(cls, account_number: str, symbol: str, side: str,
                              dollar_amount: Optional[str] = None,
                              quantity: Optional[str] = None) -> Dict[str, Any]:
-        """Directly places an equity market order on an agentic account."""
+        """Places an equity market order. Refuses (PermissionError) unless the live account list marks
+        `account_number` agentic_allowed. Raises OrderNotConfirmed when no reply arrived (the order
+        may have been placed; do not blindly retry a buy) and RuntimeError when the broker rejects it."""
+        if not account_number or not cls.is_agentic_account(account_number):
+            raise PermissionError(f"account {account_number or '<none>'} is not agentic_allowed (or the account list is unavailable); order refused")
+        if not dollar_amount and not quantity:
+            raise ValueError("market order needs dollar_amount or quantity")
         args = {
             'account_number': account_number,
             'symbol': symbol.upper().strip(),
@@ -2732,6 +2849,10 @@ class RobinhoodExecutor:
             args['quantity'] = str(quantity)
 
         res = cls.call_mcp_tool('place_equity_order', args)
+        if not res:
+            raise OrderNotConfirmed(f"no response to {side} {symbol} order; check open orders before retrying")
+        if res.get("isError"):
+            raise RuntimeError(f"{side} {symbol} order rejected: {str(res.get('content') or res)[:200]}")
         return res
 
 
@@ -3539,8 +3660,11 @@ def run_scheduled_trading_lifecycle(interval_seconds: int = 900, auto_trade: boo
         if MarketHours.is_trading_day(now.date()) and datetime.time(9, 20) <= t_cur < datetime.time(9, 30):
             if not has_run_premarket:
                 print(f"\n[🌅 09:20 AM ET PRE-MARKET BRIEFING] Generating daily trade plan...")
-                briefing = TradingStrategyEngine.generate_premarket_briefing(watchlist)
-                print(json.dumps(briefing, indent=2))
+                try:
+                    briefing = TradingStrategyEngine.generate_premarket_briefing(watchlist)
+                    print(json.dumps(briefing, indent=2, default=str))
+                except Exception as e:  # noqa: BLE001 - a notes failure must not kill the trading daemon
+                    print(f"Pre-market briefing failed: {e}", flush=True)
                 has_run_premarket = True
                 has_run_closing = False
             
@@ -3569,8 +3693,11 @@ def run_scheduled_trading_lifecycle(interval_seconds: int = 900, auto_trade: boo
         elif MarketHours.is_trading_day(now.date()) and datetime.time(16, 0) <= t_cur < datetime.time(16, 15):
             if not has_run_closing:
                 print(f"\n[🔔 04:05 PM ET MARKET CLOSE SUMMARY] Compiling daily performance...")
-                summary = TradingStrategyEngine.generate_daily_closing_summary()
-                print(json.dumps(summary, indent=2))
+                try:
+                    summary = TradingStrategyEngine.generate_daily_closing_summary()
+                    print(json.dumps(summary, indent=2, default=str))
+                except Exception as e:  # noqa: BLE001
+                    print(f"Closing summary failed: {e}", flush=True)
                 has_run_closing = True
                 has_run_premarket = False
             
@@ -3675,11 +3802,11 @@ def _read_plan_risk_rules(today: str) -> Dict[str, float]:
 def _account_snapshot(account_number: str) -> Dict[str, Any]:
     """Live equity, cash, positions and quotes for one account, in the shapes the strategy needs."""
     port = RobinhoodExecutor.get_live_portfolio(account_number) or {}
+    raw_positions = RobinhoodExecutor.get_equity_positions(account_number) or []
     bp_dict = port.get("buying_power", {})
     bp = float(bp_dict.get("buying_power", 0.0) if isinstance(bp_dict, dict) else (bp_dict or 0.0))
     cash = float(port.get("cash", bp) or bp or 0.0)
-    positions = [p for p in (RobinhoodExecutor.get_equity_positions(account_number) or [])
-                 if float(p.get("quantity", 0) or 0) > 0]
+    positions = [p for p in raw_positions if float(p.get("quantity", 0) or 0) > 0]
     symbols = [str(p.get("symbol", "")).upper() for p in positions if p.get("symbol")]
     quotes = RobinhoodExecutor.get_equity_quotes(symbols) if symbols else {}
     pos_map: Dict[str, Dict[str, float]] = {}
@@ -3695,7 +3822,27 @@ def _account_snapshot(account_number: str) -> Dict[str, Any]:
         equity = float(port.get("equity_value", 0.0) or 0.0) + cash
     if equity <= cash + 0.01 and pos_map:
         equity = cash + sum(v["quantity"] * v["price"] for v in pos_map.values())
-    return {"equity": equity, "cash": cash, "positions": positions, "pos_map": pos_map, "quotes": quotes}
+    # A failed MCP read comes back as {} / [] and is indistinguishable from "zero". Flag snapshots that
+    # cannot be trusted so the pulses skip them instead of trading on a phantom empty book.
+    problem = ""
+    if not port or not any(k in port for k in ("total_value", "equity_value", "cash", "buying_power")):
+        problem = "portfolio read failed"
+    elif not positions and float(port.get("equity_value", 0.0) or 0.0) > 1.0:
+        problem = "positions read empty but portfolio reports equity holdings"
+    elif any(sym not in quotes for sym in symbols):
+        problem = f"missing quotes for {sorted(s for s in symbols if s not in quotes)}"
+    return {"equity": equity, "cash": cash, "positions": positions, "pos_map": pos_map, "quotes": quotes,
+            "ok": not problem, "problem": problem}
+
+
+STALE_BARS_DAYS = 7   # daily history whose last bar is older than this is not used to trade
+
+
+def _bar_date(bar: Dict[str, Any]) -> Optional[datetime.date]:
+    try:
+        return datetime.date.fromisoformat(str(bar.get("datetime", ""))[:10])
+    except ValueError:
+        return None
 
 
 def _fetch_strategy_bars(symbols: List[str], range_period: str = "1y") -> Dict[str, List[Dict[str, Any]]]:
@@ -3704,7 +3851,10 @@ def _fetch_strategy_bars(symbols: List[str], range_period: str = "1y") -> Dict[s
     for s in symbols:
         try:
             b = FinancialData.fetch_historical(s, range_period=range_period, interval="1d")
-            if len(b) >= 30:
+            last = _bar_date(b[-1]) if b else None
+            if last is not None and (MarketHours.now_et().date() - last).days > STALE_BARS_DAYS:
+                _risk_log(f"STRATEGY: {s} skipped (stale history, last bar {last})")
+            elif len(b) >= 30:
                 out[s] = b
             else:
                 _risk_log(f"STRATEGY: {s} skipped ({len(b)} bars)")
@@ -3718,9 +3868,14 @@ def _rebalance_flag_path(month: str) -> str:
 
 
 def _save_json(path: str, data: Dict[str, Any]) -> None:
+    """Atomic write (temp file + rename): a crash mid-write must not leave a corrupt state flag."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, default=str)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
@@ -3739,6 +3894,9 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
 
     snap = _account_snapshot(account_number)
     equity, cash, pos_map = snap["equity"], snap["cash"], snap["pos_map"]
+    if not snap.get("ok", True):
+        _risk_log(f"STRATEGY: account snapshot incomplete ({snap.get('problem')}); skipping pulse.")
+        return
     if equity <= 0:
         _risk_log("STRATEGY: no equity reading; skipping pulse.")
         return
@@ -3758,13 +3916,26 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
         try:
             with open(flag, encoding="utf-8") as fh:
                 state = json.load(fh)
-        except (OSError, ValueError):
+            if not isinstance(state, dict):
+                raise ValueError("flag is not a JSON object")
+        except (OSError, ValueError) as exc:
+            # Re-planning here could repeat orders already placed this month: fail closed.
+            _risk_log(f"STRATEGY: rebalance flag {flag} unreadable ({exc}); no strategy orders until it is fixed or removed.")
+            return
+        if state.get("dry_run") and not dry_run:
+            _risk_log(f"STRATEGY: {month} flag came from a dry run; planning the live rebalance.")
             state = None
 
     if state is None:
         # First strategy pulse this month: rank the universe and plan the sleeve.
-        bars = _fetch_strategy_bars(MomentumStrategy.universe() + ["SPY"])
+        universe = MomentumStrategy.universe()
+        bars = _fetch_strategy_bars(universe + ["SPY"])
         spy_bars = bars.pop("SPY", [])
+        # Missing data must not read as "no eligible names / no regime" (that would liquidate the sleeve).
+        if len(spy_bars) < MomentumStrategy.REGIME_SMA_BARS or len(bars) < max(1, len(universe) // 2):
+            _risk_log(f"STRATEGY: insufficient market data (SPY {len(spy_bars)} bars, {len(bars)}/{len(universe)} "
+                      f"universe symbols); rebalance deferred to a later pulse.")
+            return
         regime = MomentumStrategy.regime(spy_bars)
         ranked = MomentumStrategy.rank(bars)
         targets = MomentumStrategy.select_sleeve(ranked, regime["regime"])
@@ -3809,16 +3980,21 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
                     state["dry_run_proceeds"] = round(float(state.get("dry_run_proceeds", 0.0)) + qty * price, 2)
                     continue
                 try:
-                    res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+                    res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=_fmt_qty(qty))
                     _risk_log(f"STRATEGY SELL {sym} {qty} sh @ ~${price:.2f} ({pnl_pct:+.1f}%) reason={s['reason']} response={str(res)[:160]}")
+                except Exception as exc:  # noqa: BLE001
+                    # Includes OrderNotConfirmed: safe to retry, the next pulse drops names no longer held.
+                    _risk_log(f"STRATEGY SELL {sym} FAILED: {exc}")
+                    still.append(s)
+                    continue
+                state["sells_done"].append(s)
+                executed_live = True
+                try:
                     ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason=s["reason"])
                     ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price,
                                                               "pnl_pct": pnl_pct, "reason": s["reason"], "strategy": "MOMENTUM_SLEEVE"})
-                    state["sells_done"].append(s)
-                    executed_live = True
                 except Exception as exc:  # noqa: BLE001
-                    _risk_log(f"STRATEGY SELL {sym} FAILED: {exc}")
-                    still.append(s)
+                    _risk_log(f"STRATEGY SELL {sym}: bookkeeping failed after order: {exc}")
             state["sells_pending"] = still
             _save_json(flag, state)
             if executed_live:
@@ -3834,7 +4010,8 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
             if dry_run:
                 deployable += float(state.get("dry_run_proceeds", 0.0))  # simulated sells never produced real cash
             still = []
-            for b in state["buys_pending"]:
+            pending = list(state["buys_pending"])
+            for i, b in enumerate(pending):
                 sym = b["symbol"]
                 amt = round(min(float(b["dollar_amount"]), deployable), 2)
                 if amt < MomentumStrategy.MIN_ORDER_DOLLARS:
@@ -3845,17 +4022,29 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
                     state["buys_done"].append({**b, "dollar_amount": amt})
                     deployable -= amt
                     continue
+                done_rec = {**b, "dollar_amount": amt}
                 try:
                     res = RobinhoodExecutor.execute_market_order(account_number, sym, "buy", dollar_amount=str(amt))
                     _risk_log(f"STRATEGY BUY {sym} ${amt:.2f} reason={b['reason']} response={str(res)[:160]}")
-                    ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY")
-                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": amt,
-                                                              "reason": b["reason"], "strategy": "MOMENTUM_SLEEVE"})
-                    state["buys_done"].append({**b, "dollar_amount": amt})
-                    deployable -= amt
+                except OrderNotConfirmed as exc:
+                    # It may have been placed: re-sending could double the position. Not retried.
+                    _risk_log(f"STRATEGY BUY {sym} ${amt:.2f} UNCONFIRMED ({exc}); not retried - check open orders.")
+                    done_rec["unconfirmed"] = True
                 except Exception as exc:  # noqa: BLE001
                     _risk_log(f"STRATEGY BUY {sym} FAILED: {exc}")
                     still.append(b)
+                    continue
+                # Persist before any bookkeeping so a crash or ledger error cannot re-queue a placed order.
+                state["buys_done"].append(done_rec)
+                state["buys_pending"] = still + pending[i + 1:]
+                _save_json(flag, state)
+                deployable -= amt
+                try:
+                    ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY")
+                    ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": amt,
+                                                              "reason": b["reason"], "strategy": "MOMENTUM_SLEEVE"})
+                except Exception as exc:  # noqa: BLE001
+                    _risk_log(f"STRATEGY BUY {sym}: bookkeeping failed after order: {exc}")
             state["buys_pending"] = still
             if still:
                 _risk_log(f"STRATEGY: {len(still)} buy(s) waiting for cash (deployable ${deployable:.2f}).")
@@ -3876,7 +4065,13 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
         return
     core_flag = os.path.join(RISK_MONITOR_FLAGS, f"core_topup_{today}.flag")
     if os.path.exists(core_flag):
-        return
+        try:
+            with open(core_flag, encoding="utf-8") as fh:
+                from_dry_run = bool(json.load(fh).get("dry_run"))
+        except (OSError, ValueError, AttributeError):
+            from_dry_run = False   # unreadable: treat as a real top-up (fail closed)
+        if dry_run or not from_dry_run:
+            return
     topup = MomentumStrategy.plan_core_topup(equity, cash, pos_map)
     if not topup:
         return
@@ -3888,12 +4083,20 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
     try:
         res = RobinhoodExecutor.execute_market_order(account_number, sym, "buy", dollar_amount=str(amt))
         _risk_log(f"STRATEGY CORE TOP-UP BUY {sym} ${amt:.2f} response={str(res)[:160]}")
+    except OrderNotConfirmed as exc:
+        _risk_log(f"STRATEGY CORE TOP-UP {sym} ${amt:.2f} UNCONFIRMED ({exc}); not retried today - check open orders.")
+        _save_json(core_flag, {"ts": now.isoformat(), "unconfirmed": True, **topup})
+        return
+    except Exception as exc:  # noqa: BLE001
+        _risk_log(f"STRATEGY CORE TOP-UP {sym} FAILED: {exc}")
+        return
+    _save_json(core_flag, {"ts": now.isoformat(), **topup})
+    try:
         ComplianceAndRiskGuard.record_trade(account_number, sym, "BUY")
         ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "BUY", "dollar_amount": amt,
                                                   "reason": "CORE_TOPUP", "strategy": "MOMENTUM_SLEEVE"})
-        _save_json(core_flag, {"ts": now.isoformat(), **topup})
     except Exception as exc:  # noqa: BLE001
-        _risk_log(f"STRATEGY CORE TOP-UP {sym} FAILED: {exc}")
+        _risk_log(f"STRATEGY CORE TOP-UP {sym}: bookkeeping failed after order: {exc}")
 
 
 def _risk_monitor_pulse(account_number: str, dry_run: bool,
@@ -3906,8 +4109,15 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool,
     snap = _account_snapshot(account_number)
     equity, positions, quotes, pos_map = snap["equity"], snap["positions"], snap["quotes"], snap["pos_map"]
     os.makedirs(RISK_MONITOR_FLAGS, exist_ok=True)
+    if not snap.get("ok", True) and not positions:
+        # Nothing trustworthy to act on, and feeding a phantom equity into the circuit breaker could arm it.
+        _risk_log(f"RISK pulse skipped: account snapshot incomplete ({snap.get('problem')})")
+        return
 
-    tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, equity)
+    if snap.get("ok", True):
+        tier, cb_msg = ComplianceAndRiskGuard.check_daily_circuit_breaker(account_number, equity)
+    else:
+        tier, cb_msg = 0, f"circuit breaker not updated: snapshot incomplete ({snap.get('problem')})"
     if tier >= 3:
         halt_flag = SESSION_HALT_FLAG.format(date=today)
         if not os.path.exists(halt_flag):
@@ -3932,14 +4142,18 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool,
             _risk_log(f"RISK [DRY RUN] {sym}: would sell {qty} sh.")
             continue
         try:
-            res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=str(qty))
+            res = RobinhoodExecutor.execute_market_order(account_number, sym, "sell", quantity=_fmt_qty(qty))
             _risk_log(f"RISK {sym}: order response={str(res)[:200]}")
+        except Exception as exc:  # noqa: BLE001
+            _risk_log(f"RISK {sym}: order FAILED: {exc}")
+            continue
+        _save_json(stop_flag, {"ts": now.isoformat(), "price": price, "qty": qty, "pnl_pct": pnl_pct, "reason": "DISASTER_STOP"})
+        try:
             ComplianceAndRiskGuard.record_trade(account_number, sym, "SELL", price=price, qty=qty, pnl_pct=pnl_pct, reason="DISASTER_STOP")
             ObsidianTradingVault.log_trade_execution({"ticker": sym, "action": "SELL", "qty": qty, "price": price,
                                                       "pnl_pct": pnl_pct, "reason": "DISASTER_STOP", "strategy": "MOMENTUM_SLEEVE"})
-            _save_json(stop_flag, {"ts": now.isoformat(), "price": price, "qty": qty, "pnl_pct": pnl_pct, "reason": "DISASTER_STOP"})
         except Exception as exc:  # noqa: BLE001
-            _risk_log(f"RISK {sym}: order FAILED: {exc}")
+            _risk_log(f"RISK {sym}: bookkeeping failed after order: {exc}")
 
     summary = ", ".join(
         f"{sym} {((v['price'] - v['average_buy_price']) / v['average_buy_price'] * 100.0):+.1f}%"
@@ -3966,12 +4180,12 @@ def run_risk_monitor(interval_seconds: int = 900, dry_run: bool = False,
                 continue
             _risk_log(f"RISK-MONITOR {session} - exiting")
             return
-        account_number = RobinhoodExecutor.get_agentic_account_number()
         today = MarketHours.now_et().strftime("%Y-%m-%d")
         rules = _read_plan_risk_rules(today)
-        _risk_log(f"RISK-MONITOR pulse REGULAR account={account_number} "
-                  f"stop_loss={rules['stop_loss_pct']}% take_profit={rules['take_profit_pct']}% dry_run={dry_run}")
         try:
+            account_number = RobinhoodExecutor.get_agentic_account_number()
+            _risk_log(f"RISK-MONITOR pulse REGULAR account={account_number} "
+                      f"stop_loss={rules['stop_loss_pct']}% take_profit={rules['take_profit_pct']}% dry_run={dry_run}")
             _risk_monitor_pulse(account_number, dry_run, rules["stop_loss_pct"], rules["take_profit_pct"])
         except Exception as exc:  # noqa: BLE001
             _risk_log(f"RISK-MONITOR pulse error: {exc}")
@@ -4699,8 +4913,8 @@ def main():
             print("-" * 80)
 
             if do_execute:
-                if not RobinhoodExecutor.is_agentic_account(resolved_acc) and "--force" not in sys.argv:
-                    print(f"  ⚠️  Execution blocked: Account {resolved_acc} is NOT flagged as 'agentic_allowed: true'. Use an agentic sub-account or pass --force.")
+                if not RobinhoodExecutor.is_agentic_account(resolved_acc):
+                    print(f"  ⚠️  Execution blocked: Account {resolved_acc} is NOT flagged as 'agentic_allowed: true'. Use the agentic account.")
                 else:
                     print(f"  EXECUTING REBALANCE ORDERS ON ACCOUNT {resolved_acc}...")
                     now_et = MarketHours.now_et()
@@ -4824,7 +5038,11 @@ def main():
         print(f"  Dollar Amount : ${float(dollar_amt):.2f}")
         print(f"  Target Account: {resolved_acc} (Agentic Sandbox)")
         print("-" * 70)
-        res = RobinhoodExecutor.execute_market_order(resolved_acc, sym, "buy", dollar_amount=str(dollar_amt))
+        try:
+            res = RobinhoodExecutor.execute_market_order(resolved_acc, sym, "buy", dollar_amount=str(dollar_amt))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ✗ Order not placed/confirmed: {exc}")
+            sys.exit(1)
         print("Response:", json.dumps(res, indent=2))
         ComplianceAndRiskGuard.record_trade(resolved_acc, sym, "BUY", reason="MANUAL_CLI")
         try:
@@ -4862,7 +5080,11 @@ def main():
         print(f"  Quantity      : {qty} shares")
         print(f"  Target Account: {resolved_acc} (Agentic Sandbox)")
         print("-" * 70)
-        res = RobinhoodExecutor.execute_market_order(resolved_acc, sym, "sell", quantity=qty)
+        try:
+            res = RobinhoodExecutor.execute_market_order(resolved_acc, sym, "sell", quantity=qty)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ✗ Order not placed/confirmed: {exc}")
+            sys.exit(1)
         print("Response:", json.dumps(res, indent=2))
         ComplianceAndRiskGuard.record_trade(resolved_acc, sym, "SELL", qty=float(qty) if qty else None, reason="MANUAL_CLI")
         try:

@@ -18,9 +18,11 @@ Robinhood provides official Model Context Protocol (MCP) integrations:
 
 ### User Account Layout & Financial Safety:
 When prompting or querying the user's account, call `robinhood__get_accounts` (or `./robinhood_trader.py accounts`) to inspect the user's brokerage accounts:
-1.  **Agentic Sandbox Account**: `000000001` (nickname: `Agentic`, type: `limited_margin`, `agentic_allowed: true`). **ALL automated orders (`place_equity_order`, `review_equity_order`) MUST target this account.** You can specify `agentic` or `000000001` in CLI commands (e.g. `./robinhood_trader.py summary agentic`, `./robinhood_trader.py orders agentic`).
-2.  **Primary Individual Margin Account**: `000000002` (type: `margin`, default account, `agentic_allowed: false`). Protected against automated mutation; read-only inspection (`get_portfolio`, `get_equity_positions`).
-3.  **Roth IRA Account**: `000000003` (type: `cash`, `brokerage_account_type: ira_roth`, `agentic_allowed: false`). Read-only inspection.
+1.  **Agentic Sandbox Account** (`<AGENTIC_ACCOUNT>`, type `limited_margin`, `agentic_allowed: true`). **ALL automated orders (`place_equity_order`, `review_equity_order`) MUST target this account.** Use the alias `agentic` in CLI commands (e.g. `./robinhood_trader.py summary agentic`, `./robinhood_trader.py orders agentic`); for raw MCP calls take the number from `robinhood__get_accounts` (the entry with `agentic_allowed: true`).
+2.  **Primary Individual Margin Account** (`<PRIMARY_ACCOUNT>`, default account, `agentic_allowed: false`). Protected against automated mutation; read-only inspection (`get_portfolio`, `get_equity_positions`). CLI alias: `primary`.
+3.  **Roth IRA Account** (`<ROTH_ACCOUNT>`, type `cash`, `brokerage_account_type: ira_roth`, `agentic_allowed: false`). Read-only inspection. CLI alias: `roth`.
+
+Account numbers are never written into the repo. `robinhood_trader.py` reads them from `RH_AGENTIC_ACCOUNT` / `RH_PRIMARY_ACCOUNT` / `RH_ROTH_ACCOUNT` or from `~/.config/ai/trader.json` (`{"accounts": {"agentic": "...", "primary": "...", "roth": "..."}}`), else discovers the single `agentic_allowed: true` account. If the agentic account cannot be determined it refuses to trade.
 
 ---
 
@@ -94,15 +96,15 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 | MCP Tool | Purpose | Key Parameters |
 | :--- | :--- | :--- |
 | `robinhood__get_accounts` | List user accounts & discover agentic vs primary accounts | `{}` |
-| `robinhood__get_portfolio` | Query balance, equity value, cash, buying power | `{"account_number": "000000001"}` |
-| `robinhood__get_equity_positions` | Fetch active equity holdings & quantities | `{"account_number": "000000001"}` |
+| `robinhood__get_portfolio` | Query balance, equity value, cash, buying power | `{"account_number": "<AGENTIC_ACCOUNT>"}` |
+| `robinhood__get_equity_positions` | Fetch active equity holdings & quantities | `{"account_number": "<AGENTIC_ACCOUNT>"}` |
 | `robinhood__get_equity_quotes` | Live real-time market quotes, bid/ask, previous close | `{"symbols": ["AAPL", "NVDA"]}` |
 | `robinhood__get_equity_historicals` | Fetch historical OHLCV daily/intraday bars | `{"symbols": ["AAPL"], "interval": "day", "start_time": "2026-05-01T00:00:00Z"}` |
 | `robinhood__get_equity_technical_indicators` | Server-side calculated RSI, MACD, SMA, Bollinger Bands | `{"symbol": "AAPL", "type": "rsi", "interval": "day", "start_time": "..."}` |
-| `robinhood__get_equity_orders` | Fetch recent stock orders & statuses | `{"account_number": "000000001"}` |
-| `robinhood__get_realized_pnl` | Fetch realized gains/losses performance metrics | `{"account_number": "000000001"}` |
-| `robinhood__review_equity_order` | Simulate a stock order without placing | `{"account_number": "000000001", "symbol": "AAPL", "side": "buy", "type": "market", "dollar_amount": "50"}` |
-| `robinhood__place_equity_order` | Execute real equity order on agentic account | `{"account_number": "000000001", "symbol": "AAPL", "side": "buy", "type": "market", "dollar_amount": "50"}` |
+| `robinhood__get_equity_orders` | Fetch recent stock orders & statuses | `{"account_number": "<AGENTIC_ACCOUNT>"}` |
+| `robinhood__get_realized_pnl` | Fetch realized gains/losses performance metrics | `{"account_number": "<AGENTIC_ACCOUNT>"}` |
+| `robinhood__review_equity_order` | Simulate a stock order without placing | `{"account_number": "<AGENTIC_ACCOUNT>", "symbol": "AAPL", "side": "buy", "type": "market", "dollar_amount": "50"}` |
+| `robinhood__place_equity_order` | Execute real equity order on agentic account | `{"account_number": "<AGENTIC_ACCOUNT>", "symbol": "AAPL", "side": "buy", "type": "market", "dollar_amount": "50"}` |
 
 ### Built-in Analysis CLI (`robinhood_trader.py`):
 | Command | Description | Example |
@@ -148,8 +150,8 @@ In `ai`, official Robinhood tools are prefixed with `robinhood__`:
 5. **Evidence before rule changes**: `./robinhood_trader.py backtest --years 5` runs the same `MomentumStrategy` functions the live loop uses. Change the rules only if the backtest (and its core-only comparison) supports it.
 6. **Tests never touch live state**: `tests/conftest.py` redirects every trader state path to a temp dir. Never remove that fixture.
 7. **Account Permission Boundary**:
-   - Automated orders MUST target `000000001` (`agentic_allowed: true`).
-   - Non-agentic accounts (`000000002`, `000000003`) are protected against automated mutation.
+   - Automated orders MUST target the agentic account (`agentic_allowed: true`). `execute_market_order` re-checks the live account list before every order and refuses otherwise.
+   - Non-agentic accounts (primary margin, Roth IRA) are protected against automated mutation.
 8. **Human Verification in Plan / Manual Modes**:
    - When running under `--plan` or `--manual`, present the proposed trades (Ticker, Action, Shares/Dollar, Limit Price, Estimated Total, Risk Target) to the user and obtain confirmation before placing orders.
 

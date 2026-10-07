@@ -248,6 +248,13 @@ if [ -d "$SKILLS_SRC" ]; then
     echo "==> Synced ${count} skill(s) to ${SKILLS_DST}"
 fi
 
+# ── 5. Privacy pre-commit hook (this repo is public) ─────────────────────────
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "${REPO_DIR}/.git" ] && [ -f "${REPO_DIR}/.githooks/pre-commit" ]; then
+    git -C "$REPO_DIR" config core.hooksPath .githooks
+    echo "==> Privacy pre-commit hook enabled (personal denylist: ~/.config/ai/private_patterns.txt)"
+fi
+
 # Configuration is loaded directly by the ai binary from ~/.local/share/ai/env
 
 # ── Subcommand: snap ──────────────────────────────────────────────────────────
@@ -416,7 +423,7 @@ if [ "${1:-}" = "llama" ] || [ "${1:-}" = "unsloth" ] || [ "${1:-}" = "llama-uns
     ln -sf "${BIN_DIR}/ai-backend" "${BIN_DIR}/llama-server-wrapper.sh"
 
     # ── Auto-fix: ensure models dir points to /mnt/scratch where weights live ─
-    SCRATCH_MODEL_DIR="/mnt/scratch/user/.local/share/ai/models"
+    SCRATCH_MODEL_DIR="${AI_SCRATCH_MODEL_DIR:-/mnt/scratch/${USER}/.local/share/ai/models}"
     if [ ! -e "$MODEL_DIR" ]; then
         # Models dir doesn't exist at all — create a symlink to scratch
         if [ -d "$SCRATCH_MODEL_DIR" ]; then

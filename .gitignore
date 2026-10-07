@@ -122,3 +122,37 @@ dev/uniref90__subsampled_1000.fasta
 # One-off local debug scripts (X11 cookie/screenshot probes)
 ckfix.py
 xshot.py
+
+# ─────────────────────────────────────────
+# Privacy: personal data never belongs in this public repo.
+# scripts/privacy_check.py (pre-commit hook) enforces this on every commit.
+# ─────────────────────────────────────────
+*.xlsx
+*.xls
+*.docx
+*.pptx
+.monitor_flags/
+.env
+*.pem
+zuliprc
+gcal_token.json
+gcal_credentials.json
+trader.json
+# Machine/lab-specific skills: keep locally (install.sh still syncs them)
+.agents/skills/boltzgen-ops/
+.agents/skills/*_private/
+# Personal one-off dev scripts
+dev/riverwatch.py
+dev/golden_water_report.py
+dev/find_gauges*.py
+dev/namdinator_*.md
+dev/clean_cli.py
+dev/fix_print.py
+dev/full_cleanup.py
+dev/update_visuals.py
+dev/patch_modes.py
+dev/read_session.py
+dev/ai_backend_envscan*.py
+dev/triplescan.py
+dev/generate_*_report.py
+dev/test_zulip_send.py

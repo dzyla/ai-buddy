@@ -237,7 +237,12 @@ char* load_session_transcript(char *messages_json, const char *mcp_script) {
     return messages_json;
 }
 
-char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
+/* Trim messages_json to at most max_bytes (JSON chars) via `ai_mcp.py
+   trim-messages`, which keeps the system prompt, the first and the latest
+   real user turn, and never splits an assistant tool_call from its tool
+   replies. Returns the (possibly new) buffer; on any failure the original is
+   returned untouched. */
+char* maybe_trim_messages(char *messages_json, const char *mcp_script, int max_bytes) {
     if (!messages_json || !mcp_script) return messages_json;
     const char *tmpdir = getenv("TMPDIR");
     if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
@@ -250,7 +255,7 @@ char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
     fputs(messages_json, fp);
     fclose(fp);
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s", mcp_script, tmpfile);
+    snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s %d", mcp_script, tmpfile, max_bytes > 0 ? max_bytes : 60000);
     char *trimmed = run_shell_command(cmd, NULL);
     unlink(tmpfile);
     if (trimmed) {
@@ -268,19 +273,25 @@ char* maybe_trim_messages(char *messages_json, const char *mcp_script) {
     return messages_json;
 }
 
-char* compact_session(char *messages_json, const char *mcp_script, CURL *curl_handle, const char *model_name, int *out_success) {
+char* compact_session(char *messages_json, const char *mcp_script, CURL *curl_handle, const char *model_name, int *out_success, int target_bytes) {
     (void)curl_handle;
     (void)model_name;
     if (out_success) *out_success = 0;
     if (!messages_json || !mcp_script) return messages_json;
 
-    char *trimmed = maybe_trim_messages(messages_json, mcp_script);
+    size_t before = strlen(messages_json);
+    /* Force a real reduction: aim below the current size even when the
+       history is already under the auto-trim threshold. */
+    int target = target_bytes;
+    if (target <= 0 || (size_t)target >= before) target = (int)(before / 2);
+    if (target < 2000) target = 2000;
 
-    /* Task 3 Fallback Validation: ensure trimmed result is non-empty, valid JSON array */
-    if (!trimmed || strlen(trimmed) < 20 || trimmed[0] != '[' || trimmed[strlen(trimmed) - 1] != ']') {
-        fprintf(stderr, "\033[1;33m[ai] Compact warning: session compaction produced invalid output. Retaining original session.\033[0m\n");
-        if (trimmed) free(trimmed);
-        return messages_json;
+    /* maybe_trim_messages frees the old buffer only when it returns a new
+       one; on failure it hands back the SAME pointer, which must not be freed. */
+    char *trimmed = maybe_trim_messages(messages_json, mcp_script, target);
+    if (trimmed == messages_json || !trimmed || strlen(trimmed) >= before) {
+        fprintf(stderr, "\033[1;33m[ai] Compact: nothing could be removed (history already minimal).\033[0m\n");
+        return trimmed ? trimmed : messages_json;
     }
 
     if (out_success) *out_success = 1;

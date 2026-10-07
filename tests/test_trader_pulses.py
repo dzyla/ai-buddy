@@ -221,3 +221,131 @@ def test_backtest_runs_on_synthetic_bars():
     assert "AAA" in res["final_positions"] and "CCC" not in res["final_positions"]
     core_only = rt.run_backtest(start_cash=600.0, universe=["AAA", "BBB", "CCC"], bars_override=hist, sleeve=False, verbose=False)
     assert core_only["sleeve_round_trips"] == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# Robustness: bad data must not trade, restarts must not duplicate orders, dry runs must not
+# block the live rebalance.
+# ---------------------------------------------------------------------------------------------
+
+def test_missing_market_data_defers_rebalance_instead_of_liquidating(broker, monkeypatch):
+    """A failed history fetch used to read as 'no eligible names' and sell the whole sleeve."""
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", lambda sym, range_period="1y", interval="1d": [])
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert broker.orders == []
+    assert not os.path.exists(rt._rebalance_flag_path("2026-09"))
+    # SPY alone missing: still deferred (an unknown regime is not BULL)
+    monkeypatch.setattr(FinancialData, "fetch_historical",
+                        lambda sym, range_period="1y", interval="1d": [] if sym == "SPY" else HIST.get(sym, []))
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert broker.orders == []
+
+
+def test_stale_history_is_not_used(broker, monkeypatch):
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    old = [dict(b, datetime=f"2026-0{1 + i // 200}-01") for i, b in enumerate(bars(100, 300))]
+    monkeypatch.setattr(FinancialData, "fetch_historical", lambda sym, range_period="1y", interval="1d": old)
+    assert rt._fetch_strategy_bars(["NVDA"]) == {}
+
+
+def test_corrupt_rebalance_flag_fails_closed(broker, monkeypatch):
+    """An unreadable flag used to be treated as 'no rebalance yet' and the month was re-planned and re-traded."""
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    os.makedirs(rt.RISK_MONITOR_FLAGS, exist_ok=True)
+    with open(rt._rebalance_flag_path("2026-09"), "w") as fh:
+        fh.write('{"month": "2026-09", "sells_pend')
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert broker.orders == []
+    assert "unreadable" in open(rt.RISK_MONITOR_LOG).read()
+
+
+def test_flag_write_is_atomic(tmp_path):
+    d = tmp_path / "atomic"
+    p = str(d / "f.json")
+    rt._save_json(p, {"a": 1})
+    rt._save_json(p, {"a": 2})
+    assert json.load(open(p)) == {"a": 2}
+    assert os.listdir(d) == ["f.json"]          # no temp files left behind
+
+
+def test_dry_run_flag_does_not_block_live_rebalance(broker, monkeypatch):
+    """Switching `service dry-run` -> `service live` mid-month used to skip that month's live rebalance."""
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    _momentum_rebalance_pulse(ACC, dry_run=True)
+    _momentum_rebalance_pulse(ACC, dry_run=True)
+    assert broker.orders == []
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert {o[0] for o in broker.orders if o[1] == "sell"} == {"LLY", "MSFT"}
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert {o[0] for o in broker.orders if o[1] == "buy"} >= {"NVDA", "PLTR"}
+    state = json.load(open(rt._rebalance_flag_path("2026-09")))
+    assert state["done"] and not state["dry_run"]
+    _momentum_rebalance_pulse(ACC, dry_run=False)            # live core top-up despite the dry-run core flag
+    assert broker.orders[-1][0] in MS.CORE_SYMBOLS
+
+
+def test_failed_portfolio_read_places_no_orders(broker, monkeypatch):
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(RobinhoodExecutor, "get_live_portfolio", lambda acc: {})
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert broker.orders == []
+    assert not os.path.exists(rt._rebalance_flag_path("2026-09"))
+
+
+def test_failed_positions_read_places_no_orders(broker, monkeypatch):
+    """Empty positions + holdings in the portfolio = a failed read, not an empty book to buy into."""
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(RobinhoodExecutor, "get_equity_positions", lambda acc: [])
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert broker.orders == []
+    assert not os.path.exists(rt._rebalance_flag_path("2026-09"))
+
+
+def test_failed_portfolio_read_does_not_feed_circuit_breaker(broker, monkeypatch):
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(11, 0))
+    _risk_monitor_pulse(ACC, dry_run=False)                   # baseline from a good read
+    monkeypatch.setattr(RobinhoodExecutor, "get_live_portfolio", lambda acc: {})   # cash missing -> phantom -17%
+    for _ in range(3):
+        _risk_monitor_pulse(ACC, dry_run=False)
+    assert not os.path.exists(rt.SESSION_HALT_FLAG.format(date="2026-09-08"))
+
+
+def test_bookkeeping_error_after_buy_does_not_rebuy(broker, monkeypatch):
+    """A ledger write failing after a placed buy used to re-queue the buy (duplicate order next pulse)."""
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    _momentum_rebalance_pulse(ACC, dry_run=False)             # sells
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(rt.ObsidianTradingVault, "log_trade_execution", classmethod(lambda cls, t: boom()))
+    _momentum_rebalance_pulse(ACC, dry_run=False)             # buys, ledger fails
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    buys = [o[0] for o in broker.orders if o[1] == "buy" and o[0] not in MS.CORE_SYMBOLS]
+    assert sorted(buys) == ["NVDA", "PLTR"]
+
+
+def test_unconfirmed_buy_is_not_retried(broker, monkeypatch):
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    _momentum_rebalance_pulse(ACC, dry_run=False)             # sells
+    sent = []
+    def lost_reply(acc, sym, side, dollar_amount=None, quantity=None):
+        sent.append((sym, side))
+        raise rt.OrderNotConfirmed("no response")
+    monkeypatch.setattr(RobinhoodExecutor, "execute_market_order", lost_reply)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    n = len(sent)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    sleeve = [s for s, side in sent if side == "buy" and s not in MS.CORE_SYMBOLS]
+    assert sorted(sleeve) == ["NVDA", "PLTR"] and n == 2
+    assert len([s for s in sent if s[0] in MS.CORE_SYMBOLS]) <= 1     # at most one core top-up attempt today
+
+
+def test_sell_quantity_never_exceeds_holding():
+    plan = MS.plan_rebalance(1000.0, 100.0, {"ABC": {"quantity": 0.1234567, "price": 50.0}}, targets=[])
+    assert plan["sells"][0]["quantity"] <= 0.1234567
+    assert rt._fmt_qty(0.1234567) == "0.123456"
+    assert rt._fmt_qty(0.30000000000000004) == "0.3"
+    assert rt._fmt_qty(2.0) == "2"
+    assert rt._fmt_qty(1e-7) == "0"

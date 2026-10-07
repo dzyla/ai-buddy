@@ -1229,14 +1229,50 @@ def fetch_smart(url):
 MEMORY_PATH = os.path.expanduser("~/.config/ai/memory.txt")
 MEMORY_DB = os.path.expanduser("~/.config/ai/memory.db")
 
-def save_memory(content):
+MEMORY_CAP = 4000
+
+def save_memory(content, replace=False):
+    """Add facts to persistent memory (injected into every system prompt).
+
+    Appends by default — this used to open the file with "w", so every call
+    silently erased everything saved before it. Lines already present are not
+    duplicated; when the 4 KB cap is exceeded the OLDEST whole lines are evicted
+    (never a mid-line cut) and the result says so. replace=True rewrites."""
     try:
         os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
-        if len(content) > 4000:
-            content = content[-4000:]
-        with open(MEMORY_PATH, "w") as f:
-            f.write(content)
-        return "Memory updated successfully."
+        new_lines = [l.rstrip() for l in str(content or "").splitlines() if l.strip()]
+        if not new_lines:
+            return "Error: save_memory needs non-empty content."
+        old_lines = []
+        if not replace and os.path.isfile(MEMORY_PATH):
+            with open(MEMORY_PATH, encoding="utf-8", errors="replace") as f:
+                old_lines = [l.rstrip() for l in f.read().splitlines() if l.strip()]
+        seen = {l.strip().lower() for l in old_lines}
+        added = []
+        for l in new_lines:
+            k = l.strip().lower()
+            if k not in seen:
+                seen.add(k)
+                added.append(l)
+        lines = old_lines + added
+        evicted = []
+        while lines and len("\n".join(lines)) > MEMORY_CAP:
+            if len(lines) == 1:
+                lines[0] = lines[0][:MEMORY_CAP]
+                break
+            evicted.append(lines.pop(0))
+        tmp = MEMORY_PATH + ".tmp.%d" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, MEMORY_PATH)
+        if not added and not replace:
+            return "Memory already contains that (no duplicate added)."
+        msg = "Memory updated successfully (%d line(s) added, %d/%d chars used)." % (
+            len(added) if not replace else len(lines), len("\n".join(lines)), MEMORY_CAP)
+        if evicted:
+            msg += " Memory was full: evicted %d oldest line(s): %s" % (
+                len(evicted), " | ".join(e[:60] for e in evicted[:3]))
+        return msg
     except Exception as e:
         return f"Error saving memory: {e}"
 
@@ -4099,8 +4135,10 @@ def _pubmed_fetch_raw(query, top_k=10, start_date=None, end_date=None, high_qual
     import urllib.request as _req
     import json as _json
 
-    base_url = os.environ.get("PUBMED_SEARCH_URL", "http://pubmed-search.example.org:8080").rstrip("/")
+    base_url = os.environ.get("PUBMED_SEARCH_URL", "").rstrip("/")
     api_key  = os.environ.get("PUBMED_API_KEY") or os.environ.get("MSS_API_KEY", "")
+    if not base_url:
+        return "Error: no search server configured. Set PUBMED_SEARCH_URL (e.g. in ~/.local/share/ai/env)."
     if not api_key:
         return "Error: no API key found. Set PUBMED_API_KEY (or MSS_API_KEY) environment variable."
 
@@ -5028,18 +5066,60 @@ def _block_tool(block):
     return ""
 
 def _has_lesson(kind, tool, signature):
-    if not os.path.isfile(_lessons_path()):
-        return False
+    """True if a lesson of this KIND already exists for this exact signature
+    (or, with no signature, for this tool). Matched per block: the old
+    whole-file check ('any ## KIND exists' AND 'tool: X appears anywhere')
+    meant that after the first lesson for a tool, no further distinct
+    lesson for that tool was ever written — learning silently saturated."""
+    kind = (kind or "").upper()
+    sig = (signature or "").strip().lower()
+    t = (tool or "").strip().lower()
+    for b in _lesson_blocks():
+        if not b.startswith("## %s " % kind):
+            continue
+        if sig:
+            if _block_signature(b) == sig:
+                return True
+        elif t and _block_tool(b) == t:
+            return True
+    return False
+
+# Errors the HARNESS itself produced (loop guards, caches, budget/plan gates,
+# context stubs). They describe the agent's control flow, not a tool's
+# behaviour, so learning from them only poisons future sessions (e.g. a
+# "FIX: list_directory stuck-in-a-loop -> succeeded with the same args").
+_SI_HARNESS_ERROR_MARKERS = (
+    "You are stuck in a loop", "[HARD STOP]",
+    "You have already called the 'think' tool", "You have called 'think'",
+    "Your 'think' reasoning was very long",
+    "context limit reached", "result omitted to preserve",
+    "[PLAN MODE]", "denied by user", "cancelled/denied by the user",
+    "Model returned an empty tool name", "[TIMEOUT]", "[INTERRUPTED",
+)
+
+def _is_harness_error(error):
+    e = error or ""
+    return any(m.lower() in e.lower() for m in _SI_HARNESS_ERROR_MARKERS)
+
+_SI_LEDGER_MAX_LINES = 5000
+
+def _ledger_append(rec):
+    """Append one record; keep the ledger bounded (it is re-read on every
+    failure/recovery, and grew without limit)."""
+    path = _ledger_path()
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
     try:
-        with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        if os.path.getsize(path) > _SI_LEDGER_MAX_LINES * 400:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            if len(lines) > _SI_LEDGER_MAX_LINES:
+                tmp = path + ".tmp.%d" % os.getpid()
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-(_SI_LEDGER_MAX_LINES * 8 // 10):])
+                os.replace(tmp, path)
     except Exception:
-        return False
-    needle_prefix = "\n## %s " % (kind or "")
-    if needle_prefix not in "\n" + content:
-        return False
-    return (signature and signature in content) or (
-        tool and ("\ntool: %s\n" % tool.lower() in "\n" + content.lower()))
+        pass
 
 def _append_lesson(kind, tool, signature, body):
     path = _lessons_path()
@@ -5082,6 +5162,8 @@ def record_failure(tool="", args="", error="", phase="execution", chain_id=None)
         return False, ""
     tool = (tool or "").strip()
     error = (error or "").strip()
+    if not tool or not error or _is_harness_error(error):
+        return False, ""
     sig = _err_signature(tool, error)
     cid = chain_id or _chain_id(tool, error)
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -5089,8 +5171,7 @@ def record_failure(tool="", args="", error="", phase="execution", chain_id=None)
            "args": (args or "")[:200], "error": error[:300],
            "signature": sig, "chain_id": cid, "phase": phase}
     try:
-        with open(_ledger_path(), "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
+        _ledger_append(rec)
     except Exception as e:
         return False, "Error writing failure ledger: %s" % e
     n = _ledger_signature_count(sig)
@@ -5105,7 +5186,8 @@ def record_failure(tool="", args="", error="", phase="execution", chain_id=None)
         return True, "[RECURRING FAILURE] " + body
     return False, ""
 
-def record_recovery(tool="", args="", prior_error="", phase="execution", chain_id=None):
+def record_recovery(tool="", args="", prior_error="", phase="execution", chain_id=None,
+                    failed_args=None):
     """Record that the model recovered from a prior failure of the SAME tool.
 
     Harness-driven (no model discipline required): the C loop notices a failed
@@ -5119,16 +5201,21 @@ def record_recovery(tool="", args="", prior_error="", phase="execution", chain_i
     tool = (tool or "").strip()
     prior_error = (prior_error or "").strip()
     args = (args or "").strip()
+    if not tool or not prior_error or _is_harness_error(prior_error):
+        return ""
+    if failed_args is not None and failed_args.strip() == args:
+        # Same call failed then succeeded: transient or harness-made error,
+        # not a change of approach — nothing worth teaching future sessions.
+        return ""
     sig = _err_signature(tool, prior_error)
     cid = chain_id or _chain_id(tool, prior_error)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
-        with open(_ledger_path(), "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": ts, "kind": "recovery", "tool": tool,
-                                "approach": args[:200],
-                                "prior_error": prior_error[:300],
-                                "signature": sig, "chain_id": cid,
-                                "phase": phase}) + "\n")
+        _ledger_append({"ts": ts, "kind": "recovery", "tool": tool,
+                        "approach": args[:200],
+                        "prior_error": prior_error[:300],
+                        "signature": sig, "chain_id": cid,
+                        "phase": phase})
     except Exception as e:
         return "Error writing recovery ledger: %s" % e
     lesson_text = ("`%s` failed (%s) then succeeded with approach: `%s`."
@@ -5459,6 +5546,154 @@ def self_improve_status():
         lines.append("--- lessons.md ---")
         lines.append(lessons.strip())
     return "\n".join(lines)
+
+
+# Tools kept by `list-tools` under INFER_TOOL_PROFILE=core (small-context models).
+CORE_TOOL_PROFILE = (
+    "think", "execute_command", "read_file", "write_file", "edit_file",
+    "list_directory", "search_files", "web_search", "fetch_webpage",
+    "save_memory", "load_skill", "todo", "present_plan",
+    "start_background_process", "check_process_status", "task_complete",
+)
+
+
+# ── Context trimming (called by ai.c when messages_json exceeds the budget) ──
+# Internal steering messages ai.c injects as role=user; never the real task.
+_TRIM_INTERNAL_USER_PREFIXES = (
+    "Please call task_complete", "Your last response was empty", "[TIMEOUT]",
+    "Your last response was cut off", "[SYSTEM]", "[SYSTEM ", "[HARD STOP]",
+    "[STALL]", "[INTERRUPTED", "[CONTEXT",
+)
+_TRIM_NOTE = "\n\n[CONTEXT NOTE: older conversation messages were trimmed to fit the model's context window.]"
+
+
+def _trim_msg_size(m):
+    return len(json.dumps(m, ensure_ascii=False))
+
+
+def _trim_text(m):
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return ""
+
+
+def trim_messages(messages, max_bytes=60000, keep_recent_full=4, tool_stub_chars=800):
+    """Shrink an OpenAI messages array to <= max_bytes (JSON chars) WITHOUT
+    breaking the protocol or losing the task:
+      - leading system message(s) are always kept;
+      - the first user turn and the LATEST real user turn are always kept
+        (dropping the latest turn made the model resume an old task);
+      - an assistant message with tool_calls and its tool replies are kept or
+        dropped as one unit, so no tool message is ever orphaned (API 400);
+      - older tool outputs are shortened before whole units are dropped;
+      - the newest unit is always kept.
+    Below the budget the array is returned unchanged (keeps the server's KV /
+    prompt cache prefix stable)."""
+    if not isinstance(messages, list) or not messages:
+        return messages
+    total = sum(_trim_msg_size(m) for m in messages)
+    if total <= max_bytes:
+        return messages
+
+    head = []
+    i = 0
+    while i < len(messages) and messages[i].get("role") == "system":
+        head.append(dict(messages[i]))
+        i += 1
+    rest = messages[i:]
+
+    # Group into units: assistant(tool_calls) + its matching tool replies.
+    units = []
+    for m in rest:
+        role = m.get("role")
+        if role == "tool":
+            if units and units[-1][0].get("role") == "assistant" and units[-1][0].get("tool_calls"):
+                ids = {c.get("id") for c in units[-1][0]["tool_calls"]}
+                if m.get("tool_call_id") in ids:
+                    units[-1].append(m)
+                    continue
+            continue  # orphan tool message: drop it
+        units.append([m])
+
+    # Shorten 'think' reasoning everywhere (cheap, keeps the call itself).
+    for u in units:
+        a = u[0]
+        if a.get("role") == "assistant" and a.get("tool_calls"):
+            new_calls = []
+            for call in a["tool_calls"]:
+                fn = call.get("function", {})
+                if fn.get("name") == "think":
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                        r = args.get("reasoning", "")
+                        if len(r) > 120:
+                            args["reasoning"] = r[:120] + "…"
+                            call = dict(call)
+                            call["function"] = dict(fn, arguments=json.dumps(args))
+                    except Exception:
+                        pass
+                new_calls.append(call)
+            u[0] = dict(a, tool_calls=new_calls)
+
+    user_idx = [k for k, u in enumerate(units) if u[0].get("role") == "user"]
+    real_user = [k for k in user_idx
+                 if not _trim_text(units[k][0]).lstrip().startswith(_TRIM_INTERNAL_USER_PREFIXES)]
+    anchors = set()
+    if user_idx:
+        anchors.add(user_idx[0])
+    if real_user:
+        anchors.add(real_user[-1])
+    elif user_idx:
+        anchors.add(user_idx[-1])
+    if units:
+        anchors.add(len(units) - 1)
+
+    def _size():
+        return (sum(_trim_msg_size(m) for m in head) +
+                sum(_trim_msg_size(m) for u in units if u for m in u))
+
+    # Stage 1: stub older tool outputs (all but the newest keep_recent_full units).
+    cutoff = max(0, len(units) - keep_recent_full)
+    for k in range(cutoff):
+        if _size() <= max_bytes:
+            break
+        u = units[k]
+        for j, m in enumerate(u):
+            c = m.get("content")
+            if m.get("role") == "tool" and isinstance(c, str) and len(c) > tool_stub_chars:
+                u[j] = dict(m, content=c[:tool_stub_chars] +
+                            "\n... [older tool output trimmed to save context]")
+
+    # Stage 2: drop oldest non-anchor units.
+    dropped = 0
+    for k in range(len(units)):
+        if _size() <= max_bytes:
+            break
+        if k in anchors or not units[k]:
+            continue
+        dropped += len(units[k])
+        units[k] = []
+
+    # Stage 3: still too big — shorten any oversized content in what is left
+    # (e.g. a huge piped stdin in the first user turn, or a giant last tool result).
+    if _size() > max_bytes:
+        budget_each = max(2000, max_bytes // 4)
+        for u in units:
+            for j, m in enumerate(u):
+                c = m.get("content")
+                if isinstance(c, str) and len(c) > budget_each:
+                    half = budget_each // 2
+                    u[j] = dict(m, content=c[:half] + "\n... [trimmed to fit context] ...\n" + c[-half:])
+
+    if dropped and head and isinstance(head[0].get("content"), str) \
+            and _TRIM_NOTE not in head[0]["content"]:
+        head[0]["content"] = head[0]["content"] + _TRIM_NOTE
+    return head + [m for u in units for m in u]
+
+
 def main():
     # A pipe-writing backend must not raise a BrokenPipeError traceback when the
     # parent (ai.c) closes the pipe on interrupt/exit. Restore default SIGPIPE so
@@ -5528,7 +5763,8 @@ def main():
     if action == "record-failure":
         rec = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
         _, lesson = record_failure(rec.get("tool", ""), rec.get("args", ""),
-                                   rec.get("error", ""), rec.get("phase", "execution"))
+                                   rec.get("error", ""), rec.get("phase", "execution"),
+                                   chain_id=rec.get("chain_id") or None)
         if lesson:
             print(lesson)
         sys.exit(0)
@@ -5536,7 +5772,9 @@ def main():
     if action == "record-recovery":
         rec = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
         lesson = record_recovery(rec.get("tool", ""), rec.get("args", ""),
-                                 rec.get("prior_error", ""), rec.get("phase", "execution"))
+                                 rec.get("prior_error", ""), rec.get("phase", "execution"),
+                                 chain_id=rec.get("chain_id") or None,
+                                 failed_args=rec.get("failed_args"))
         if lesson:
             print(lesson)
         sys.exit(0)
@@ -5590,32 +5828,14 @@ def main():
         try:
             with open(sys.argv[2]) as f:
                 messages = json.load(f)
-            # Compress think reasoning in assistant messages to reclaim context tokens
-            MAX_THINK = 120
-            compressed = []
-            for msg in messages:
-                if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                    new_calls = []
-                    for call in msg['tool_calls']:
-                        if call.get('function', {}).get('name') == 'think':
-                            try:
-                                args = json.loads(call['function']['arguments'])
-                                r = args.get('reasoning', '')
-                                if len(r) > MAX_THINK:
-                                    args['reasoning'] = r[:MAX_THINK] + '…'
-                                    call = dict(call)
-                                    call['function'] = dict(call['function'])
-                                    call['function']['arguments'] = json.dumps(args)
-                            except Exception:
-                                pass
-                        new_calls.append(call)
-                    msg = dict(msg)
-                    msg['tool_calls'] = new_calls
-                compressed.append(msg)
-            # Keep: system prompt (0), first user turn (1), last 20 messages
-            if len(compressed) > 22:
-                compressed = compressed[:2] + compressed[-20:]
-            print(json.dumps(compressed))
+            # Optional target size in JSON chars (ai.c passes its budget).
+            max_bytes = 60000
+            if len(sys.argv) > 3:
+                try:
+                    max_bytes = max(2000, int(sys.argv[3]))
+                except Exception:
+                    pass
+            print(json.dumps(trim_messages(messages, max_bytes)))
         except Exception:
             print("[]")
         sys.exit(0)
@@ -6302,13 +6522,17 @@ def main():
             "type": "function",
             "function": {
                 "name": "save_memory",
-                "description": "Save key facts, user preferences, or context to persistent memory. This memory is automatically loaded in subsequent runs.",
+                "description": "Add key facts, user preferences, or context to persistent memory (appended; duplicates skipped; oldest lines evicted past 4 KB). This memory is automatically loaded in subsequent runs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "The exact content to store in memory. Keep it concise."
+                            "description": "The fact(s) to add, one per line. Keep it concise."
+                        },
+                        "replace": {
+                            "type": "boolean",
+                            "description": "Rewrite the whole memory with content instead of appending (use only to clean up or correct it)."
                         }
                     },
                     "required": ["content"]
@@ -7248,6 +7472,17 @@ def main():
                 except Exception:
                     pass
 
+        # Small-context profile: the full catalog is ~45 KB (~12k tokens) and is
+        # sent with EVERY request, which alone overflows a 16k-ctx local model.
+        # INFER_TOOL_PROFILE=core (set by ai.c for --short-ctx or a detected
+        # context window <= 32k) keeps only the everyday tools; load_skill and
+        # execute_command still reach everything else.
+        if os.environ.get("INFER_TOOL_PROFILE", "").strip().lower() == "core":
+            extra = {x.strip() for x in os.environ.get("INFER_CORE_TOOLS_EXTRA", "").split(",") if x.strip()}
+            keep = set(CORE_TOOL_PROFILE) | extra
+            openai_tools = [t for t in openai_tools
+                            if t.get("function", {}).get("name") in keep]
+
         print(json.dumps(openai_tools))
 
     elif action == "show-metrics" or action == "metrics":
@@ -7568,7 +7803,7 @@ def main():
             print(result)
         elif tool_name == "save_memory" or server_name == "save_memory":
             content = arguments.get("content", "")
-            result = save_memory(content)
+            result = save_memory(content, replace=bool(arguments.get("replace", False)))
             print(result)
         elif tool_name == "remember" or server_name == "remember":
             content = arguments.get("content", "")
@@ -7931,7 +8166,8 @@ def main():
                     description=arguments.get("description"),
                     location=arguments.get("location"),
                     attendees=arguments.get("attendees"),
-                    calendar_id=arguments.get("calendar_id", 'primary')
+                    calendar_id=arguments.get("calendar_id", 'primary'),
+                    time_zone=arguments.get("time_zone"),
                 )
                 print(result)
             except Exception as e:

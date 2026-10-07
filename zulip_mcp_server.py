@@ -273,6 +273,8 @@ def do_get_messages(arguments):
                 return "\n".join(lines)
             else:
                 return "No messages found in your subscribed channels or private messages."
+        # Never fall through to an unfiltered (realm-wide) query.
+        return f"Error getting subscriptions: {subs_res.get('msg', 'Unknown error')}"
 
     # Otherwise, query using user-specified filters
     narrow = []

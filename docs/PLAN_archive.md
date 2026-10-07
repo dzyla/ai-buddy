@@ -1,7 +1,7 @@
 # Implementation Plan for ai-buddy Improvements
 
 ## Overview
-Implement changes from `~/Code/ai-buddy/improvements.md` (18 tasks), verify each step compiles and passes unit tests, and create comprehensive test suites for local AI functionality.
+Implement changes from `./improvements.md` (18 tasks), verify each step compiles and passes unit tests, and create comprehensive test suites for local AI functionality.
 
 ## Task Roadmap
 

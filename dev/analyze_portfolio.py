@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import os
 import subprocess
+import sys
 import json
 
 def call_mcp(proc, method, params, req_id):
@@ -31,7 +33,20 @@ call_mcp(proc, 'initialize', {'protocolVersion': '2024-11-05', 'capabilities': {
 proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
 proc.stdin.flush()
 
-acc = '000000002'
+def _configured_primary():
+    """RH_PRIMARY_ACCOUNT, else accounts.primary in ~/.config/ai/trader.json (never hardcoded: public repo)."""
+    if os.environ.get('RH_PRIMARY_ACCOUNT'):
+        return os.environ['RH_PRIMARY_ACCOUNT']
+    path = os.environ.get('RH_TRADER_CONFIG') or os.path.expanduser('~/.config/ai/trader.json')
+    try:
+        with open(path) as fh:
+            return str((json.load(fh).get('accounts') or {}).get('primary') or '') or None
+    except (OSError, ValueError):
+        return None
+
+acc = sys.argv[1] if len(sys.argv) > 1 else _configured_primary()
+if not acc:
+    sys.exit('usage: analyze_portfolio.py <account_number>  (or set RH_PRIMARY_ACCOUNT / accounts.primary in ~/.config/ai/trader.json)')
 port = call_mcp(proc, 'tools/call', {'name': 'get_portfolio', 'arguments': {'account_number': acc}}, 10)
 positions = call_mcp(proc, 'tools/call', {'name': 'get_equity_positions', 'arguments': {'account_number': acc}}, 11)
 

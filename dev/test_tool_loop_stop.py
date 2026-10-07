@@ -19,8 +19,9 @@ SEQ = [{"id": f"loop_{i}", "type": "function",
 env = os.environ.copy()
 env["MOCK_TOOL_SEQ"] = json.dumps(SEQ)
 env["MOCK_TASK_COMPLETE"] = "DONE-after-loop"
-server = subprocess.Popen(["~/miniconda3/bin/python3", "tests/mock_llm_server.py", str(PORT)],
-                          env=env, cwd="~/Code/ai-buddy")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+server = subprocess.Popen([sys.executable, "tests/mock_llm_server.py", str(PORT)],
+                          env=env, cwd=REPO)
 try:
     # wait for readiness
     for _ in range(30):
@@ -33,7 +34,7 @@ try:
         print("FAIL: mock server never came up"); sys.exit(1)
 
     r = subprocess.run(
-        ["~/Code/ai-buddy/ai", "-q", "", "-n", "do the task"],
+        [os.path.join(REPO, "ai"), "-q", "", "-n", "do the task"],
         env=env | {"INFER_BASE_URL": f"http://127.0.0.1:{PORT}/v1/",
                    "INFER_API_KEY": "x", "INFER_MODEL": "mock",
                    "INFER_TOOL_CHOICE": "auto",

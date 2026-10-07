@@ -44,10 +44,13 @@ Optional environment variables:
 - `INFER_QUIET=1` — suppress `[thinking]` output from the `think` tool (same as `-q`).
 - `INFER_TOOL_CHOICE` — `required` (default) or `auto`; controls the `tool_choice` field sent in every request.
 - `INFER_MAX_TOOL_OUTPUT` — caps individual tool output (default: 65536).
-- `INFER_TRIM_THRESHOLD` — triggers message trimming if context exceeds this size (default: 100000).
+- `INFER_CONTEXT_WINDOW` — model context in tokens (else `LLAMA_CTX_SIZE`, else detected from `/props` / `/v1/models` `n_ctx`). When known, `apply_context_budget` derives tighter trim/stub/tool-output limits (~3 chars/token, minus tool catalog and reply reserve); explicitly set thresholds are never overridden.
+- `INFER_TOOL_PROFILE=core` — send only the core tool subset (~10 KB instead of ~45 KB). Set automatically for windows ≤32k tokens and `--short-ctx`.
+- `INFER_TRIM_THRESHOLD` — triggers message trimming if context exceeds this size (default: 100000). Trimming only runs above it, cuts to ~60%, always keeps the system prompt and first/latest real user turns, keeps assistant `tool_calls` with their tool replies, and shortens old tool output before dropping messages.
 - `INFER_STUB_THRESHOLD` — stubs subsequent tool results once context size exceeds this (default: 250000).
 - `INFER_RESUME=1` — resume the previous conversation (same as `-r`/`--resume`). See "Session persistence" below.
 - `INFER_SYSTEM_PROMPT_FILE` — path to a system-prompt override file. Defaults to `~/.config/ai/system_prompt.md` if that exists; otherwise the compiled-in `SYSTEM_PROMPT` is used. Lets you tune agent behavior without recompiling.
+- `INFER_AUTO_COMMIT=1` — opt into git auto-commit after successful commands (same as `--git`; `--no-git` wins). Off by default; it only stages files git already tracks (`git add -u`) and restores the index if the commit is blocked.
 - `INFER_FETCH_BASIC=1` — force `fetch_webpage` to use the plain urllib+trafilatura path instead of the default robust `fetch_smart` cascade (curl_cffi TLS impersonation → Playwright+stealth → urllib).
 
 ## Architecture: two cooperating processes
@@ -73,7 +76,7 @@ The system is split across two files that talk to each other by **shell-invoking
 - Detects `finish_reason: "length"` (model hit token limit) and injects a recovery nudge instead of rendering truncated output.
 - In interactive mode handles `:compact`, `:clear`, `:status`, `:memory`, `:auto`, and `:help` colon-commands, and Shift-Tab (`ESC [ Z`) to toggle `g_auto_approve` both at the prompt and during agent execution (raw mode via the libcurl progress callback). The `ai>` prompt changes to `ai(auto)>` while auto-approve is active.
 - The interactive prompt uses a self-contained line editor (`read_line_interactive` / `lineed_*` in `ai.c`): arrow keys navigate history (up/down) and move the cursor (left/right), with Ctrl+A/E (line start/end), Ctrl+K/U (kill to end/start), Ctrl+W (kill word), Ctrl+L (clear screen), Home/End, Delete. History is persisted to `~/.cache/ai/input_history` across sessions.
-- `compact_session`: sends the full conversation to the LLM for summarisation, prints progress dots via the libcurl progress callback while waiting, and only replaces the conversation history if the LLM returns a usable summary (≥20 chars).
+- `:compact` trims the conversation towards a target size with the same protocol-safe rules as automatic trimming (it does not ask the LLM for a summary).
 - **Session persistence:** at the end of every run the full `messages_json` is written to `~/.cache/ai/sessions/last.json`. `-r`/`--resume` (or `INFER_RESUME=1`) reloads it: `ai.c` shells to `python3 ai_mcp.py session-transcript <file>`, which converts the raw array into a clean user/assistant transcript (JSONL, one message per line) — old system message, tool churn, and internal nudges are dropped, and `task_complete` summaries become assistant text. Each line is spliced in via `append_message` between the fresh system message and the new user turn, avoiding dangling-tool_call API errors.
 - **System prompt** is assembled from `load_system_prompt()` (file override → compiled-in `SYSTEM_PROMPT` fallback) plus live context, memory, and skills.
 
@@ -113,5 +116,14 @@ A native tool requires edits in **both** files, kept in sync:
 ## Runtime state locations
 
 - `~/.cache/ai/history.jsonl` — every job logged (prompt, pipe writer, response).
-- `~/.config/ai/memory.txt` — persistent memory (capped 4KB), injected into every system prompt.
+- `~/.config/ai/memory.txt` — persistent memory (capped 4KB), injected into every system prompt. `save_memory` appends, skips duplicates, and evicts the oldest whole lines past the cap (`replace=true` overwrites).
+- `~/.config/ai/self_improve/` — failure-learning ledger (`ledger.jsonl`, capped at 5000 lines) and `lessons.md`. Guard/timeout errors are not learned from. Tests must use an isolated `HOME`.
+- `~/.config/ai/trader.json` — Robinhood account mapping (`{"accounts": {"agentic": ..., "primary": ..., "roth": ...}}`); env `RH_*_ACCOUNT` overrides. Trading refuses if the agentic account can't be resolved.
 - `mcp.json` / `~/.config/ai/mcp.json` (and several other paths checked in `CONFIG_PATHS` order) — MCP server registry. Full search order: `./mcp.json`, `./mcp_config.json`, `~/.config/ai/mcp.json`, `~/.config/ai/mcp_config.json`, `~/.gemini/config/mcp_config.json`, `~/.lmstudio/mcp.json`.
+
+## Privacy (the GitHub repo is public)
+
+- Never commit personal data: lab data files, account numbers, private hosts/IPs, real e-mails, `/home/<user>` paths. Put such values in `~/.local/share/ai/env`, `~/.config/ai/*.json`, or a gitignored file.
+- `.githooks/pre-commit` runs `scripts/privacy_check.py` on every commit (enabled by `install.sh` via `git config core.hooksPath .githooks`). It checks generic leak patterns plus a personal denylist in `~/.config/ai/private_patterns.txt` (outside the repo, one regex per line). `python3 scripts/privacy_check.py --all` audits every tracked file. Mark an intentional line with `privacy-ok`.
+- Machine/lab-specific skills stay local and gitignored (e.g. `.agents/skills/boltzgen-ops/`, `.agents/skills/*_private/`); `install.sh` still syncs them to `~/.config/ai/skills/`.
+- Tests run the binary with `cwd` set to a temp dir or with auto-commit off — never let the binary commit inside this repo.

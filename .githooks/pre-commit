@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuse commits that contain personal data. Enabled by install.sh via
+#   git config core.hooksPath .githooks
+exec python3 "$(git rev-parse --show-toplevel)/scripts/privacy_check.py"

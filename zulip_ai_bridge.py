@@ -27,6 +27,9 @@ from urllib.parse import unquote, quote
 import csv
 import io
 import time
+import signal
+import shutil
+import tempfile
 
 # Configure logging for truncation events
 logging.basicConfig(
@@ -54,6 +57,71 @@ SPREADSHEET_EXTS = {'.xlsx', '.xls', '.csv'}
 
 ARCHIVE_EXTS = {'.zip', '.tar', '.gz', '.bz2', '.xz', '.7z'}
 
+# Zulip rejects/truncates messages over 10000 chars; leave headroom for the
+# "(Part i/n)" header and re-opened code fences.
+ZULIP_MAX_CHUNK = 8500
+
+# Linux caps a single argv string at 128 KiB (MAX_ARG_STRLEN); larger prompts
+# are piped to `ai` on stdin instead of failing with E2BIG.
+MAX_ARGV_PROMPT_BYTES = 100000
+
+# Per-message upload directories older than this are pruned.
+UPLOAD_RETENTION_S = 7 * 24 * 3600
+
+
+def _kill_process_group(proc):
+    """SIGKILL the whole process group of `proc` (ai + its tool subprocesses)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_ai_subprocess(cmd, env=None, timeout=None, input=None):
+    """Run the `ai` agent in its own session/process group.
+
+    Unlike subprocess.run(timeout=...), which only kills the direct child,
+    a timeout here kills every process the agent spawned (ai_mcp.py tool
+    calls, execute_command shells), so timed-out jobs leave no orphans.
+    stdin is /dev/null unless `input` is given, so the agent never grabs the
+    bridge's terminal (raw-mode keyboard polling) when run interactively.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    except BaseException:
+        _kill_process_group(proc)
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _safe_upload_name(name):
+    """Reduce an attacker-controlled upload label to a harmless basename."""
+    name = os.path.basename((name or "").replace("\\", "/")).strip()
+    name = re.sub(r'[\x00-\x1f]', '', name)
+    if name in ("", ".", ".."):
+        name = "downloaded_file"
+    return name[:200]
+
 
 class FileParser:
     """
@@ -70,6 +138,7 @@ class FileParser:
         self.base_url = cleaned_base
         # Try to import optional dependencies
         self._pdfplumber = None
+        self._pdfium = None
         self._tesseract = None
         self._pillow = None
         try:
@@ -112,6 +181,7 @@ class FileParser:
             logger.warning(f"Blocked download from untrusted domain: {full_url}")
             return False, "Download from untrusted domain"
 
+        resp = None
         try:
             # Use authenticated Zulip session when available (crucial for private Zulip uploads)
             session = getattr(self.client, "session", None)
@@ -127,14 +197,29 @@ class FileParser:
             resp.raise_for_status()
 
             # Check Content-Length header if available
-            content_length = int(resp.headers.get('Content-Length', 0))
+            try:
+                content_length = int(resp.headers.get('Content-Length', 0) or 0)
+            except (TypeError, ValueError):
+                content_length = 0
             if content_length > MAX_FILE_SIZE:
                 logger.warning(f"File too large: {content_length} bytes (max {MAX_FILE_SIZE})")
                 return False, "File exceeds size limit"
 
+            # Content-Length may be absent or lie: enforce the cap while streaming.
+            written = 0
             with open(dest_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
+                    written += len(chunk)
+                    if written > MAX_FILE_SIZE:
+                        break
                     f.write(chunk)
+            if written > MAX_FILE_SIZE:
+                logger.warning(f"File exceeded {MAX_FILE_SIZE} bytes while streaming; aborted")
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+                return False, "File exceeds size limit"
             return True, None
         except requests.exceptions.RequestException as e:
             logger.error(f"Download failed: {e}")
@@ -145,6 +230,12 @@ class FileParser:
         except OSError as e:
             logger.error(f"Download file system error: {e}")
             return False, str(e)
+        finally:
+            if resp is not None and hasattr(resp, "close"):
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
     def _is_trusted_url(self, url):
         """Check if a URL is from the configured Zulip server domain.
@@ -158,15 +249,15 @@ class FileParser:
             # Relative paths (empty netloc) are same-origin and always trusted.
             if not parsed.netloc:
                 return True
-            # Extract domain netloc from both allowed base_url and downloaded url
-            base_parsed = urlparse(self.base_url)
-            allowed = (base_parsed.netloc or self.base_url.replace('https://', '').replace('http://', '').split('/')[0]).rstrip('/')
-            downloaded = parsed.netloc.replace('https://', '').replace('http://', '').rstrip('/')
-            return (
-                downloaded == allowed
-                or downloaded.endswith("." + allowed)
-                or allowed.endswith("." + downloaded)
-            )
+            # Compare hostnames (drops userinfo and port). Only the configured
+            # host and its subdomains are trusted -- never a parent domain,
+            # since the authenticated session would send credentials there.
+            base_parsed = urlparse(self.base_url if '://' in self.base_url else f"https://{self.base_url}")
+            allowed = (base_parsed.hostname or '').lower().rstrip('.')
+            downloaded = (parsed.hostname or '').lower().rstrip('.')
+            if not allowed or not downloaded:
+                return False
+            return downloaded == allowed or downloaded.endswith("." + allowed)
         except Exception:
             return False
 
@@ -308,8 +399,6 @@ class FileParser:
 
     def _parse_excel(self, path):
         """Parse Excel files."""
-        if self._pillow is None:
-            return None
         try:
             import openpyxl
             wb = openpyxl.load_workbook(path, read_only=True)
@@ -392,8 +481,12 @@ class FileParser:
             return content, []
 
         processed_urls = []
-        download_dir = os.path.join(os.path.expanduser('~'), '.cache', 'zulip_ai_uploads')
-        os.makedirs(download_dir, exist_ok=True)
+        upload_root = os.path.join(os.path.expanduser('~'), '.cache', 'zulip_ai_uploads')
+        os.makedirs(upload_root, exist_ok=True)
+        self._prune_uploads(upload_root)
+        # One private directory per message: concurrent messages attaching the
+        # same filename can no longer clobber each other's downloads.
+        download_dir = tempfile.mkdtemp(prefix="msg_", dir=upload_root)
 
         for m in matches:
             full_match = m.group(0)
@@ -417,6 +510,8 @@ class FileParser:
             filename = label.strip() if label.strip() else os.path.basename(decoded_url.split('?')[0])
             if not filename or filename == 'user_uploads':
                 filename = os.path.basename(decoded_url.split('?')[0]) or 'downloaded_file'
+            # The label is user-controlled: never let it escape download_dir.
+            filename = _safe_upload_name(filename)
 
             dest_path = os.path.join(download_dir, filename)
 
@@ -442,6 +537,23 @@ class FileParser:
             logger.info(f"Processed: {filename}")
 
         return content, processed_urls
+
+    @staticmethod
+    def _prune_uploads(upload_root, max_age=UPLOAD_RETENTION_S):
+        """Delete per-message upload directories older than `max_age` seconds."""
+        cutoff = time.time() - max_age
+        try:
+            for entry in os.scandir(upload_root):
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.path, ignore_errors=True)
+                        else:
+                            os.remove(entry.path)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 def load_env_file():
@@ -591,8 +703,21 @@ class ZulipMemoryManager:
         if not os.path.exists(path):
             return records
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            # The log grows forever; only read its tail (grow the window if
+            # it does not yet contain enough records).
+            lines = []
+            window = 256 * 1024
+            size = os.path.getsize(path)
+            while True:
+                with open(path, "rb") as f:
+                    f.seek(max(0, size - window))
+                    data = f.read()
+                lines = data.decode("utf-8", errors="replace").splitlines()
+                if size > window:
+                    lines = lines[1:]  # first line is probably partial
+                if size <= window or len(lines) >= limit * 4:
+                    break
+                window *= 4
             for line in reversed(lines):
                 line = line.strip()
                 if not line:
@@ -668,7 +793,7 @@ class ZulipMemoryManager:
         }
 
 
-def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr=""):
+def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr="", min_mtime=None):
     """
     Extract meaningful information from the session file and logs when stdout is empty.
     Checks:
@@ -676,6 +801,10 @@ def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr=""):
     2. Assistant reasoning_content (cleaned up)
     3. Tool execution results in the session
     4. Subprocess stderr
+
+    If `min_mtime` is given, session files last modified before it are
+    ignored: they belong to an earlier, unrelated run (e.g. when `ai` crashed
+    before saving), and replaying them would answer with a stale conversation.
     """
     if last_sess_path:
         candidates = [last_sess_path]
@@ -691,6 +820,12 @@ def extract_session_fallback(last_sess_path=None, raw_stdout="", raw_stderr=""):
 
     for cand_path in candidates:
         if os.path.isfile(cand_path):
+            if min_mtime is not None:
+                try:
+                    if os.path.getmtime(cand_path) < min_mtime:
+                        continue
+                except OSError:
+                    continue
             try:
                 with open(cand_path, "r", encoding="utf-8") as sf:
                     sdata = json.load(sf)
@@ -766,6 +901,9 @@ class ZulipAiBridge:
         # Initialize persistent Zulip chat memory
         self.memory = ZulipMemoryManager()
         print("Zulip chat memory manager initialized.")
+        # Live worker threads (pruned as they finish) so state does not grow.
+        self._workers = set()
+        self._workers_lock = threading.Lock()
 
     def _add_reaction(self, msg, emoji_name):
         """Add an emoji reaction to the message."""
@@ -814,7 +952,7 @@ class ZulipAiBridge:
             return True
 
         # Check content for mention patterns:
-        # e.g. @**AI bot**, @_**AI bot**, @**AI bot|1101112**, @_**AI bot|1101112**
+        # e.g. @**AI bot**, @_**AI bot**, @**AI bot|4242**, @_**AI bot|4242**
         # or @**ai-bot**, @_**ai-bot**
         names = []
         if self.bot_name:
@@ -903,10 +1041,10 @@ class ZulipAiBridge:
             self._add_reaction(msg, "hourglass_flowing_sand")
 
         try:
-            subprocess.run(["systemctl", "--user", "reset-failed", "llama-server.socket", "llama-server.service"], capture_output=True)
-            res = subprocess.run(["systemctl", "--user", "start", "llama-server.service"], capture_output=True)
+            subprocess.run(["systemctl", "--user", "reset-failed", "llama-server.socket", "llama-server.service"], capture_output=True, timeout=30)
+            res = subprocess.run(["systemctl", "--user", "start", "llama-server.service"], capture_output=True, timeout=60)
             if res.returncode != 0:
-                subprocess.run(["systemctl", "--user", "start", "llama-server.socket"], capture_output=True)
+                subprocess.run(["systemctl", "--user", "start", "llama-server.socket"], capture_output=True, timeout=30)
                 try:
                     requests.get(health_url, timeout=0.5)
                 except Exception:
@@ -924,7 +1062,7 @@ class ZulipAiBridge:
                 return True, "ok"
 
             try:
-                chk = subprocess.run(["systemctl", "--user", "is-failed", "llama-server.service"], capture_output=True, text=True)
+                chk = subprocess.run(["systemctl", "--user", "is-failed", "llama-server.service"], capture_output=True, text=True, timeout=10)
                 if chk.stdout.strip() == "failed":
                     logger.error("llama-server.service entered failed state during startup")
                     break
@@ -949,7 +1087,25 @@ class ZulipAiBridge:
         return self._file_parser._download_file(url, dest_path)
 
     def _detect_owner(self):
-        """Try to detect the owner's Zulip email/username from past private messages."""
+        """Detect the owner's Zulip email.
+
+        Prefers the authoritative `bot_owner_id` of the bot account. Falls back
+        to recent private-message history only when it is unambiguous (exactly
+        one non-bot sender): otherwise whoever DMed the bot last before a
+        restart would silently become the owner. Set ZULIP_USER to be explicit.
+        """
+        try:
+            if self.bot_user_id and hasattr(self.client, "get_user_by_id"):
+                res = self.client.get_user_by_id(self.bot_user_id)
+                owner_id = (res.get("user") or {}).get("bot_owner_id") if isinstance(res, dict) else None
+                if owner_id:
+                    ores = self.client.get_user_by_id(owner_id)
+                    email = (ores.get("user") or {}).get("email") if isinstance(ores, dict) else None
+                    if email:
+                        print(f"Detected owner from bot_owner_id: {email}")
+                        return email
+        except Exception as e:
+            logger.debug(f"Could not resolve bot owner: {e}")
         try:
             payload = {
                 "anchor": "newest",
@@ -960,12 +1116,16 @@ class ZulipAiBridge:
             }
             res = self.client.get_messages(payload)
             if res.get("result") == "success":
-                messages = res.get("messages", [])
-                for msg in reversed(messages):
-                    sender_email = msg.get("sender_email")
-                    if sender_email and sender_email != self.bot_email:
-                        print(f"Detected owner from past private messages: {sender_email}")
-                        return sender_email
+                senders = {
+                    m.get("sender_email") for m in res.get("messages", [])
+                    if m.get("sender_email") and m.get("sender_email") != self.bot_email
+                }
+                if len(senders) == 1:
+                    owner = senders.pop()
+                    print(f"Detected owner from past private messages: {owner}")
+                    return owner
+                if senders:
+                    print("⚠️ Multiple users have DMed the bot; refusing to guess the owner. Set ZULIP_USER.")
         except Exception as e:
             print(f"Error detecting owner from messages: {e}")
         return None
@@ -975,41 +1135,57 @@ class ZulipAiBridge:
 
         Retries on transient errors (rate limiting / connection drops) with
         exponential backoff, since Zulip may temporarily refuse messages.
+        Note the Zulip client reports most API failures as a returned
+        {"result": "error"} dict rather than raising.
         """
         max_retries = 3
         backoff = 2
         message = {
-            "type": "private" if msg['type'] == 'private' else "stream",
+            "type": "private" if msg.get('type') == 'private' else "stream",
         }
-        if msg['type'] == 'private':
-            message["to"] = [msg['sender_email']]
+        if msg.get('type') == 'private':
+            recipients = msg.get('display_recipient')
+            emails = []
+            if isinstance(recipients, list):
+                # Group DM: answer the whole group, not just the sender.
+                emails = [r.get('email') for r in recipients
+                          if isinstance(r, dict) and r.get('email') and r.get('email') != self.bot_email]
+            message["to"] = emails or [msg.get('sender_email')]
         else:
-            message["to"] = msg['display_recipient']
-            message["topic"] = msg['subject']
+            message["to"] = msg.get('display_recipient')
+            message["topic"] = msg.get('subject')
         message["content"] = content
 
         last_error = None
         for attempt in range(max_retries):
+            retryable = True
+            delay = backoff
             try:
-                self.client.send_message(message)
-                return
+                res = self.client.send_message(message)
+                if not isinstance(res, dict) or res.get("result") == "success":
+                    return
+                last_error = res.get("msg") or res.get("code") or "unknown error"
+                if res.get("code") == "RATE_LIMIT_HIT":
+                    try:
+                        delay = max(float(res.get("retry-after", backoff)), 0)
+                    except (TypeError, ValueError):
+                        delay = backoff
+                else:
+                    # Permanent API errors (bad stream, invalid content) will
+                    # not succeed on retry.
+                    retryable = False
             except Exception as e:
                 last_error = e
-                if attempt < max_retries - 1:
-                    print(f"⚠️ send_message failed (attempt {attempt+1}/{max_retries}): {e}")
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 30)
-                else:
-                    print(f"❌ send_message failed after {max_retries} attempts: {last_error}")
+            if retryable and attempt < max_retries - 1:
+                print(f"⚠️ send_message failed (attempt {attempt+1}/{max_retries}): {last_error}")
+                time.sleep(min(delay, 60))
+                backoff = min(backoff * 2, 30)
+            else:
+                print(f"❌ send_message failed after {attempt+1} attempt(s): {last_error}")
+                break
 
         # Append an error notice to the original message thread as a last resort.
-        error_notice = (
-            f"⚠️ Could not deliver reply after {max_retries} attempts: {last_error}"
-        )
-        if msg['type'] == 'private':
-            message["content"] = error_notice
-        else:
-            message["content"] = error_notice
+        message["content"] = f"⚠️ Could not deliver reply: {last_error}"
         try:
             self.client.send_message(message)
         except Exception:
@@ -1094,7 +1270,7 @@ class ZulipAiBridge:
             self._send_reply(msg, "*(agent returned no output)*")
             return
 
-        max_chunk = 8500
+        max_chunk = ZULIP_MAX_CHUNK
         if len(response_text) <= max_chunk:
             self._send_reply(msg, response_text)
             return
@@ -1112,8 +1288,15 @@ class ZulipAiBridge:
                 split_idx = remaining.rfind('\n', 0, max_chunk)
             if split_idx == -1 or split_idx < 2000:
                 split_idx = max_chunk
-            chunks.append(remaining[:split_idx].rstrip())
+            chunk = remaining[:split_idx].rstrip()
             remaining = remaining[split_idx:].lstrip()
+            # Don't leave a code block open across a message boundary: close
+            # it here and re-open it (with its language tag) in the next part.
+            fences = re.findall(r'^[ \t]*```(\S*)', chunk, re.MULTILINE)
+            if len(fences) % 2 == 1:
+                chunk += "\n```"
+                remaining = f"```{fences[-1]}\n" + remaining
+            chunks.append(chunk)
 
         if remaining:
             chunks[-1] += f"\n\n*…[output truncated at {len(response_text)} chars]*"
@@ -1263,7 +1446,14 @@ class ZulipAiBridge:
         mode_flags.append("-c")
 
         ai_bin = self._resolve_ai_bin()
-        ai_cmd = [ai_bin, "-q"] + mode_flags + [prompt]
+        stdin_input = None
+        if len(prompt.encode("utf-8", errors="replace")) > MAX_ARGV_PROMPT_BYTES:
+            # Too big for a single argv string (E2BIG); pipe it on stdin.
+            stdin_input = prompt
+            prompt_arg = "Respond to the Zulip message provided in the context below."
+        else:
+            prompt_arg = prompt
+        ai_cmd = [ai_bin, "-q"] + mode_flags + [prompt_arg]
 
         raw_stdout = ""
         raw_stderr = ""
@@ -1273,13 +1463,11 @@ class ZulipAiBridge:
         extracted_reasoning = None
 
         try:
-            result = subprocess.run(
+            result = run_ai_subprocess(
                 ai_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 env=run_env,
-                text=True,
-                timeout=task_timeout
+                timeout=task_timeout,
+                input=stdin_input,
             )
             raw_stdout = result.stdout or ""
             raw_stderr = result.stderr or ""
@@ -1298,7 +1486,8 @@ class ZulipAiBridge:
             if not response_text:
                 fallback_text, fallback_status, reasoning_snip = extract_session_fallback(
                     raw_stdout=raw_stdout,
-                    raw_stderr=raw_stderr
+                    raw_stderr=raw_stderr,
+                    min_mtime=start_time - 1
                 )
                 response_text = fallback_text
                 status = fallback_status
@@ -1371,25 +1560,31 @@ class ZulipAiBridge:
         if sender_email == self.bot_email:
             return
 
-        # Restrict to the owner/configured user to protect privacy
-        import getpass
-        allowed_user = os.environ.get("ZULIP_USER") or self.detected_owner or getpass.getuser()
+        # Restrict to the owner/configured user to protect privacy.
+        # ZULIP_USER may be an email, a bare username (local part), or a
+        # numeric Zulip user id. Display names are never trusted: any user can
+        # set theirs to the owner's name or email. With no owner configured or
+        # detected, nobody is allowed (fail closed).
+        allowed_user = os.environ.get("ZULIP_USER") or self.detected_owner or ""
 
         # Normalize values for case-insensitive comparison
         allowed_user_clean = allowed_user.strip().lower()
         sender_email_clean = sender_email.strip().lower()
-        sender_full_name_clean = msg.get('sender_full_name', '').strip().lower()
         sender_username_clean = sender_email_clean.split('@')[0] if '@' in sender_email_clean else sender_email_clean
 
-        is_allowed = (
-            allowed_user_clean == sender_email_clean or
-            allowed_user_clean == sender_full_name_clean or
-            allowed_user_clean == sender_username_clean or
-            (allowed_user_clean.isdigit() and sender_username_clean == f"user{allowed_user_clean}") or
-            (sender_username_clean.startswith("user") and sender_username_clean[4:] == allowed_user_clean)
-        )
+        if not allowed_user_clean:
+            is_allowed = False
+        elif allowed_user_clean.isdigit():
+            is_allowed = (
+                str(msg.get('sender_id', '')) == allowed_user_clean or
+                sender_username_clean == f"user{allowed_user_clean}"
+            )
+        elif '@' in allowed_user_clean:
+            is_allowed = allowed_user_clean == sender_email_clean
+        else:
+            is_allowed = allowed_user_clean == sender_username_clean
 
-        print(f"Privacy validation - allowed: '{allowed_user_clean}', sender: '{sender_email_clean}', name: '{sender_full_name_clean}', user: '{sender_username_clean}' -> ALLOWED={is_allowed}")
+        print(f"Privacy validation - allowed: '{allowed_user_clean}', sender: '{sender_email_clean}' -> ALLOWED={is_allowed}")
 
         if not is_allowed:
             # Quietly ignore messages from others to protect privacy
@@ -1425,7 +1620,7 @@ class ZulipAiBridge:
                 f"- **`/timeout <seconds>`** — Set standard task timeout (current: `{to}s`)\n"
                 "- **`/wake`** (or `/restart-server`) — Wake up or restart the local LLM inference server\n"
                 "- **`/long <query>`** — Execute deep research / long-running job with extended 2h timeout\n\n"
-                "*Note: In shared channels/streams, mention `@AI bot` to talk to me.*"
+                f"*Note: In shared channels/streams, mention `@{self.bot_name}` to talk to me.*"
             )
             return
 
@@ -1533,22 +1728,53 @@ class ZulipAiBridge:
             self._send_reply(msg, f"⏱️ Timeouts: Standard: **{default_to}s**, Long Jobs: **{long_to}s** (use `/timeout <seconds>` to update)")
             return
 
-        # Replace Zulip upload URLs with extracted file content
-        content, processed = self._file_parser.process_message_urls(content)
-
         if not content.strip():
             return
 
-        print(f"Received query from {sender_email}: {content}")
+        print(f"Received query from {sender_email}: {content[:200]}")
 
         # Dispatch to a daemon thread — the Zulip event loop returns immediately
         # and is ready to receive the next message while this one is being processed.
-        t = threading.Thread(
-            target=self._process_message,
-            args=(msg, content),
-            daemon=True
-        )
+        # Upload downloads/parsing also happen in the worker (they can take
+        # tens of seconds and must not stall the listener).
+        self._dispatch(msg, content)
+
+    def _dispatch(self, msg, content):
+        """Start a tracked daemon worker thread for one message."""
+        t = threading.Thread(target=self._worker, args=(msg, content), daemon=True)
+        with self._workers_lock:
+            self._workers.add(t)
         t.start()
+        return t
+
+    def _worker(self, msg, content):
+        """Worker-thread body: fetch uploads, run the agent, never raise."""
+        try:
+            # Replace Zulip upload URLs with extracted file content
+            content, _processed = self._file_parser.process_message_urls(content)
+            if content.strip():
+                self._process_message(msg, content)
+        except Exception as e:
+            logger.exception("Worker failed while processing message")
+            self._remove_reaction(msg, "thought_balloon")
+            self._remove_reaction(msg, "hourglass_flowing_sand")
+            self._set_typing(msg, "stop")
+            self._add_reaction(msg, "warning")
+            try:
+                self._send_reply(msg, f"⚠️ Bridge error while processing your message: `{e}`")
+            except Exception:
+                pass
+        finally:
+            with self._workers_lock:
+                self._workers.discard(threading.current_thread())
+
+    def _safe_handle_message(self, msg):
+        """Listener callback: an exception here would tear down
+        call_on_each_message (and its event queue), so contain it."""
+        try:
+            self.handle_message(msg)
+        except Exception:
+            logger.exception(f"Error handling Zulip message id={msg.get('id') if isinstance(msg, dict) else None}")
 
     def _manage_context_window(self, context_messages, current_content):
         """Apply context window management to prevent overflow."""
@@ -1581,14 +1807,19 @@ class ZulipAiBridge:
         current_backoff = 1
         
         while True:
+            started = time.time()
             try:
-                self.client.call_on_each_message(self.handle_message)
+                self.client.call_on_each_message(self._safe_handle_message)
             except (ConnectionError, requests.exceptions.RequestException) as e:
+                if time.time() - started > 300:
+                    current_backoff = 1  # previous session was healthy
                 print(f"⚠️ Connection error: {e}")
                 print(f"⏳ Reconnecting in {current_backoff}s...")
                 time.sleep(current_backoff)
                 current_backoff = min(current_backoff * 2, max_backoff)
             except Exception as e:
+                if time.time() - started > 300:
+                    current_backoff = 1
                 print(f"❌ Unexpected error: {e}")
                 print(f"⏳ Restarting in {current_backoff}s...")
                 time.sleep(current_backoff)

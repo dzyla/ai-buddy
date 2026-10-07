@@ -54,12 +54,25 @@ The engine automatically enumerates all authorized accounts via MCP and enforces
 
 | Account Number | Type / Nickname | Permission | Usage |
 | :--- | :--- | :---: | :--- |
-| **`000000001`** | `Agentic` (Limited Margin) | `agentic_allowed: true` | **Dedicated Agentic Sandbox**: Real/simulated automated order placement, stop-loss and take-profit triggers. |
-| **`000000002`** | Primary Margin (Default) | `agentic_allowed: false` | **Protected Primary Account**: Read-only portfolio analysis, tax-loss harvesting audits, and executive summaries. |
-| **`000000003`** | Roth IRA | `agentic_allowed: false` | **Retirement Account**: Read-only inspection. |
+| **`<AGENTIC_ACCOUNT>`** | `Agentic` (Limited Margin) | `agentic_allowed: true` | **Dedicated Agentic Sandbox**: Real/simulated automated order placement, stop-loss and take-profit triggers. |
+| **`<PRIMARY_ACCOUNT>`** | Primary Margin (Default) | `agentic_allowed: false` | **Protected Primary Account**: Read-only portfolio analysis, tax-loss harvesting audits, and executive summaries. |
+| **`<ROTH_ACCOUNT>`** | Roth IRA | `agentic_allowed: false` | **Retirement Account**: Read-only inspection. |
 
 > [!IMPORTANT]
-> The harness prohibits automated order placement against any account where `agentic_allowed` is `false`. Automated orders target `000000001` only.
+> The harness prohibits automated order placement against any account where `agentic_allowed` is `false`. `execute_market_order` re-checks the live account list before every order, and the daemon refuses to trade if it cannot determine the agentic account (it never falls back to another account).
+
+### Account configuration (local, untracked)
+
+Account numbers are not stored in the repo. They are resolved, in order, from:
+
+1. Environment variables `RH_AGENTIC_ACCOUNT`, `RH_PRIMARY_ACCOUNT`, `RH_ROTH_ACCOUNT`.
+2. `~/.config/ai/trader.json` (path overridable with `RH_TRADER_CONFIG`; keep it `chmod 600`):
+   ```json
+   {"accounts": {"agentic": "<AGENTIC_ACCOUNT>", "primary": "<PRIMARY_ACCOUNT>", "roth": "<ROTH_ACCOUNT>"}}
+   ```
+3. Discovery via `get_accounts`: the single account with `agentic_allowed: true` (agentic) and the `is_default` account (primary). Zero or several agentic accounts with no configuration means no automated trading.
+
+CLI aliases: `agentic`, `primary` (or `default`), `roth`.
 
 ---
 
@@ -71,7 +84,7 @@ US Equities (NYSE / NASDAQ) trade on **US Eastern Time (ET)**. For operators in 
 | :--- | :---: | :---: | :--- |
 | **🌅 Pre-Market Briefing** | **07:20 AM MT** | 09:20 AM ET | Scans watchlist, analyzes overnight news sentiment, calculates staged setups, updates Obsidian daily note & ticker theses. |
 | **🔔 Market Open Bell** | **07:30 AM MT** | 09:30 AM ET | Verifies opening quotes and begins the 60-second active session pulse. |
-| **⚡ Regular Trading Hours** | **07:30 AM – 02:00 PM MT** | 09:30 AM – 04:00 PM ET | Safety pulse every 60s (circuit breaker, -20% disaster stop). From 10:00 ET: daily core top-up; on the first trading day of the month, the sleeve rebalance. |
+| **⚡ Regular Trading Hours** | **07:30 AM – 02:00 PM MT** (11:00 AM MT on early-close days) | 09:30 AM – 04:00 PM ET (1:00 PM on the day after Thanksgiving, Christmas Eve, July 3) | Safety pulse every 60s (circuit breaker, -20% disaster stop). From 10:00 ET: daily core top-up; on the first trading day of the month, the sleeve rebalance. |
 | **🔕 Market Close Summary** | **02:00 PM – 02:15 PM MT** | 04:00 PM – 04:15 PM ET | Compiles daily closing summary, writes to `trading_journal.json`, and updates Obsidian daily note. |
 | **🌙 Off-Hours Power Save** | **02:15 PM – 07:20 AM MT** (Nights/Weekends/Holidays) | 04:15 PM – 09:20 AM ET | Sleeps until 07:20 AM MT of the next trading day. |
 
@@ -119,7 +132,7 @@ systemctl --user stop robinhood-trader.service
 
 ## 5. CLI Command Reference
 
-All commands are accessible directly via [`./robinhood_trader.py`](file://~/ai-buddy/robinhood_trader.py):
+All commands are accessible directly via [`./robinhood_trader.py`](../robinhood_trader.py):
 
 | Command | Arguments | Description | Example |
 | :--- | :--- | :--- | :--- |
@@ -128,7 +141,7 @@ All commands are accessible directly via [`./robinhood_trader.py`](file://~/ai-b
 | `orders` | `[account]` | View recent equity orders, fill prices, execution timestamps, and placing agent | `./robinhood_trader.py orders agentic` |
 | `pnl` | `[account]` | Realized gains, total return rate, and unrealized equity performance | `./robinhood_trader.py pnl agentic` |
 | `trades` | `[account]` | Closed trade-by-trade P&L retrospective history | `./robinhood_trader.py trades agentic` |
-| `buy` | `<ticker> [dollar] [acc]`| Execute instant market buy order on Agentic Sandbox (`000000001`) | `./robinhood_trader.py buy SMCI 25 agentic` |
+| `buy` | `<ticker> [dollar] [acc]`| Execute instant market buy order on the Agentic Sandbox account | `./robinhood_trader.py buy SMCI 25 agentic` |
 | `sell` | `<ticker> [qty\|all] [acc]`| Execute market sell order on Agentic Sandbox | `./robinhood_trader.py sell AVGO all agentic` |
 | `audit` | `[account]` | Quantitative health score (0–100), concentration cap breaches, semi overlap, dead-money and dust audit | `./robinhood_trader.py audit agentic` |
 | `harvest-losses`| `[account]` | Tax-loss harvesting candidates with dollar savings and wash-sale guidance | `./robinhood_trader.py harvest-losses` |

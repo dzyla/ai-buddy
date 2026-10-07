@@ -9,6 +9,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from zulip_ai_bridge import ContextWindowManager, FileParser
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Keep tests from reading/writing the real ~/.local/share/ai and ~/.cache."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("ZULIP_USER", raising=False)
+    return home
+
+
+def _join_workers(bridge, timeout=5):
+    for t in list(getattr(bridge, "_workers", ())):
+        t.join(timeout)
+
+
 # ---------------------------------------------------------------------------
 # ContextWindowManager
 # ---------------------------------------------------------------------------
@@ -345,7 +360,7 @@ def test_process_message_uses_auto_flags(monkeypatch):
             stderr = ""
         return R()
 
-    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run):
+    with patch("zulip_ai_bridge.run_ai_subprocess", side_effect=fake_run):
         bridge._process_message(msg, "do something")
 
     assert any(f == "--auto" for f in captured["cmd"])
@@ -393,7 +408,7 @@ def test_long_job_detection_and_flags():
             stderr = ""
         return R()
 
-    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run):
+    with patch("zulip_ai_bridge.run_ai_subprocess", side_effect=fake_run):
         bridge._process_message(msg, msg["content"])
 
     assert bridge._is_long_job(msg["content"])
@@ -443,7 +458,7 @@ def test_zulip_memory_manager(tmp_path):
 
     chat_record = {
         "session_id": "test_zlp_001",
-        "sender_email": "dawid@example.com",
+        "sender_email": "owner@example.com",
         "query": "What's going on with the workstation?",
         "status": "success",
         "duration_s": 1.25,
@@ -526,13 +541,13 @@ def test_slash_commands_in_bridge(tmp_path):
 
     client = MockZulipClient()
     bridge = ZulipAiBridge(client=client)
-    bridge.detected_owner = "dawid@example.com"
+    bridge.detected_owner = "owner@example.com"
     bridge.memory = ZulipMemoryManager(storage_dir=str(tmp_path / "zulip_chats"))
 
     # Seed one record
     bridge.memory.record_chat({
         "session_id": "seed_01",
-        "sender_email": "dawid@example.com",
+        "sender_email": "owner@example.com",
         "query": "hello world",
         "status": "success",
         "duration_s": 0.5,
@@ -540,15 +555,15 @@ def test_slash_commands_in_bridge(tmp_path):
     })
 
     # Test /ping
-    bridge.handle_message({"type": "private", "sender_email": "dawid@example.com", "content": "/ping"})
+    bridge.handle_message({"type": "private", "sender_email": "owner@example.com", "content": "/ping"})
     assert any("Zulip AI Bridge is active" in m["content"] for m in client.sent_messages)
 
     # Test /history
-    bridge.handle_message({"type": "private", "sender_email": "dawid@example.com", "content": "/history"})
+    bridge.handle_message({"type": "private", "sender_email": "owner@example.com", "content": "/history"})
     assert any("Recent Zulip Chat Memory" in m["content"] for m in client.sent_messages)
 
     # Test /debug
-    bridge.handle_message({"type": "private", "sender_email": "dawid@example.com", "content": "/debug"})
+    bridge.handle_message({"type": "private", "sender_email": "owner@example.com", "content": "/debug"})
     assert any("Zulip AI Bridge Diagnostics" in m["content"] for m in client.sent_messages)
 
 
@@ -573,12 +588,6 @@ def test_session_fallback_on_empty_stdout(tmp_path):
     sess_dir = tmp_path / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
     last_json = sess_dir / "last.json"
-    last_json.write_text(json.dumps({
-        "messages": [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "Hello from cached session!"}
-        ]
-    }))
 
     msg = {
         "id": 55,
@@ -588,13 +597,20 @@ def test_session_fallback_on_empty_stdout(tmp_path):
     }
 
     def fake_run(cmd, **kwargs):
+        # The agent writes its session file while it runs.
+        last_json.write_text(json.dumps({
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Hello from cached session!"}
+            ]
+        }))
         class R:
             returncode = 0
             stdout = ""
             stderr = ""
         return R()
 
-    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run), \
+    with patch("zulip_ai_bridge.run_ai_subprocess", side_effect=fake_run), \
          patch("os.path.expanduser", side_effect=lambda p: str(last_json) if "last.json" in p else p):
         bridge._process_message(msg, msg["content"])
 
@@ -632,7 +648,7 @@ def test_error_reporting_on_failed_agent():
             stderr = "CUDA out of memory"
         return R()
 
-    with patch("zulip_ai_bridge.subprocess.run", side_effect=fake_run), \
+    with patch("zulip_ai_bridge.run_ai_subprocess", side_effect=fake_run), \
          patch("os.path.isfile", return_value=False):
         bridge._process_message(msg, msg["content"])
 
@@ -693,20 +709,21 @@ def test_stream_message_with_mention_is_processed(monkeypatch):
 
     with patch.object(bridge, "_process_message", side_effect=fake_process):
         bridge.handle_message(msg)
+        _join_workers(bridge)
 
     assert len(processed_content) == 1
     assert processed_content[0] == "summarize this paper for me"
 
 
 def test_stream_message_with_user_id_mention(monkeypatch):
-    """Silent or user-id-qualified mentions like @_**AI bot|1101112** should be recognized."""
+    """Silent or user-id-qualified mentions like @_**AI bot|4242** should be recognized."""
     from unittest.mock import patch
     from zulip_ai_bridge import ZulipAiBridge
 
     monkeypatch.setenv("ZULIP_USER", "owner@example.com")
     client = MockZulipClient()
     bridge = ZulipAiBridge(client=client)
-    bridge.bot_user_id = 1101112
+    bridge.bot_user_id = 4242
     bridge.bot_name = "AI bot"
 
     msg = {
@@ -715,7 +732,7 @@ def test_stream_message_with_user_id_mention(monkeypatch):
         "display_recipient": "research",
         "subject": "binding",
         "sender_email": "owner@example.com",
-        "content": "@_**AI bot|1101112**: what is the binding affinity?",
+        "content": "@_**AI bot|4242**: what is the binding affinity?",
     }
 
     processed_content = []
@@ -725,6 +742,7 @@ def test_stream_message_with_user_id_mention(monkeypatch):
 
     with patch.object(bridge, "_process_message", side_effect=fake_process):
         bridge.handle_message(msg)
+        _join_workers(bridge)
 
     assert len(processed_content) == 1
     assert processed_content[0] == "what is the binding affinity?"
@@ -753,6 +771,7 @@ def test_private_message_processed_without_mention(monkeypatch):
 
     with patch.object(bridge, "_process_message", side_effect=fake_process):
         bridge.handle_message(msg)
+        _join_workers(bridge)
 
     assert len(processed_content) == 1
     assert processed_content[0] == "hello there"
@@ -807,3 +826,420 @@ def test_process_message_urls_relative_and_markdown(tmp_path):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Robustness / security regression tests
+# ---------------------------------------------------------------------------
+
+def _bridge(client=None):
+    from zulip_ai_bridge import ZulipAiBridge
+    return ZulipAiBridge(client=client or MockZulipClient())
+
+
+def test_owner_check_rejects_display_name_spoof(monkeypatch):
+    """A sender whose *display name* equals the owner's email must not pass."""
+    bridge = _bridge()
+    bridge.detected_owner = "owner@example.com"
+    msg = {"id": 1, "type": "private", "sender_email": "attacker@example.org",
+           "sender_full_name": "owner@example.com", "content": "hi"}
+    with patch_process(bridge) as calls:
+        bridge.handle_message(msg)
+        _join_workers(bridge)
+    assert calls == []
+
+
+def test_owner_check_rejects_user_prefix_spoof(monkeypatch):
+    """ZULIP_USER=bob must not authorize userbob@..."""
+    monkeypatch.setenv("ZULIP_USER", "bob")
+    bridge = _bridge()
+    msg = {"id": 1, "type": "private", "sender_email": "userbob@example.org", "content": "hi"}
+    with patch_process(bridge) as calls:
+        bridge.handle_message(msg)
+        _join_workers(bridge)
+    assert calls == []
+
+
+def test_owner_check_numeric_id_matches_sender_id(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER", "42")
+    bridge = _bridge()
+    msg = {"id": 1, "type": "private", "sender_email": "someone@example.com",
+           "sender_id": 42, "content": "hi"}
+    with patch_process(bridge) as calls:
+        bridge.handle_message(msg)
+        _join_workers(bridge)
+    assert calls == ["hi"]
+
+
+def test_no_owner_configured_rejects_everyone(monkeypatch):
+    """With no ZULIP_USER and no detectable owner, nobody is authorized
+    (previously fell back to the local unix username, matching any email
+    with that local part)."""
+    import getpass
+    bridge = _bridge()
+    bridge.detected_owner = None
+    msg = {"id": 1, "type": "private",
+           "sender_email": f"{getpass.getuser()}@example.org", "content": "hi"}
+    with patch_process(bridge) as calls:
+        bridge.handle_message(msg)
+        _join_workers(bridge)
+    assert calls == []
+
+
+class _OwnerClient(MockZulipClient):
+    def __init__(self, pm_senders, bot_owner_id=None):
+        super().__init__()
+        self.pm_senders = pm_senders
+        self.bot_owner_id = bot_owner_id
+
+    def get_profile(self):
+        return {"result": "success", "user_id": 7, "full_name": "AI bot",
+                "email": self.email}
+
+    def get_user_by_id(self, user_id, **kw):
+        if user_id == 7:
+            u = {"user_id": 7, "email": self.email, "is_bot": True}
+            if self.bot_owner_id:
+                u["bot_owner_id"] = self.bot_owner_id
+            return {"result": "success", "user": u}
+        if user_id == 3:
+            return {"result": "success", "user": {"user_id": 3, "email": "owner@example.com"}}
+        return {"result": "error", "msg": "no such user"}
+
+    def get_messages(self, payload):
+        return {"result": "success",
+                "messages": [{"id": i, "sender_email": e} for i, e in enumerate(self.pm_senders)]}
+
+
+def test_detect_owner_prefers_bot_owner_id():
+    bridge = _bridge(_OwnerClient(["attacker@example.org"], bot_owner_id=3))
+    assert bridge.detected_owner == "owner@example.com"
+
+
+def test_detect_owner_ambiguous_pm_history_is_rejected():
+    bridge = _bridge(_OwnerClient(["owner@example.com", "attacker@example.org"]))
+    assert bridge.detected_owner is None
+
+
+def test_detect_owner_unambiguous_pm_history():
+    bridge = _bridge(_OwnerClient(["owner@example.com", "owner@example.com"]))
+    assert bridge.detected_owner == "owner@example.com"
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def patch_process(bridge):
+    from unittest.mock import patch
+    calls = []
+    with patch.object(bridge, "_process_message", side_effect=lambda m, c: calls.append(c)):
+        yield calls
+
+
+def test_handle_message_never_raises_on_malformed_event():
+    """A malformed event must not propagate out of the listener callback
+    (it would tear down call_on_each_message and drop the event queue)."""
+    bridge = _bridge()
+    bridge._safe_handle_message({"bogus": True})  # no sender_email/content
+
+
+def test_run_survives_callback_exception():
+    from unittest.mock import patch
+    bridge = _bridge()
+    seen = []
+
+    def fake_handle(m):
+        if m.get("boom"):
+            raise RuntimeError("boom")
+        seen.append(m)
+
+    def fake_call_on_each_message(cb):
+        cb({"boom": True})
+        cb({"ok": True})
+        raise KeyboardInterrupt
+
+    bridge.client.call_on_each_message = fake_call_on_each_message
+    with patch.object(bridge, "handle_message", side_effect=fake_handle):
+        with pytest.raises(KeyboardInterrupt):
+            bridge.run()
+    assert seen == [{"ok": True}]
+
+
+def test_file_downloads_happen_off_listener_thread(monkeypatch):
+    """Uploads are downloaded/parsed in the worker, not the listener callback."""
+    from unittest.mock import patch
+    monkeypatch.setenv("ZULIP_USER", "owner@example.com")
+    bridge = _bridge()
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, args=(), daemon=None):
+            started.append((target, args))
+        def start(self):
+            pass
+
+    with patch.object(bridge._file_parser, "process_message_urls",
+                      side_effect=AssertionError("ran on listener thread")), \
+         patch("zulip_ai_bridge.threading.Thread", FakeThread):
+        bridge.handle_message({"id": 1, "type": "private", "sender_email": "owner@example.com",
+                               "content": "see /user_uploads/1/a.txt"})
+    assert len(started) == 1
+
+
+def test_worker_exception_reports_and_does_not_raise():
+    from unittest.mock import patch
+    client = MockZulipClient()
+    bridge = _bridge(client)
+    msg = {"id": 9, "type": "private", "sender_email": "owner@example.com", "content": "x"}
+    with patch.object(bridge, "_process_message", side_effect=RuntimeError("kaboom")):
+        bridge._worker(msg, "x")
+    assert any("kaboom" in m["content"] for m in client.sent_messages)
+
+
+def test_worker_threads_are_pruned():
+    from unittest.mock import patch
+    bridge = _bridge()
+    with patch.object(bridge, "_process_message"):
+        for i in range(3):
+            bridge._dispatch({"id": i, "type": "private", "sender_email": "o@example.com"}, "x")
+        _join_workers(bridge)
+    assert len(bridge._workers) == 0
+
+
+# --- file download safety --------------------------------------------------
+
+def test_upload_label_path_traversal_is_contained(tmp_path):
+    from unittest.mock import patch
+    parser = FileParser(MockClient("https://chat.example.com"), "https://chat.example.com")
+    dests = []
+
+    def fake_dl(url, dest):
+        dests.append(dest)
+        return False, "nope"
+
+    with patch.object(parser, "_download_file", side_effect=fake_dl):
+        parser.process_message_urls("[../../../.bashrc](/user_uploads/1/x/.bashrc) "
+                                    "[/etc/passwd](/user_uploads/1/y/passwd)")
+    root = os.path.realpath(os.path.expanduser("~/.cache/zulip_ai_uploads"))
+    assert len(dests) == 2
+    for d in dests:
+        assert os.path.realpath(d).startswith(root + os.sep), d
+
+
+def test_download_enforces_size_cap_without_content_length(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    import zulip_ai_bridge as zab
+    monkeypatch.setattr(zab, "MAX_FILE_SIZE", 1000)
+    closed = []
+
+    class FakeResponse:
+        url = "https://chat.example.com/user_uploads/1/big.bin"
+        headers = {}
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size=8192):
+            for _ in range(10):
+                yield b"x" * 500
+        def close(self): closed.append(True)
+
+    parser = FileParser(MockClient("https://chat.example.com"), "https://chat.example.com")
+    dest = tmp_path / "big.bin"
+    with patch("zulip_ai_bridge.requests.get", return_value=FakeResponse()):
+        ok, err = parser._download_file("https://chat.example.com/user_uploads/1/big.bin", str(dest))
+    assert ok is False and "size" in err
+    assert not dest.exists()
+    assert closed
+
+
+def test_download_bad_content_length_does_not_raise(tmp_path):
+    from unittest.mock import patch
+
+    class FakeResponse:
+        url = "https://chat.example.com/f"
+        headers = {"Content-Length": "garbage"}
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size=8192): return iter([b"ok"])
+        def close(self): pass
+
+    parser = FileParser(MockClient("https://chat.example.com"), "https://chat.example.com")
+    with patch("zulip_ai_bridge.requests.get", return_value=FakeResponse()):
+        ok, err = parser._download_file("https://chat.example.com/f", str(tmp_path / "f"))
+    assert ok is True
+
+
+def test_trusted_url_rejects_parent_domain():
+    parser = FileParser(MockClient("https://chat.example.com"), "https://chat.example.com")
+    assert parser._is_trusted_url("https://example.com/user_uploads/x") is False
+    assert parser._is_trusted_url("https://chat.example.com:443/user_uploads/x") is True
+    assert parser._is_trusted_url("https://chat.example.com@evil.org/x") is False
+
+
+def test_parse_pdf_without_optional_libs(tmp_path):
+    from unittest.mock import patch
+    with patch.dict(sys.modules, {"pdfplumber": None, "pypdfium2": None}):
+        parser = FileParser(MockClient("https://chat.example.com"), "https://chat.example.com")
+    f = tmp_path / "x.pdf"
+    f.write_bytes(b"not really a pdf")
+    parser._parse_pdf(str(f))  # must not raise AttributeError
+
+
+def test_parse_excel_does_not_require_pillow(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    from unittest.mock import patch
+    wb = openpyxl.Workbook()
+    wb.active.append(["gene", "score"])
+    f = tmp_path / "t.xlsx"
+    wb.save(f)
+    with patch.dict(sys.modules, {"PIL": None}):
+        parser = FileParser(MockClient("https://chat.example.com"), "https://chat.example.com")
+    assert "gene" in (parser._parse_excel(str(f)) or "")
+
+
+# --- delivery -------------------------------------------------------------
+
+def test_send_reply_retries_on_error_result(monkeypatch):
+    import zulip_ai_bridge as zab
+    monkeypatch.setattr(zab.time, "sleep", lambda s: None)
+
+    class C(MockZulipClient):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+        def send_message(self, payload):
+            self.n += 1
+            self.sent_messages.append(dict(payload))
+            if self.n == 1:
+                return {"result": "error", "code": "RATE_LIMIT_HIT", "retry-after": 0.01,
+                        "msg": "API usage exceeded rate limit"}
+            return {"result": "success", "id": self.n}
+
+    client = C()
+    bridge = _bridge(client)
+    bridge._send_reply({"type": "private", "sender_email": "owner@example.com"}, "hello")
+    assert [m["content"] for m in client.sent_messages] == ["hello", "hello"]
+
+
+def test_send_reply_error_result_triggers_notice(monkeypatch):
+    import zulip_ai_bridge as zab
+    monkeypatch.setattr(zab.time, "sleep", lambda s: None)
+
+    class C(MockZulipClient):
+        def send_message(self, payload):
+            self.sent_messages.append(dict(payload))
+            if payload["content"] == "hello":
+                return {"result": "error", "msg": "Stream does not exist"}
+            return {"result": "success", "id": 1}
+
+    client = C()
+    bridge = _bridge(client)
+    bridge._send_reply({"type": "private", "sender_email": "owner@example.com"}, "hello")
+    assert "Could not deliver" in client.sent_messages[-1]["content"]
+
+
+def test_send_reply_group_dm_goes_to_all_participants():
+    client = MockZulipClient()
+    bridge = _bridge(client)
+    msg = {"type": "private", "sender_email": "owner@example.com",
+           "display_recipient": [{"email": "owner@example.com"}, {"email": "colleague@example.com"},
+                                 {"email": "bot@example.zulipchat.com"}]}
+    bridge._send_reply(msg, "hi")
+    assert sorted(client.sent_messages[0]["to"]) == ["colleague@example.com", "owner@example.com"]
+
+
+def test_send_full_reply_balances_code_fences():
+    client = MockZulipClient()
+    bridge = _bridge(client)
+    text = "intro\n\n```python\n" + "\n".join(f"x = {i}" for i in range(3000)) + "\n```\n"
+    bridge._send_full_reply({"type": "private", "sender_email": "owner@example.com"}, text)
+    assert len(client.sent_messages) >= 2
+    for m in client.sent_messages:
+        assert m["content"].count("```") % 2 == 0, m["content"][-200:]
+        assert len(m["content"]) <= 10000
+
+
+# --- subprocess handling ----------------------------------------------------
+
+def test_run_ai_subprocess_returns_output():
+    from zulip_ai_bridge import run_ai_subprocess
+    r = run_ai_subprocess(["sh", "-c", "echo out; echo err >&2; exit 3"], env=os.environ.copy(), timeout=10)
+    assert r.returncode == 3 and r.stdout.strip() == "out" and r.stderr.strip() == "err"
+
+
+def test_run_ai_subprocess_kills_grandchildren_on_timeout(tmp_path):
+    import subprocess, time
+    from zulip_ai_bridge import run_ai_subprocess
+    pidfile = tmp_path / "pid"
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_ai_subprocess(["sh", "-c", f"sleep 60 & echo $! > {pidfile}; wait"],
+                          env=os.environ.copy(), timeout=1)
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        # reap if it became our zombie (it should not: it is reparented)
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("grandchild survived the timeout")
+
+
+def test_large_prompt_is_passed_via_stdin(monkeypatch):
+    """argv strings > 128 KiB fail with E2BIG on Linux; big prompts go via stdin."""
+    from unittest.mock import patch
+    client = MockZulipClient()
+    bridge = _bridge(client)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        class R:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+        return R()
+
+    big = "A" * 200000
+    with patch("zulip_ai_bridge.run_ai_subprocess", side_effect=fake_run):
+        bridge._process_message({"id": 1, "type": "private", "sender_email": "owner@example.com"}, big)
+    assert all(len(a.encode()) < 100000 for a in captured["cmd"])
+    assert big in captured["input"]
+
+
+def test_session_fallback_ignores_stale_session(tmp_path):
+    import json, time
+    from zulip_ai_bridge import extract_session_fallback
+    sess = tmp_path / "last.json"
+    sess.write_text(json.dumps([{"role": "assistant", "content": "answer from an OLD run"}]))
+    old = time.time() - 3600
+    os.utime(sess, (old, old))
+    text, status, _ = extract_session_fallback(last_sess_path=str(sess), raw_stdout="",
+                                               min_mtime=time.time() - 5)
+    assert "OLD run" not in text
+    assert status == "empty_output"
+
+
+# --- memory ---------------------------------------------------------------
+
+def test_memory_get_recent_reads_tail(tmp_path):
+    from zulip_ai_bridge import ZulipMemoryManager
+    mem = ZulipMemoryManager(storage_dir=str(tmp_path / "zulip_chats"))
+    for i in range(50):
+        mem.record_chat({"session_id": f"s{i}", "query": "q" * 2000, "status": "success"})
+    recent = mem.get_recent(limit=3)
+    assert [r["session_id"] for r in recent] == ["s49", "s48", "s47"]
+
+
+# --- MCP server -------------------------------------------------------------
+
+def test_mcp_get_messages_does_not_fall_back_to_unfiltered_query():
+    from unittest.mock import MagicMock, patch
+    import zulip_mcp_server as zms
+    client = MagicMock()
+    client.get_subscriptions.return_value = {"result": "error", "msg": "nope"}
+    with patch.object(zms, "get_zulip_client", return_value=client):
+        out = zms.do_get_messages({})
+    assert out.startswith("Error")
+    client.get_messages.assert_not_called()

@@ -9,6 +9,9 @@ message history, tools) without needing a real LLM.
 The reply is controlled by env vars:
   MOCK_REPLY_CONTENT  — assistant text to return (default: "MOCK_OK")
   MOCK_CAPTURE        — file to append each request body to (JSON per line)
+  MOCK_TOOL_SEQ       — JSON list of tool calls, one per request (an item may
+                        itself be a list = parallel tool calls in one turn)
+  MOCK_N_CTX          — if set, GET /props reports this n_ctx
 
 Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 """
@@ -68,25 +71,28 @@ class Handler(BaseHTTPRequestHandler):
             tc = json.loads(tool_call_env)
 
         if tc is not None:
-            fn = tc.get("function", {})
+            # A MOCK_TOOL_SEQ item may be a list -> parallel tool calls in one turn.
+            tcs = tc if isinstance(tc, list) else [tc]
             self.send_response(200)
             if stream:
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                self._sse({"role": "assistant", "content": None,
-                           "tool_calls": [{"index": 0, "id": tc.get("id", "call_mock_1"),
-                                           "type": "function",
-                                           "function": {"name": fn.get("name", ""), "arguments": ""}}]})
-                self._sse({"tool_calls": [{"index": 0,
-                           "function": {"arguments": fn.get("arguments", "")}}]})
+                for idx, one in enumerate(tcs):
+                    fn = one.get("function", {})
+                    self._sse({"role": "assistant", "content": None,
+                               "tool_calls": [{"index": idx, "id": one.get("id", "call_mock_%d" % (idx + 1)),
+                                               "type": "function",
+                                               "function": {"name": fn.get("name", ""), "arguments": ""}}]})
+                    self._sse({"tool_calls": [{"index": idx,
+                               "function": {"arguments": fn.get("arguments", "")}}]})
                 self._sse({}, finish="tool_calls")
                 self.wfile.write(b"data: [DONE]\n\n")
             else:
                 self.send_header("Content-Type", "application/json")
                 resp = {
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": [tc]}, "finish_reason": "tool_calls"}],
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": tcs}, "finish_reason": "tool_calls"}],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 }
                 payload = json.dumps(resp).encode()
@@ -158,10 +164,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
 
     def do_GET(self):
-        # /v1/models or health probe
+        # /v1/models or health probe. MOCK_N_CTX makes /props report a
+        # llama.cpp-style runtime context window (n_ctx).
+        n_ctx = os.environ.get("MOCK_N_CTX")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
+        if n_ctx and self.path.startswith("/props"):
+            self.wfile.write(json.dumps({"default_generation_settings": {"n_ctx": int(n_ctx)}}).encode())
+            return
         self.wfile.write(b'{"data":[{"id":"mock"}]}')
 
 

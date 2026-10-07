@@ -668,13 +668,11 @@ def _read_gguf_arch_cached(path):
     """
     import glob
     for cand in (
-        "~/miniconda3/lib/python3.12/site-packages",
         str(Path.home() / "miniconda3" / "lib" / "python3.12" / "site-packages"),
         *glob.glob(str(Path.home() / "miniconda3" / "lib" / "python3.*" / "site-packages")),
         *glob.glob(str(Path.home() / ".local" / "lib" / "python3.*" / "site-packages")),
         str(Path.home() / ".local" / "share" / "ai" / "llama.cpp" / "gguf-py"),
         str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
-        "~/Code/llama.cpp/gguf-py",
     ):
         if os.path.isdir(cand) and cand not in sys.path:
             sys.path.insert(0, cand)
@@ -882,7 +880,6 @@ def read_gguf_block_count(path):
     if _gg is None:
         for cand in (
             str(Path.home() / "Code" / "llama.cpp" / "gguf-py"),
-            "~/Code/llama.cpp/gguf-py",
         ):
             if os.path.isdir(cand):
                 sys.path.insert(0, cand)

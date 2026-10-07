@@ -220,6 +220,12 @@ def test_call_tool_mcp_iserror_normalised(tmp_path):
     cwd.mkdir()
     (cwd / "mcp.json").write_text(json.dumps(cfg))
     env = os.environ.copy()
+    # Isolated HOME: call-tool logs metrics, and the session recap turns >=3
+    # metric failures into a PITFALL lesson — with the real HOME this test
+    # planted an "explode / kaboom" lesson in the user's live lessons.md.
+    home = tmp_path / "home"
+    home.mkdir()
+    env["HOME"] = str(home)
     r = subprocess.run([sys.executable, os.path.join(REPO, "ai_mcp.py"),
                         "call-tool", "fake", "explode", "{}"],
                        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=60)

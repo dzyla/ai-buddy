@@ -1,6 +1,6 @@
 # Robinhood trader redesign: core + monthly momentum sleeve
 
-Date: 2026-09-20. Account: agentic sandbox 000000001.
+Date: 2026-09-20. Account: the agentic sandbox account (small balance).
 
 ## Problem
 

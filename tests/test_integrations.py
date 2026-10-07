@@ -19,7 +19,15 @@ sys.path.insert(0, REPO)
 # These integrations depend on optional third-party libs; skip cleanly if absent.
 pytest.importorskip("googleapiclient")
 pytest.importorskip("google.oauth2.credentials")
-pytest.importorskip("zulip")
+# The Zulip tests mock get_zulip_client(), so the real `zulip` package is not
+# needed: install a stub module when it is absent instead of skipping the file.
+try:
+    import zulip  # noqa: F401
+except ImportError:
+    import types
+    _zstub = types.ModuleType("zulip")
+    _zstub.Client = None
+    sys.modules["zulip"] = _zstub
 
 import gcal  # noqa: E402
 import zulip_mcp_server as zms  # noqa: E402
@@ -124,6 +132,288 @@ def test_calendar_errors_are_returned_not_raised():
     with patch.object(gcal, "get_calendar_service", return_value=service):
         out = gcal.delete_event("evt123")
     assert out.startswith("Error deleting event")
+
+
+def _http_error(status, reason="err", message="boom"):
+    from googleapiclient.errors import HttpError
+    import json as _json
+    resp = MagicMock(status=status, reason=reason)
+    content = _json.dumps({"error": {"code": status, "message": message,
+                                     "errors": [{"reason": reason}]}}).encode()
+    return HttpError(resp, content)
+
+
+def _list_service(pages_by_cal, cal_list=None):
+    """Service whose events().list(calendarId=...).execute() returns successive
+    pages for each calendar. pages_by_cal: {cid: [page_dict, ...] | Exception}."""
+    service = MagicMock()
+    service.calendarList.return_value.list.return_value.execute.return_value = (
+        cal_list or {"items": [{"id": c, "summary": c, "selected": True}
+                               for c in pages_by_cal]})
+    calls = []
+
+    def _list(**kw):
+        calls.append(kw)
+        req = MagicMock()
+        src = pages_by_cal[kw["calendarId"]]
+        if isinstance(src, Exception):
+            req.execute.side_effect = src
+        else:
+            idx = sum(1 for c in calls if c["calendarId"] == kw["calendarId"]) - 1
+            req.execute.return_value = src[idx]
+        return req
+    service.events.return_value.list.side_effect = _list
+    return service, calls
+
+
+def _evt(eid, start, end, summary="E"):
+    k = "date" if "T" not in start else "dateTime"
+    return {"id": eid, "summary": summary, "start": {k: start}, "end": {k: end}}
+
+
+def test_list_events_shows_event_ids_for_update_and_delete():
+    service, _ = _list_service({"primary": [{"items": [
+        _evt("abc123", "2026-07-05T10:00:00-06:00", "2026-07-05T11:00:00-06:00")]}]})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.list_events("2026-07-05T00:00:00Z", "2026-07-06T00:00:00Z")
+    assert "abc123" in out
+
+
+def test_list_events_follows_next_page_token():
+    service, calls = _list_service({"primary": [
+        {"items": [_evt("p1", "2026-07-05T10:00:00Z", "2026-07-05T11:00:00Z")],
+         "nextPageToken": "tok2"},
+        {"items": [_evt("p2", "2026-07-06T10:00:00Z", "2026-07-06T11:00:00Z")]},
+    ]})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.list_events("2026-07-05T00:00:00Z", "2026-07-08T00:00:00Z")
+    assert "p1" in out and "p2" in out
+    assert calls[1].get("pageToken") == "tok2"
+
+
+def test_list_events_sorts_by_actual_instant_across_offsets():
+    # 09:00-06:00 (=15:00Z) is LATER than 10:00Z even though it sorts first as a string.
+    service, _ = _list_service({
+        "a": [{"items": [_evt("late", "2026-07-05T09:00:00-06:00", "2026-07-05T10:00:00-06:00")]}],
+        "b": [{"items": [_evt("early", "2026-07-05T10:00:00Z", "2026-07-05T11:00:00Z")]}],
+    })
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.list_events("2026-07-05T00:00:00Z", "2026-07-06T00:00:00Z")
+    assert out.index("early") < out.index("late")
+
+
+def test_list_events_naive_and_date_bounds_get_offsets():
+    service, calls = _list_service({"primary": [{"items": []}]})
+    with patch.object(gcal, "get_calendar_service", return_value=service), \
+         patch.object(gcal, "local_tz_name", return_value="America/Denver"):
+        gcal.list_events("2026-07-05", "2026-07-05")
+    # Google rejects offset-less timeMin/timeMax; a bare end date means end of that day.
+    assert calls[0]["timeMin"] == "2026-07-05T00:00:00-06:00"
+    assert calls[0]["timeMax"] == "2026-07-06T00:00:00-06:00"
+
+
+def test_list_events_uses_dst_correct_offset():
+    service, calls = _list_service({"primary": [{"items": []}]})
+    with patch.object(gcal, "get_calendar_service", return_value=service), \
+         patch.object(gcal, "local_tz_name", return_value="America/Denver"):
+        gcal.list_events("2026-01-05T08:00:00", "2026-01-05T17:00:00")
+    assert calls[0]["timeMin"] == "2026-01-05T08:00:00-07:00"  # MST, not MDT
+
+
+def test_list_events_reports_failing_calendars_instead_of_no_events():
+    service, _ = _list_service({"primary": _http_error(404, "notFound", "Not Found")})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.list_events("2026-07-05T00:00:00Z", "2026-07-06T00:00:00Z",
+                               calendar_ids=["primary"])
+    assert "No events found" not in out
+    assert "404" in out or "not found" in out.lower()
+
+
+def test_list_events_rejects_garbage_time():
+    service, _ = _list_service({"primary": [{"items": []}]})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.list_events("next tuesday", None)
+    assert out.startswith("Error") and "ISO 8601" in out
+
+
+def test_list_events_all_day_shows_inclusive_end():
+    service, _ = _list_service({"primary": [{"items": [
+        _evt("v1", "2026-07-05", "2026-07-08", "Vacation")]}]})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.list_events("2026-07-01T00:00:00Z", "2026-07-10T00:00:00Z")
+    assert "2026-07-05 to 2026-07-07 (all day)" in out
+
+
+def test_create_all_day_single_date_gets_exclusive_end():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        gcal.create_event("Holiday", "2026-07-05", "2026-07-05")
+    body = service.events().insert.call_args.kwargs["body"]
+    assert body["end"] == {"date": "2026-07-06"}
+
+
+def test_create_event_rejects_end_before_start():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.create_event("X", "2026-07-05T15:00:00", "2026-07-05T14:00:00",
+                                time_zone="UTC")
+    assert out.startswith("Error") and "after" in out
+    service.events().insert.assert_not_called()
+
+
+def test_create_event_rejects_mixed_date_and_datetime():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.create_event("X", "2026-07-05", "2026-07-05T14:00:00")
+    assert out.startswith("Error")
+    service.events().insert.assert_not_called()
+
+
+def test_create_event_requires_summary_and_times():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.create_event(None, "2026-07-05T14:00:00", None)
+    assert out.startswith("Error")
+    service.events().insert.assert_not_called()
+
+
+def test_create_event_keeps_explicit_offset():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        gcal.create_event("X", "2026-07-05T14:00:00Z", "2026-07-05T15:00:00Z",
+                          time_zone="America/New_York")
+    body = service.events().insert.call_args.kwargs["body"]
+    assert body["start"]["dateTime"] == "2026-07-05T14:00:00Z"
+
+
+def test_api_calls_use_retries_for_rate_limits():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        gcal.delete_event("evt123")
+    kw = service.events().delete.return_value.execute.call_args.kwargs
+    assert kw.get("num_retries", 0) >= 1
+
+
+def test_delete_event_gone_is_reported_as_already_deleted():
+    service = MagicMock()
+    service.events.return_value.delete.return_value.execute.side_effect = \
+        _http_error(410, "deleted", "Resource has been deleted")
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.delete_event("evt123")
+    assert "already" in out.lower()
+    assert not out.startswith("Error")
+
+
+def test_delete_event_not_found_gives_actionable_hint():
+    service = MagicMock()
+    service.events.return_value.delete.return_value.execute.side_effect = \
+        _http_error(404, "notFound", "Not Found")
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.delete_event("nope")
+    assert out.startswith("Error deleting event")
+    assert "gcal_list_events" in out
+    assert "Traceback" not in out and "<HttpError" not in out
+
+
+def test_update_event_start_only_preserves_duration():
+    service = _mock_service()
+    service.events.return_value.get.return_value.execute.return_value = _evt(
+        "evt123", "2026-07-05T14:00:00-06:00", "2026-07-05T15:30:00-06:00")
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        gcal.update_event("evt123", start_time="2026-07-05T16:00:00",
+                          time_zone="America/Denver")
+    body = service.events().patch.call_args.kwargs["body"]
+    assert body["start"] == {"dateTime": "2026-07-05T16:00:00", "timeZone": "America/Denver"}
+    assert body["end"] == {"dateTime": "2026-07-05T17:30:00", "timeZone": "America/Denver"}
+
+
+def test_update_event_requires_event_id():
+    service = _mock_service()
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.update_event(None, summary="x")
+    assert out.startswith("Error") and "event_id" in out
+    service.events().patch.assert_not_called()
+
+
+def _freebusy_service(calendars):
+    service = MagicMock()
+    service.freebusy.return_value.query.return_value.execute.return_value = {
+        "calendars": calendars}
+    return service
+
+
+def test_check_availability_accepts_single_calendar_id_string():
+    service = _freebusy_service({"work@x.com": {"busy": []}})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        gcal.check_availability("2026-07-05T08:00:00Z", "2026-07-05T17:00:00Z",
+                                calendar_ids="work@x.com")
+    body = service.freebusy().query.call_args.kwargs["body"]
+    assert body["items"] == [{"id": "work@x.com"}]
+
+
+def test_check_availability_calendar_error_is_not_reported_free():
+    service = _freebusy_service({"bad@x.com": {"busy": [], "errors": [
+        {"domain": "global", "reason": "notFound"}]}})
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.check_availability("2026-07-05T08:00:00Z", "2026-07-05T17:00:00Z",
+                                      calendar_ids=["bad@x.com"])
+    assert "Fully Available" not in out
+    assert "notFound" in out
+
+
+def test_check_availability_merges_overlapping_busy_across_calendars():
+    service = _freebusy_service({
+        "a": {"busy": [{"start": "2026-07-05T09:00:00Z", "end": "2026-07-05T10:00:00Z"}]},
+        "b": {"busy": [{"start": "2026-07-05T09:30:00Z", "end": "2026-07-05T11:00:00Z"},
+                       {"start": "2026-07-05T13:00:00Z", "end": "2026-07-05T14:00:00Z"}]},
+    })
+    with patch.object(gcal, "get_calendar_service", return_value=service):
+        out = gcal.check_availability("2026-07-05T08:00:00Z", "2026-07-05T17:00:00Z",
+                                      calendar_ids=["a", "b"])
+    assert "2026-07-05T09:00:00Z to 2026-07-05T11:00:00Z" in out
+    assert "Free" in out and "2026-07-05T11:00:00Z to 2026-07-05T13:00:00Z" in out
+
+
+def test_check_availability_normalizes_naive_times():
+    service = _freebusy_service({"primary": {"busy": []}})
+    with patch.object(gcal, "get_calendar_service", return_value=service), \
+         patch.object(gcal, "local_tz_name", return_value="America/Denver"):
+        gcal.check_availability("2026-07-05T08:00:00", "2026-07-05T17:00:00")
+    body = service.freebusy().query.call_args.kwargs["body"]
+    assert body["timeMin"] == "2026-07-05T08:00:00-06:00"
+
+
+def test_expired_refresh_token_gives_actionable_error(tmp_path, monkeypatch):
+    from google.auth.exceptions import RefreshError
+    token = tmp_path / "gcal_token.json"
+    token.write_text("{}")
+    monkeypatch.setattr(gcal, "TOKEN_PATH", str(token))
+    monkeypatch.setattr(gcal, "CREDS_PATH", str(tmp_path / "gcal_credentials.json"))
+    (tmp_path / "gcal_credentials.json").write_text("{}")
+    creds = MagicMock(valid=False, expired=True, refresh_token="r")
+    creds.refresh.side_effect = RefreshError("invalid_grant: Token has been expired or revoked.")
+    with patch.object(gcal.Credentials, "from_authorized_user_file", return_value=creds), \
+         patch.object(gcal, "InstalledAppFlow") as flow:
+        with pytest.raises(Exception) as exc:
+            gcal.get_calendar_service()
+        flow.from_client_secrets_file.assert_not_called()  # never blocks on a browser
+    msg = str(exc.value)
+    assert "expired or revoked" in msg and "gcal.py auth" in msg
+    assert token.read_text() == "{}"  # token file untouched
+
+
+def test_local_tz_name_strips_posix_colon_prefix(monkeypatch):
+    monkeypatch.setenv("TZ", ":America/Denver")
+    assert gcal.local_tz_name() == "America/Denver"
+
+
+def test_auth_tolerant_has_no_hardcoded_home(tmp_path, monkeypatch):
+    import importlib
+    import gcal_auth_tolerant as gat
+    monkeypatch.setenv("HOME", str(tmp_path))
+    gat = importlib.reload(gat)
+    assert gat.TOKEN == str(tmp_path / ".config/ai/gcal_token.json")
+    assert gat.CRED == str(tmp_path / ".config/ai/gcal_credentials.json")
 
 
 # ── Zulip ────────────────────────────────────────────────────────────────────

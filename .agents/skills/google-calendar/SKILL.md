@@ -9,9 +9,12 @@ Use this skill when the user asks to check their schedule, view upcoming events,
 
 ## Available Tools
 
-- `gcal_list_events`: Lists events between `time_min` and `time_max` (both ISO 8601 strings, e.g. `2026-07-01T00:00:00-06:00`).
-- `gcal_create_event`: Creates a new event with `summary`, `start_time`, `end_time` (ISO 8601 strings with timezone offset), and optional `description`, `location`, and `attendees`.
-- `gcal_check_availability`: Queries busy time slots between `time_min` and `time_max` to determine availability.
+- `gcal_list_events`: Lists events between `time_min` and `time_max` (ISO 8601, e.g. `2026-07-01T00:00:00-06:00`; a bare date like `2026-07-01` also works and, as `time_max`, means the end of that day). Each line ends with `event_id: ... | calendar_id: ...` — use those exact values for update/delete.
+- `gcal_create_event`: Creates an event with `summary`, `start_time`, `end_time`, and optional `description`, `location`, `attendees`, `calendar_id`.
+- `gcal_quick_add`: Creates an event from a natural-language phrase ("Dentist next Tuesday 3pm"); Google parses the time.
+- `gcal_update_event`: Patch an event (only fields you pass change). Moving only `start_time` keeps the original duration.
+- `gcal_delete_event`: Deletes an event by `event_id` (+ `calendar_id` if not primary).
+- `gcal_check_availability`: Busy slots per calendar between `time_min` and `time_max`, plus merged busy times and the free gaps. A calendar reported as "could not check" is UNKNOWN, not free.
 
 ---
 
@@ -20,11 +23,21 @@ Use this skill when the user asks to check their schedule, view upcoming events,
 > [!IMPORTANT]
 > Always check the **Local Time** and timezone offset in the **Host System Context** before calling calendar tools.
 
-- Google Calendar API requires date-times to be formatted as ISO 8601 strings with a timezone offset or Z for UTC (e.g. `2026-07-01T14:30:00-06:00`).
+- Use ISO 8601 date-times; an explicit offset or Z is optional (e.g. `2026-07-01T14:30:00-06:00` or `2026-07-01T14:30:00`).
 - If the user asks for "today", calculate the date range from `00:00:00` to `23:59:59` on the current local date, applying the correct local timezone offset.
+- Naive times (no offset, e.g. `2026-07-01T14:30:00`) are interpreted in the user's local timezone with the correct DST offset for that date, so you do not have to compute the offset yourself.
 - Always verify that the end time of an event is after the start time.
+- **All-day events:** pass bare dates. Google's all-day end date is **exclusive**: a 3-day trip on Jul 5–7 is `start_time=2026-07-05`, `end_time=2026-07-08`. A single day can be given as start == end (it is converted automatically). `gcal_list_events` shows all-day ranges with the inclusive last day.
+- Do not mix a bare date with a date-time in the same event.
 
 ---
+
+## Handling Errors
+
+Tool errors are short strings starting with `Error ...` and usually include a hint. Read it and fix the call instead of retrying blindly:
+- `HTTP 404`: wrong `event_id`/`calendar_id` — call `gcal_list_events` and use the IDs it prints.
+- `HTTP 403`/`429`: rate limit (already retried) or no write access to that calendar.
+- `token is expired or revoked`: tell the user to run `python3 ~/.local/bin/gcal.py auth` in a terminal (the tool never opens a browser itself). Apps left in Google's "Testing" mode get refresh tokens that expire after 7 days.
 
 ## Handling Authentication Setup
 

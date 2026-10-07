@@ -12,8 +12,8 @@ from typing import Dict, List, Any, Callable, Tuple
 
 # Configuration
 CONVERSATION_ID = "45a20dc1-6e2a-4f05-ac4a-233756b6eba4"
-ARTIFACT_DIR = f"~/.gemini/antigravity-cli/brain/{CONVERSATION_ID}"
-WORKSPACE_DIR = "~/ai-buddy"
+ARTIFACT_DIR = os.environ.get("BENCH_ARTIFACT_DIR", os.path.expanduser(f"~/.cache/ai/bench/{CONVERSATION_ID}"))
+WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def write_temp_file(name: str, content: str):
     path = os.path.join(WORKSPACE_DIR, name)

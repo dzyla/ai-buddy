@@ -75,24 +75,24 @@ class TestPlanning:
     }
 
     def test_plan_rebalance_sells_rotated_out_and_buys_equal_weight(self):
-        equity, cash = 630.0, 107.0
+        equity, cash = 650.0, 107.0
         plan = MS.plan_rebalance(equity, cash, self.POS, targets=["TSM", "NVDA", "PLTR"])
         sold = {s["symbol"] for s in plan["sells"]}
         assert sold == {"LLY", "MSFT"}                  # core never sold, TSM kept
         assert all(s["reason"] == "ROTATE_OUT" for s in plan["sells"])
         buys = {b["symbol"]: b["dollar_amount"] for b in plan["buys"]}
-        per_name = equity * MS.SLEEVE_TARGET_PCT / 3   # $63
+        per_name = equity * MS.SLEEVE_TARGET_PCT / 3   # $65
         assert buys["NVDA"] == pytest.approx(per_name, abs=0.01)
         assert buys["PLTR"] == pytest.approx(per_name, abs=0.01)
-        assert "TSM" not in buys                        # already above its $63 target
+        assert "TSM" not in buys                        # already above its $65 target
         assert plan["projected_cash"] >= equity * MS.CASH_BUFFER_PCT - 0.01
 
     def test_plan_rebalance_respects_hold_list(self):
-        plan = MS.plan_rebalance(630.0, 107.0, self.POS, targets=["NVDA"], hold={"lly"})
+        plan = MS.plan_rebalance(650.0, 107.0, self.POS, targets=["NVDA"], hold={"lly"})
         assert {s["symbol"] for s in plan["sells"]} == {"TSM", "MSFT"}
 
     def test_plan_rebalance_bear_regime_liquidates_sleeve_only(self):
-        plan = MS.plan_rebalance(630.0, 107.0, self.POS, targets=[])
+        plan = MS.plan_rebalance(650.0, 107.0, self.POS, targets=[])
         assert {s["symbol"] for s in plan["sells"]} == {"LLY", "TSM", "MSFT"}
         assert all(s["reason"] == "REGIME_EXIT" for s in plan["sells"])
         assert plan["buys"] == []
@@ -100,24 +100,24 @@ class TestPlanning:
     def test_plan_rebalance_never_breaches_cash_buffer(self):
         # tiny cash, nothing to sell -> buys limited to what is above the 10% buffer
         pos = {"VTI": {"quantity": 1.0, "price": 560.0}}
-        plan = MS.plan_rebalance(630.0, 70.0, pos, targets=["A", "B", "C"])
+        plan = MS.plan_rebalance(650.0, 70.0, pos, targets=["A", "B", "C"])
         total_buys = sum(b["dollar_amount"] for b in plan["buys"])
-        assert total_buys <= 70.0 - 63.0 + 0.01
-        assert plan["projected_cash"] >= 63.0 - 0.01
+        assert total_buys <= 70.0 - 65.0 + 0.01
+        assert plan["projected_cash"] >= 65.0 - 0.01
 
     def test_plan_core_topup(self):
-        # core = 124 VTI + 114 QQQ of 630; each ETF targets 189 -> QQQ is furthest below, shortfall 74.6
-        plan = MS.plan_core_topup(630.0, 300.0, self.POS)
+        # core = 124 VTI + 114 QQQ of 650; each ETF targets 195 -> QQQ is furthest below, shortfall 80.6
+        plan = MS.plan_core_topup(650.0, 300.0, self.POS)
         assert plan["symbol"] == "QQQ"
-        assert plan["dollar_amount"] == pytest.approx(630 * 0.30 - 0.16 * 715, abs=0.01)
+        assert plan["dollar_amount"] == pytest.approx(650 * 0.30 - 0.16 * 715, abs=0.01)
         # empty book: first top-up buys one ETF up to its half share only, never the whole core target
         first = MS.plan_core_topup(600.0, 600.0, {})
         assert first["dollar_amount"] == pytest.approx(600 * 0.30, abs=0.01)
-        assert MS.plan_core_topup(630.0, 63.0, self.POS) is None       # no cash above buffer
-        capped = MS.plan_core_topup(630.0, 300.0, self.POS, max_dollars=50.0)
+        assert MS.plan_core_topup(650.0, 65.0, self.POS) is None       # no cash above buffer
+        capped = MS.plan_core_topup(650.0, 300.0, self.POS, max_dollars=50.0)
         assert capped["dollar_amount"] == 50.0
         full = {"VTI": {"quantity": 1.0, "price": 400.0}, "QQQ": {"quantity": 0.0, "price": 700.0}}
-        assert MS.plan_core_topup(630.0, 300.0, full) is None          # already at 60%
+        assert MS.plan_core_topup(650.0, 300.0, full) is None          # already at 60%
 
     def test_disaster_stop_hits(self):
         positions = [

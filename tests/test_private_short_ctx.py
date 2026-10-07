@@ -11,6 +11,7 @@ import ai_mcp
 def test_private_mode_mcp_skips_metrics_and_ledger(monkeypatch, tmp_path):
     metrics_file = tmp_path / "metrics.jsonl"
     ledger_file = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("HOME", str(tmp_path))  # never touch the real ~/.config/ai
     
     monkeypatch.setenv("INFER_PRIVATE_MODE", "1")
     monkeypatch.setattr(ai_mcp, "_ledger_path", lambda: str(ledger_file))
@@ -33,6 +34,7 @@ def test_private_mode_mcp_skips_metrics_and_ledger(monkeypatch, tmp_path):
 
 def test_private_mode_normal_behavior(monkeypatch, tmp_path):
     ledger_file = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("HOME", str(tmp_path))  # lessons.md must not be the real one
     monkeypatch.delenv("INFER_PRIVATE_MODE", raising=False)
     monkeypatch.setattr(ai_mcp, "_ledger_path", lambda: str(ledger_file))
     

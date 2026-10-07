@@ -11,7 +11,7 @@ Registered automatically via mcp.json — ai_mcp.py starts it as needed.
 Environment variables:
     PUBMED_API_KEY    API key for the search server (required)
     MSS_API_KEY       Alias for PUBMED_API_KEY
-    PUBMED_SEARCH_URL Base URL of the search server (default: http://pubmed-search.example.org:8080)
+    PUBMED_SEARCH_URL Base URL of the search server (required)
 """
 
 import sys
@@ -19,7 +19,7 @@ import os
 import json
 import urllib.request
 
-SEARCH_URL = os.environ.get("PUBMED_SEARCH_URL", "http://pubmed-search.example.org:8080").rstrip("/")
+SEARCH_URL = os.environ.get("PUBMED_SEARCH_URL", "").rstrip("/")
 
 TOOL_SCHEMA = {
     "name": "pubmed_search",
@@ -64,6 +64,8 @@ def _do_search(query, top_k=10, start_date=None, end_date=None, high_quality_onl
     api_key = os.environ.get("PUBMED_API_KEY") or os.environ.get("MSS_API_KEY", "")
     if not api_key:
         return "Error: no API key. Set PUBMED_API_KEY environment variable."
+    if not SEARCH_URL:
+        return "Error: no search server configured. Set PUBMED_SEARCH_URL environment variable."
 
     top_k = max(5, min(10, int(top_k)))
     payload = {"query": query, "top_k": top_k, "high_quality_only": bool(high_quality_only)}
