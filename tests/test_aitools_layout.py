@@ -173,12 +173,13 @@ def test_no_aitools_module_too_big():
     assert sizes and not too_big, too_big
 
 
-def test_monkeypatch_memory_path_reaches_moved_code(tmp_path, monkeypatch):
+def test_monkeypatch_path_constant_reaches_moved_code(tmp_path, monkeypatch):
+    # (Was MEMORY_PATH: memory now lives in the state db, see tests/test_state_store.py.)
     import ai_mcp
-    p = tmp_path / "mem.txt"
-    monkeypatch.setattr(ai_mcp, "MEMORY_PATH", str(p))
-    ai_mcp.save_memory("x")
-    assert p.read_text().strip() == "x"
+    p = tmp_path / "pool.json"
+    monkeypatch.setattr(ai_mcp, "CONTEXT_POOL_FILE", str(p))
+    ai_mcp.append_to_context_pool("x")
+    assert json.loads(p.read_text())[0]["content"] == "x"
 
 
 def test_registry_interface(tmp_path, monkeypatch):

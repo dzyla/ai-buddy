@@ -256,25 +256,42 @@ static void free_turn_items(void) {
     g_turn_item_count = 0;
 }
 
+/* ai_mcp.py path, resolved once in main(); used by helpers outside main. */
+static const char *g_mcp_script = NULL;
+
+/* Scheduled tasks live in the SQLite state store (aitools/state.py). `ai_mcp.py state-export
+   tasks` prints one "<id>\t<next_run epoch>\t<kind>" line per task. Cached for 15 s because the
+   idle prompt polls the countdown every second. Returns the cached text (not owned) or NULL. */
+static char *g_tasks_cache = NULL;
+static time_t g_tasks_cache_at = 0;
+static const char *scheduled_tasks_export(void) {
+    time_t now = time(NULL);
+    if (g_tasks_cache_at && now - g_tasks_cache_at < 15) return g_tasks_cache;
+    g_tasks_cache_at = now;
+    free(g_tasks_cache);
+    g_tasks_cache = NULL;
+    if (!g_mcp_script) return NULL;
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "python3 %s state-export tasks 2>/dev/null", g_mcp_script);
+    g_tasks_cache = run_shell_command(cmd, NULL);
+    return g_tasks_cache;
+}
+
 static void print_jobs_and_tasks_status(void) {
     printf("\n\033[1;36m╭── 📋 Active Background Jobs & Scheduled Tasks ──────────────────╮\033[0m\n");
-    
-    const char *home = getenv("HOME");
-    char task_dir[512];
-    snprintf(task_dir, sizeof(task_dir), "%s/.config/ai/scheduled_tasks", home ? home : "~");
-    
-    DIR *d = opendir(task_dir);
+
     int count = 0;
-    if (d) {
-        struct dirent *dir;
-        while ((dir = readdir(d)) != NULL) {
-            if (dir->d_name[0] == '.') continue;
-            if (strstr(dir->d_name, ".json")) {
-                count++;
-                printf("\033[36m│\033[0m  \033[1;33m•\033[0m Task: \033[1m%s\033[0m \033[32m[SCHEDULED]\033[0m\n", dir->d_name);
-            }
+    const char *p = scheduled_tasks_export();
+    while (p && *p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        const char *tab = memchr(p, '\t', len);
+        int idlen = (int)(tab ? (size_t)(tab - p) : len);
+        if (idlen > 0) {
+            count++;
+            printf("\033[36m│\033[0m  \033[1;33m•\033[0m Task: \033[1m%.*s\033[0m \033[32m[SCHEDULED]\033[0m\n", idlen, p);
         }
-        closedir(d);
+        p = nl ? nl + 1 : NULL;
     }
     if (count == 0) {
         printf("\033[36m│\033[0m  \033[2mNo background tasks currently running or scheduled.\033[0m\n");
@@ -2278,74 +2295,23 @@ static void lineed_redraw(const char *prompt, const char *buf, int len, int curs
 }
 
 static int get_next_scheduled_task_delay(void) {
-    char dir_path[512];
-    snprintf(dir_path, sizeof(dir_path), "%s/.config/ai/scheduled_tasks", getenv("HOME"));
-    DIR *d = opendir(dir_path);
-    if (!d) return -1;
-    
-    struct dirent *dir;
+    /* Seconds until the soonest scheduled task is due (state db next_run), -1 if none. */
     int min_delay = -1;
     time_t now = time(NULL);
-    
-    while ((dir = readdir(d)) != NULL) {
-        if (strstr(dir->d_name, ".json") != NULL) {
-            char filepath[1024];
-            snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, dir->d_name);
-            FILE *f = fopen(filepath, "r");
-            if (f) {
-                fseek(f, 0, SEEK_END);
-                long fsize = ftell(f);
-                fseek(f, 0, SEEK_SET);
-                if (fsize > 0 && fsize < 65536) {
-                    char *json = malloc(fsize + 1);
-                    if (fread(json, 1, fsize, f) == (size_t)fsize) {
-                        json[fsize] = '\0';
-                        char *interval_ptr = strstr(json, "\"interval_seconds\":");
-                        char *last_run_ptr = strstr(json, "\"last_run\":");
-                        char *created_ptr = strstr(json, "\"created_at\":");
-                        if (interval_ptr) {
-                            int interval = atoi(interval_ptr + 19);
-                            char *target_ptr = NULL;
-                            if (last_run_ptr) {
-                                char *q1 = strchr(last_run_ptr + 11, '"');
-                                if (q1 && strncmp(q1 + 1, "never", 5) != 0) {
-                                    target_ptr = q1 + 1;
-                                }
-                            }
-                            if (!target_ptr && created_ptr) {
-                                char *q1 = strchr(created_ptr + 13, '"');
-                                if (q1) target_ptr = q1 + 1;
-                            }
-                            if (target_ptr) {
-                                int Y, M, D, h, m, s;
-                                if (sscanf(target_ptr, "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
-                                    struct tm tm = {0};
-                                    tm.tm_year = Y - 1900;
-                                    tm.tm_mon = M - 1;
-                                    tm.tm_mday = D;
-                                    tm.tm_hour = h;
-                                    tm.tm_min = m;
-                                    tm.tm_sec = s;
-                                    tm.tm_isdst = -1;
-                                    time_t start_time = mktime(&tm);
-                                    if (start_time != (time_t)-1) {
-                                        int delay = (start_time + interval) - now;
-                                        if (delay < 0) delay = 0;
-                                        if (min_delay == -1 || delay < min_delay) {
-                                            min_delay = delay;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    free(json);
-                }
-                fclose(f);
+    const char *p = scheduled_tasks_export();
+    while (p && *p) {
+        const char *tab = strchr(p, '\t');
+        const char *nl = strchr(p, '\n');
+        if (tab && (!nl || tab < nl)) {
+            long long next_run = atoll(tab + 1);
+            if (next_run > 0) {
+                long long d = next_run - (long long)now;
+                if (d < 0) d = 0;
+                if (min_delay == -1 || d < min_delay) min_delay = (int)d;
             }
         }
+        p = nl ? nl + 1 : NULL;
     }
-    closedir(d);
     return min_delay;
 }
 
@@ -4561,7 +4527,8 @@ int main(int argc, char **argv) {
             mcp_script = "/usr/local/bin/ai_mcp.py";
         }
     }
-    
+    g_mcp_script = mcp_script;
+
     char *tools_json = NULL;
     /* Small known context window -> lean tool catalog (see apply_context_budget). */
     if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE"))
@@ -4775,7 +4742,7 @@ int main(int argc, char **argv) {
     strcpy(messages_json, "[]");
 
     // Add System Prompt, Context, Memory & Skills
-    char *memory = read_memory_file();
+    char *memory = read_memory_file(mcp_script, 0);
     char *sys_ctx = get_system_context();
     char *triggers = load_critical_triggers();
 
@@ -5336,7 +5303,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (strcmp(user_input, ":memory") == 0) {
-                    char *mem = read_memory_file();
+                    char *mem = read_memory_file(mcp_script, 1);
                     if (mem && strlen(mem) > 0)
                         printf("\n\033[1;36mPersistent memory:\033[0m\n%s\n\n", mem);
                     else

@@ -1,9 +1,22 @@
-"""Scheduled tasks, reminders and the run-scheduler loop."""
+"""Scheduled tasks, reminders and the run-scheduler loop.
+
+Task specs live in the state db (`scheduled_tasks` table, aitools/state.py); a task exists exactly
+as long as its row does (deleting the row cancels it). Only the per-task scheduler PID lock files
+stay on disk, in ~/.config/ai/scheduled_tasks/<id>.pid.
+"""
 import os
 from .misc import (  # noqa: F401
     _resolve_ai_bin,
 )
 from . import entry_script as _entry_script
+from . import state
+
+
+def _task_dir():
+    """Directory of the scheduler PID lock files (created on demand)."""
+    d = os.path.expanduser("~/.config/ai/scheduled_tasks")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None):
     """Schedule a recurring or one-shot background task.
@@ -22,10 +35,7 @@ def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None)
     if not safe_task_id:
         return "Error: task_id must contain alphanumeric characters, hyphens, or underscores."
 
-    task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
-    os.makedirs(task_dir, exist_ok=True)
-
-    task_file = os.path.join(task_dir, f"{safe_task_id}.json")
+    task_dir = _task_dir()
     pid_file  = os.path.join(task_dir, f"{safe_task_id}.pid")
 
     saved_env = {}
@@ -33,15 +43,15 @@ def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None)
         if k.startswith("INFER_") or k.startswith("ZULIP_") or k.startswith("AI_REMINDER_") or k == "PATH":
             saved_env[k] = v
 
-    existed = os.path.exists(task_file)
+    try:
+        existing = state.task_get(safe_task_id)
+    except Exception as e:
+        return f"Error reading scheduled tasks: {e}"
+    existed = existing is not None
 
     # --- Build or update task data ---
     if existed:
-        try:
-            with open(task_file) as f:
-                task_data = json.load(f)
-        except Exception:
-            task_data = {}
+        task_data = existing
         # Preserve creation time and run counters on update
         task_data["prompt"]           = prompt
         task_data["interval_seconds"] = max(10, int(interval_seconds))
@@ -68,10 +78,10 @@ def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None)
         task_data.setdefault(field, default)
 
     try:
-        with open(task_file, "w") as f:
-            json.dump(task_data, f, indent=2)
+        state.task_put(safe_task_id, task_data,
+                       next_run=time.time() + task_data["interval_seconds"])
     except Exception as e:
-        return f"Error writing task file: {e}"
+        return f"Error writing scheduled task: {e}"
 
     if existed:
         # Check if a scheduler process is still alive for this task
@@ -110,7 +120,7 @@ def schedule_task(task_id, prompt, interval_seconds, run_once=False, extra=None)
                 f"(running every {interval_seconds}s in the background).")
     except Exception as e:
         try:
-            os.remove(task_file)
+            state.task_delete(safe_task_id)
         except Exception:
             pass
         return f"Error spawning scheduler process: {e}"
@@ -219,10 +229,8 @@ def unschedule_task(task_id):
     import os
     import signal
     safe_task_id = "".join(c for c in task_id if c.isalnum() or c in ("_", "-"))
-    task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
-    task_file = os.path.join(task_dir, f"{safe_task_id}.json")
-    pid_file = os.path.join(task_dir, f"{safe_task_id}.pid")
-    
+    pid_file = os.path.join(os.path.expanduser("~/.config/ai/scheduled_tasks"), f"{safe_task_id}.pid")
+
     # Kill the scheduler loop process immediately if alive
     if os.path.exists(pid_file):
         try:
@@ -236,37 +244,28 @@ def unschedule_task(task_id):
         except Exception:
             pass
 
-    if os.path.exists(task_file):
-        try:
-            os.remove(task_file)
-            return f"Successfully unscheduled/cancelled task '{safe_task_id}'."
-        except Exception as e:
-            return f"Error removing task file: {e}"
-    else:
-        return f"Task '{safe_task_id}' not found or already unscheduled."
+    try:
+        removed = state.task_delete(safe_task_id)
+    except Exception as e:
+        return f"Error removing scheduled task: {e}"
+    if removed:
+        return f"Successfully unscheduled/cancelled task '{safe_task_id}'."
+    return f"Task '{safe_task_id}' not found or already unscheduled."
 
 def list_scheduled_tasks():
-    import os, json, time
+    import os
+    try:
+        tasks = state.task_list()
+    except Exception as e:
+        return f"Error reading scheduled tasks: {e}"
+    if not tasks:
+        return "No scheduled tasks found."
+
     task_dir = os.path.expanduser("~/.config/ai/scheduled_tasks")
-    if not os.path.exists(task_dir) or not os.path.isdir(task_dir):
-        return "No scheduled tasks found."
-
-    files = [f for f in os.listdir(task_dir) if f.endswith(".json")]
-    if not files:
-        return "No scheduled tasks found."
-
     lines = []
-    now = time.time()
-    for f in sorted(files):
-        path = os.path.join(task_dir, f)
-        pid_path = path.replace(".json", ".pid")
-        try:
-            with open(path) as tf:
-                data = json.load(tf)
-        except Exception:
-            continue
-
-        tid      = data.get("task_id", f[:-5])
+    for data in tasks:
+        tid      = data.get("task_id", "?")
+        pid_path = os.path.join(task_dir, f"{tid}.pid")
         interval = data.get("interval_seconds", "?")
         created  = data.get("created_at", "?")
         last_run = data.get("last_run", "never")
@@ -324,9 +323,22 @@ def run_scheduler_loop(task_id):
     if not safe_task_id:
         return
 
-    task_dir  = os.path.expanduser("~/.config/ai/scheduled_tasks")
-    task_file = os.path.join(task_dir, f"{safe_task_id}.json")
+    task_dir  = _task_dir()
     pid_file  = os.path.join(task_dir, f"{safe_task_id}.pid")
+
+    def task_exists():
+        """The row is the task: gone = cancelled. A db error counts as 'still there'."""
+        try:
+            return state.task_exists(safe_task_id)
+        except Exception as e:
+            log_message(f"Error checking task: {e}")
+            return True
+
+    def remove_task():
+        try:
+            state.task_delete(safe_task_id)
+        except Exception as e:
+            log_message(f"Error deleting task: {e}")
 
     cache_dir = os.path.expanduser("~/.cache/ai")
     os.makedirs(cache_dir, exist_ok=True)
@@ -378,24 +390,22 @@ def run_scheduler_loop(task_id):
             if remaining <= 0:
                 return True   # continue
             time.sleep(min(remaining, 5.0))
-            if not os.path.exists(task_file):
+            if not task_exists():
                 return False  # cancelled
 
     log_message(f"Scheduler loop started (PID {my_pid}).")
 
     # ── Main loop ────────────────────────────────────────────────────────────
     while True:
-        if not os.path.exists(task_file):
-            log_message("Task file deleted. Exiting scheduler loop.")
-            break
-
         try:
-            with open(task_file) as f:
-                task_data = json.load(f)
+            task_data = state.task_get(safe_task_id)
         except Exception as e:
-            log_message(f"Error reading task file: {e}")
+            log_message(f"Error reading task: {e}")
             time.sleep(1)
             continue
+        if task_data is None:
+            log_message("Task deleted. Exiting scheduler loop.")
+            break
 
         interval        = int(task_data.get("interval_seconds", 300))
         prompt          = task_data.get("prompt", "")
@@ -411,10 +421,7 @@ def run_scheduler_loop(task_id):
         # ── Guard: max_runs limit ────────────────────────────────────────────
         if max_runs > 0 and run_count >= max_runs:
             log_message(f"max_runs={max_runs} reached ({run_count} runs). Auto-cancelling task.")
-            try:
-                os.remove(task_file)
-            except Exception:
-                pass
+            remove_task()
             break
 
         # ── Guard: TTL expiry ────────────────────────────────────────────────
@@ -424,10 +431,7 @@ def run_scheduler_loop(task_id):
                 elapsed_h  = (datetime.now() - created_dt).total_seconds() / 3600
                 if elapsed_h >= ttl_hours:
                     log_message(f"TTL expired ({elapsed_h:.1f}h >= {ttl_hours}h). Auto-cancelling task.")
-                    try:
-                        os.remove(task_file)
-                    except Exception:
-                        pass
+                    remove_task()
                     break
             except Exception:
                 pass
@@ -435,34 +439,32 @@ def run_scheduler_loop(task_id):
         # ── Guard: consecutive failure limit ─────────────────────────────────
         if consec_failures >= MAX_CONSEC_FAIL:
             log_message(f"consec_failures={consec_failures} >= {MAX_CONSEC_FAIL}. Auto-retiring task.")
-            try:
-                os.remove(task_file)
-            except Exception:
-                pass
+            remove_task()
             break
 
         # ── Interruptible sleep ──────────────────────────────────────────────
+        try:  # ai.c shows the countdown to the next run from this column
+            state.task_set_next_run(safe_task_id, time.time() + interval)
+        except Exception:
+            pass
         if not interruptible_sleep(interval):
-            log_message("Task file deleted during sleep. Exiting.")
+            log_message("Task deleted during sleep. Exiting.")
             break
 
         # Re-read after sleep (may have been updated)
-        if not os.path.exists(task_file):
-            log_message("Task file gone after sleep. Exiting.")
-            break
         try:
-            with open(task_file) as f:
-                task_data = json.load(f)
+            fresh = state.task_get(safe_task_id)
         except Exception:
-            pass
+            fresh = task_data
+        if fresh is None:
+            log_message("Task gone after sleep. Exiting.")
+            break
+        task_data = fresh
 
         # ── run_once: delete before spawning so crash can't repeat ───────────
         if run_once:
-            try:
-                os.remove(task_file)
-                log_message("run_once: task file removed before agent spawn.")
-            except Exception as e:
-                log_message(f"run_once: could not remove task file: {e}")
+            remove_task()
+            log_message("run_once: task removed before agent spawn.")
 
         # ── Reminder shortcut (direct Zulip, no LLM) ─────────────────────────
         if task_data.get("kind") == "reminder":
@@ -474,18 +476,17 @@ def run_scheduler_loop(task_id):
                 os.environ.clear()
                 os.environ.update(_saved_env)
             log_message(f"Reminder delivered: {status}")
-            if run_once or not os.path.exists(task_file):
+            if run_once or not task_exists():
                 log_message("Reminder run_once: exiting.")
                 break
             continue
 
         # ── Update run metadata ───────────────────────────────────────────────
-        if not run_once and os.path.exists(task_file):
+        if not run_once and task_exists():
             try:
                 task_data["last_run"]  = time.strftime("%Y-%m-%d %H:%M:%S")
                 task_data["run_count"] = run_count + 1
-                with open(task_file, "w") as f:
-                    json.dump(task_data, f, indent=2)
+                state.task_update(safe_task_id, task_data)
             except Exception as e:
                 log_message(f"Error updating task metadata: {e}")
 
@@ -523,24 +524,22 @@ def run_scheduler_loop(task_id):
             log_message(f"Error running agent: {e}")
 
         # ── Update failure counters ───────────────────────────────────────────
-        if not run_once and os.path.exists(task_file):
+        if not run_once and task_exists():
             try:
-                with open(task_file) as f:
-                    task_data = json.load(f)
+                task_data = state.task_get(safe_task_id) or task_data
                 if success:
                     task_data["consec_failures"] = 0
                 else:
                     task_data["fail_count"]       = int(task_data.get("fail_count", 0)) + 1
                     task_data["consec_failures"]  = int(task_data.get("consec_failures", 0)) + 1
                     task_data["last_error"]        = time.strftime("%Y-%m-%d %H:%M:%S")
-                with open(task_file, "w") as f:
-                    json.dump(task_data, f, indent=2)
+                state.task_update(safe_task_id, task_data)
             except Exception as e:
                 log_message(f"Error persisting failure counters: {e}")
 
         # ── Exit if task was cancelled during agent run ───────────────────────
-        if run_once or not os.path.exists(task_file):
-            log_message("Task file gone after agent run. Exiting scheduler loop.")
+        if run_once or not task_exists():
+            log_message("Task gone after agent run. Exiting scheduler loop.")
             break
 
     # ── Cleanup ───────────────────────────────────────────────────────────────

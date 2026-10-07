@@ -39,6 +39,7 @@ MOCK = os.path.join(REPO, "tests", "mock_llm_server.py")
 PORT = 8821
 
 sys.path.insert(0, REPO)
+from aitools import state  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -94,7 +95,7 @@ def test_chain_promotes_to_master_and_demotes_on_new_failure(si):
     si.record_recovery("read_file", "used ls first", err2)
     # 2 recoveries, last event = recovery -> MASTERED, MASTER lesson written
     assert si._chain_is_mastered(cid)
-    lessons = open(si._lessons_path(), encoding="utf-8").read()
+    lessons = state.lessons_render(limit=None)
     assert "## MASTER" in lessons
     # A NEW failure on the same error un-masters it (the fix must keep holding)
     si.record_failure("read_file", "", "No such file or directory: file_3.txt")
@@ -102,7 +103,7 @@ def test_chain_promotes_to_master_and_demotes_on_new_failure(si):
     # Mastering again promotes; the MASTER lesson is NOT duplicated
     si.record_recovery("read_file", "used ls first", "No such file or directory: file_3.txt")
     assert si._chain_is_mastered(cid)
-    lessons2 = open(si._lessons_path(), encoding="utf-8").read()
+    lessons2 = state.lessons_render(limit=None)
     assert lessons2.count("## MASTER") == 1, "master lesson should not duplicate"
 
 
@@ -292,9 +293,9 @@ def test_binary_links_failure_and_recovery_into_one_chain():
     ]
     r = _run_agent(home, seq, extra_env={"INFER_SELF_IMPROVE_RECURRENCE": "1"})
     assert r.returncode == 0, r.stderr
-    ledger = os.path.join(home, ".config", "ai", "self_improve", "ledger.jsonl")
-    assert os.path.exists(ledger), "ledger not written"
-    recs = [json.loads(l) for l in open(ledger) if l.strip()]
+    # the binary inherits $AI_STATE_DB (conftest), so the state API reads what it wrote
+    recs = state.ledger_rows()
+    assert recs, "ledger not written"
     fails = [x for x in recs if x["kind"] == "failure"]
     recs_ok = [x for x in recs if x["kind"] == "recovery"]
     assert fails and recs_ok, recs
@@ -325,10 +326,9 @@ def test_binary_injects_session_recap_into_model_context():
     ]
     r1 = _run_agent(home, seq, extra_env={"INFER_SELF_IMPROVE_RECURRENCE": "1"})
     assert r1.returncode == 0, r1.stderr
-    lessons = os.path.join(home, ".config", "ai", "self_improve", "lessons.md")
-    assert os.path.exists(lessons)
-    assert "## MASTER" in open(lessons).read(), \
-        "chain should be promoted to MASTER after 2 recoveries: " + open(lessons).read()
+    lessons = state.lessons_render(limit=None)
+    assert "## MASTER" in lessons, \
+        "chain should be promoted to MASTER after 2 recoveries: " + lessons
     # RUN 2 (fresh process): the recap with the mastered chain must reach
     # the MODEL — assert on the captured system message, not the terminal.
     seq2 = [{"id": "b1", "type": "function",

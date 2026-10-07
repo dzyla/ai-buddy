@@ -103,7 +103,7 @@ def run_check(online=False, client_factory=None, env_applied=None, out=print):
                  f"set ZULIP_CONFIG={alt} or copy it to ~/.zuliprc.")
     if "ZULIP_API_KEY" in env_creds:
         warn("ZULIP_API_KEY is set in the environment; it gets copied into scheduled-task files "
-             "(~/.config/ai/scheduled_tasks). Prefer keeping the key only in the zuliprc file.")
+             "(the scheduled_tasks table of ~/.local/share/ai/state.db). Prefer keeping the key only in the zuliprc file.")
 
     # 3. construct the client (no network traffic)
     client = None

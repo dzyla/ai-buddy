@@ -1,4 +1,7 @@
-"""Conversation-history index (SQLite FTS over history.jsonl + saved sessions) and Zulip chat logs."""
+"""Conversation-history index (SQLite FTS over history.jsonl + saved sessions) and Zulip chat logs.
+
+history_index.db is a derived, rebuildable CACHE (rebuild_history_index), not state; durable state
+lives in the state db (aitools/state.py), whose `sessions` table is updated as files are indexed."""
 import os
 import json
 import re
@@ -202,6 +205,8 @@ def _index_session_file(conn, path):
         return row is not None  # keep archive copy if the file is mid-rewrite
     body, last_user = _transcript_body(messages)
     _upsert_session_row(conn, sid, content, body, last_user, len(messages), st.st_size, st.st_mtime)
+    from .sessions import record_session  # sessions index in the state db (this file is a cache)
+    record_session(sid, path=path, ended=st.st_mtime, summary=last_user)
     return True
 
 

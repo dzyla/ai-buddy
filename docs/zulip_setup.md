@@ -406,6 +406,6 @@ Start with `python3 zulip_ai_bridge.py --check --online`, then read
 
 | Path | Contents |
 |---|---|
-| `~/.local/share/ai/zulip_chats.jsonl`, `~/.cache/ai/zulip_chats.jsonl` | One summary line per conversation. |
+| `chat_audit` table in `~/.local/share/ai/state.db` | One summary row per conversation (kept 90 days; the old `zulip_chats.jsonl` files are imported once and renamed `*.migrated.bak`). |
 | `~/.local/share/ai/zulip_chats/<id>.json` | Full record of each conversation: prompt, output, stderr. |
 | `~/.cache/zulip_ai_uploads/` | Downloaded attachments, pruned after 7 days. |

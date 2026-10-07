@@ -24,6 +24,8 @@ import urllib.request
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+from aitools import state  # noqa: E402
 AI_BIN = os.path.join(REPO, "ai")
 MOCK = os.path.join(REPO, "tests", "mock_llm_server.py")
 PORT = 8813
@@ -101,16 +103,13 @@ def test_binary_learns_from_tool_error_across_sessions():
     # RUN 1: error then success -> should write ledger + PITFALL + FIX.
     r1 = _run_agent(home, _make_seq(missing, ok_file), missing, ok_file)
     assert r1.returncode == 0, r1.stderr
-    ledger = os.path.join(home, ".config", "ai", "self_improve", "ledger.jsonl")
-    lessons = os.path.join(home, ".config", "ai", "self_improve", "lessons.md")
-    assert os.path.exists(ledger), "ledger.jsonl not written by harness"
-    with open(ledger) as f:
-        kinds = [json.loads(l)["kind"] for l in f if l.strip()]
+    # the binary inherits $AI_STATE_DB (conftest), so the state API reads what it wrote
+    kinds = [r["kind"] for r in state.ledger_rows()]
+    assert kinds, "ledger not written by harness"
     assert "failure" in kinds
     assert "recovery" in kinds, "harness did not auto-record the recovery/fix"
-    with open(lessons) as f:
-        txt = f.read()
-    assert "## PITFALL " in txt and "## FIX " in txt, lessons
+    txt = state.lessons_render(limit=None)
+    assert "## PITFALL " in txt and "## FIX " in txt, txt
 
     # RUN 2: same error again (fresh process, same HOME)
     # -> the harness must surface the lesson learned in RUN 1.

@@ -1,5 +1,21 @@
-"""Message trimming (trim-messages) and resume transcripts (session-transcript)."""
+"""Message trimming (trim-messages), resume transcripts (session-transcript) and the sessions
+index (state db `sessions` table)."""
 import json
+
+from . import state
+
+
+def record_session(session_id, path=None, ended=None, summary=None, started=None):
+    """Upsert one row of the sessions index (id, started, ended, path, summary). Called when the
+    history indexer (re)indexes a saved session file; never raises."""
+    if not session_id or session_id == "last":
+        return False
+    try:
+        state.session_upsert(session_id, started=started, ended=ended, path=path,
+                             summary=(summary or "")[:300] or None)
+        return True
+    except Exception:
+        return False
 
 # ── Context trimming (called by ai.c when messages_json exceeds the budget) ──
 # Internal steering messages ai.c injects as role=user; never the real task.

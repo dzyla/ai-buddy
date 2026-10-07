@@ -342,7 +342,7 @@ class MessageHandlerMixin:
                 f"- **Permission Mode:** `{mode}`\n"
                 f"- **Configured Model:** `{model}`\n"
                 f"- **Task Timeout:** `{to}s`\n"
-                f"- **Memory Log:** `~/.local/share/ai/zulip_chats.jsonl`\n"
+                f"- **Memory Log:** `chat_audit` table in `~/.local/share/ai/state.db`\n"
                 f"*(Use `/debug` for server health or `/history` for recent chat logs)*"
             )
             return

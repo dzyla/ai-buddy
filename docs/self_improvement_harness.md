@@ -14,11 +14,13 @@ persisted — no cross-session memory, no remembering of the fix.
 ## What I implemented (all local, no external service)
 
 ### 1. Automatic failure ledger + lesson store (`ai_mcp.py`)
-New persistent state under `~/.config/ai/self_improve/`:
-- `ledger.jsonl` — every tool failure and every recovery, with a normalized
+Persistent state (since the state-store migration: tables in `~/.local/share/ai/state.db`,
+`aitools/state.py`; the old `~/.config/ai/self_improve/` files are imported once and renamed
+`*.migrated.bak`):
+- `ledger` (was `ledger.jsonl`) — every tool failure and every recovery, with a normalized
   `signature` (tool + error text, numbers/paths collapsed) so the SAME mistake is
   recognized across sessions even when paths/ids differ.
-- `lessons.md` — human-readable, curated-ish lessons: `## PITFALL` (recurring
+- `lessons` (was `lessons.md`; rendered as the same markdown blocks) — human-readable, curated-ish lessons: `## PITFALL` (recurring
   failures, auto-promoted) and `## FIX` (error → working approach).
 
 Functions: `record_failure`, `record_recovery`, `lessons_for`, `self_improve_status`,

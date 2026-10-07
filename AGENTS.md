@@ -274,7 +274,7 @@ globally to every request while the process is running:
 - **Interactive Feedback:** reacts with Zulip emojis (`thought_balloon` on pickup, `hourglass_flowing_sand` during server/model load, `white_check_mark` on success, `warning` on failure) and sends typing status indicators.
 - **Inference Server Watchdog:** automatically verifies `/health` before dispatching. If the llama server socket is failed or inactive, restarts `llama-server.socket` and polls until the model finishes loading (up to 45s) instead of failing with a 33s timeout.
 - **Permission mode:** defaults to `auto` (full autonomy) over Zulip — the bot investigates AND executes. Override with `BRIDGE_AI_MODE=plan|manual` for restricted access. The bridge is already gated to the owner via `ZULIP_USER` / detected owner, so auto is safe here and actually useful (plan mode over Zulip just posts plans and halts — no interactive approve flow).
-- **Zulip Chat Memory & Audit Log:** every interaction is persistently recorded in `~/.local/share/ai/zulip_chats.jsonl` (and `~/.cache/ai/zulip_chats.jsonl`) with full session JSON in `~/.local/share/ai/zulip_chats/<session_id>.json`. Captures query, context, duration, returncode, stdout/stderr, and fallbacks.
+- **Zulip Chat Memory & Audit Log:** every interaction is persistently recorded in the `chat_audit` table of `~/.local/share/ai/state.db` (90-day retention) with full session JSON in `~/.local/share/ai/zulip_chats/<session_id>.json`. Captures query, context, duration, returncode, stdout/stderr, and fallbacks.
 - **Built-in slash commands:**
   - `/help` — list available bridge commands and mention rules
   - `/ping` — liveness check + active model + server URL

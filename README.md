@@ -455,7 +455,7 @@ ai "what's my name?"   # recalled in a fresh session
 | `write_file` | Write a file, creating parent dirs as needed |
 | `edit_file` | Search-and-replace edit; fuzzy-matches trailing whitespace |
 | `list_directory` | Directory listing with sizes |
-| `save_memory` | Persist text to `~/.config/ai/memory.txt` (4 KB cap) |
+| `save_memory` | Persist text to the `memory` table of `~/.local/share/ai/state.db` (4 KB cap) |
 | `delegate_task` | Spawn a child `ai` process for independent sub-tasks |
 | `computer_control` | Screenshot, mouse, keyboard via xdotool/scrot |
 | `task_complete` | Signal completion; `summary` rendered as markdown |
@@ -508,7 +508,7 @@ For complete configuration instructions, bot creation, and setting up the system
 | Path | Purpose |
 |------|---------|
 | `~/.local/share/ai/env` | Active backend config (INFER_* vars) |
-| `~/.config/ai/memory.txt` | Persistent memory, injected into every prompt |
+| `~/.local/share/ai/state.db` | SQLite state store: persistent memory (injected into every prompt), lessons, failure ledger, scheduled tasks, sessions index, Zulip chat audit |
 | `~/.config/ai/mcp.json` | Global MCP server registry |
 | `~/.config/ai/skills/` | Global skills directory |
 | `~/.cache/ai/history.jsonl` | Append-only job log |

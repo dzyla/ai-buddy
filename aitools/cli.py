@@ -15,13 +15,14 @@ from .browser import _browser_daemon_main
 from .history import HISTORY_DB, _ensure_history_schema, _prune_cache_sessions, get_zulip_chat, search_zulip_chats
 from .mcp_client import list_tools, load_config
 from .memory import recall, remember
-from .metrics import count_tokens, log_metric, show_metrics
+from .metrics import classify_tool_output, count_tokens, log_metric, show_metrics
 from .registry import CORE_TOOL_PROFILE, TOOL_SCHEMAS, invoke, prepare, repair_json, EMPTY_TOOL_NAME_ERROR
 from .render import render_markdown
 from .scheduler import run_scheduler_loop
 from .selfimprove import (lessons_for, metrics_lesson_sync, record_failure, record_recovery, self_improve_status,
                           session_recap)
 from .sessions import session_transcript, trim_messages
+from . import state
 
 
 def main(argv=None):
@@ -146,6 +147,36 @@ def _main(argv):
 
     if action == "session-recap":
         print(session_recap(), end="")
+        sys.exit(0)
+
+    # ── State store (aitools/state.py) ──
+    if action == "state-export":
+        # ai.c reads the persistent memory (and the scheduled-task countdown) through this.
+        what = argv[2] if len(argv) > 2 else ""
+        try:
+            if what == "memory":
+                out = state.memory_render()
+            elif what == "lessons":
+                out = state.lessons_render()
+            elif what == "tasks":
+                out = "\n".join("%s\t%d\t%s" % (tid, int(nr or 0), kind or "")
+                                for tid, nr, kind in state.task_rows())
+            else:
+                print("Usage: ai_mcp.py state-export memory|lessons|tasks", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"state-export failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        if out:
+            print(out)
+        sys.exit(0)
+
+    if action == "state-migrate":
+        print(json.dumps(state.migrate_legacy(argv[2] if len(argv) > 2 else None)))
+        sys.exit(0)
+
+    if action == "state-stats":
+        print(json.dumps(state.stats(), indent=2))
         sys.exit(0)
 
     if action == "zulip-history":
@@ -360,18 +391,7 @@ def _call_tool(argv, mcp_servers):
             sys.stdout = _real_out
         except Exception:
             pass
-        out = _buf.getvalue()
-        head = out.lstrip()[:200]
-        success = True
-        err = None
-        if _crashed["v"]:
-            success = False
-            err = "uncaught exception in tool"
-        elif (head.startswith("Error") or head.startswith('{"error"')
-                or "failed (exit" in out or "[SYSTEM WARNING:" in out
-                or "[Command Failed" in out):
-            success = False
-            err = head
+        success, err = classify_tool_output(_buf.getvalue(), crashed=_crashed["v"])
         try:
             log_metric(tool_name, (time.time() - _t0) * 1000,
                        success=success, error=err)

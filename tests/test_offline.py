@@ -614,26 +614,29 @@ def test_small_ctx_caps_tool_output(tmp_path):
 
 
 # ── save_memory ──
-def test_save_memory_appends_dedups_and_evicts(tmp_path, monkeypatch):
-    mem = tmp_path / "memory.txt"
-    monkeypatch.setattr(ai_mcp, "MEMORY_PATH", str(mem))
+def test_save_memory_appends_dedups_and_evicts():
+    # memory lives in the state db ($AI_STATE_DB from conftest); read it back through the API
+    from aitools import state
+
+    def mem():
+        return "\n".join(state.memory_list())
     ai_mcp.save_memory("User prefers metric units")
     ai_mcp.save_memory("Lab server is gpu-box")
-    text = mem.read_text()
+    text = mem()
     assert "metric units" in text and "gpu-box" in text, "second save erased the first"
     r = ai_mcp.save_memory("user prefers metric units")
     assert "no duplicate" in r
-    assert mem.read_text().lower().count("metric units") == 1
+    assert mem().lower().count("metric units") == 1
     for i in range(80):
         ai_mcp.save_memory("fact number %03d " % i + "p" * 60)
-    text = mem.read_text()
+    text = mem()
     assert len(text) <= ai_mcp.MEMORY_CAP + 1
     assert "fact number 079" in text            # newest kept
     assert "metric units" not in text            # oldest whole lines evicted
     for line in text.splitlines():               # never a mid-line cut
         assert line.startswith("fact number") or line == ""
     ai_mcp.save_memory("only this", replace=True)
-    assert mem.read_text().strip() == "only this"
+    assert mem().strip() == "only this"
 
 
 # ── self-improvement ──
@@ -693,9 +696,8 @@ def test_binary_loop_guard_does_not_poison_lessons(tmp_path):
     with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
         r = _sandbox_run(tmp_path, srv.base_url, ["list"])
     assert r.returncode == 0, r.stderr[-2000:]
-    lessons = tmp_path / "home" / ".config" / "ai" / "self_improve" / "lessons.md"
-    text = lessons.read_text() if lessons.exists() else ""
-    assert "stuck in a loop" not in text
+    from aitools import state
+    assert "stuck in a loop" not in state.lessons_render(status=None, limit=None)
 
 
 def test_binary_records_failure_with_huge_output(tmp_path):
@@ -708,8 +710,8 @@ def test_binary_records_failure_with_huge_output(tmp_path):
     with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
         r = _sandbox_run(tmp_path, srv.base_url, ["run it"])
     assert r.returncode == 0, r.stderr[-2000:]
-    ledger = tmp_path / "home" / ".config" / "ai" / "self_improve" / "ledger.jsonl"
-    assert ledger.exists() and '"execute_command"' in ledger.read_text()
+    from aitools import state
+    assert "execute_command" in {r["tool"] for r in state.ledger_rows()}
 
 
 def test_task_timeout_forces_exactly_one_more_iteration(tmp_path):

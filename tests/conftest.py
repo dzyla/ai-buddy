@@ -34,3 +34,13 @@ def isolate_trader_state(tmp_path, monkeypatch):
     if hasattr(rt, "TRADING_HOLD_FILE"):
         monkeypatch.setattr(rt, "TRADING_HOLD_FILE", str(cfg / "trading_hold.txt"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_state_db(tmp_path, monkeypatch):
+    """Point the SQLite state store (aitools/state.py) at a per-test file.
+
+    With $AI_STATE_DB set, state.connect() never runs the lazy legacy migration, so no test can
+    import from (or rename files in) the real HOME. Subprocesses inherit the variable."""
+    monkeypatch.setenv("AI_STATE_DB", str(tmp_path / "state.db"))
+    yield

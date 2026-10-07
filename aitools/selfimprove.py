@@ -3,6 +3,7 @@ import os
 import json
 import time
 import sqlite3
+from . import state
 from .history import (  # noqa: F401
     HISTORY_DB,
     _ensure_history_schema,
@@ -130,23 +131,17 @@ def list_skills_dir():
 # ── Automatic failure-learning ledger ────────────────────────────────────────
 # The C harness records tool failures deterministically, without relying on the
 # model choosing to persist anything. This solves "the agent makes the same
-# mistake twice and doesn't remember making it." Every failure goes to a JSONL
-# ledger; recurring signatures auto-promote to a lessons.md entry; when a tool
+# mistake twice and doesn't remember making it." Every failure goes to the
+# state-db `ledger` table; recurring signatures auto-promote to a `lessons` row
+# (rendered as the old lessons.md markdown blocks); when a tool
 # that previously failed later succeeds, the working approach is auto-learned
 # as a FIX lesson. On a future error, `lessons_for` returns the stored lessons
 # so the harness can surface the memory right where the model needs it.
 import re as _re
 
 def _si_dir():
-    d = os.path.join(os.path.expanduser("~"), ".config", "ai", "self_improve")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _ledger_path():
-    return os.path.join(_si_dir(), "ledger.jsonl")
-
-def _lessons_path():
-    return os.path.join(_si_dir(), "lessons.md")
+    """Legacy location of ledger.jsonl/lessons.md (migrated into the state db; not written)."""
+    return os.path.join(os.path.expanduser("~"), ".config", "ai", "self_improve")
 
 def _si_recurrence_threshold():
     raw = os.environ.get("INFER_SELF_IMPROVE_RECURRENCE", "2")
@@ -166,23 +161,10 @@ def _err_signature(tool, error):
     return s
 
 def _ledger_signature_count(signature):
-    n = 0
-    if os.path.isfile(_ledger_path()):
-        try:
-            with open(_ledger_path(), encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except Exception:
-                        continue
-                    if rec.get("signature") == signature:
-                        n += 1
-        except Exception:
-            pass
-    return n
+    try:
+        return state.ledger_count(signature=signature)
+    except Exception:
+        return 0
 
 def _block_tool(block):
     for line in block.splitlines():
@@ -196,18 +178,10 @@ def _has_lesson(kind, tool, signature):
     whole-file check ('any ## KIND exists' AND 'tool: X appears anywhere')
     meant that after the first lesson for a tool, no further distinct
     lesson for that tool was ever written — learning silently saturated."""
-    kind = (kind or "").upper()
-    sig = (signature or "").strip().lower()
-    t = (tool or "").strip().lower()
-    for b in _lesson_blocks():
-        if not b.startswith("## %s " % kind):
-            continue
-        if sig:
-            if _block_signature(b) == sig:
-                return True
-        elif t and _block_tool(b) == t:
-            return True
-    return False
+    try:
+        return state.lesson_exists(kind, tool=tool, signature=signature)
+    except Exception:
+        return True  # state db unusable: claim it exists so nothing tries to write a lesson
 
 # Errors the HARNESS itself produced (loop guards, caches, budget/plan gates,
 # context stubs). They describe the agent's control flow, not a tool's
@@ -226,32 +200,24 @@ def _is_harness_error(error):
     e = error or ""
     return any(m.lower() in e.lower() for m in _SI_HARNESS_ERROR_MARKERS)
 
-_SI_LEDGER_MAX_LINES = 5000
+_SI_LEDGER_MAX_LINES = state.LEDGER_MAX_ROWS
 
 def _ledger_append(rec):
-    """Append one record; keep the ledger bounded (it is re-read on every
-    failure/recovery, and grew without limit)."""
-    path = _ledger_path()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec) + "\n")
-    try:
-        if os.path.getsize(path) > _SI_LEDGER_MAX_LINES * 400:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            if len(lines) > _SI_LEDGER_MAX_LINES:
-                tmp = path + ".tmp.%d" % os.getpid()
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.writelines(lines[-(_SI_LEDGER_MAX_LINES * 8 // 10):])
-                os.replace(tmp, path)
-    except Exception:
-        pass
+    """Append one ledger record (dict in the old JSONL shape) to the state db; the store keeps
+    the ledger bounded at _SI_LEDGER_MAX_LINES rows."""
+    kind = rec.get("kind") or "failure"
+    state.ledger_append(tool=rec.get("tool", ""), ok=(kind == "recovery"),
+                        error=rec.get("error") or rec.get("prior_error") or "",
+                        chain_id=rec.get("chain_id", ""),
+                        args=rec.get("args") or rec.get("approach") or "",
+                        kind=kind, signature=rec.get("signature", ""), phase=rec.get("phase", ""),
+                        max_rows=_SI_LEDGER_MAX_LINES)
 
 def _append_lesson(kind, tool, signature, body):
-    path = _lessons_path()
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\n## %s %s\ntool: %s\nsignature: %s\n> %s\n"
-                % (kind, ts, (tool or ""), (signature or ""), body))
+    try:
+        state.lesson_upsert(kind, tool or "", signature or "", body)
+    except Exception:
+        pass  # learning is best-effort; never break the tool call that triggered it
 
 def _chain_id(tool, error):
     """Stable id for an ERROR CHAIN: the same mistake, however many times it
@@ -259,22 +225,12 @@ def _chain_id(tool, error):
     failure -> recovery -> (repeat) -> promotion to a permanent lesson."""
     return "chain_" + _err_signature(tool, error)[:80].replace(" ", "_")
 
-def _read_ledger():
-    recs = []
-    if os.path.isfile(_ledger_path()):
-        try:
-            with open(_ledger_path(), encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        recs.append(json.loads(line))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return recs
+def _read_ledger(chain_id=None):
+    """Ledger rows (dicts: ts, kind, tool, chain_id, signature, error, ok, args_hash, phase)."""
+    try:
+        return state.ledger_rows(chain_id=chain_id)
+    except Exception:
+        return []
 
 def record_failure(tool="", args="", error="", phase="execution", chain_id=None):
     """Record a failed tool call in the ledger, linked to its error chain.
@@ -291,8 +247,7 @@ def record_failure(tool="", args="", error="", phase="execution", chain_id=None)
         return False, ""
     sig = _err_signature(tool, error)
     cid = chain_id or _chain_id(tool, error)
-    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-           "kind": "failure", "tool": tool,
+    rec = {"kind": "failure", "tool": tool,
            "args": (args or "")[:200], "error": error[:300],
            "signature": sig, "chain_id": cid, "phase": phase}
     try:
@@ -334,9 +289,8 @@ def record_recovery(tool="", args="", prior_error="", phase="execution", chain_i
         return ""
     sig = _err_signature(tool, prior_error)
     cid = chain_id or _chain_id(tool, prior_error)
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
-        _ledger_append({"ts": ts, "kind": "recovery", "tool": tool,
+        _ledger_append({"kind": "recovery", "tool": tool,
                         "approach": args[:200],
                         "prior_error": prior_error[:300],
                         "signature": sig, "chain_id": cid,
@@ -375,9 +329,7 @@ def _master_skill_note(tool, chain_id, prior_error, approach):
 def _chain_stats(chain_id):
     """Count failures/recoveries of one error chain from the ledger."""
     st = {"failures": 0, "recovered": 0, "last_event": ""}
-    for rec in _read_ledger():
-        if rec.get("chain_id") != chain_id:
-            continue
+    for rec in _read_ledger(chain_id=chain_id):
         if rec.get("kind") == "failure":
             st["failures"] += 1
             st["last_event"] = "failure"
@@ -414,23 +366,12 @@ def _sig_error_tokens(sig, tool=""):
     return set(sig.split()) - tool_words - {"error", "failed", "the", "a", "an"}
 
 def _lesson_blocks():
-    if not os.path.isfile(_lessons_path()):
-        return []
+    """Approved, unexpired lessons as markdown blocks ('## KIND ts / tool: / signature: / > body'),
+    oldest first — the shape lessons_for/session_recap match on."""
     try:
-        with open(_lessons_path(), encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        return [state.lesson_block(r) for r in state.lessons_list(status="approved")]
     except Exception:
         return []
-    blocks, cur = [], []
-    for line in content.splitlines():
-        if line.startswith("## "):
-            if cur:
-                blocks.append("\n".join(cur))
-                cur = []
-        cur.append(line)
-    if cur:
-        blocks.append("\n".join(cur))
-    return [b for b in blocks if b.strip()]
 
 def lessons_for(tool="", error=""):
     """Return persisted lessons relevant to a tool name / error signature.
@@ -648,19 +589,16 @@ def self_improve_status():
             st["failures"] += 1
         else:
             st["recovered"] += 1
-    lessons = ""
-    if os.path.isfile(_lessons_path()):
-        try:
-            with open(_lessons_path(), encoding="utf-8") as f:
-                lessons = f.read()
-        except Exception:
-            lessons = ""
-    lines = ["Self-improvement state (%s):" % _si_dir(),
+    try:
+        lessons = state.lessons_render(status=None, limit=None)
+    except Exception:
+        lessons = ""
+    lines = ["Self-improvement state (%s):" % state.db_path(),
              "- failures recorded : %d" % nfail,
              "- recoveries recorded: %d" % nrec,
              "- error chains       : %d" % len(chains),
              "- mastered chains    : %d" % sum(1 for c in chains if _chain_is_mastered(c)),
-             "- lessons.md         : %s" % _lessons_path(),
+             "- lessons            : %d (state db `lessons` table)" % len(_lesson_blocks()),
              "- recurrence threshold: %d (INFER_SELF_IMPROVE_RECURRENCE)" % _si_recurrence_threshold(),
              "- mastered threshold  : %s (INFER_CHAIN_MASTERED)" % os.environ.get("INFER_CHAIN_MASTERED", "2")]
     for cid, st in sorted(chains.items()):
@@ -668,6 +606,6 @@ def self_improve_status():
         lines.append("  - %s %s: %d fail / %d recovered%s"
                      % (st["tool"], cid, st["failures"], st["recovered"], flag))
     if lessons.strip():
-        lines.append("--- lessons.md ---")
+        lines.append("--- lessons ---")
         lines.append(lessons.strip())
     return "\n".join(lines)

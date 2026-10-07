@@ -10,10 +10,10 @@ skill system so future sessions — including your own — start from today's di
 This is how the harness improves over time.
 
 ## How the harness learns automatically (you don't have to opt in)
-Every tool failure is recorded to `~/.config/ai/self_improve/ledger.jsonl`, linked to an
+Every tool failure is recorded in the failure ledger (`ledger` table of `~/.local/share/ai/state.db`), linked to an
 **error chain** — a stable id for that one mistake, however many times it recurs. When the
 SAME failure signature is seen repeatedly, an auto-generated "recurring pitfall" (PITFALL)
-lesson is persisted to `lessons.md`. When a tool that failed earlier in a task later
+lesson is persisted to the `lessons` table. When a tool that failed earlier in a task later
 SUCCEEDS, the working approach is auto-learned as a FIX lesson in the SAME chain. Once a
 chain has been recovered ≥ INFER_CHAIN_MASTERED times (default 2) and hasn't failed since,
 it is promoted to a MASTER lesson. A new failure on a mastered chain de-masters it until

@@ -15,6 +15,7 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from aitools import state  # noqa: E402
 
 # These integrations depend on optional third-party libs; skip cleanly if absent.
 pytest.importorskip("googleapiclient")
@@ -568,11 +569,10 @@ def test_deliver_reminder_sends_to_stream(monkeypatch):
     assert sent["topic"] == "food"
 
 
-def test_set_reminder_persists_task_file(monkeypatch, tmp_path):
-    """End-to-end through the real schedule_task: the reminder is written to a
-    task file with kind=reminder and run_once, and NO background process spawns
-    (Popen is stubbed)."""
-    import json
+def test_set_reminder_persists_task(monkeypatch, tmp_path):
+    """End-to-end through the real schedule_task: the reminder is stored as a
+    scheduled_tasks row (state db) with kind=reminder and run_once, and NO
+    background process spawns (Popen is stubbed)."""
     import subprocess
     monkeypatch.setenv("HOME", str(tmp_path))
     spawned = []
@@ -581,9 +581,9 @@ def test_set_reminder_persists_task_file(monkeypatch, tmp_path):
     out = ai_mcp.set_reminder(message="water the plants", delay_seconds=3600,
                               zulip_to="me@x.com", task_id="rem_test")
     assert "Reminder set" in out
-    task_file = tmp_path / ".config" / "ai" / "scheduled_tasks" / "rem_test.json"
-    assert task_file.exists()
-    data = json.loads(task_file.read_text())
+    data = state.task_get("rem_test")
+    assert data is not None
+    assert [r[0] for r in state.task_rows()] == ["rem_test"]
     assert data["kind"] == "reminder"
     assert data["message"] == "water the plants"
     assert data["zulip_to"] == "me@x.com"
@@ -595,15 +595,12 @@ def test_set_reminder_persists_task_file(monkeypatch, tmp_path):
 def test_scheduler_loop_delivers_reminder(monkeypatch, tmp_path):
     """Drive the real run_scheduler_loop reminder branch: a zero-delay run_once
     reminder task must call _deliver_reminder exactly once and then exit."""
-    import json
     monkeypatch.setenv("HOME", str(tmp_path))
-    task_dir = tmp_path / ".config" / "ai" / "scheduled_tasks"
-    task_dir.mkdir(parents=True)
-    (task_dir / "rem_fire.json").write_text(json.dumps({
+    state.task_put("rem_fire", {
         "task_id": "rem_fire", "prompt": "[reminder]", "interval_seconds": 0,
         "run_once": True, "kind": "reminder", "message": "stretch",
         "zulip_to": "me@x.com", "env": {},
-    }))
+    })
     delivered = []
     monkeypatch.setattr(ai_mcp, "_deliver_reminder",
                         lambda td: delivered.append(td) or "sent")
@@ -612,4 +609,4 @@ def test_scheduler_loop_delivers_reminder(monkeypatch, tmp_path):
 
     assert len(delivered) == 1
     assert delivered[0]["message"] == "stretch"
-    assert not (task_dir / "rem_fire.json").exists()  # run_once cleaned up
+    assert state.task_get("rem_fire") is None  # run_once cleaned up

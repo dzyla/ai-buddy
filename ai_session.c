@@ -50,49 +50,31 @@ static char* append_message(char *messages_json, const char *msg_to_append) {
     return messages_json;
 }
 
-char* read_memory_file(void) {
-    char *home = getenv("HOME");
-    if (!home) return NULL;
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/.config/ai/memory.txt", home);
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        snprintf(path, sizeof(path), "%s/.local/share/ai/memory.json", home);
-        fp = fopen(path, "r");
+/* Persistent memory now lives in the SQLite state store (aitools/state.py); it is read through
+   `ai_mcp.py state-export memory` (newest whole lines, <= 4 KB) and cached for the life of the
+   process. refresh=1 re-reads it (the :memory command, after save_memory in this session).
+   Returns a malloc'd copy, or NULL when there is no memory. */
+char* read_memory_file(const char *mcp_script, int refresh) {
+    static char *cache = NULL;
+    static int loaded = 0;
+    if (!mcp_script || !*mcp_script) return NULL;
+    if (!loaded || refresh) {
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), "python3 %s state-export memory 2>/dev/null", mcp_script);
+        char *out = run_shell_command(cmd, NULL);
+        free(cache);
+        cache = NULL;
+        if (out) {
+            size_t n = strlen(out);
+            while (n > 0 && isspace((unsigned char)out[n - 1])) out[--n] = '\0';
+            char *p = out;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p) cache = strdup(out);
+            free(out);
+        }
+        loaded = 1;
     }
-    if (!fp) return NULL;
-    
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    if (size <= 0 || size > 65536) {
-        fclose(fp);
-        return NULL;
-    }
-    
-    char *buf = malloc(size + 1);
-    if (!buf) {
-        fclose(fp);
-        return NULL;
-    }
-    
-    size_t read_bytes = fread(buf, 1, size, fp);
-    buf[read_bytes] = '\0';
-    fclose(fp);
-
-    /* Basic validation */
-    char *p = buf;
-    while (*p && isspace((unsigned char)*p)) p++;
-    if (!*p) {
-        free(buf);
-        return NULL;
-    }
-    if (strstr(path, ".json") && *p != '{' && *p != '[') {
-        free(buf);
-        return NULL;
-    }
-    return buf;
+    return cache ? strdup(cache) : NULL;
 }
 
 char* load_system_prompt(void) {

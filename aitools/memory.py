@@ -5,6 +5,8 @@ import re
 import time
 import sqlite3
 
+from . import state
+
 VAULT_DIR = os.path.expanduser("~/.config/ai/vault")
 
 # --- Helper functions for improvements ---
@@ -54,45 +56,39 @@ def search_context(query):
     return "\n".join(results)
 
 
+# Legacy locations, kept only as names: memory.txt and memory.db are imported into the state store
+# (aitools/state.py) by its one-time migration and renamed to *.migrated.bak. Nothing reads them.
 MEMORY_PATH = os.path.expanduser("~/.config/ai/memory.txt")
 MEMORY_DB = os.path.expanduser("~/.config/ai/memory.db")
 
 MEMORY_CAP = 4000
 
+
+def _state_conn():
+    """The state db: the `memories` (remember/recall) and `vault_fts` FTS tables live there now."""
+    return state.connect()
+
+
 def save_memory(content, replace=False):
     """Add facts to persistent memory (injected into every system prompt).
 
-    Appends by default — this used to open the file with "w", so every call
-    silently erased everything saved before it. Lines already present are not
-    duplicated; when the 4 KB cap is exceeded the OLDEST whole lines are evicted
-    (never a mid-line cut) and the result says so. replace=True rewrites."""
+    Appends by default. Lines already present (case-insensitive) are not duplicated; when the
+    4 KB cap is exceeded the OLDEST whole lines are evicted (never a mid-line cut) and the result
+    says so. replace=True rewrites. Stored in the state db's `memory` table."""
     try:
-        os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
         new_lines = [l.rstrip() for l in str(content or "").splitlines() if l.strip()]
         if not new_lines:
             return "Error: save_memory needs non-empty content."
-        old_lines = []
-        if not replace and os.path.isfile(MEMORY_PATH):
-            with open(MEMORY_PATH, encoding="utf-8", errors="replace") as f:
-                old_lines = [l.rstrip() for l in f.read().splitlines() if l.strip()]
-        seen = {l.strip().lower() for l in old_lines}
-        added = []
-        for l in new_lines:
-            k = l.strip().lower()
-            if k not in seen:
-                seen.add(k)
-                added.append(l)
-        lines = old_lines + added
-        evicted = []
-        while lines and len("\n".join(lines)) > MEMORY_CAP:
-            if len(lines) == 1:
-                lines[0] = lines[0][:MEMORY_CAP]
-                break
-            evicted.append(lines.pop(0))
-        tmp = MEMORY_PATH + ".tmp.%d" % os.getpid()
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        os.replace(tmp, MEMORY_PATH)
+        conn = state.connect()
+        try:
+            with state.transaction(conn):
+                if replace:
+                    state.memory_clear(conn=conn)
+                added = [l for l in new_lines if state.memory_add(l, conn=conn) == "added"]
+                evicted = state.memory_evict(MEMORY_CAP, conn=conn)
+                lines = state.memory_list(conn=conn)
+        finally:
+            conn.close()
         if not added and not replace:
             return "Memory already contains that (no duplicate added)."
         msg = "Memory updated successfully (%d line(s) added, %d/%d chars used)." % (
@@ -156,8 +152,7 @@ def vault_write(title, content, links=""):
             f.write(full_content)
             
         # Update SQLite index
-        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
-        conn = sqlite3.connect(MEMORY_DB)
+        conn = _state_conn()
         _ensure_vault_schema(conn)
         conn.execute("DELETE FROM vault_fts WHERE title = ?", (title,))
         conn.execute("INSERT INTO vault_fts(title, content) VALUES (?, ?)", (title, full_content))
@@ -181,8 +176,7 @@ def vault_read(title):
 
 def vault_search(query):
     try:
-        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
-        conn = sqlite3.connect(MEMORY_DB)
+        conn = _state_conn()
         _ensure_vault_schema(conn)
         
         words = re.findall(r"\w+", query)
@@ -226,8 +220,7 @@ def vault_backlinks(title):
     try:
         if title.endswith(".md"):
             title = title[:-3] # Remove .md for backlink search
-        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
-        conn = sqlite3.connect(MEMORY_DB)
+        conn = _state_conn()
         _ensure_vault_schema(conn)
         # Search for [[title]] using exact phrase match
         safe_query = f'"{title}"' 
@@ -249,8 +242,7 @@ def vault_backlinks(title):
 def remember(content, metadata=""):
     """Save a piece of information to the FTS5 memory database with optional metadata."""
     try:
-        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
-        conn = sqlite3.connect(MEMORY_DB)
+        conn = _state_conn()
         _ensure_memories_schema(conn)
         if len(content) > 4000:
             content = content[-4000:]
@@ -270,8 +262,7 @@ def remember(content, metadata=""):
 def recall(query):
     """Search memories using FTS5 full-text search with fallback to LIKE search."""
     try:
-        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
-        conn = sqlite3.connect(MEMORY_DB)
+        conn = _state_conn()
         _ensure_memories_schema(conn)
         
         # Extract alphanumeric words for safe FTS query

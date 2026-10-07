@@ -11,6 +11,7 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from aitools import state  # noqa: E402
 
 
 @pytest.fixture
@@ -41,10 +42,9 @@ def test_failure_then_recurrence_creates_pitfall(si):
     ok, lesson2 = si.record_failure("read_file", '{"path":"/b/2.txt"}', "No such file or directory: f2.txt")
     assert ok is True
     assert "[RECURRING FAILURE]" in lesson2
-    # ledger has 2 failure entries; lessons.md now has a PITFALL
-    ledger = open(si._ledger_path(), encoding="utf-8").read()
-    assert ledger.count('"kind": "failure"') == 2
-    lessons = open(si._lessons_path(), encoding="utf-8").read()
+    # ledger has 2 failure entries; the lessons table now has a PITFALL
+    assert state.ledger_count(kind="failure") == 2
+    lessons = state.lessons_render(limit=None)
     assert "## PITFALL" in lessons
 
 
@@ -54,7 +54,7 @@ def test_recovery_persists_fix_and_lessons_for_finds_it(si):
     si.record_failure("read_file", '{"path":"/nope2.txt"}', "No such file or directory: nope.txt")
     lesson = si.record_recovery("read_file", '{"path":"/real/data.txt"}', "No such file or directory: nope.txt")
     assert "succeeded" in lesson
-    lessons = open(si._lessons_path(), encoding="utf-8").read()
+    lessons = state.lessons_render(limit=None)
     assert "## FIX" in lessons
     # On a future error for the SAME tool, we surface the lessons.
     ret = si.lessons_for("read_file", "No such file or directory: whatever_789.txt")

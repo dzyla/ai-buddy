@@ -4,12 +4,22 @@ import os
 import json
 import time
 import logging
-import threading
 
 import requests
 
 from .config import load_env_file
 
+
+class _LazyState:
+    """aitools.state, imported on first use (aitools is installed beside zulip_bridge in
+    ~/.local/share/ai/lib; importing the bridge package alone must not require it)."""
+
+    def __getattr__(self, name):
+        from aitools import state as _state
+        return getattr(_state, name)
+
+
+state = _LazyState()
 
 logger = logging.getLogger("ZulipBridge")
 
@@ -18,23 +28,21 @@ logger = logging.getLogger("ZulipBridge")
 class ZulipMemoryManager:
     """
     Manages a durable audit trail and memory of Zulip conversations.
-    Records every incoming message, context, subprocess execution, stdout/stderr,
-    fallbacks used, delivered reply, duration, and status.
-    Provides querying and diagnostic tools.
+    Each exchange's summary record goes to the state db's `chat_audit` table (aitools/state.py,
+    90-day retention); the full per-chat record (context, stdout/stderr, fallbacks, reply) is
+    also written to <storage_dir>/<session_id>.json. Provides querying and diagnostic tools.
     """
+    OK_STATUSES = ("success", "stdout", "fallback_reasoning", "fallback_tools")
+
     def __init__(self, storage_dir=None):
         if storage_dir is None:
             self.storage_dir = os.path.expanduser("~/.local/share/ai/zulip_chats")
         else:
             self.storage_dir = storage_dir
-        self.jsonl_path = os.path.join(os.path.dirname(self.storage_dir), "zulip_chats.jsonl")
-        self.cache_jsonl_path = os.path.expanduser("~/.cache/ai/zulip_chats.jsonl")
         os.makedirs(self.storage_dir, exist_ok=True)
-        os.makedirs(os.path.dirname(self.cache_jsonl_path), exist_ok=True)
-        self._lock = threading.Lock()
 
     def record_chat(self, chat_data):
-        """Append a chat record atomically to memory files and write full session json."""
+        """Write the full session json and append a summary row to the chat audit."""
         session_id = chat_data.get("session_id")
         if not session_id:
             session_id = f"zulip_{int(time.time())}_{os.getpid()}"
@@ -48,7 +56,6 @@ class ZulipMemoryManager:
         except Exception as e:
             logger.warning(f"Failed to write detailed zulip chat session file: {e}")
 
-        # Write summary record to JSONL logs
         summary_record = {
             "session_id": session_id,
             "timestamp": chat_data.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S %Z")),
@@ -69,56 +76,35 @@ class ZulipMemoryManager:
             "extracted_reasoning": bool(chat_data.get("extracted_reasoning")),
             "fallback_used": chat_data.get("fallback_used")
         }
-
-        line = json.dumps(summary_record, ensure_ascii=False) + "\n"
-        with self._lock:
-            for p in (self.jsonl_path, self.cache_jsonl_path):
-                try:
-                    with open(p, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as e:
-                    logger.warning(f"Failed to append to {p}: {e}")
-
+        try:
+            state.chat_audit_add("zulip", summary_record["sender_email"], summary_record["query"],
+                                 (chat_data.get("response_delivered") or "")[:4000],
+                                 session_id=session_id, status=summary_record["status"],
+                                 meta=summary_record)
+        except Exception as e:
+            logger.warning(f"Failed to record zulip chat audit row: {e}")
         return session_id
 
+    @staticmethod
+    def _summary(row):
+        rec = dict(row.get("meta") or {})
+        rec.setdefault("session_id", row.get("session_id"))
+        rec.setdefault("query", row.get("prompt"))
+        rec.setdefault("sender_email", row.get("sender"))
+        rec.setdefault("status", row.get("status"))
+        rec.setdefault("reply_snippet", (row.get("reply") or "")[:200])
+        rec.setdefault("timestamp", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row.get("ts") or 0)))
+        return rec
+
     def get_recent(self, limit=10, error_only=False):
-        """Get recent chat records from the JSONL log."""
-        records = []
-        path = self.jsonl_path if os.path.exists(self.jsonl_path) else self.cache_jsonl_path
-        if not os.path.exists(path):
-            return records
+        """Most recent chat summary records, newest first."""
         try:
-            # The log grows forever; only read its tail (grow the window if
-            # it does not yet contain enough records).
-            lines = []
-            window = 256 * 1024
-            size = os.path.getsize(path)
-            while True:
-                with open(path, "rb") as f:
-                    f.seek(max(0, size - window))
-                    data = f.read()
-                lines = data.decode("utf-8", errors="replace").splitlines()
-                if size > window:
-                    lines = lines[1:]  # first line is probably partial
-                if size <= window or len(lines) >= limit * 4:
-                    break
-                window *= 4
-            for line in reversed(lines):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    if error_only and data.get("status") in ("success", "stdout", "fallback_reasoning", "fallback_tools"):
-                        continue
-                    records.append(data)
-                    if len(records) >= limit:
-                        break
-                except Exception:
-                    continue
+            rows = state.chat_audit_recent(limit=limit, source="zulip",
+                                           exclude_status=self.OK_STATUSES if error_only else ())
         except Exception as e:
             logger.error(f"Failed to read zulip chat history: {e}")
-        return records
+            return []
+        return [self._summary(r) for r in rows]
 
     def get_chat(self, session_id):
         """Retrieve the full record for a specific chat."""
@@ -129,10 +115,11 @@ class ZulipMemoryManager:
                     return json.load(f)
             except Exception:
                 pass
-        for r in self.get_recent(limit=100):
-            if r.get("session_id") == session_id:
-                return r
-        return None
+        try:
+            rows = state.chat_audit_recent(limit=1, session_id=session_id, source="zulip")
+        except Exception:
+            rows = []
+        return self._summary(rows[0]) if rows else None
 
     def get_diagnostics(self):
         """Compute diagnostic status of the bridge and recent chat health."""

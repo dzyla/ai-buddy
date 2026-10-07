@@ -3,6 +3,28 @@ import os
 import json
 import re as _re
 
+def classify_tool_output(out, crashed=False):
+    """(success, error) for one tool call from its printed output — the metric classification
+    used by `call-tool` (error markers mirror ai.c's own is_err detection, so the metrics and the
+    failure ledger agree). Reusable by in-process callers of registry.dispatch."""
+    out = out or ""
+    head = out.lstrip()[:200]
+    if crashed:
+        return False, "uncaught exception in tool"
+    if (head.startswith("Error") or head.startswith('{"error"')
+            or "failed (exit" in out or "[SYSTEM WARNING:" in out
+            or "[Command Failed" in out):
+        return False, head
+    return True, None
+
+
+def record_tool_metric(tool_name, duration_ms, out, crashed=False):
+    """Classify a tool's output and log the metric (no-op in private mode)."""
+    success, err = classify_tool_output(out, crashed)
+    log_metric(tool_name, duration_ms, success=success, error=err)
+    return success, err
+
+
 def log_metric(tool_name, duration_ms, success=True, error=None):
     if os.environ.get("INFER_PRIVATE_MODE") in ("1", "true"):
         return

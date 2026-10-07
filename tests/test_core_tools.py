@@ -20,6 +20,7 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from aitools import state  # noqa: E402
 
 
 @pytest.fixture
@@ -246,7 +247,7 @@ def test_metrics_lesson_sync_creates_pitfall(ai):
     ])
     created = ai._metrics_lesson_sync(min_fails=3)
     assert len(created) == 1
-    lessons = open(ai._lessons_path(), encoding="utf-8").read()
+    lessons = state.lessons_render(limit=None)
     assert "## PITFALL" in lessons
     assert "Metric-detected recurring failure" in lessons
     assert "fetch_webpage" in lessons
@@ -296,7 +297,7 @@ def test_master_promotion_writes_skill_note(ai, monkeypatch):
     monkeypatch.setenv("INFER_MASTER_SKILL_NOTE", "1")
     ai.record_failure("read_file", '{"path":"/x1"}', "No such file: x1")
     ai.record_recovery("read_file", '{"path":"/x2"}', "No such file: x1")
-    lessons = open(ai._lessons_path(), encoding="utf-8").read()
+    lessons = state.lessons_render(limit=None)
     assert "## MASTER" in lessons
     logp = ai._learning_log_path()
     assert os.path.exists(logp)
