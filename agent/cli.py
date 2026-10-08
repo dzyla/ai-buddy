@@ -98,22 +98,24 @@ class Budget:
     stub_explicit: bool = False
     max_tool_explicit: bool = False
 
+    TOOL_FLOOR, TOOL_CEIL = 4000, 262144
+
     def apply(self, context_window, tools_len):
-        """Derive tighter limits from a known context window (never looser, explicit values win).
+        """Derive all three limits from a known context window, in both directions (tighter than
+        the defaults on a small window, looser on a long one); explicit values win and an unknown
+        window keeps the defaults. Same arithmetic as ai.c apply_context_budget.
         Returns a warning line when the tool catalog alone uses over half the window, else None."""
         if context_window <= 0:
             return None
         ctx_chars = context_window * 3
         reserve = min(context_window // 4, 8192) * 3
         budget = max(ctx_chars - tools_len - reserve, 8000)
-        if not self.trim_explicit and budget * 8 // 10 < self.trim:
+        if not self.trim_explicit:
             self.trim = budget * 8 // 10
-        if not self.stub_explicit and budget * 95 // 100 < self.stub:
+        if not self.stub_explicit:
             self.stub = budget * 95 // 100
         if not self.max_tool_explicit:
-            per_tool = max(4000, budget // 4)
-            if per_tool < self.max_tool:
-                self.max_tool = per_tool
+            self.max_tool = min(max(budget // 4, self.TOOL_FLOOR), self.TOOL_CEIL)
         if tools_len > ctx_chars // 2:
             return ("\033[33m[ai] warning: the tool catalog (%d KB) uses over half of the %d-token context "
                     "window; use --short-ctx or INFER_TOOL_PROFILE=core.\033[0m\n" % (tools_len // 1024, context_window))

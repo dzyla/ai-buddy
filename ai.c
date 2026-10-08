@@ -853,27 +853,47 @@ static int   stub_threshold   = 250000;/* set via INFER_STUB_THRESHOLD; default 
 static int   g_trim_explicit = 0, g_stub_explicit = 0, g_maxtool_explicit = 0;
 
 /* The thresholds above are JSON *characters*, but the model's limit is
-   n_ctx *tokens* and the request also carries the tool catalog. A 100 KB /
-   250 KB / 64 KB default silently overflows a 16-32k local model, so when the
+   n_ctx *tokens* and the request also carries the tool catalog. When the
    context window is known (INFER_CONTEXT_WINDOW / LLAMA_CTX_SIZE, or detected
-   from /props or /v1/models) derive tighter limits — never looser than the
-   defaults, and never overriding a value the user set explicitly.
-   ~3 chars/token is a conservative ratio for mixed prose/code/JSON. */
+   from /props or /v1/models) all three limits are derived from the budget in
+   BOTH directions: a 16-32k model gets tighter limits than the defaults (which
+   would silently overflow it), a 128k+ model gets looser ones (so long files and
+   long histories are not trimmed at ~33k tokens). A value the user set
+   explicitly is never overridden; an unknown window keeps the defaults.
+   ~3 chars/token is a conservative ratio for mixed prose/code/JSON.
+   Per-tool cap: budget/4, floor 4000 (a 8k model's whole budget is ~8 KB),
+   ceiling 256 KB (~85k tokens; one result bigger than that is better read in
+   ranges, and stays under the stub threshold on any window).
+   Mirrored by agent/cli.py Budget.apply (tests/test_context_budget.py). */
+#define BUDGET_TOOL_FLOOR 4000L
+#define BUDGET_TOOL_CEIL  262144L
 static void apply_context_budget(size_t tools_len) {
-    if (context_window <= 0) return;
-    long ctx_chars  = (long)context_window * 3;
-    long reserve    = (long)(context_window / 4 < 8192 ? context_window / 4 : 8192) * 3; /* reply */
-    long budget     = ctx_chars - (long)tools_len - reserve;
-    if (budget < 8000) budget = 8000;
-    if (!g_trim_explicit && budget * 8 / 10 < trim_threshold)   trim_threshold  = (int)(budget * 8 / 10);
-    if (!g_stub_explicit && budget * 95 / 100 < stub_threshold) stub_threshold  = (int)(budget * 95 / 100);
-    if (!g_maxtool_explicit) {
-        long per_tool = budget / 4 < 4000 ? 4000 : budget / 4;
-        if (per_tool < max_tool_output) max_tool_output = (int)per_tool;
+    if (context_window > 0) {
+        long ctx_chars  = (long)context_window * 3;
+        long reserve    = (long)(context_window / 4 < 8192 ? context_window / 4 : 8192) * 3; /* reply */
+        long budget     = ctx_chars - (long)tools_len - reserve;
+        if (budget < 8000) budget = 8000;
+        if (!g_trim_explicit) trim_threshold = (int)(budget * 8 / 10);
+        if (!g_stub_explicit) stub_threshold = (int)(budget * 95 / 100);
+        if (!g_maxtool_explicit) {
+            long per_tool = budget / 4;
+            if (per_tool < BUDGET_TOOL_FLOOR) per_tool = BUDGET_TOOL_FLOOR;
+            if (per_tool > BUDGET_TOOL_CEIL)  per_tool = BUDGET_TOOL_CEIL;
+            max_tool_output = (int)per_tool;
+        }
+        if ((long)tools_len > ctx_chars / 2)
+            fprintf(stderr, "\033[33m[ai] warning: the tool catalog (%zu KB) uses over half of the %d-token context window; "
+                            "use --short-ctx or INFER_TOOL_PROFILE=core.\033[0m\n", tools_len / 1024, context_window);
     }
-    if ((long)tools_len > ctx_chars / 2)
-        fprintf(stderr, "\033[33m[ai] warning: the tool catalog (%zu KB) uses over half of the %d-token context window; "
-                        "use --short-ctx or INFER_TOOL_PROFILE=core.\033[0m\n", tools_len / 1024, context_window);
+    /* Tools (read_file: whole-file / digest thresholds, ranged chunk size) size their
+       output to the effective cap. Not INFER_MAX_TOOL_OUTPUT: a child `ai` would
+       then treat it as an explicit user setting. */
+    char cap_s[32];
+    snprintf(cap_s, sizeof(cap_s), "%d", max_tool_output);
+    setenv("INFER_EFFECTIVE_MAX_TOOL_OUTPUT", cap_s, 1);
+    if (getenv("INFER_DEBUG") || getenv("INFER_PRINT_BUDGET"))
+        fprintf(stderr, "[ai] context budget: n_ctx=%d tools=%zu trim=%d stub=%d max_tool=%d\n",
+                context_window, tools_len, trim_threshold, stub_threshold, max_tool_output);
 }
 static char  *g_goal_text     = NULL; /* -g/--goal flag */
 

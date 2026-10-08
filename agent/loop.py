@@ -204,10 +204,18 @@ class Engine:
                 lean = tools.catalog()
                 if lean:
                     self.tools = lean
-        tools_len = len(json.dumps(self.tools, separators=(",", ":"))) if self.tools else 0
+        # measured like ai.c: strlen of the `list-tools` line (json.dumps default separators + "\n")
+        tools_len = len(json.dumps(self.tools)) + 1 if self.tools else 0
         warn = cfg.budget.apply(cfg.context_window, tools_len)
         if warn:
             self.err(warn)
+        # Tools size their output to the effective cap (not INFER_MAX_TOOL_OUTPUT: a child `ai`
+        # would take that as an explicit user setting).
+        os.environ["INFER_EFFECTIVE_MAX_TOOL_OUTPUT"] = str(cfg.budget.max_tool)
+        if os.environ.get("INFER_DEBUG") or os.environ.get("INFER_PRINT_BUDGET"):
+            b = cfg.budget
+            self.err("[ai] context budget: n_ctx=%d tools=%d trim=%d stub=%d max_tool=%d\n"
+                     % (cfg.context_window, tools_len, b.trim, b.stub, b.max_tool))
 
         if cfg.interactive and not run_query:
             self.out("\033[1;35mai\033[0m \033[2m\u00b7 session %s \u00b7 type :help for commands\033[0m\n\n"

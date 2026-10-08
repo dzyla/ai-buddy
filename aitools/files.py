@@ -320,6 +320,20 @@ def extract_code_outline(content):
             break
     return "\n".join(outline)
 
+def effective_max_tool_output():
+    """The per-call tool output cap the running engine applies: INFER_EFFECTIVE_MAX_TOOL_OUTPUT
+    (exported by ai.c / agent/ after deriving it from the context window), else an explicit
+    INFER_MAX_TOOL_OUTPUT, else the 65536 default."""
+    for k in ("INFER_EFFECTIVE_MAX_TOOL_OUTPUT", "INFER_MAX_TOOL_OUTPUT"):
+        try:
+            v = int(os.environ.get(k) or 0)
+        except ValueError:
+            v = 0
+        if v > 0:
+            return v
+    return 65536
+
+
 def read_file(path, start_line=None, end_line=None):
     try:
         abs_path = os.path.abspath(os.path.expanduser(path))
@@ -358,20 +372,28 @@ def read_file(path, start_line=None, end_line=None):
                 e_val = total_lines
             s = max(0, s_val - 1)
             e = min(total_lines, max(s, e_val))
-            snippet = "\n".join(lines[s:e])
-            return (f"[{abs_path} | lines {s+1}-{e} of {total_lines}]\n"
-                    f"[Use read_file with start_line/end_line to read other sections]\n\n"
+            # Keep the chunk under the per-call cap (whole lines), so a too-wide range is cut
+            # with a "continue at" hint instead of being truncated or BLOCKED by the agent loop.
+            chunk_limit = max(2000, int(effective_max_tool_output() * 0.8))
+            used, stop = 0, s
+            while stop < e:
+                used += len(lines[stop].encode("utf-8", "replace")) + 1
+                if used > chunk_limit and stop > s:
+                    break
+                stop += 1
+            snippet = "\n".join(lines[s:stop])
+            hint = "[Use read_file with start_line/end_line to read other sections]"
+            if stop < e:
+                hint = (f"[Requested lines {s+1}-{e} exceed the per-call output limit (~{chunk_limit} chars); "
+                        f"showing {s+1}-{stop}. Continue with start_line={stop+1}]")
+            return (f"[{abs_path} | lines {s+1}-{stop} of {total_lines}]\n"
+                    f"{hint}\n\n"
                     f"{snippet}")
 
-        # Small file — return as-is
-        max_tool = 65536
-        max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
-        if max_tool_output_env:
-            try:
-                max_tool = int(max_tool_output_env)
-            except ValueError:
-                pass
-
+        # Thresholds follow the engine's effective per-call cap (derived from the model's
+        # context window): a long-context model reads a 120 KB file whole, and the digest
+        # sub-agent is only used for files far beyond what one result can carry.
+        max_tool = effective_max_tool_output()
         small_file_limit = max(12000, int(max_tool * 0.8))
         large_file_limit = max(80000, int(max_tool * 5.0))
 
