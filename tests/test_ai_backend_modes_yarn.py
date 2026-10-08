@@ -48,6 +48,10 @@ def hermetic(ab, monkeypatch, tmp_path):
     monkeypatch.setattr(ab, "ENV_FILE", env_file)
     monkeypatch.setattr(ab, "SYSTEMD_SERVICE", tmp_path / "dummy.service")
     monkeypatch.setattr(ab, "SYSTEMD_SOCKET", tmp_path / "dummy.socket")
+    # persist_env_changes() would otherwise `systemctl --user restart llama-server.service` (the
+    # developer's live server, which then rewrites the real env file) and probe the proxy port.
+    monkeypatch.setattr(ab, "restart_systemd_service", lambda *a, **k: None)
+    monkeypatch.setattr(ab, "is_proxy_running", lambda *a, **k: False)
     for var in ("LLAMA_MODEL_PATH", "CUDA_VISIBLE_DEVICES", "LLAMA_MTP", "LLAMA_CTX_SIZE",
                 "LLAMA_CTX_SIZE_FACTOR", "LLAMA_CTX_SIZE_MAX", "LLAMA_N_GPU_LAYERS",
                 "LLAMA_DRAFT_MODEL_PATH", "LLAMA_MTP_DRAFT_PATH",
