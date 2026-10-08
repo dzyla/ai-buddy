@@ -100,7 +100,7 @@ class Budget:
 
     TOOL_FLOOR, TOOL_CEIL = 4000, 262144
 
-    def apply(self, context_window, tools_len):
+    def apply(self, context_window, tools_len, max_tokens=32768):
         """Derive all three limits from a known context window, in both directions (tighter than
         the defaults on a small window, looser on a long one); explicit values win and an unknown
         window keeps the defaults. Same arithmetic as ai.c apply_context_budget.
@@ -108,7 +108,7 @@ class Budget:
         if context_window <= 0:
             return None
         ctx_chars = context_window * 3
-        reserve = min(context_window // 4, 8192) * 3
+        reserve = min(context_window // 4, max(8192, max_tokens)) * 3      # reply reserve
         budget = max(ctx_chars - tools_len - reserve, 8000)
         if not self.trim_explicit:
             self.trim = budget * 8 // 10
@@ -148,7 +148,8 @@ class Config:
     resume: str = None                # None: no resume; "": last session; else id / path
     goal: str = None
     mode_preset: str = None
-    context_window: int = 0
+    context_window: int = 0           # INFER_CONTEXT_WINDOW (explicit), else detected
+    ctx_size_hint: int = 0            # LLAMA_CTX_SIZE: server total --ctx-size, an upper bound only
     task_timeout: int = 1800
     image_path: str = None
     prompt: str = ""
@@ -333,9 +334,12 @@ def parse(argv, environ=None, stdin_tty=False):
     if c.mode_preset:
         c.preset_ok = o.apply_preset(c.mode_preset)
 
-    ctxwin = getenv("INFER_CONTEXT_WINDOW") or getenv("LLAMA_CTX_SIZE")
-    if ctxwin:
-        c.context_window = _atoi(ctxwin)
+    # INFER_CONTEXT_WINDOW is an explicit override; LLAMA_CTX_SIZE (the server's TOTAL --ctx-size,
+    # split across --parallel slots, maybe stale) only caps the per-slot n_ctx detected from /props.
+    if getenv("INFER_CONTEXT_WINDOW"):
+        c.context_window = _atoi(getenv("INFER_CONTEXT_WINDOW"))
+    if getenv("LLAMA_CTX_SIZE"):
+        c.ctx_size_hint = _atoi(getenv("LLAMA_CTX_SIZE"))
     if getenv("INFER_TASK_TIMEOUT"):
         c.task_timeout = _atoi(getenv("INFER_TASK_TIMEOUT"))
     b = c.budget

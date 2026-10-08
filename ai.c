@@ -845,7 +845,8 @@ static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops
 static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
 static int   no_tools_mode          = 0;
 char  *resume_session_id = NULL; /* -r/--resume [id] or INFER_RESUME */
-static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW */
+static int   context_window   = 0;    /* set via INFER_CONTEXT_WINDOW (explicit), else detected */
+static int   ctx_size_hint    = 0;    /* LLAMA_CTX_SIZE: the server's total --ctx-size, an upper bound only */
 static int   task_timeout_sec = 1800; /* set via INFER_TASK_TIMEOUT; 0 = no timeout */
 static int   max_tool_output  = 65536;/* set via INFER_MAX_TOOL_OUTPUT; default 65536 */
 static int   trim_threshold   = 100000;/* set via INFER_TRIM_THRESHOLD; default 100000 */
@@ -854,8 +855,8 @@ static int   g_trim_explicit = 0, g_stub_explicit = 0, g_maxtool_explicit = 0;
 
 /* The thresholds above are JSON *characters*, but the model's limit is
    n_ctx *tokens* and the request also carries the tool catalog. When the
-   context window is known (INFER_CONTEXT_WINDOW / LLAMA_CTX_SIZE, or detected
-   from /props or /v1/models) all three limits are derived from the budget in
+   context window is known (INFER_CONTEXT_WINDOW, else the per-slot n_ctx from
+   /props or /v1/models capped by LLAMA_CTX_SIZE) all three limits are derived from the budget in
    BOTH directions: a 16-32k model gets tighter limits than the defaults (which
    would silently overflow it), a 128k+ model gets looser ones (so long files and
    long histories are not trimmed at ~33k tokens). A value the user set
@@ -870,7 +871,9 @@ static int   g_trim_explicit = 0, g_stub_explicit = 0, g_maxtool_explicit = 0;
 static void apply_context_budget(size_t tools_len) {
     if (context_window > 0) {
         long ctx_chars  = (long)context_window * 3;
-        long reserve    = (long)(context_window / 4 < 8192 ? context_window / 4 : 8192) * 3; /* reply */
+        /* reply reserve: a quarter of the window, at most max(8192, max_tokens) tokens */
+        long reply_cap  = max_tokens_val > 8192 ? max_tokens_val : 8192;
+        long reserve    = (context_window / 4 < reply_cap ? context_window / 4 : reply_cap) * 3L;
         long budget     = ctx_chars - (long)tools_len - reserve;
         if (budget < 8000) budget = 8000;
         if (!g_trim_explicit) trim_threshold = (int)(budget * 8 / 10);
@@ -3160,6 +3163,8 @@ struct stream_context {
     size_t line_len;
     size_t line_cap;
 
+    char *error_body;   /* a plain JSON {"error":...} body (HTTP 4xx/5xx instead of SSE) */
+
     struct response *original_chunk;
 };
 
@@ -3182,6 +3187,7 @@ static void free_stream_context(struct stream_context *ctx) {
         if (ctx->tool_calls[i].arguments) free(ctx->tool_calls[i].arguments);
     }
     if (ctx->line_buf) free(ctx->line_buf);
+    if (ctx->error_body) free(ctx->error_body);
 }
 
 static void stream_retry_reset(void *userdata) {
@@ -3507,7 +3513,13 @@ static void process_sse_line(struct stream_context *ctx, const char *line, size_
         if (strncmp(data_ptr, "[DONE]", 6) == 0) {
             return;
         }
+        if (!ctx->error_body && data_len > 9 && strncmp(data_ptr, "{\"error\"", 9) == 0)
+            ctx->error_body = strndup(data_ptr, data_len);
         process_sse_json(ctx, data_ptr, data_len);
+    } else if (*line == '{' && !ctx->error_body && memmem(line, len, "\"error\"", 7)) {
+        /* An HTTP error answered with a plain JSON body (e.g. llama.cpp's 400
+           "exceeds the available context size"): keep it for the error handler. */
+        ctx->error_body = strndup(line, len);
     }
 }
 
@@ -4754,9 +4766,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\033[33m[ai] warning: unknown --mode '%s' (xhigh/normal/low/instruct); using defaults\033[0m\n", mode_preset_val);
         }
     }
+    /* INFER_CONTEXT_WINDOW is an explicit override. LLAMA_CTX_SIZE is the server's TOTAL
+       --ctx-size (split across --parallel slots, possibly stale for another backend): only an
+       upper bound for the per-slot n_ctx detected from /props (resolve_context_window). */
     char *env_ctxwin = getenv("INFER_CONTEXT_WINDOW");
-    if (!env_ctxwin || !*env_ctxwin) env_ctxwin = getenv("LLAMA_CTX_SIZE");
     if (env_ctxwin && *env_ctxwin) context_window = atoi(env_ctxwin);
+    char *env_llama_ctx = getenv("LLAMA_CTX_SIZE");
+    if (env_llama_ctx && *env_llama_ctx) ctx_size_hint = atoi(env_llama_ctx);
     char *env_timeout = getenv("INFER_TASK_TIMEOUT");
     if (env_timeout && *env_timeout) task_timeout_sec = atoi(env_timeout);
     char *env_max_tool = getenv("INFER_MAX_TOOL_OUTPUT");
@@ -4821,8 +4837,11 @@ int main(int argc, char **argv) {
 
     char *tools_json = NULL;
     /* Small known context window -> lean tool catalog (see apply_context_budget). */
-    if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE"))
-        setenv("INFER_TOOL_PROFILE", "core", 1);
+    {
+        int known = context_window > 0 ? context_window : ctx_size_hint; /* min(hint, /props) <= hint */
+        if (known > 0 && known <= 32768 && !getenv("INFER_TOOL_PROFILE"))
+            setenv("INFER_TOOL_PROFILE", "core", 1);
+    }
     if (!no_tools_mode) {
         tools_json = list_tools_json(mcp_script);
         if (tools_json && (strncmp(tools_json, "Error", 5) == 0 || strlen(tools_json) < 5)) {
@@ -5239,7 +5258,9 @@ int main(int argc, char **argv) {
     curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
 
     if (context_window == 0) {
-        context_window = detect_context_window(c, api_url);
+        int detected = detect_context_window(c, api_url);
+        context_window = detected;
+        if (ctx_size_hint > 0 && (detected <= 0 || ctx_size_hint < detected)) context_window = ctx_size_hint;
         /* Detected a small window only now: re-list with the lean catalog. */
         if (context_window > 0 && context_window <= 32768 && !getenv("INFER_TOOL_PROFILE")
             && !no_tools_mode && tools_json) {
@@ -5658,6 +5679,9 @@ int main(int argc, char **argv) {
             int length_nudge_count = 0;   /* consecutive token-limit nudges; force completion if model never progresses */
             int timeout_fired = 0;        /* INFER_TASK_TIMEOUT grace iteration already granted */
             int force_complete_after = 5; /* INFER_NUDGE_CAP: bail out and force task_complete after this many stalled nudges */
+            int ctx_retry_used = 0;       /* one trim-and-retry per context-overflow 400 */
+            size_t force_trim_to = 0;     /* set when usage.prompt_tokens > 80% of n_ctx */
+            size_t req_msgs_len = 0;      /* messages_json size of the request in flight */
             struct timespec task_start;
             clock_gettime(CLOCK_MONOTONIC, &task_start);
 
@@ -5670,6 +5694,14 @@ step_limit_check:
                    prompt-cache prefix stays stable between iterations. */
                 if (trim_threshold > 0 && strlen(messages_json) > (size_t)trim_threshold)
                     messages_json = maybe_trim_messages(messages_json, mcp_script, trim_threshold * 6 / 10);
+                /* The server's own token count said the last prompt was near the window: the
+                   ~3 chars/token guess is off for this content, so trim by the measured ratio. */
+                if (force_trim_to > 0) {
+                    if (strlen(messages_json) > force_trim_to)
+                        messages_json = maybe_trim_messages(messages_json, mcp_script, (int)force_trim_to);
+                    force_trim_to = 0;
+                }
+                req_msgs_len = strlen(messages_json);
 
                 /* Inject any :btw note typed by the user during the previous iteration */
                 if (g_btw_available && !g_esc_requested) {
@@ -5867,6 +5899,13 @@ step_limit_check:
                         process_sse_line(&s_ctx, s_ctx.line_buf, s_ctx.line_len);
                     }
                     reconstruct_final_json(&s_ctx);
+                    if (s_ctx.error_body && s_ctx.num_tool_calls == 0
+                        && !(s_ctx.accumulated_content && *s_ctx.accumulated_content)) {
+                        /* hand the server's error object to the response parser below */
+                        free(chunk.data);
+                        chunk.data = strdup(s_ctx.error_body);
+                        chunk.size = strlen(chunk.data);
+                    }
                     if (s_ctx.accumulated_reasoning && *s_ctx.accumulated_reasoning) {
                         add_turn_item(ITEM_THINKING, "thinking", NULL, s_ctx.accumulated_reasoning, 0, 0, 0, 0);
                     }
@@ -5966,6 +6005,11 @@ step_limit_check:
                     /* Accumulate session-wide token count */
                     g_session_tokens = total_tokens;
                 }
+                if (context_window > 0 && prompt_tokens > context_window / 10 * 8 && req_msgs_len > 0) {
+                    force_trim_to = (size_t)((double)req_msgs_len * 0.6 * context_window / prompt_tokens);
+                    fprintf(stderr, "\033[2m[ai] prompt used %d of %d context tokens; trimming history to ~%zu KB "
+                                    "before the next request.\033[0m\n", prompt_tokens, context_window, force_trim_to / 1024);
+                }
 
                 if (error_tok != -1) {
                     char *err_msg = NULL;
@@ -5982,6 +6026,22 @@ step_limit_check:
                             }
                             k = json_skip_token(tok, r, k + 2);
                         }
+                    }
+                    /* Recoverable once: the prompt overflowed the server's context (the chars/token
+                       guess was too optimistic) -> trim to half the usual target and retry. */
+                    int ctx_overflow = strstr(chunk.data, "exceed_context_size") != NULL
+                        || (err_msg && (strstr(err_msg, "context size") || strstr(err_msg, "context length")));
+                    if (ctx_overflow && !ctx_retry_used) {
+                        ctx_retry_used = 1;
+                        size_t cur = strlen(messages_json);
+                        size_t target = (size_t)(trim_threshold > 0 ? trim_threshold : 100000) * 3 / 10;
+                        if (target > cur / 2) target = cur / 2;
+                        fprintf(stderr, "\033[1;33m[ai] request exceeded the model's context window; trimming history "
+                                        "to ~%zu KB and retrying once.\033[0m\n", target / 1024);
+                        messages_json = maybe_trim_messages(messages_json, mcp_script, (int)target);
+                        if (err_msg) free(err_msg);
+                        has_more = 1;
+                        goto next_turn;
                     }
                     if (err_msg) {
                         /* Recoverable: model returned empty output — nudge it to call task_complete */
@@ -6008,6 +6068,8 @@ step_limit_check:
                     break;
                 }
 
+
+                ctx_retry_used = 0;
 
                 if (message_tok != -1) {
                     char *msg_str = malloc(tok[message_tok].end - tok[message_tok].start + 1);

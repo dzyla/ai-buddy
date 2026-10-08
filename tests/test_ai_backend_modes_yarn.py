@@ -385,12 +385,12 @@ def test_cmd_ctx_shorthand_units(ab, hermetic, capsys):
     ab.cmd_ctx("512k")
     env = ab.load_env()
     assert env.get("LLAMA_CTX_SIZE") == "524288"
-    assert env.get("INFER_CONTEXT_WINDOW") == "524288"
+    assert "INFER_CONTEXT_WINDOW" not in env      # client-side override stays user-only
 
     ab.cmd_ctx("1m")
     env = ab.load_env()
     assert env.get("LLAMA_CTX_SIZE") == "1048576"
-    assert env.get("INFER_CONTEXT_WINDOW") == "1048576"
+    assert "INFER_CONTEXT_WINDOW" not in env
 
     ab.cmd_ctx("auto")
     env = ab.load_env()

@@ -2330,7 +2330,10 @@ def cmd_ctx(size=None, auto_restart=True):
         if not parsed:
             print(f"Invalid size '{size}'. Use a number (e.g. 524288, 512k, 256k) or 'auto'.", file=sys.stderr)
             sys.exit(1)
-        persist_env_changes({"LLAMA_CTX_SIZE": parsed, "INFER_CONTEXT_WINDOW": parsed}, auto_restart=auto_restart)
+        # Only the server's total --ctx-size: the client (ai) reads the per-slot n_ctx from /props
+        # and caps it by LLAMA_CTX_SIZE. INFER_CONTEXT_WINDOW stays a user-only override (and a
+        # value an older ai-backend wrote here is cleared).
+        persist_env_changes({"LLAMA_CTX_SIZE": parsed, "INFER_CONTEXT_WINDOW": None}, auto_restart=auto_restart)
         sync_ctx_to_systemd(parsed)
         print(f"Context size locked to {parsed} tokens.")
 

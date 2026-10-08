@@ -321,10 +321,10 @@ def extract_code_outline(content):
     return "\n".join(outline)
 
 def effective_max_tool_output():
-    """The per-call tool output cap the running engine applies: INFER_EFFECTIVE_MAX_TOOL_OUTPUT
-    (exported by ai.c / agent/ after deriving it from the context window), else an explicit
-    INFER_MAX_TOOL_OUTPUT, else the 65536 default."""
-    for k in ("INFER_EFFECTIVE_MAX_TOOL_OUTPUT", "INFER_MAX_TOOL_OUTPUT"):
+    """The per-call tool output cap: an explicit INFER_MAX_TOOL_OUTPUT, else the engine's
+    INFER_EFFECTIVE_MAX_TOOL_OUTPUT (exported by ai.c / agent/ after deriving it from the context
+    window), else the 65536 default."""
+    for k in ("INFER_MAX_TOOL_OUTPUT", "INFER_EFFECTIVE_MAX_TOOL_OUTPUT"):
         try:
             v = int(os.environ.get(k) or 0)
         except ValueError:
@@ -371,6 +371,8 @@ def read_file(path, start_line=None, end_line=None):
             except (ValueError, TypeError):
                 e_val = total_lines
             s = max(0, s_val - 1)
+            if s >= total_lines and total_lines > 0:
+                return (f"Error: start_line {s_val} is beyond end of file ({total_lines} lines) | {abs_path}")
             e = min(total_lines, max(s, e_val))
             # Keep the chunk under the per-call cap (whole lines), so a too-wide range is cut
             # with a "continue at" hint instead of being truncated or BLOCKED by the agent loop.
@@ -382,13 +384,21 @@ def read_file(path, start_line=None, end_line=None):
                     break
                 stop += 1
             snippet = "\n".join(lines[s:stop])
-            hint = "[Use read_file with start_line/end_line to read other sections]"
+            hints = []
+            if stop == s + 1 and len(snippet.encode("utf-8", "replace")) > chunk_limit:
+                line_len = len(snippet)
+                snippet = snippet.encode("utf-8", "replace")[:chunk_limit].decode("utf-8", "ignore")
+                hints.append(f"[Line {s+1} is {line_len} chars; showing the first {len(snippet)}. Use "
+                             f"execute_command with cut -c / head -c (e.g. sed -n '{s+1}p' FILE | cut -c "
+                             f"{len(snippet)+1}-) for the rest]")
             if stop < e:
-                hint = (f"[Requested lines {s+1}-{e} exceed the per-call output limit (~{chunk_limit} chars); "
-                        f"showing {s+1}-{stop}. Continue with start_line={stop+1}]")
+                hints.append(f"[Requested lines {s+1}-{e} exceed the per-call output limit (~{chunk_limit} chars); "
+                             f"showing {s+1}-{stop}. Continue with start_line={stop+1}]")
+            if not hints:
+                hints.append("[Use read_file with start_line/end_line to read other sections]")
             return (f"[{abs_path} | lines {s+1}-{stop} of {total_lines}]\n"
-                    f"{hint}\n\n"
-                    f"{snippet}")
+                    + "\n".join(hints) + "\n\n"
+                    + snippet)
 
         # Thresholds follow the engine's effective per-call cap (derived from the model's
         # context window): a long-context model reads a 120 KB file whole, and the digest

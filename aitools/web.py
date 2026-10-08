@@ -7,6 +7,8 @@ import urllib.error
 import re
 import time
 
+from .files import effective_max_tool_output
+
 try:
     import trafilatura
     _HAS_TRAFILATURA = True
@@ -219,13 +221,7 @@ def _html_to_text_fallback(html, url):
         return (f"[WARNING: This page requires JavaScript and returned no useful content "
                 f"({word_count} words). Use execute_command with curl to a plain-text API. "
                 f"For weather: curl -s 'wttr.in/CITY?format=3']\n\n{text[:2000]}")
-    max_tool = 65536
-    max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
-    if max_tool_output_env:
-        try:
-            max_tool = int(max_tool_output_env)
-        except ValueError:
-            pass
+    max_tool = effective_max_tool_output()
     web_limit = max(10000, int(max_tool * 0.8))
     if len(text) > web_limit:
         text = text[:web_limit] + f"\n... [truncated. Page content size was {len(text)} characters. Limit is {web_limit}.]"
@@ -250,13 +246,7 @@ def fetch_webpage_basic(url):
                     no_fallback=False,
                 )
                 if text and len(text.split()) > 30:
-                    max_tool = 65536
-                    max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
-                    if max_tool_output_env:
-                        try:
-                            max_tool = int(max_tool_output_env)
-                        except ValueError:
-                            pass
+                    max_tool = effective_max_tool_output()
                     web_limit = max(12000, int(max_tool * 0.8))
                     if len(text) > web_limit:
                         text = text[:web_limit] + f"\n... [truncated. Page content size was {len(text)} characters. Limit is {web_limit}.]"
@@ -370,13 +360,7 @@ def fetch_webpage_js(url, wait_for="networkidle", timeout_ms=30000):
         # Collapse excessive blank lines
         text = re.sub(r'\n{3,}', '\n\n', text).strip()
 
-        max_tool = 65536
-        max_tool_output_env = os.environ.get("INFER_MAX_TOOL_OUTPUT")
-        if max_tool_output_env:
-            try:
-                max_tool = int(max_tool_output_env)
-            except ValueError:
-                pass
+        max_tool = effective_max_tool_output()
         web_limit = max(12000, int(max_tool * 0.8))
         if len(text) > web_limit:
             text = text[:web_limit] + f"\n... [truncated. Content was {len(text)} chars, limit {web_limit}.]"
@@ -422,7 +406,7 @@ def fetch_smart(url):
         if not text:
             text = _html_to_text_fallback(html, url)
         if not _is_blocked(text, resp.status_code):
-            max_tool = int(os.environ.get("INFER_MAX_TOOL_OUTPUT", 65536))
+            max_tool = effective_max_tool_output()
             web_limit = max(12000, int(max_tool * 0.8))
             if len(text) > web_limit:
                 text = text[:web_limit] + f"\n... [truncated at {web_limit} chars]"

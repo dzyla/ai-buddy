@@ -35,6 +35,12 @@ def _env_int(name, default):
     return n
 
 
+def is_context_overflow(err):
+    """A 400 saying the prompt exceeds the server's context (llama.cpp, vLLM, OpenAI wording)."""
+    e = (err or "").lower()
+    return "context size" in e or "context length" in e or "exceed_context_size" in e
+
+
 class Engine:
     def __init__(self, ch, argv):
         self.ch = ch
@@ -47,6 +53,8 @@ class Engine:
         self.plan_remaining = 0
         self.plan_note = None
         self.session_tokens = 0
+        self.ctx_retry_used = False     # one trim-and-retry per context-overflow 400
+        self.force_trim_to = 0          # set when usage.prompt_tokens > 80% of n_ctx
         self.turn_count = 0
         self.tool_count = 0             # tool calls this session (the answer footer / Ctrl-O redraw)
         self.si_failed = {}
@@ -141,7 +149,8 @@ class Engine:
                 self.err("\033[33m[ai] warning: unknown --mode '%s' (xhigh/normal/low/instruct); using "
                          "defaults\033[0m\n" % cfg.mode_preset)
 
-        if 0 < cfg.context_window <= 32768 and "INFER_TOOL_PROFILE" not in os.environ:
+        known = cfg.context_window or cfg.ctx_size_hint      # min(hint, /props) <= hint
+        if 0 < known <= 32768 and "INFER_TOOL_PROFILE" not in os.environ:
             os.environ["INFER_TOOL_PROFILE"] = "core"
         self.tools = None if cfg.no_tools else tools.catalog()
 
@@ -197,7 +206,9 @@ class Engine:
             run_query = True
 
         if cfg.context_window == 0:
-            cfg.context_window = llm.detect_context_window(self.client)
+            detected = llm.detect_context_window(self.client)
+            hint = cfg.ctx_size_hint
+            cfg.context_window = hint if hint > 0 and (detected <= 0 or hint < detected) else detected
             if 0 < cfg.context_window <= 32768 and "INFER_TOOL_PROFILE" not in os.environ \
                     and not cfg.no_tools and self.tools:
                 os.environ["INFER_TOOL_PROFILE"] = "core"
@@ -206,7 +217,7 @@ class Engine:
                     self.tools = lean
         # measured like ai.c: strlen of the `list-tools` line (json.dumps default separators + "\n")
         tools_len = len(json.dumps(self.tools)) + 1 if self.tools else 0
-        warn = cfg.budget.apply(cfg.context_window, tools_len)
+        warn = cfg.budget.apply(cfg.context_window, tools_len, cfg.opts.max_tokens)
         if warn:
             self.err(warn)
         # Tools size their output to the effective cap (not INFER_MAX_TOOL_OUTPUT: a child `ai`
@@ -541,6 +552,13 @@ class Engine:
         cfg = self.cfg
         if cfg.budget.trim > 0 and M.size(self.messages) > cfg.budget.trim:
             self.messages = M.trim(self.messages, cfg.budget.trim * 6 // 10, self.err)
+        # The server's token count said the last prompt was near the window: the ~3 chars/token
+        # guess is off for this content, so trim by the measured ratio.
+        if self.force_trim_to > 0:
+            if M.size(self.messages) > self.force_trim_to:
+                self.messages = M.trim(self.messages, self.force_trim_to, self.err)
+            self.force_trim_to = 0
+        req_size = M.size(self.messages)
         while not self.ch.btw.empty() and not self.esc.is_set():
             note = self.ch.btw.get()
             self.messages.append({"role": "user", "content": "[User note mid-task: %s]" % note})
@@ -560,12 +578,28 @@ class Engine:
                 self.messages.append({"role": "user", "content": "Your last response was empty. Please call "
                                       "task_complete now with a summary of what you just did."})
                 return True, loop_count, length_nudges, True
+            if not self.ctx_retry_used and is_context_overflow(e):
+                # Recoverable once: the prompt overflowed the server's context -> trim to half the
+                # usual target and retry.
+                self.ctx_retry_used = True
+                target = min((cfg.budget.trim if cfg.budget.trim > 0 else 100000) * 3 // 10, M.size(self.messages) // 2)
+                self.err("\033[1;33m[ai] request exceeded the model's context window; trimming history to ~%d KB "
+                         "and retrying once.\033[0m\n" % (target // 1024))
+                self.messages = M.trim(self.messages, target, self.err)
+                return True, loop_count, length_nudges, False
             self.err("\n\033[1;31m[ai Error]\033[0m %s\n" % e)
             return False, loop_count, length_nudges, True
+        self.ctx_retry_used = False
 
         usage = res.get("usage") or {}
         if usage:
             self.session_tokens = usage.get("total_tokens", 0)
+        pt = int(usage.get("prompt_tokens") or 0)
+        n = cfg.context_window
+        if n > 0 and pt > n // 10 * 8 and req_size > 0:
+            self.force_trim_to = int(req_size * 0.6 * n / pt)
+            self.err("\033[2m[ai] prompt used %d of %d context tokens; trimming history to ~%d KB before the next "
+                     "request.\033[0m\n" % (pt, n, self.force_trim_to // 1024))
         msg = M.clean_message(res["message"])
         self.messages.append(msg)
         elapsed = res.get("elapsed", 0.0)

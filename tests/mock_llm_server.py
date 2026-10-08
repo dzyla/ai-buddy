@@ -15,6 +15,10 @@ The reply is controlled by env vars:
                         "finish_reason": "length"}, is a plain text reply)
   MOCK_N_CTX          — if set, GET /props reports this n_ctx
   MOCK_TIMES          — file to append each request's arrival time (epoch secs) to
+  MOCK_CTX_ERROR_AT   — 1-based request number(s), comma-separated, answered with llama.cpp's HTTP 400
+                        "exceeds the available context size" (consumes no MOCK_TOOL_SEQ item)
+  MOCK_PROMPT_TOKENS  — usage.prompt_tokens reported on every reply (JSON and SSE)
+  MOCK_CHARS_PER_TOKEN — report usage.prompt_tokens = request body chars / this ratio instead
 
 Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 """
@@ -25,8 +29,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def _usage():
+    pt = int(os.environ.get("MOCK_PROMPT_TOKENS") or 1)
+    if os.environ.get("MOCK_CHARS_PER_TOKEN"):
+        pt = int(Handler._last_len / float(os.environ["MOCK_CHARS_PER_TOKEN"]))
+    return {"prompt_tokens": pt, "completion_tokens": 1, "total_tokens": pt + 1}
+
+
 class Handler(BaseHTTPRequestHandler):
     _seq_idx = 0  # index into MOCK_TOOL_SEQ for the current server process
+    _req_no = 0   # chat requests received so far
+    _last_len = 0  # body size of the request being answered
 
     def log_message(self, *args):
         pass  # silence
@@ -50,6 +63,19 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.environ["MOCK_TIMES"], "a") as f:
                 f.write("%.6f\n" % time.time())
         self._capture(raw)
+        Handler._req_no += 1
+        Handler._last_len = len(raw)
+        err_at = [int(x) for x in (os.environ.get("MOCK_CTX_ERROR_AT") or "").split(",") if x.strip()]
+        if Handler._req_no in err_at:
+            err = {"error": {"code": 400, "message": "the request exceeds the available context size, try increasing it",
+                             "type": "exceed_context_size_error", "n_prompt_tokens": 140000, "n_ctx": 131072}}
+            payload = json.dumps(err).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         try:
             body = json.loads(raw)
         except Exception:
@@ -123,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
                 resp = {
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": tcs}, "finish_reason": "tool_calls"}],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    "usage": _usage(),
                 }
                 payload = json.dumps(resp).encode()
                 self.send_header("Content-Length", str(len(payload)))
@@ -158,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": "chatcmpl-mock", "object": "chat.completion", "created": 0,
             "model": "mock",
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "usage": _usage(),
         }
         payload = json.dumps(resp).encode()
         self.send_response(200)
@@ -171,6 +197,8 @@ class Handler(BaseHTTPRequestHandler):
         chunk = {"id": "chatcmpl-mock", "object": "chat.completion.chunk",
                  "created": 0, "model": "mock",
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if finish is not None and (os.environ.get("MOCK_PROMPT_TOKENS") or os.environ.get("MOCK_CHARS_PER_TOKEN")):
+            chunk["usage"] = _usage()
         self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
 
     def _respond_stream(self, summary, content):
