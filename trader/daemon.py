@@ -253,12 +253,14 @@ def _bar_date(bar: Dict[str, Any]) -> Optional[datetime.date]:
         return None
 
 
-def _fetch_strategy_bars(symbols: List[str], range_period: str = "1y") -> Dict[str, List[Dict[str, Any]]]:
-    """Daily bars for the strategy (Robinhood MCP first, Yahoo fallback). Symbols with < 30 bars are dropped."""
+def _fetch_strategy_bars(symbols: List[str], range_period: str = "1y", broker: Any = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Daily bars for the strategy (Robinhood MCP first, Yahoo fallback). Symbols with < 30 bars are dropped.
+    `broker` (shadow mode: the read-only wrapper) is the Robinhood source; default RobinhoodExecutor."""
     out: Dict[str, List[Dict[str, Any]]] = {}
+    kw: Dict[str, Any] = {} if broker is None else {"broker": broker}
     for s in symbols:
         try:
-            b = FinancialData.fetch_historical(s, range_period=range_period, interval="1d")
+            b = FinancialData.fetch_historical(s, range_period=range_period, interval="1d", **kw)
             last = _bar_date(b[-1]) if b else None
             if last is not None and (MarketHours.now_et().date() - last).days > STALE_BARS_DAYS:
                 _risk_log(f"STRATEGY: {s} skipped (stale history, last bar {last})")

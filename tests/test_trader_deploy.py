@@ -26,7 +26,8 @@ def _git(cwd, *args):
 def clone(tmp_path):
     dst = tmp_path / "clone"
     _git(tmp_path, "clone", "-q", REPO, str(dst))
-    for rel in ("trader", "robinhood_trader.py"):
+    # trader code AND the tests/conftest that gate it, so the gate sees a consistent tree
+    for rel in ("trader", "robinhood_trader.py", "tests", "conftest.py", "pytest.ini"):
         src, out = os.path.join(REPO, rel), dst / rel
         if os.path.isdir(src):
             shutil.rmtree(out, ignore_errors=True)
@@ -52,9 +53,14 @@ def base(tmp_path):
     return tmp_path / "ai-trader-test"
 
 
-def _deploy(clone, home, *args, base=None):
+def _deploy(clone, home, *args, base=None, nested_gate=True):
     env = {**os.environ, "HOME": str(home)}
     env.pop("AI_TRADER_HOME", None)
+    # A gate run here leaves tests/test_trader_deploy.py out (as it does when deploy.sh runs from
+    # within a real gate), so these tests don't re-run themselves recursively.
+    env.pop("AI_TRADER_DEPLOY_GATE", None)
+    if nested_gate:
+        env["AI_TRADER_DEPLOY_GATE"] = "1"
     if base is not None:
         env["AI_TRADER_HOME"] = str(base)
     return subprocess.run(["bash", str(clone / "trader" / "deploy.sh"), *args], cwd=str(home),
@@ -144,6 +150,61 @@ def test_failing_tests_are_refused(clone, home, base):
     assert r.returncode != 0
     assert "tests failed" in (r.stdout + r.stderr).lower()
     assert not (base / "current").exists()
+
+
+def test_gate_lists_every_trader_test_file():
+    import glob
+    import re
+    src = open(os.path.join(REPO, "trader", "deploy.sh")).read()
+    listed = set(re.findall(r"tests/test_[a-z_]+\.py", src[src.index("TRADER_TESTS=("):]))
+    want = {os.path.relpath(p, REPO) for p in glob.glob(os.path.join(REPO, "tests", "test_trader_*.py"))}
+    want |= {"tests/test_robinhood_trader.py", "tests/test_momentum_strategy.py"}
+    assert want <= listed, sorted(want - listed)
+
+
+def test_ref_deploys_a_commit_despite_a_dirty_tree(clone, home, base):
+    old_sha = _git(clone, "rev-parse", "HEAD")
+    with open(clone / "trader" / "shadow.py", "a") as fh:
+        fh.write("\nRELEASE_MARKER = 'second'\n")
+    _git(clone, "commit", "-q", "--no-verify", "-am", "second")
+    with open(clone / "robinhood_trader.py", "a") as fh:   # dirty, uncommitted edit
+        fh.write("\n# local edit\n")
+    (clone / "untracked.txt").write_text("x")
+    r = _deploy(clone, home, "--skip-tests", "--ref", old_sha, base=base)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rel = _release(r)
+    assert os.path.basename(rel).endswith("-" + _git(clone, "rev-parse", "--short", old_sha))
+    assert "commit=" + old_sha in open(os.path.join(rel, "VERSION")).read()
+    assert "RELEASE_MARKER" not in open(os.path.join(rel, "trader", "shadow.py")).read()
+    assert "# local edit" not in open(os.path.join(rel, "robinhood_trader.py")).read()
+    # without --ref the same dirty tree is still refused
+    r2 = _deploy(clone, home, "--skip-tests", base=base)
+    assert r2.returncode != 0 and "dirty" in (r2.stdout + r2.stderr).lower()
+
+
+def test_ref_rejects_a_non_commit(clone, home, base):
+    r = _deploy(clone, home, "--skip-tests", "--ref", "no-such-ref", base=base)
+    assert r.returncode != 0 and "not a commit" in r.stderr
+    assert not (base / "current").exists()
+
+
+def test_gate_tests_the_deployed_commit_not_the_worktree(clone, home, base):
+    """--ref <broken commit> with a fixed (dirty) working tree is refused: the gate runs on a
+    checkout of the commit. And a good commit passes the gate while the worktree is broken."""
+    good = _git(clone, "rev-parse", "HEAD")
+    with open(clone / "trader" / "strategy.py", "a") as fh:
+        fh.write("\nraise RuntimeError('broken release')\n")
+    _git(clone, "commit", "-q", "--no-verify", "-am", "break it")
+    bad = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "-q", good, "--", "trader/strategy.py")      # worktree fixed, uncommitted
+    r = _deploy(clone, home, "--ref", bad, base=base)
+    assert r.returncode != 0 and "tests failed" in (r.stdout + r.stderr).lower()
+    assert not (base / "current").exists()
+    with open(clone / "trader" / "strategy.py", "a") as fh:            # worktree broken instead
+        fh.write("\nraise RuntimeError('broken worktree')\n")
+    r = _deploy(clone, home, "--ref", good, base=base)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    assert "commit=" + good in open(os.path.join(_release(r), "VERSION")).read()
 
 
 REPOINT_PROBE = textwrap.dedent("""

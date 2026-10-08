@@ -56,7 +56,7 @@ class FakeBroker:
 
 @pytest.fixture
 def market(monkeypatch):
-    monkeypatch.setattr(FinancialData, "fetch_historical", lambda sym, range_period="1y", interval="1d": HIST.get(sym, []))
+    monkeypatch.setattr(FinancialData, "fetch_historical", lambda sym, range_period="1y", interval="1d", **kw: HIST.get(sym, []))
     monkeypatch.setattr(MS, "universe", classmethod(lambda cls: ["NVDA", "PLTR", "TSM", "AMD"]))
     now = datetime.datetime(2026, 9, 8, 10, 30, tzinfo=ET_ZONE)
     monkeypatch.setattr(MarketHours, "now_et", lambda: now)
@@ -145,3 +145,78 @@ def test_daemon_hook_swallows_errors(market, monkeypatch, tmp_path):
     cfg.write_text(json.dumps({"shadow": {"enabled": True}}))
     monkeypatch.setenv("RH_TRADER_CONFIG", str(cfg))
     assert shadow.maybe_run_shadow(ACC, market) is None
+
+
+# ── read-only by construction ────────────────────────────────────────────────
+def _rh_bars(rows):
+    return [{"begins_at": f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}T00:00:00Z", "open_price": r["open"],
+             "high_price": r["high"], "low_price": r["low"], "close_price": r["close"], "volume": r["volume"]}
+            for i, r in enumerate(rows)]
+
+
+def _executor_mutators():
+    E = rt.RobinhoodExecutor
+    return sorted(n for n in dir(E) if not n.startswith("__") and callable(getattr(E, n))
+                  and not n.startswith("get_") and n not in shadow.READ_ONLY_METHODS)
+
+
+def test_read_only_broker_blocks_every_mutator_of_the_real_executor(monkeypatch):
+    E = rt.RobinhoodExecutor
+    calls = []
+    muts = _executor_mutators()
+    assert "execute_market_order" in muts and "call_mcp_tool" in muts
+    for n in muts:
+        monkeypatch.setattr(E, n, classmethod(lambda cls, *a, _n=n, **k: calls.append(_n)), raising=False)
+    ro = shadow.ReadOnlyBroker(E)
+    for n in muts:
+        with pytest.raises(PermissionError):
+            getattr(ro, n)("ACC1", "VTI", "buy")
+    assert calls == []
+    # the wrapped executor is not reachable through the wrapper
+    assert ro._inner is not E
+    with pytest.raises(PermissionError):
+        ro._inner()
+    with pytest.raises(AttributeError):
+        ro.__dict__
+    assert getattr(ro.get_equity_quotes, "__self__", None) is None
+    with pytest.raises(PermissionError):
+        ro.anything = 1
+
+
+def test_shadow_pulse_on_the_real_executor_reads_only_through_the_wrapper(monkeypatch):
+    """broker=None: shadow wraps the real RobinhoodExecutor. Price history must come through the
+    wrapper's get_equity_historicals (not RobinhoodExecutor directly), and no mutator is ever hit."""
+    E = rt.RobinhoodExecutor
+    fb = FakeBroker()
+    hits, mutations = [], []
+    for n in _executor_mutators():
+        monkeypatch.setattr(E, n, classmethod(lambda cls, *a, _n=n, **k: mutations.append(_n)), raising=False)
+    monkeypatch.setattr(E, "get_live_portfolio", classmethod(lambda cls, acc=None: fb.get_live_portfolio(acc)))
+    monkeypatch.setattr(E, "get_equity_positions", classmethod(lambda cls, acc=None: fb.get_equity_positions(acc)))
+    monkeypatch.setattr(E, "get_equity_quotes", classmethod(lambda cls, syms: fb.get_equity_quotes(syms)))
+    monkeypatch.setattr(E, "get_agentic_account_number", classmethod(lambda cls: ACC))
+
+    def hist(cls, symbols, interval="day", span_days=90):
+        hits.append(tuple(symbols))
+        return {s: _rh_bars(HIST[s]) for s in symbols if s in HIST}
+    monkeypatch.setattr(E, "get_equity_historicals", classmethod(hist))
+    monkeypatch.setattr(FinancialData, "fetch_historical_yahoo",
+                        classmethod(lambda cls, *a, **k: pytest.fail("Yahoo fallback reached")))
+    monkeypatch.setattr(MS, "universe", classmethod(lambda cls: ["NVDA", "PLTR", "TSM", "AMD"]))
+    # make the history fresh relative to "now" (the last synthetic bar is in 2026-10)
+    now = datetime.datetime(2026, 10, 9, 10, 30, tzinfo=ET_ZONE)
+    monkeypatch.setattr(MarketHours, "now_et", lambda: now)
+
+    seen_brokers = []
+    real_fetch = FinancialData.fetch_historical.__func__
+
+    def spy_fetch(cls, ticker, range_period="6mo", interval="1d", broker=None):
+        seen_brokers.append(broker)
+        return real_fetch(cls, ticker, range_period, interval, broker=broker)
+    monkeypatch.setattr(FinancialData, "fetch_historical", classmethod(spy_fetch))
+
+    rec = shadow.run_shadow_pulse(now, {"shadow": {"enabled": True, "strategy": {}}}, account_number=ACC)
+    assert mutations == []
+    assert hits, "price history was not fetched"
+    assert seen_brokers and all(isinstance(b, shadow.ReadOnlyBroker) for b in seen_brokers)
+    assert rec["status"] == "ok", rec

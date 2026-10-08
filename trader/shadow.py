@@ -43,18 +43,35 @@ class ReadOnlyBroker:
 
     Allowed: `get_*` and READ_ONLY_METHODS. Everything else - execute_market_order,
     place_equity_order, cancel_*, call_mcp_tool, ... - raises PermissionError without touching
-    the wrapped broker."""
+    the wrapped broker. The wrapped broker is held only in a closure (no attribute) and read
+    methods are handed out as plain wrapper functions (no `__self__` pointing at the broker), so
+    shadow code cannot reach the real executor through the wrapper by accident."""
+
+    __slots__ = ("_lookup",)
 
     def __init__(self, inner: Any):
-        object.__setattr__(self, "_inner", inner)
+        def _lookup(name: str) -> Any:
+            if not (name.startswith("get_") or name in READ_ONLY_METHODS):
+                raise PermissionError(f"shadow mode: broker method {name!r} is blocked (read-only broker)")
+            fn = getattr(inner, name)
+
+            def _read(*a: Any, **kw: Any) -> Any:
+                return fn(*a, **kw)
+            _read.__name__ = name
+            return _read
+        object.__setattr__(self, "_lookup", _lookup)
 
     def __getattr__(self, name: str) -> Any:
-        if name.startswith("get_") or name in READ_ONLY_METHODS:
-            return getattr(self._inner, name)
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return object.__getattribute__(self, "_lookup")(name)
+        except PermissionError as exc:
+            msg = str(exc)
 
-        def _blocked(*_a: Any, **_kw: Any) -> Any:
-            raise PermissionError(f"shadow mode: broker method {name!r} is blocked (read-only broker)")
-        return _blocked
+            def _blocked(*_a: Any, **_kw: Any) -> Any:
+                raise PermissionError(msg)
+            return _blocked
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise PermissionError("ReadOnlyBroker is immutable")
@@ -136,7 +153,7 @@ def run_shadow_pulse(now: Optional[datetime.datetime] = None, config: Optional[D
 
     hold = MomentumStrategy.load_hold_list()
     universe = strat.universe()
-    bars = _fetch_strategy_bars(universe + ["SPY"])
+    bars = _fetch_strategy_bars(universe + ["SPY"], broker=ro)  # price history through the wrapper too
     spy_bars = bars.pop("SPY", [])
     if len(spy_bars) < strat.REGIME_SMA_BARS or len(bars) < max(1, len(universe) // 2):
         return _done(f"insufficient market data (SPY {len(spy_bars)} bars, {len(bars)}/{len(universe)} symbols)")

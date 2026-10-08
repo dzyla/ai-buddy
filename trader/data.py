@@ -120,8 +120,11 @@ class FinancialData:
             }
 
     @classmethod
-    def fetch_historical(cls, ticker: str, range_period: str = "6mo", interval: str = "1d") -> List[Dict[str, Any]]:
-        """Fetches historical OHLCV bars (open, high, low, close, volume)."""
+    def fetch_historical(cls, ticker: str, range_period: str = "6mo", interval: str = "1d",
+                         broker: Any = None) -> List[Dict[str, Any]]:
+        """Fetches historical OHLCV bars (open, high, low, close, volume).
+        `broker` supplies get_equity_historicals (default RobinhoodExecutor; shadow mode passes its
+        read-only wrapper)."""
         ticker = ticker.strip().upper()
 
         span_days = 90
@@ -143,7 +146,8 @@ class FinancialData:
 
         # 1. Primary source: Robinhood MCP Historical Bars
         try:
-            rh_hist = RobinhoodExecutor.get_equity_historicals([ticker], interval="day", span_days=span_days)
+            rh_hist = (RobinhoodExecutor if broker is None else broker).get_equity_historicals(
+                [ticker], interval="day", span_days=span_days)
             if ticker in rh_hist and len(rh_hist[ticker]) > 0:
                 bars = []
                 for b in rh_hist[ticker]:

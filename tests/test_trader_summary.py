@@ -128,3 +128,43 @@ def test_daemon_hook_sends_once_after_close_on_trading_days(journal, monkeypatch
     assert summary.maybe_send_daily_summary(at(12, 18, 0)) is None           # Saturday
     assert summary.maybe_send_daily_summary(at(8, 16, 5)) == "log"
     assert sent and sent[0][0] == DAY
+
+
+def test_flag_save_failure_after_send_does_not_resend(journal, monkeypatch):
+    """A failed flag write after a successful Zulip send must not make every daemon loop resend."""
+    sent = []
+    fake = types.ModuleType("zulip_mcp_server")
+    fake.do_send_message = lambda args: sent.append(args) or "Successfully sent message (ID: 1) to x."
+    monkeypatch.setitem(sys.modules, "zulip_mcp_server", fake)
+    monkeypatch.setenv("AI_TRADER_ZULIP_TO", "owner@example.com")
+
+    def disk_full(path, data):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(summary, "_save_json", disk_full)
+    monkeypatch.setattr(summary, "_close_snapshot", lambda account_number=None: None)
+    now = datetime.datetime(2026, 9, 8, 16, 5, tzinfo=ET_ZONE)
+    assert summary.maybe_send_daily_summary(now) == "zulip"
+    for _ in range(3):  # later daemon loops
+        assert summary.maybe_send_daily_summary(now) is None
+    assert summary.send_daily_summary("again", DAY) == "suppressed"
+    assert len(sent) == 1
+    assert not os.path.exists(os.path.join(rt.RISK_MONITOR_FLAGS, f"summary_{DAY}.flag"))
+
+
+def test_hook_appends_one_close_snapshot_per_day(journal, monkeypatch):
+    """While the summary is still pending (no flag yet), repeated loops must not append a new
+    equity-journal line (nor take a new broker snapshot) every iteration."""
+    day = "2026-09-09"
+    snaps = []
+    monkeypatch.setattr(summary, "send_daily_summary", lambda text, day=None: "log")   # never writes the flag
+    monkeypatch.setattr(summary, "_close_snapshot",
+                        lambda account_number=None: snaps.append(1) or {"equity": 1000.0, "cash": 10.0, "pos_map": {}})
+    now = datetime.datetime(2026, 9, 9, 16, 5, tzinfo=ET_ZONE)
+    for _ in range(4):
+        summary.maybe_send_daily_summary(now)
+    lines = [r for r in summary._read_jsonl(summary.equity_journal_path()) if r.get("date") == day]
+    assert len(lines) == 1 and len(snaps) == 1
+    # a restarted daemon (fresh in-memory guard) still sees the day in the journal
+    monkeypatch.setattr(summary, "_SNAPSHOT_KEYS", set())
+    summary.maybe_send_daily_summary(now)
+    assert len(snaps) == 1

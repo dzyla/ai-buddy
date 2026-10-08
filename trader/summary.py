@@ -26,6 +26,13 @@ from .daemon import _account_snapshot, _rebalance_flag_path, _risk_log, _save_js
 
 SUMMARY_AFTER_ET = datetime.time(16, 0)
 
+# In-memory once-per-day guards for the long-lived daemon, keyed by the on-disk flag / journal path
+# (so a redirected state dir starts fresh). They keep the daemon from re-sending the summary every
+# loop when the flag file cannot be written, and from appending a close snapshot to the equity
+# journal on every loop iteration while the summary is still pending.
+_SENT_FLAGS: set = set()
+_SNAPSHOT_KEYS: set = set()
+
 
 def equity_journal_path() -> str:
     return os.path.join(_cfg.CACHE_DIR, "equity_journal.jsonl")
@@ -226,7 +233,7 @@ def send_daily_summary(text: str, day: Any = None) -> str:
     """Deliver once per day. Returns "zulip", "notify-send", "log" or "suppressed" (already sent today)."""
     day = _day_str(day) if day is not None else MarketHours.now_et().strftime("%Y-%m-%d")
     flag = _summary_flag(day)
-    if os.path.exists(flag):
+    if flag in _SENT_FLAGS or os.path.exists(flag):
         return "suppressed"
     status = ""
     to = os.environ.get("AI_TRADER_ZULIP_TO") or os.environ.get("AI_REMINDER_ZULIP_TO")
@@ -244,7 +251,11 @@ def send_daily_summary(text: str, day: Any = None) -> str:
     if not status:
         status = "log"
     print(text, flush=True)
-    _save_json(flag, {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "via": status})
+    _SENT_FLAGS.add(flag)   # delivered: never again today from this process, even if the flag write fails
+    try:
+        _save_json(flag, {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "via": status})
+    except OSError as exc:
+        _risk_log(f"DAILY SUMMARY {day}: could not save the sent flag ({exc}); suppressed in memory")
     _risk_log(f"DAILY SUMMARY {day}: delivered via {status}")
     return status
 
@@ -266,12 +277,18 @@ def maybe_send_daily_summary(now: Optional[datetime.datetime] = None,
     day = now.strftime("%Y-%m-%d")
     if not MarketHours.is_trading_day(now.date()) or now.time() < SUMMARY_AFTER_ET:
         return None
-    if os.path.exists(_summary_flag(day)):
+    flag = _summary_flag(day)
+    if flag in _SENT_FLAGS or os.path.exists(flag):
         return None
-    try:
-        snap = _close_snapshot(account_number)
-        if snap:
-            record_equity_snapshot(day, snap)
-    except Exception as exc:  # noqa: BLE001 - the summary still goes out without a close reading
-        _risk_log(f"DAILY SUMMARY: close snapshot failed: {exc}")
+    snap_key = (equity_journal_path(), day)
+    if snap_key not in _SNAPSHOT_KEYS:
+        # One close snapshot per day: also after a restart (the journal already has the day).
+        _SNAPSHOT_KEYS.add(snap_key)
+        if not any(r.get("date") == day for r in _read_jsonl(equity_journal_path())):
+            try:
+                snap = _close_snapshot(account_number)
+                if snap:
+                    record_equity_snapshot(day, snap)
+            except Exception as exc:  # noqa: BLE001 - the summary still goes out without a close reading
+                _risk_log(f"DAILY SUMMARY: close snapshot failed: {exc}")
     return send_daily_summary(build_daily_summary(day, account_number), day)

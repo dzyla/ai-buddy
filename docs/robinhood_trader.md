@@ -146,7 +146,8 @@ release exists and never restarts it.
 ### Deploying
 
 ```bash
-bash trader/deploy.sh             # refuses on a dirty tree or failing trader tests
+bash trader/deploy.sh             # HEAD; refuses on a dirty tree or failing trader tests
+bash trader/deploy.sh --ref <sha> # that commit, whatever the worktree state (still test-gated)
 cp services/robinhood-trader.service ~/.config/systemd/user/   # first time / when the unit changed
 systemctl --user daemon-reload && systemctl --user restart robinhood-trader
 journalctl --user -u robinhood-trader -f                       # confirm two clean pulses
@@ -157,7 +158,8 @@ tree (`trader/`, `robinhood_trader.py`, `VERSION` with the commit), atomically r
 symlink, keeps the newest five releases plus the one `current` pointed at before (the running daemon
 may still be executing it) and prints the release path. The shim resolves the symlink at start-up and
 loads every module eagerly, so repointing `current` never changes the code of a running daemon; only a
-restart picks up the new release. `AI_TRADER_HOME` overrides the base directory. `--skip-tests` skips
+restart picks up the new release. The test gate runs every trader test file against a temporary
+checkout of the deployed commit (not the working tree). `AI_TRADER_HOME` overrides the base directory. `--skip-tests` skips
 the test gate; it exists for the deploy tests only and is refused unless `AI_TRADER_HOME` points to a
 non-default directory. Rollback: `ln -sfn releases/<older> ~/.local/share/ai-trader/current` and restart
 the unit.
