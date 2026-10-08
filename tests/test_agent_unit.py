@@ -110,8 +110,10 @@ def test_request_builder_matches_c_engine_capture(tmp_path, args, extra):
     env = {"INFER_BASE_URL": "http://x/v1/", "INFER_API_KEY": "k", "INFER_MODEL": "mock",
            "INFER_TOOL_CHOICE": "auto", **extra}
     cfg = cli.parse(args, env)
-    payload = llm.build_payload(cfg.model, req["messages"], req.get("tools"), cfg.opts)
-    assert payload == req
+    # the C capture talks to a local mock: both engines then ask for return_progress
+    assert req.get("return_progress") is True
+    payload = llm.build_payload(cfg.model, req["messages"], req.get("tools"), cfg.opts, return_progress=True)
+    assert payload == req and list(payload) == list(req)      # same fields, same order
 
 
 # ── argument parsing / prompt assembly ───────────────────────────────────────
