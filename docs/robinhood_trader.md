@@ -58,7 +58,8 @@ A production-grade, autonomous financial analysis, risk management, and trading 
    - **Core 60%**: `VTI` + `QQQ`, topped up once a day whenever cash exceeds the buffer. Never sold by the bot.
    - **Sleeve 30%**: top 3 names from the curated universe by 6-month (126-bar) total return, eligible only when close > SMA200, average 20-day volume >= 500k and price >= $5. Equal weight, rebalanced on the first trading day the daemon sees each month (flag `rebalance_YYYY-MM.json`). Sells go first; buys follow on the next pulse once cash has settled.
    - **Rank buffer (hysteresis)**: a sleeve name already held is kept while it is still eligible and ranked within top 3 + `SLEEVE_RANK_BUFFER` (default 2); the free slots go to the best-ranked other names. Set `{"strategy": {"sleeve_rank_buffer": 0}}` in `~/.config/ai/trader.json` for the old strict top-3 rotation. It is applied only when a month's plan is first made, so a running month's flag is never re-planned; the flag records `incumbents` and `rank_buffer`.
-   - **Regime gate**: if `SPY` closes below its SMA200 on rebalance day, the sleeve goes to cash.
+   - **Bear parking (`bear_park`, off by default)**: `{"strategy": {"bear_park": "BND"}}` buys the whole 30% sleeve allocation into that bond ETF instead of leaving it in cash when SPY is below its SMA200 at the monthly rebalance. Fallback chain if the ticker has no usable bars: configured ticker, then BND, AGG, SGOV, then cash (today's behaviour; a failed fetch also means cash). Buy reason `PARK_TARGET`; when the regime is BULL again the parked ETF is sold first through the normal rotate-out (sells before buys, same settlement wait) and the sleeve is re-bought. The parked ETF is exempt from the per-name -20% disaster stop (only while `bear_park` is configured; the exemption never causes a trade); the circuit breaker and the daily core top-up are unchanged. Like the rank buffer it is read only when a month's plan is first made (the flag records `park` and `park_requested`), so enabling it mid-month never triggers an unscheduled trade. Research (`dev/backtest_momentum.py --variants live_default,live_default+park_BND`) showed it ties the live rules within noise, so it is a SHADOW candidate only; keep it null live.
+   - **Regime gate**: if `SPY` closes below its SMA200 on rebalance day, the sleeve goes to cash (or to the parked bond ETF when `bear_park` is set).
    - **Cash 10%**: buffer that buys never breach.
    - **Disaster stop**: any sleeve position at or below -20% from average cost is sold on the next pulse. There are no partial take-profits, profit-lock floors or trailing stops (the 5-year backtest showed those clipped winners and netted ~$0 on 250 trades).
    - **Hold list**: symbols in `~/.config/ai/trading_hold.txt` (one per line) are never sold by the bot.
@@ -179,6 +180,19 @@ Enable it in `~/.config/ai/trader.json` (template: `config/trader.example.json`)
 {"shadow": {"enabled": true, "strategy": {"sleeve_rank_buffer": 0, "sleeve_top_n": 4}}}
 ```
 
+To shadow the bond-parking candidate (`bear_park`), set exactly this in `~/.config/ai/trader.json` and leave the
+live `strategy` block without `bear_park`:
+
+```json
+{"shadow": {"enabled": true, "strategy": {"bear_park": "BND"}}}
+```
+
+In a BEAR regime the shadow record then has `"targets": []`, `"park": "BND"` and a planned `buy BND` (reason
+`PARK_TARGET`) beside the sleeve sells; the daily summary shows `shadow targets: BND (park) | live targets: CASH`.
+Without a bear regime it plans exactly what the live rules plan. A shadow `bear_park` is a plain ticker (not a core
+ETF or SPY); anything else is listed in `ignored_overrides`. A shadow without its own `bear_park` inherits the live
+setting (null by default).
+
 Once per trading day, after the live pulse (from 10:00 ET), the daemon calls
 `trader.shadow.run_shadow_pulse`: it reads the account through `ReadOnlyBroker` (every order, cancel or
 raw MCP method raises `PermissionError`), ranks the universe with a `MomentumStrategy` subclass carrying
@@ -187,7 +201,7 @@ the overrides, and appends one line to `~/.cache/ai/trading/shadow/<YYYY-MM>.jso
 `planned_orders` (sells, buys, core top-up) it would place today. It writes no live flag, ledger or note;
 `shadow_<date>.flag` limits it to one attempt a day. Accepted keys: `sleeve_rank_buffer`, `sleeve_top_n`,
 `core_target_pct`, `sleeve_target_pct`, `cash_buffer_pct`, `lookback_bars`, `regime_sma_bars`,
-`disaster_stop_pct`, `min_avg_volume`, `min_price`; unknown or out-of-range keys are listed as
+`disaster_stop_pct`, `min_avg_volume`, `min_price`, `bear_park` (ticker string); unknown or out-of-range keys are listed as
 `ignored_overrides`.
 
 ### Daily summary

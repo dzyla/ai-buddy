@@ -67,7 +67,7 @@ trap cleanup EXIT
 # Every trader test file. Inside a gate run (tests/test_trader_deploy.py deploys from within the
 # gate), the deploy tests themselves are left out so the gate cannot recurse.
 TRADER_TESTS=(tests/test_robinhood_trader.py tests/test_momentum_strategy.py tests/test_trader_pulses.py
-              tests/test_trader_shadow.py tests/test_trader_summary.py tests/test_trader_package.py
+              tests/test_trader_bear_park.py tests/test_trader_shadow.py tests/test_trader_summary.py tests/test_trader_package.py
               tests/test_trader_daemon_hooks.py tests/test_trader_deploy.py)
 if [ -n "${AI_TRADER_DEPLOY_GATE:-}" ]; then
     TRADER_TESTS=("${TRADER_TESTS[@]/tests\/test_trader_deploy.py/}")

@@ -351,19 +351,21 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
         incumbents = MomentumStrategy.sleeve_incumbents(pos_map, hold)
         rank_buffer = MomentumStrategy.rank_buffer()
         targets = MomentumStrategy.select_sleeve(ranked, regime["regime"], incumbents=incumbents, buffer=rank_buffer)
-        plan = MomentumStrategy.plan_rebalance(equity, cash, pos_map, targets, hold)
+        park = MomentumStrategy.choose_park(regime["regime"], targets, _fetch_strategy_bars)
+        plan = MomentumStrategy.plan_rebalance(equity, cash, pos_map, targets, hold, park=park)
         state = {
             "month": month, "date": today, "dry_run": dry_run,
             "equity": round(equity, 2), "cash": round(cash, 2),
             "regime": regime, "targets": targets, "hold": sorted(hold),
             "incumbents": incumbents, "rank_buffer": rank_buffer,
+            "park": park, "park_requested": MomentumStrategy.bear_park(),
             "ranking": ranked[:10],
             "sells_pending": plan["sells"], "buys_pending": plan["buys"],
             "sells_done": [], "buys_done": [], "done": False,
         }
         _save_json(flag, state)
         _risk_log(f"STRATEGY REBALANCE {month}: regime={regime['regime']} (SPY {regime.get('close')} vs SMA200 {regime.get('sma200')}) "
-                  f"targets={targets or 'CASH'} sells={[s['symbol'] for s in plan['sells']]} "
+                  f"targets={targets or (f'PARK {park}' if park else 'CASH')} sells={[s['symbol'] for s in plan['sells']]} "
                   f"buys={[(b['symbol'], b['dollar_amount']) for b in plan['buys']]} equity=${equity:,.2f} cash=${cash:,.2f}")
         try:
             ObsidianTradingVault.save_rebalance_note(month, state)
@@ -538,7 +540,8 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool,
             _risk_log(f"🚨 {cb_msg} -> session halt flag written. Positions are HELD (no forced liquidation).")
 
     hold = MomentumStrategy.load_hold_list()
-    hits = MomentumStrategy.disaster_stop_hits(positions, quotes, hold)
+    hits = MomentumStrategy.disaster_stop_hits(positions, quotes, hold,
+                                              exempt=MomentumStrategy.park_candidates(MomentumStrategy.bear_park()))
     _, pdt_reason = ComplianceAndRiskGuard.can_day_trade(account_number, equity)
     for h in hits:
         sym, qty, price, pnl_pct = h["symbol"], h["quantity"], h["price"], h["pnl_pct"]

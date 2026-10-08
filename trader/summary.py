@@ -167,7 +167,8 @@ def build_daily_summary(day: Any, account_number: Optional[str] = None) -> str:
     if sleeve:
         for s, p in sorted(sleeve.items()):
             q, px = float(p.get("quantity", 0) or 0), float(p.get("price", 0) or 0)
-            out.append(f"- {s} {q:g} sh ({_money(q * px)})")
+            tag = " (park)" if str(state.get("park") or "").upper() == s.upper() else ""
+            out.append(f"- {s}{tag} {q:g} sh ({_money(q * px)})")
     elif positions:
         out.append("- none (core only)")
     else:
@@ -176,6 +177,8 @@ def build_daily_summary(day: Any, account_number: Optional[str] = None) -> str:
     out += ["", "**Shadow vs live**"]
     shadow_recs = [r for r in _read_jsonl(os.path.join(_cfg.CACHE_DIR, "shadow", f"{month}.jsonl")) if r.get("date") == day]
     live = state.get("targets") if isinstance(state.get("targets"), list) else None
+    if live is not None and not live and isinstance(state.get("park"), str):
+        live = [f"{state['park']} (park)"]
     if not shadow_recs:
         out.append("- n/a (no shadow pulse today)")
     else:
@@ -184,7 +187,10 @@ def build_daily_summary(day: Any, account_number: Optional[str] = None) -> str:
             out.append(f"- shadow pulse skipped: {sh.get('reason', 'unknown')}")
         else:
             st = list(sh.get("targets") or [])
-            out.append(f"- shadow targets: {', '.join(st) or 'CASH'} | live targets: {', '.join(live) if live is not None else 'n/a'}")
+            if not st and isinstance(sh.get("park"), str):
+                st = [f"{sh['park']} (park)"]
+            out.append(f"- shadow targets: {', '.join(st) or 'CASH'} | live targets: "
+                       f"{(', '.join(live) or 'CASH') if live is not None else 'n/a'}")
             if live is not None:
                 only_s = [s for s in st if s not in live]
                 only_l = [s for s in live if s not in st]

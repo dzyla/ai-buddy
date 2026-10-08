@@ -2,7 +2,8 @@
 
 import math
 import datetime
-from typing import List, Dict, Any, Optional, Tuple
+import re
+from typing import Callable, Iterable, List, Dict, Any, Optional, Tuple
 
 from .config import SECTOR_UNIVERSES, TRADING_HOLD_FILE, load_trader_config
 
@@ -40,6 +41,14 @@ class MomentumStrategy:
     # dev/backtest_momentum.py (2005-2026, 3 universes): turnover -20..-28%, Sharpe/max DD unchanged within noise.
     # 0 = the original strict top-N rotation. Override: trader.json {"strategy": {"sleeve_rank_buffer": n}}.
     SLEEVE_RANK_BUFFER = 2
+    # Bear-regime parking (OFF by default = cash). When SPY < SMA200 at the monthly rebalance the sleeve's 30% is
+    # bought into this bond ETF instead of staying in cash; it is sold through the normal rotate-out path once the
+    # regime is BULL again, and is exempt from the per-name disaster stop. Fallback chain if the ticker has no
+    # usable bars: configured -> BND -> AGG -> SGOV -> cash. dev/backtest_momentum.py `park_BND` (research: tied the
+    # live strategy within noise, hence shadow-only). Override: trader.json {"strategy": {"bear_park": "BND"}};
+    # read only when a month's plan is first made, so enabling it mid-month never triggers an unscheduled trade.
+    BEAR_PARK: Optional[str] = None
+    PARK_FALLBACKS: Tuple[str, ...] = ("BND", "AGG", "SGOV")
     LOOKBACK_BARS = 126        # ~6 months of trading days
     REGIME_SMA_BARS = 200
     DISASTER_STOP_PCT = 20.0
@@ -136,6 +145,58 @@ class MomentumStrategy:
         return cls.SLEEVE_RANK_BUFFER
 
     @classmethod
+    def clean_park(cls, val: Any) -> Optional[str]:
+        """A valid parking ticker (upper-cased) or None. Core ETFs, SPY and non-tickers are rejected."""
+        if not isinstance(val, str):
+            return None
+        sym = val.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", sym) or sym in cls.CORE_SYMBOLS or sym == "SPY":
+            return None
+        return sym
+
+    @classmethod
+    def bear_park(cls) -> Optional[str]:
+        """Bear-regime parking ETF: `strategy.bear_park` in trader.json (a plain ticker), else the default (None = cash)."""
+        try:
+            val = (load_trader_config().get("strategy") or {}).get("bear_park")
+        except AttributeError:
+            val = None
+        return cls.clean_park(val) or cls.clean_park(cls.BEAR_PARK)
+
+    @classmethod
+    def park_candidates(cls, primary: Optional[str]) -> List[str]:
+        """Fallback chain for the parking asset (empty when parking is off)."""
+        first = cls.clean_park(primary)
+        if not first:
+            return []
+        return list(dict.fromkeys([first, *cls.PARK_FALLBACKS]))
+
+    @classmethod
+    def resolve_park(cls, primary: Optional[str], bars_by_symbol: Dict[str, List[Dict[str, Any]]]) -> Optional[str]:
+        """First candidate with usable bars (>= 2, last close > 0); None -> stay in cash."""
+        for sym in cls.park_candidates(primary):
+            b = bars_by_symbol.get(sym) or []
+            try:
+                if len(b) >= 2 and float(b[-1]["close"]) > 0:
+                    return sym
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def choose_park(cls, regime: str, targets: List[str],
+                    fetch: Callable[[List[str]], Dict[str, List[Dict[str, Any]]]]) -> Optional[str]:
+        """The parking ETF for this rebalance, or None (cash). Only in a BEAR regime with no sleeve targets and
+        bear_park configured; a failed data fetch means cash (today's behaviour), never an error."""
+        primary = cls.bear_park()
+        if not primary or regime != "BEAR" or targets:
+            return None
+        try:
+            return cls.resolve_park(primary, fetch(cls.park_candidates(primary)))
+        except Exception:  # noqa: BLE001
+            return None
+
+    @classmethod
     def select_sleeve(cls, ranked: List[Dict[str, Any]], regime: str, top_n: Optional[int] = None,
                       incumbents: Optional[List[str]] = None, buffer: int = 0) -> List[str]:
         """Top-N eligible names. With `buffer` > 0, a name already held (`incumbents`) is kept while it is
@@ -168,13 +229,19 @@ class MomentumStrategy:
 
     @classmethod
     def plan_rebalance(cls, equity: float, cash: float, positions: Dict[str, Dict[str, float]],
-                       targets: List[str], hold: Optional[set] = None) -> Dict[str, Any]:
+                       targets: List[str], hold: Optional[set] = None,
+                       park: Optional[str] = None) -> Dict[str, Any]:
         """Deterministic sleeve rebalance: sells first (rotated-out names), then equal-weight buys.
+
+        `park` (bear regime, no `targets`): the whole sleeve allocation goes to this ETF instead of cash; it is
+        ignored when there are targets. park=None is exactly the original behaviour.
 
         positions: {symbol: {"quantity": q, "price": p}}. Returns {"sells": [...], "buys": [...],
         "projected_cash": x}. Buys never push cash below CASH_BUFFER_PCT of equity.
         """
         hold = {h.upper() for h in (hold or set())}
+        park_sym = cls.clean_park(park) if (park and not targets) else None
+        wanted = [park_sym] if park_sym else targets
         sells: List[Dict[str, Any]] = []
         buys: List[Dict[str, Any]] = []
         projected_cash = float(cash)
@@ -182,22 +249,22 @@ class MomentumStrategy:
             s = sym.upper()
             qty = float(pos.get("quantity", 0) or 0)
             price = float(pos.get("price", 0) or 0)
-            if qty <= 0 or s in cls.CORE_SYMBOLS or s in hold or s in targets:
+            if qty <= 0 or s in cls.CORE_SYMBOLS or s in hold or s in wanted:
                 continue
             sells.append({"symbol": s, "quantity": _floor_qty(qty),
                           "reason": "REGIME_EXIT" if not targets else "ROTATE_OUT"})
             projected_cash += qty * price
-        if targets:
-            per_name = equity * cls.SLEEVE_TARGET_PCT / len(targets)
+        if wanted:
+            per_name = equity * cls.SLEEVE_TARGET_PCT / len(wanted)
             buffer = equity * cls.CASH_BUFFER_PCT
-            for s in targets:
+            for s in wanted:
                 pos = positions.get(s, {})
                 current_val = float(pos.get("quantity", 0) or 0) * float(pos.get("price", 0) or 0)
                 want = per_name - current_val
                 room = projected_cash - buffer
                 amt = round(min(want, room), 2)
                 if amt >= cls.MIN_ORDER_DOLLARS:
-                    buys.append({"symbol": s, "dollar_amount": amt, "reason": "SLEEVE_TARGET"})
+                    buys.append({"symbol": s, "dollar_amount": amt, "reason": "PARK_TARGET" if park_sym else "SLEEVE_TARGET"})
                     projected_cash -= amt
         return {"sells": sells, "buys": buys, "projected_cash": round(projected_cash, 2)}
 
@@ -224,9 +291,10 @@ class MomentumStrategy:
 
     @classmethod
     def disaster_stop_hits(cls, positions: List[Dict[str, Any]], quotes: Dict[str, Dict[str, Any]],
-                           hold: Optional[set] = None) -> List[Dict[str, Any]]:
-        """Sleeve positions at or below -DISASTER_STOP_PCT from average cost."""
-        hold = {h.upper() for h in (hold or set())}
+                           hold: Optional[set] = None, exempt: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+        """Sleeve positions at or below -DISASTER_STOP_PCT from average cost. `exempt` symbols (the bear-regime
+        parking ETFs) are never stopped; they leave through the monthly rotate-out instead."""
+        hold = {h.upper() for h in (hold or set())} | {e.upper() for e in (exempt or ())}
         hits = []
         for pos in positions:
             sym = str(pos.get("symbol", "")).upper()

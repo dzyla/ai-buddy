@@ -129,6 +129,8 @@ VARIANTS = {
     "park_SHY": Variant("park_SHY", park="SHY"),
     "park_IEF": Variant("park_IEF", park="IEF"),
     "park_BIL": Variant("park_BIL", park="BIL"),
+    # The live `bear_park` option (trader.json strategy.bear_park): BND -> AGG -> SGOV -> cash while SPY < SMA200.
+    "park_BND": Variant("park_BND", park="BND"),
     "no_stop": Variant("no_stop", stop_pct=None),
     "stop_15": Variant("stop_15", stop_pct=15.0),
     "top_5": Variant("top_5", top_n=5),
@@ -358,7 +360,7 @@ class Sim:
             # 1) disaster stop (sleeve names only, every pulse => day's low)
             if v.stop_pct:
                 for s in list(self.pos):
-                    if s in self.core or s == v.park or s not in opens:
+                    if s in self.core or s in MS.park_candidates(v.park) or s not in opens:
                         continue
                     stop = self.pos[s]["avg"] * (1 - v.stop_pct / 100)
                     if self.px(s, d, "low") <= stop:
@@ -372,12 +374,15 @@ class Sim:
             if day_in_month == self.offset and prev_d is not None:
                 regime = self.regime(prev_d)
                 tg, w = self.targets(prev_d, regime)
-                if not tg and v.park and v.park in opens:
-                    tg, w = [v.park], {v.park: 1.0}
+                park = None
+                if not tg and v.park and regime != "BULL":   # parking is a BEAR-regime feature (as live)
+                    park = next((c for c in MS.park_candidates(v.park) if c in opens), None)
+                    if park:
+                        tg, w = [park], {park: 1.0}
                 eq = self.equity(opens)
                 if v.sizing == "equal":
                     pos_map = {s: {"quantity": p["qty"], "price": opens.get(s, p["mark"])} for s, p in self.pos.items()}
-                    plan = MS.plan_rebalance(eq, self.cash, pos_map, tg)      # live planner (equal weight)
+                    plan = MS.plan_rebalance(eq, self.cash, pos_map, [] if park else tg, park=park)   # live planner (equal weight)
                     for sl in plan["sells"]:
                         if sl["symbol"] in opens:
                             self.sell(sl["symbol"], opens[sl["symbol"]])
@@ -538,7 +543,7 @@ def main() -> None:
     report = {}
     for uname in args.universe.split(","):
         universe = UNIVERSES[uname] or MS.universe()
-        bars = load(universe, ["SPY"] + list(MS.CORE_SYMBOLS) + ["SHY", "IEF", "BIL"])
+        bars = load(universe, ["SPY"] + list(MS.CORE_SYMBOLS) + ["SHY", "IEF", "BIL", "BND", "AGG", "SGOV"])
         print(f"\n=== universe {uname} ({len([s for s in universe if s in bars])} names), "
               f"start ${args.cash:,.0f}, slippage {args.slippage_bps:g} bps ===")
         print(HEADER)

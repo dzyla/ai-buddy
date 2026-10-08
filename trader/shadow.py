@@ -86,6 +86,8 @@ def shadow_strategy(overrides: Optional[Dict[str, Any]]) -> Tuple[type, Dict[str
     ignored: List[str] = []
     for key, val in (overrides or {}).items():
         spec = SHADOW_OVERRIDES.get(key)
+        if key == "bear_park":
+            continue   # string ticker, validated below
         if spec is None or isinstance(val, bool):
             ignored.append(key)
             continue
@@ -100,6 +102,13 @@ def shadow_strategy(overrides: Optional[Dict[str, Any]]) -> Tuple[type, Dict[str
             continue
         attrs[attr] = v
         applied[key] = v
+    if "bear_park" in (overrides or {}):
+        sym = MomentumStrategy.clean_park((overrides or {})["bear_park"])
+        if sym:
+            applied["bear_park"] = sym
+            attrs["bear_park"] = classmethod(lambda cls, _s=sym: _s)
+        else:
+            ignored.append("bear_park")
     if "SLEEVE_RANK_BUFFER" in attrs:
         buf = attrs["SLEEVE_RANK_BUFFER"]
         attrs["rank_buffer"] = classmethod(lambda cls: buf)
@@ -122,7 +131,9 @@ def _live_targets(month: str) -> Optional[List[str]]:
         with open(_rebalance_flag_path(month), encoding="utf-8") as fh:
             state = json.load(fh)
         targets = state.get("targets") if isinstance(state, dict) else None
-        return list(targets) if isinstance(targets, list) else None
+        if not isinstance(targets, list):
+            return None
+        return list(targets) + ([state["park"]] if not targets and isinstance(state.get("park"), str) else [])
     except (OSError, ValueError):
         return None
 
@@ -164,7 +175,8 @@ def run_shadow_pulse(now: Optional[datetime.datetime] = None, config: Optional[D
     base_regime = MomentumStrategy.regime(spy_bars)
     baseline = MomentumStrategy.select_sleeve(MomentumStrategy.rank(bars), base_regime["regime"],
                                               incumbents=incumbents, buffer=MomentumStrategy.rank_buffer())
-    plan = strat.plan_rebalance(equity, cash, pos_map, targets, hold)
+    park = strat.choose_park(regime["regime"], targets, lambda syms: _fetch_strategy_bars(syms, broker=ro))
+    plan = strat.plan_rebalance(equity, cash, pos_map, targets, hold, park=park)
     orders: List[Dict[str, Any]] = [{"side": "sell", **s} for s in plan["sells"]]
     orders += [{"side": "buy", **b} for b in plan["buys"]]
     # Core top-up on the cash left after the sleeve plan (approximation: positions are pre-trade).
@@ -172,7 +184,7 @@ def run_shadow_pulse(now: Optional[datetime.datetime] = None, config: Optional[D
     if topup:
         orders.append({"side": "buy", **topup})
     record.update({"status": "ok", "regime": regime["regime"], "equity": round(equity, 2), "cash": round(cash, 2),
-                   "targets": targets, "baseline_targets": baseline, "live_targets": _live_targets(month),
+                   "targets": targets, "park": park, "baseline_targets": baseline, "live_targets": _live_targets(month),
                    "incumbents": incumbents, "planned_orders": orders})
     return _done()
 

@@ -9,6 +9,8 @@
   },
   "shadow": {
     "enabled": false,
-    "strategy": {}
+    "strategy": {
+      "bear_park": "BND"
+    }
   }
 }
