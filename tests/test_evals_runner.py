@@ -282,6 +282,17 @@ def test_engine_flag_sets_env(rev):
     assert env["INFER_ENGINE"] == "c"
 
 
+def _runner_env(tmp_path=None):
+    """The runner's env: no INFER_* leak; TMPDIR under the test's tmp_path, so the temp dirs the
+    runner keeps for failed tasks are cleaned up with it."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+    if tmp_path is not None:
+        d = os.path.join(str(tmp_path), "runner_tmp")
+        os.makedirs(d, exist_ok=True)
+        env["TMPDIR"] = d
+    return env
+
+
 def _run_custom(tmp_path, tasks):
     if not os.path.exists(os.path.join(REPO, "ai")):
         pytest.skip("ai binary not built")
@@ -290,7 +301,7 @@ def _run_custom(tmp_path, tasks):
     for i, t in enumerate(tasks, 1):
         (tdir / f"{i:02d}_{t['id']}.json").write_text(json.dumps(t))
     out = tmp_path / "out.json"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+    env = _runner_env(tmp_path)
     r = subprocess.run([sys.executable, RUNNER, "--mock", "--tasks-dir", str(tdir),
                         "--json", str(out)], cwd="/", env=env, capture_output=True, text=True,
                        timeout=300)
@@ -436,7 +447,7 @@ def test_progress_line_printed_as_each_task_finishes(tmp_path):
     tdir.mkdir()
     (tdir / "01_quick.json").write_text(json.dumps(_sleep_task("quick", 0)))
     (tdir / "02_slow.json").write_text(json.dumps(_sleep_task("slow", 6)))
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+    env = _runner_env(tmp_path)
     p = subprocess.Popen([sys.executable, RUNNER, "--mock", "--jobs", "1", "--tasks-dir", str(tdir)], cwd="/",
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
