@@ -1,5 +1,6 @@
 {
   "id": "edit_config_value",
+  "tier": "easy",
   "description": "Change one value in a config file and leave the rest untouched.",
   "prompt": "In settings.ini, change the server port from 8080 to 9090. Do not change anything else in the file.",
   "files": {

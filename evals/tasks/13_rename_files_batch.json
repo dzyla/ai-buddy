@@ -1,5 +1,6 @@
 {
   "id": "rename_files_batch",
+  "tier": "medium",
   "description": "Batch-rename files with a shell loop.",
   "prompt": "Rename every IMG_*.JPG file in the current directory to photo_<number>.jpg (for example IMG_001.JPG becomes photo_001.jpg). Leave other files alone.",
   "files": {

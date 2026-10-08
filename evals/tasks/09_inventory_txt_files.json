@@ -1,5 +1,6 @@
 {
   "id": "inventory_txt_files",
+  "tier": "easy",
   "description": "List a directory and write a sorted inventory of one file type.",
   "prompt": "Write the names of all .txt files in the current directory, sorted alphabetically, one per line, to inventory.md. Do not include other file types.",
   "files": {

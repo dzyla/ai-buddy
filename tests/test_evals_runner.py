@@ -25,14 +25,66 @@ def _tasks():
     return sorted(glob.glob(os.path.join(EVALS, "tasks", "*.json")))
 
 
-def test_at_least_twelve_tasks():
-    assert len(_tasks()) >= 12
+def _load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_at_least_twenty_tasks():
+    assert len(_tasks()) >= 20
+
+
+def test_tiers_assigned_and_populated():
+    tiers = {}
+    for p in _tasks():
+        t = _load(p)
+        assert t["tier"] in ("easy", "medium", "hard"), p
+        tiers.setdefault(t["tier"], []).append(t["id"])
+    assert len(tiers["easy"]) >= 4 and len(tiers["medium"]) >= 4 and len(tiers["hard"]) >= 10
+    for new in ("long_context_needle_30k", "long_context_needle_60k", "long_context_needle_100k",
+                "multi_file_bug_fix", "data_analysis_csv", "plan_and_execute",
+                "misleading_error_recovery"):
+        assert new in tiers["hard"], new
+
+
+def test_generated_fixtures_match_task_expectations():
+    """The needle line numbers the mocks read, and the CSV median the check expects, are what the
+    seeded generators really produce (so the mock reads and live checks cannot drift)."""
+    import statistics
+    sys.path.insert(0, EVALS)
+    try:
+        import generators
+    finally:
+        sys.path.remove(EVALS)
+    for p in _tasks():
+        t = _load(p)
+        for spec in t.get("generate", []):
+            if spec["kind"] == "lab_notebook":
+                text, where = generators.lab_notebook(spec["seed"], spec["chars"],
+                                                      [tuple(n) for n in spec["needles"]])
+                assert generators.generate(spec) == (spec["path"], text)  # deterministic
+                lines = text.splitlines()
+                assert abs(len(text) - spec["chars"]) < 1000
+                assert len(lines) == t["meta"]["total_lines"]
+                code_check = [c for c in t["checks"] if c["type"] == "file_contains" and not c.get("not")][0]
+                needle = [n for d, n in spec["needles"] if d == 0.70][0]
+                assert code_check["text"] in needle and where[needle] == t["meta"]["needle_line"]
+                assert text.count(code_check["text"]) == 1  # only the planted line has the code
+                for c in t["checks"]:  # distractors are present but are not the answer
+                    if c.get("not") and c["type"] == "file_contains":
+                        assert c["text"] in text
+            elif spec["kind"] == "sales_csv":
+                rows = generators.sales_rows(spec["seed"], spec["rows"])
+                assert len(rows) == 500
+                vals = [float(r[3]) for r in rows if r[1] == "C" and r[2] == "active"]
+                assert "%.2f" % statistics.median(vals) == "511.95"
 
 
 @pytest.mark.parametrize("path", _tasks(), ids=os.path.basename)
 def test_task_schema(path):
     with open(path, encoding="utf-8") as f:
         t = json.load(f)
+    assert t["tier"] in ("easy", "medium", "hard")
     assert t["id"] and t["id"] == os.path.splitext(os.path.basename(path))[0].split("_", 1)[1]
     assert isinstance(t["prompt"], str) and len(t["prompt"]) > 20
     assert t["checks"], "a task needs checks"
@@ -89,6 +141,12 @@ def test_mock_run_json_report(mock_run):
               if not res["passed"]]
     assert not failed, failed
     assert report["passed"] == len(results)
+    assert report["repeat"] == 1 and report["pass_at_1"] == 1.0
+    for res in results:
+        assert res["tier"] in ("easy", "medium", "hard")
+        assert res["wall_time_s"] > 0 and res["tokens"] > 0
+    assert set(report["by_tier"]) == {"easy", "medium", "hard", "overall"}
+    assert report["by_tier"]["overall"]["runs"] == len(results)
 
 
 def test_mock_run_prints_table(mock_run):
@@ -96,6 +154,37 @@ def test_mock_run_prints_table(mock_run):
     with open(_tasks()[0], encoding="utf-8") as f:
         first = json.load(f)["id"]
     assert first in r.stdout and "PASS" in r.stdout
+
+
+def test_mock_run_prints_tier_summary(mock_run):
+    r, _ = mock_run
+    assert "med steps" in r.stdout and "overall" in r.stdout and "hard" in r.stdout
+
+
+def _run_args(*extra):
+    if not os.path.exists(os.path.join(REPO, "ai")):
+        pytest.skip("ai binary not built")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+    return subprocess.run([sys.executable, RUNNER, "--mock", *extra], cwd="/", env=env,
+                          capture_output=True, text=True, timeout=600)
+
+
+def test_tier_filter_and_repeat(tmp_path):
+    out = tmp_path / "o.json"
+    r = _run_args("--tier", "easy,medium", "--repeat", "2", "--json", str(out))
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    rep = json.loads(out.read_text())
+    want = [_load(p) for p in _tasks() if _load(p)["tier"] in ("easy", "medium")]
+    assert rep["total"] == 2 * len(want) and rep["repeat"] == 2
+    assert {x["tier"] for x in rep["results"]} == {"easy", "medium"}
+    assert set(rep["by_tier"]) == {"easy", "medium", "overall"}
+    assert sorted({x["run"] for x in rep["results"]}) == [1, 2]
+    assert "pass@1 = 1.000" in r.stdout
+
+
+def test_bad_tier_rejected():
+    r = _run_args("--tier", "impossible")
+    assert r.returncode == 2
 
 
 # ── unit tests of the scorer (no binary) ────────────────────────────────────
@@ -295,3 +384,23 @@ def test_recovery_tasks_mark_their_failing_step():
         with open(path, encoding="utf-8") as f:
             steps = json.load(f)["mock"]["steps"]
         assert steps[0].get("expect_error") is True, name
+
+
+def test_tier_summary_math(rev):
+    res = [{"tier": "easy", "passed": True, "steps": 2, "duration_s": 1.0, "tokens": 100},
+           {"tier": "easy", "passed": False, "steps": 4, "duration_s": 3.0, "tokens": 50,
+            "tokens_estimated": True},
+           {"tier": "hard", "passed": True, "steps": 10, "duration_s": 9.0, "tokens": 1000}]
+    s = rev.tier_summary(res)
+    assert s["easy"]["pass_rate"] == 0.5 and s["easy"]["median_steps"] == 3
+    assert s["easy"]["median_wall_s"] == 2.0 and s["easy"]["tokens"] == 150
+    assert s["easy"]["tokens_estimated"] is True and s["hard"]["tokens_estimated"] is False
+    assert s["overall"]["runs"] == 3 and abs(s["overall"]["pass_rate"] - 0.6667) < 1e-3
+    assert "medium" not in s
+
+
+def test_session_tokens(rev):
+    assert rev.session_tokens([{"usage": {"total_tokens": 7}}, {"usage": {"prompt_tokens": 2,
+                                                                         "completion_tokens": 1}}]) == (10, False)
+    tok, est = rev.session_tokens([{"role": "user", "content": "x" * 400}])
+    assert est and tok > 90

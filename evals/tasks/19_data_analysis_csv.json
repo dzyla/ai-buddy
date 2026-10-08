@@ -1,0 +1,51 @@
+{
+  "id": "data_analysis_csv",
+  "tier": "hard",
+  "description": "500-row seeded CSV (evals/generators.py sales_csv seed 11); median of value for group C, status active (65 rows, 511.95).",
+  "prompt": "sales.csv has 500 rows with columns id,group,status,value. Considering only rows where group is C and status is active, compute the median of value. Write just the median, with two decimals, to median.txt (compute it with a script or shell tools, not by eye) and report it.",
+  "generate": [
+    {
+      "kind": "sales_csv",
+      "path": "sales.csv",
+      "seed": 11,
+      "rows": 500
+    }
+  ],
+  "timeout": 600,
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "median.txt",
+      "text": "511.95"
+    },
+    {
+      "type": "file_contains",
+      "path": "median.txt",
+      "text": "537.5",
+      "not": true
+    },
+    {
+      "type": "answer_contains",
+      "text": "511.95"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command"
+    },
+    {
+      "type": "max_steps",
+      "value": 15
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 -c \"import csv,statistics;v=[float(r['value']) for r in csv.DictReader(open('sales.csv')) if r['group']=='C' and r['status']=='active'];open('median.txt','w').write('%.2f\\n'%statistics.median(v))\" && cat median.txt"
+        }
+      }
+    ],
+    "final": "The median value for group C, active rows is 511.95 (saved in median.txt)."
+  }
+}

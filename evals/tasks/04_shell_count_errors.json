@@ -1,5 +1,6 @@
 {
   "id": "shell_count_errors",
+  "tier": "medium",
   "description": "Use the shell to count matching log lines and save the number.",
   "prompt": "app.log has one event per line. Using a shell command, count how many lines have level ERROR, then write just that number to count.txt.",
   "files": {

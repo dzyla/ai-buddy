@@ -1,5 +1,6 @@
 {
   "id": "write_and_run_script",
+  "tier": "hard",
   "description": "Write a small program, run it, and save its output.",
   "prompt": "Write a Python script fib.py that prints the first 10 Fibonacci numbers (starting 0, 1), one per line. Run it and save its output to fib_out.txt.",
   "checks": [

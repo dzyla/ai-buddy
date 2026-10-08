@@ -1,0 +1,132 @@
+{
+  "id": "long_context_needle_60k",
+  "tier": "hard",
+  "description": "Long-context needle (~60k tokens, 234 KB, 2051 lines). One planted fact at ~70% depth with near-miss distractors (other room/cooler/old code). The file is far above INFER_MAX_TOOL_OUTPUT (64 KB default): a plain cat is truncated or BLOCKED and an unranged read_file returns only an outline/head/tail (or a sub-agent digest above ~320 KB), so the agent must read it in start_line/end_line chunks.",
+  "prompt": "notebook.txt is a long lab notebook (one entry per line). Read through it in chunks with read_file using start_line/end_line (do not rely on grep) and find the CURRENT key code for the -80C freezer in room B214. Write only the code, in the form d-d-d-d, to answer.txt and state it in your final answer.",
+  "generate": [
+    {
+      "kind": "lab_notebook",
+      "path": "notebook.txt",
+      "seed": 6001,
+      "chars": 240000,
+      "needles": [
+        [
+          0.18,
+          "Note: the key code for the cold room in room B214 is 3-8-2-5."
+        ],
+        [
+          0.45,
+          "Old log: the key code for the -80C freezer in room B241 is 3-2-8-6."
+        ],
+        [
+          0.7,
+          "Reminder from facility manager: the key code for the -80C freezer in room B214 is 3-8-2-6 (this is the current code, changed after the September audit)."
+        ],
+        [
+          0.86,
+          "Supplier note: the key code for the -20C freezer in room B214 was 8-3-2-6 before it was replaced."
+        ]
+      ]
+    }
+  ],
+  "meta": {
+    "needle_line": 1435,
+    "total_lines": 2051,
+    "approx_tokens": 60000
+  },
+  "timeout": 1800,
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "answer.txt",
+      "text": "3-8-2-6"
+    },
+    {
+      "type": "file_contains",
+      "path": "answer.txt",
+      "text": "3-8-2-5",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "answer.txt",
+      "text": "3-2-8-6",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "answer.txt",
+      "text": "8-3-2-6",
+      "not": true
+    },
+    {
+      "type": "answer_contains",
+      "text": "3-8-2-6"
+    },
+    {
+      "type": "answer_contains",
+      "text": "3-8-2-5",
+      "not": true
+    },
+    {
+      "type": "answer_contains",
+      "text": "3-2-8-6",
+      "not": true
+    },
+    {
+      "type": "answer_contains",
+      "text": "8-3-2-6",
+      "not": true
+    },
+    {
+      "type": "tool_result_contains",
+      "tool": "read_file",
+      "text": "3-8-2-6"
+    },
+    {
+      "type": "tool_used",
+      "name": "read_file",
+      "min": 3
+    },
+    {
+      "type": "max_steps",
+      "value": 40
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "notebook.txt",
+          "start_line": 1,
+          "end_line": 100
+        }
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "notebook.txt",
+          "start_line": 101,
+          "end_line": 200
+        }
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "notebook.txt",
+          "start_line": 1420,
+          "end_line": 1450
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "answer.txt",
+          "content": "3-8-2-6\n"
+        }
+      }
+    ],
+    "final": "The current key code for the -80C freezer in room B214 is 3-8-2-6."
+  }
+}

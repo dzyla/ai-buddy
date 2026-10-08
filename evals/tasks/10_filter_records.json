@@ -1,5 +1,6 @@
 {
   "id": "filter_records",
+  "tier": "medium",
   "description": "Filter structured records by a condition and write the result.",
   "prompt": "people.txt has lines of the form name,age. Write the names of everyone aged 18 or older to adults.txt, one per line, in the original order.",
   "files": {

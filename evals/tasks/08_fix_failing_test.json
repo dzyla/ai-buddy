@@ -1,5 +1,6 @@
 {
   "id": "fix_failing_test",
+  "tier": "hard",
   "description": "Fix a bug so a test script passes, without editing the test.",
   "prompt": "`python3 test_calc.py` fails. Fix the bug in calc.py (do not modify test_calc.py) and run the test again to confirm it passes.",
   "files": {

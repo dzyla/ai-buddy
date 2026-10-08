@@ -35,6 +35,16 @@ Usage:
   python3 evals/run_evals.py --mock [--json out.json]
   python3 evals/run_evals.py --engine py --base-url http://127.0.0.1:8080/v1/ --model M --json out.json
   python3 evals/run_evals.py --only edit_config_value,fix_failing_test
+  python3 evals/run_evals.py --tier hard --repeat 3 --json hard.json   # live, tier + pass@1
+
+Tiers: every task has "tier": "easy" | "medium" | "hard" (easy = one tool call / direct answer,
+medium = 2-4 steps or recovery, hard = multi-file reasoning, debugging, long context, safety).
+--tier takes a comma list; a per-tier summary (pass rate, median steps / wall time, tokens) is
+printed after the table. --repeat N runs every task N times and reports pass@1 (mean pass rate).
+Tokens come from the session's usage records when present, else ~chars/4 of the session (marked ~).
+
+Optional task field `generate`: [{"kind", "path", ...}] writes seeded synthetic files into the
+workdir at setup (see evals/generators.py), for inputs too big to embed in the task JSON.
 """
 import argparse
 import concurrent.futures
@@ -47,14 +57,18 @@ import signal
 import socket
 import subprocess
 import sys
+import statistics
 import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import generators  # noqa: E402
 REPO = os.path.dirname(HERE)
 TASKS_DIR = os.path.join(HERE, "tasks")
 AI_BIN = os.path.join(REPO, "ai")
 MOCK_SERVER = os.path.join(REPO, "tests", "mock_llm_server.py")
+TIERS = ("easy", "medium", "hard")
 CHECK_TYPES = ("answer_contains", "file_exists", "file_contains", "tool_used", "max_steps",
                "tool_result_contains")
 _STATE_RE = re.compile(r"^\[CURRENT STATE step \d+\] \S+ -> (\w+)")
@@ -64,7 +78,7 @@ SCRUB = ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "LLAMA_CTX_SIZE", "LLAMA_N_GPU_LAY
 
 
 # ── task loading ─────────────────────────────────────────────────────────────
-def load_tasks(only=None, tasks_dir=TASKS_DIR):
+def load_tasks(only=None, tasks_dir=TASKS_DIR, tiers=None):
     tasks = []
     for path in sorted(glob.glob(os.path.join(tasks_dir, "*.json"))):
         with open(path, encoding="utf-8") as f:
@@ -78,6 +92,8 @@ def load_tasks(only=None, tasks_dir=TASKS_DIR):
             print("WARNING: unknown task id(s) ignored: %s" % ", ".join(sorted(unknown)),
                   file=sys.stderr)
         tasks = [t for t in tasks if t["id"] in wanted]
+    if tiers:
+        tasks = [t for t in tasks if t.get("tier") in set(tiers)]
     return tasks
 
 
@@ -245,6 +261,19 @@ def _session(home):
         return None
 
 
+def session_tokens(session):
+    """-> (tokens, estimated). Sum of `usage.total_tokens` records when the session has them,
+    else ~chars/4 of the whole session JSON."""
+    total = 0
+    for m in session or []:
+        u = m.get("usage") if isinstance(m, dict) else None
+        if isinstance(u, dict):
+            total += int(u.get("total_tokens") or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)))
+    if total:
+        return total, False
+    return len(json.dumps(session or [])) // 4, True
+
+
 def _tool_names(session):
     names = []
     for m in session or []:
@@ -375,6 +404,12 @@ def run_task(task, endpoint, engine, keep=False):
                 f.write(content)
             if rel.endswith(".sh"):
                 os.chmod(p, 0o755)
+    for spec in task.get("generate", []):
+        rel, text = generators.generate(spec)
+        p = os.path.join(work, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
     timeout = int(task.get("timeout", 300 if endpoint else 60))
     cmd = [AI_BIN, "-y", task["prompt"]]
     t0 = time.time()
@@ -408,8 +443,11 @@ def run_task(task, endpoint, engine, keep=False):
         if endpoint is None and session is not None:
             checks.extend(_mock_error_checks(task, results))
         passed = bool(checks) and all(ok for ok, _, _ in checks)
-        return {"id": task["id"], "passed": passed, "steps": steps,
-                "duration_s": round(time.time() - t0, 2), "tools": tools,
+        tokens, tokens_est = session_tokens(session)
+        wall = round(time.time() - t0, 2)
+        return {"id": task["id"], "tier": task.get("tier", "?"), "passed": passed, "steps": steps,
+                "duration_s": wall, "wall_time_s": wall, "tokens": tokens,
+                "tokens_estimated": tokens_est, "tools": tools,
                 "tool_errors": [c[-300:] for _, _, c in results if tool_result_is_error(c)],
                 "answer": ctx["answer"][:500],
                 "checks": [{"ok": bool(ok), "check": label, "detail": str(detail)}
@@ -436,6 +474,33 @@ def print_table(results):
     print("%d/%d passed (%.0f%%)" % (n, len(results), 100.0 * n / max(1, len(results))))
 
 
+def tier_summary(results):
+    """-> {tier or "overall": {runs, passed, pass_rate, median_steps, median_wall_s, tokens,
+    tokens_estimated}} over per-run results (a task repeated N times contributes N runs)."""
+    groups = {t: [r for r in results if r.get("tier") == t] for t in TIERS}
+    groups = {t: rs for t, rs in groups.items() if rs}
+    groups["overall"] = list(results)
+    out = {}
+    for name, rs in groups.items():
+        n = sum(r["passed"] for r in rs)
+        out[name] = {"runs": len(rs), "passed": n, "pass_rate": round(n / len(rs), 4),
+                     "median_steps": statistics.median(r["steps"] for r in rs),
+                     "median_wall_s": round(statistics.median(r["duration_s"] for r in rs), 2),
+                     "tokens": sum(r.get("tokens", 0) for r in rs),
+                     "tokens_estimated": any(r.get("tokens_estimated") for r in rs)}
+    return out
+
+
+def print_tier_summary(summary):
+    print()
+    print("%-8s  %4s  %6s  %7s  %9s  %9s  %s" % ("tier", "runs", "passed", "rate", "med steps",
+                                                 "med wall", "tokens"))
+    for name, s in summary.items():
+        print("%-8s  %4d  %6d  %6.1f%%  %9.1f  %8.1fs  %s%d" % (
+            name, s["runs"], s["passed"], 100 * s["pass_rate"], s["median_steps"],
+            s["median_wall_s"], "~" if s["tokens_estimated"] else "", s["tokens"]))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Run the ai agent eval set.")
     ap.add_argument("--mock", action="store_true",
@@ -447,6 +512,10 @@ def main(argv=None):
     ap.add_argument("--api-key", help="API key (default: INFER_API_KEY or 'none')")
     ap.add_argument("--json", help="write the full report to this file")
     ap.add_argument("--only", default="", help="comma-separated task ids")
+    ap.add_argument("--tier", default="",
+                    help="comma-separated tiers to run: easy,medium,hard (default: all)")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="run each task N times and report pass@1 (mean pass rate)")
     ap.add_argument("--tasks-dir", default=TASKS_DIR, help="directory of task *.json files")
     ap.add_argument("--jobs", type=int, default=None,
                     help="tasks run in parallel (default: 4 with --mock, 1 otherwise)")
@@ -477,19 +546,35 @@ def main(argv=None):
             print("ERROR: no endpoint: pass --base-url and --model (or set INFER_BASE_URL/"
                   "INFER_MODEL), or use --mock.", file=sys.stderr)
             return 2
-    tasks = load_tasks([x.strip() for x in args.only.split(",") if x.strip()], args.tasks_dir)
+    tiers = [x.strip() for x in args.tier.split(",") if x.strip()]
+    bad = [x for x in tiers if x not in TIERS]
+    if bad or args.repeat < 1:
+        print("ERROR: --tier takes %s and --repeat must be >= 1" % ",".join(TIERS), file=sys.stderr)
+        return 2
+    tasks = load_tasks([x.strip() for x in args.only.split(",") if x.strip()], args.tasks_dir,
+                       tiers)
     if not tasks:
         print("ERROR: no tasks selected", file=sys.stderr)
         return 2
     jobs = args.jobs or (4 if args.mock else 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        results = list(pool.map(lambda t: run_task(t, endpoint, args.engine, args.keep), tasks))
+        results = list(pool.map(lambda t: run_task(t, endpoint, args.engine, args.keep),
+                                [t for t in tasks for _ in range(args.repeat)]))
+    seen = {}
+    for r in results:
+        seen[r["id"]] = r["run"] = seen.get(r["id"], 0) + 1
 
     print_table(results)
+    summary = tier_summary(results)
+    print_tier_summary(summary)
     n = sum(r["passed"] for r in results)
+    if args.repeat > 1:
+        print("pass@1 = %.3f over %d runs (%d tasks x %d)" % (n / len(results), len(results),
+                                                             len(tasks), args.repeat))
     report = {"mode": "mock" if args.mock else "live", "engine": args.engine or "default",
               "model": "mock" if args.mock else endpoint[1], "passed": n, "total": len(results),
-              "results": results}
+              "repeat": args.repeat, "tiers": tiers or list(TIERS), "pass_at_1": round(n / len(results), 4),
+              "by_tier": summary, "results": results}
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=1)

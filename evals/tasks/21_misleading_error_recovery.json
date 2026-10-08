@@ -1,0 +1,80 @@
+{
+  "id": "misleading_error_recovery",
+  "tier": "hard",
+  "description": "run.py fails with a message blaming the PORT environment variable; the real cause is a misspelled key in config.json.",
+  "prompt": "Run `python3 run.py`. It fails. Find the real cause and fix it so that it runs and writes out.txt. Do not edit run.py or app.py, and do not just set environment variables to get around the error.",
+  "files": {
+    "run.py": "import app\n\nopen('out.txt', 'w').write(app.start() + '\\n')\nprint('started')\n",
+    "app.py": "import json\n\n\ndef start():\n    cfg = json.load(open('config.json'))\n    port = cfg.get('port')\n    if port is None:\n        raise RuntimeError('PORT environment variable is not set; export PORT and retry')\n    return 'listening on %d' % port\n",
+    "config.json": "{\n  \"host\": \"0.0.0.0\",\n  \"prt\": 8080\n}\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "out.txt",
+      "text": "listening on 8080"
+    },
+    {
+      "type": "file_contains",
+      "path": "config.json",
+      "text": "\"port\""
+    },
+    {
+      "type": "file_contains",
+      "path": "config.json",
+      "text": "\"prt\"",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "app.py",
+      "text": "cfg.get('port')"
+    },
+    {
+      "type": "file_contains",
+      "path": "run.py",
+      "text": "app.start()"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command",
+      "min": 2
+    },
+    {
+      "type": "max_steps",
+      "value": 15
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 run.py"
+        },
+        "expect_error": true
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "config.json"
+        }
+      },
+      {
+        "tool": "edit_file",
+        "args": {
+          "path": "config.json",
+          "search_content": "\"prt\"",
+          "replace_content": "\"port\""
+        }
+      },
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 run.py && cat out.txt"
+        }
+      }
+    ],
+    "final": "The error blamed the PORT env var, but config.json had the key misspelled as `prt`. I renamed it to `port`; run.py now writes 'listening on 8080' to out.txt."
+  }
+}

@@ -1,5 +1,6 @@
 {
   "id": "read_and_answer",
+  "tier": "easy",
   "description": "Read a lab note and answer a factual question from it.",
   "prompt": "Read notes.txt in the current directory. What concentration of HEPES was the sample prepared in? Answer briefly with the number and unit.",
   "files": {

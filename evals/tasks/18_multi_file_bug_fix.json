@@ -1,0 +1,96 @@
+{
+  "id": "multi_file_bug_fix",
+  "tier": "hard",
+  "description": "Failing pytest whose symptom shows up in cart/report but whose root cause is float truncation in shop/money.py.",
+  "prompt": "The tests in this project fail (run `python3 -m pytest -q`). Find the root cause and fix it in the source package under shop/ without modifying anything in tests/, then rerun the tests to confirm they all pass. Fix the root cause, not the symptom.",
+  "files": {
+    "conftest.py": "",
+    "shop/__init__.py": "",
+    "shop/money.py": "\"\"\"Money helpers: all prices are handled as integer cents.\"\"\"\n\n\ndef to_cents(price):\n    \"\"\"Convert a price string such as '19.99' to integer cents.\"\"\"\n    return int(float(price) * 100)\n\n\ndef format_cents(cents):\n    return \"$%d.%02d\" % (cents // 100, cents % 100)\n",
+    "shop/pricing.py": "def apply_discount(cents, percent):\n    \"\"\"Integer cents after a percentage discount (rounded down).\"\"\"\n    return cents * (100 - percent) // 100\n",
+    "shop/cart.py": "from shop.money import to_cents\nfrom shop.pricing import apply_discount\n\n\nclass Cart:\n    def __init__(self):\n        self.items = []\n\n    def add(self, name, price, qty=1):\n        self.items.append((name, to_cents(price), qty))\n\n    def subtotal(self):\n        return sum(cents * qty for _, cents, qty in self.items)\n\n    def total(self, discount_percent=0):\n        return apply_discount(self.subtotal(), discount_percent)\n",
+    "shop/report.py": "from shop.money import format_cents\n\n\ndef summary(cart, discount_percent=0):\n    return \"Total: \" + format_cents(cart.total(discount_percent))\n",
+    "tests/test_shop.py": "from shop.cart import Cart\nfrom shop.money import to_cents\nfrom shop.report import summary\n\n\ndef test_to_cents():\n    assert to_cents(\"19.99\") == 1999\n    assert to_cents(\"0.29\") == 29\n\n\ndef test_subtotal():\n    c = Cart()\n    c.add(\"widget\", \"19.99\", 3)\n    c.add(\"gum\", \"0.29\")\n    assert c.subtotal() == 6026\n\n\ndef test_summary_with_discount():\n    c = Cart()\n    c.add(\"widget\", \"19.99\", 3)\n    c.add(\"gum\", \"0.29\")\n    assert summary(c, 10) == \"Total: $54.23\"\n"
+  },
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "shop/money.py",
+      "text": "int(float(price) * 100)",
+      "not": true
+    },
+    {
+      "type": "file_contains",
+      "path": "shop/money.py",
+      "text": "def to_cents"
+    },
+    {
+      "type": "file_contains",
+      "path": "shop/cart.py",
+      "text": "to_cents(price)"
+    },
+    {
+      "type": "file_contains",
+      "path": "shop/pricing.py",
+      "text": "cents * (100 - percent) // 100"
+    },
+    {
+      "type": "file_contains",
+      "path": "tests/test_shop.py",
+      "text": "assert summary(c, 10) == \"Total: $54.23\""
+    },
+    {
+      "type": "file_contains",
+      "path": "tests/test_shop.py",
+      "text": "assert c.subtotal() == 6026"
+    },
+    {
+      "type": "tool_used",
+      "name": "execute_command",
+      "min": 2
+    },
+    {
+      "type": "answer_contains",
+      "any": [
+        "pass",
+        "money"
+      ]
+    },
+    {
+      "type": "max_steps",
+      "value": 20
+    }
+  ],
+  "mock": {
+    "steps": [
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 -m pytest -q"
+        },
+        "expect_error": true
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "shop/money.py"
+        }
+      },
+      {
+        "tool": "edit_file",
+        "args": {
+          "path": "shop/money.py",
+          "search_content": "int(float(price) * 100)",
+          "replace_content": "int(round(float(price) * 100))"
+        }
+      },
+      {
+        "tool": "execute_command",
+        "args": {
+          "command": "python3 -m pytest -q"
+        }
+      }
+    ],
+    "final": "Root cause: to_cents in shop/money.py truncated float(price)*100 (19.99 -> 1998). Now rounds; all tests pass."
+  }
+}

@@ -1,5 +1,6 @@
 {
   "id": "rename_function_across_files",
+  "tier": "hard",
   "description": "Find which module defines a function and rename it there and at its call site.",
   "prompt": "One of util_a.py, util_b.py, util_c.py defines a function compute_flux. Rename that function to compute_flux_v2, and update main.py, which imports and calls it. Change nothing else.",
   "files": {

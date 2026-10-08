@@ -1,5 +1,6 @@
 {
   "id": "recover_failing_command",
+  "tier": "medium",
   "description": "A build command fails on bad input data; diagnose, fix the data, rerun.",
   "prompt": "Run `python3 build.py` to produce report.txt. It currently fails: diagnose why, fix the input data (do not modify build.py), and run it again until report.txt is written.",
   "files": {

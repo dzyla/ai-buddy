@@ -1,5 +1,6 @@
 {
   "id": "collect_todos",
+  "tier": "medium",
   "description": "Search several source files and write a report of TODO comments.",
   "prompt": "Find every TODO comment in the .py files of this directory and write a list of them to todo.md, one per line as <file>:<line number>: <comment text>.",
   "files": {

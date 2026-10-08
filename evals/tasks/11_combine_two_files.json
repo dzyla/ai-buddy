@@ -1,5 +1,6 @@
 {
   "id": "combine_two_files",
+  "tier": "medium",
   "description": "Read two files (parallel tool calls) and combine their contents.",
   "prompt": "part1.txt and part2.txt each contain one code word. Read both and write the two words, part1 first, separated by a single space, to combined.txt.",
   "files": {
