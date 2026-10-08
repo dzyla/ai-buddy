@@ -71,6 +71,7 @@ class Options:
     reasoning_budget: int = -1
     preserve_thinking: bool = False
     keep_reasoning: int = 2           # INFER_KEEP_REASONING: reasoning kept on the last N assistant msgs; -1 all
+    keep_reasoning_block: int = 4     # INFER_KEEP_REASONING_BLOCK: hysteresis block (aitools.sessions.stripped_in_turn)
     tool_choice: str = "required"
 
     def sent_max_tokens(self):
@@ -334,9 +335,10 @@ def parse(argv, environ=None, stdin_tty=False):
         o.reasoning_budget = _atoi(getenv("INFER_REASONING_BUDGET"))
     if _truthy(getenv("INFER_PRESERVE_THINKING")):
         o.preserve_thinking = True
-    from aitools.sessions import keep_reasoning_from_env
+    from aitools.sessions import keep_block_from_env, keep_reasoning_from_env
     o.keep_reasoning = keep_reasoning_from_env(o.preserve_thinking,
                                                {"INFER_KEEP_REASONING": getenv("INFER_KEEP_REASONING")})
+    o.keep_reasoning_block = keep_block_from_env({"INFER_KEEP_REASONING_BLOCK": getenv("INFER_KEEP_REASONING_BLOCK")})
     if getenv("INFER_MAX_TOKENS"):
         o.max_tokens = _atoi(getenv("INFER_MAX_TOKENS"))
         o.step_max_tokens = o.max_tokens      # an explicit completion budget wins over the default cap

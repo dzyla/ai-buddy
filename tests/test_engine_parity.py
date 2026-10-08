@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(REPO, "tests"))
 from test_offline import AI_BIN, MockServer  # noqa: E402
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]")
-STAMP = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: [A-Za-z+0-9]+)?")
+STAMP = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?(?: [A-Za-z+0-9]+)?")
 SID = re.compile(r"sess_\d+_\d+")
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 

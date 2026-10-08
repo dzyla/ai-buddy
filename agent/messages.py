@@ -51,11 +51,11 @@ def size(messages):
     return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace"))
 
 
-def request_view(messages, keep):
-    """aitools.sessions.request_view: the history as sent, reasoning kept only on the last `keep`
-    assistant messages of the current turn (keep < 0: the history itself)."""
+def request_view(messages, keep, block):
+    """aitools.sessions.request_view: the history as sent, reasoning kept only on the recent
+    assistant messages of the current turn (keep, block hysteresis; keep < 0: the history itself)."""
     from aitools.sessions import request_view as view
-    return view(messages, keep)
+    return view(messages, keep, block)
 
 
 def trim(messages, max_bytes, log=None, keep_reasoning=None):

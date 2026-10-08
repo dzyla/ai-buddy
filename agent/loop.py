@@ -302,7 +302,8 @@ class Engine:
     def _wire(self):
         """The history as sent: old reasoning stripped (INFER_KEEP_REASONING); self.messages and
         the saved session keep all of it."""
-        return M.request_view(self.messages, self.cfg.opts.keep_reasoning)
+        o = self.cfg.opts
+        return M.request_view(self.messages, o.keep_reasoning, o.keep_reasoning_block)
 
     def _req_size(self):
         return M.size(self._wire())
@@ -316,7 +317,8 @@ class Engine:
             target = before // 2
         target = max(target, 2000)
         out = self._trim(target)
-        if out is self.messages or M.size(M.request_view(out, self.cfg.opts.keep_reasoning)) >= before:
+        o = self.cfg.opts
+        if out is self.messages or M.size(M.request_view(out, o.keep_reasoning, o.keep_reasoning_block)) >= before:
             self.err("\033[1;33m[ai] Compact: nothing could be removed (history already minimal).\033[0m\n")
             return False
         self.messages = out

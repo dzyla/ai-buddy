@@ -36,7 +36,8 @@ def record_session(session_id, path=None, ended=None, summary=None, started=None
         return False
 
 # ── Context trimming (called by ai.c when messages_json exceeds the budget) ──
-# Internal steering messages ai.c injects as role=user; never the real task.
+# Internal steering messages both engines inject as role=user; never the real task. The single
+# source for trimming and for reasoning retention (RETENTION_INTERNAL_PREFIXES below).
 _TRIM_INTERNAL_USER_PREFIXES = (
     "Please call task_complete", "Your last response was empty", "[TIMEOUT]",
     "Your last response was cut off", "[SYSTEM]", "[SYSTEM ", "[HARD STOP]",
@@ -47,13 +48,15 @@ _TRIM_INTERNAL_USER_PREFIXES = (
 _TRIM_NOTE = "\n\n[CONTEXT NOTE: older conversation messages were trimmed to fit the model's context window.]"
 
 
-# ── Reasoning retention (INFER_KEEP_REASONING) ──
-# A turn boundary is a real user message; these harness-injected user messages are not (ai.c
-# mirrors this tuple in reasoning_internal_prefixes[] -- keep both in sync).
+# ── Reasoning retention (INFER_KEEP_REASONING / INFER_KEEP_REASONING_BLOCK) ──
+# A turn boundary is a real user message; the harness nudges above and these two (a mid-task
+# :btw note, the read_file image message) are not. ai.c mirrors this tuple in
+# reasoning_internal_prefixes[] (tests/test_reasoning_retention.py asserts set equality).
 RETENTION_INTERNAL_PREFIXES = _TRIM_INTERNAL_USER_PREFIXES + (
     "[User note mid-task", "Here is the image file",
 )
 KEEP_REASONING_DEFAULT = 2
+KEEP_REASONING_BLOCK_DEFAULT = 4
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
 
 
@@ -85,6 +88,17 @@ def keep_reasoning_from_env(preserve_thinking=False, environ=None):
     return -1 if preserve_thinking else KEEP_REASONING_DEFAULT
 
 
+def keep_block_from_env(environ=None):
+    """INFER_KEEP_REASONING_BLOCK: the hysteresis block B (>= 0; 0 = strict sliding window);
+    unset or unparsable -> KEEP_REASONING_BLOCK_DEFAULT."""
+    env = os.environ if environ is None else environ
+    try:
+        b = int(str(env.get("INFER_KEEP_REASONING_BLOCK")).strip())
+    except (TypeError, ValueError):
+        return KEEP_REASONING_BLOCK_DEFAULT
+    return b if b >= 0 else KEEP_REASONING_BLOCK_DEFAULT
+
+
 def strip_think(text):
     """Drop inline thinking from assistant text: every <think>...</think> block, then anything up
     to a remaining unmatched </think> (templates that open the block in the prompt). Leading
@@ -105,21 +119,31 @@ def _is_turn_boundary(m):
             and not _trim_text(m).lstrip().startswith(RETENTION_INTERNAL_PREFIXES))
 
 
-def _reasoning_keep_set(messages, keep):
-    """Indices of the assistant messages whose reasoning is kept: the last `keep` assistant
-    messages after the latest real user message."""
+def stripped_in_turn(m, keep, block):
+    """How many of the current turn's first assistant messages lose their reasoning when the turn
+    has `m` of them. keep 0: all; block 0: a strict sliding window (m - keep); otherwise block
+    hysteresis: the kept count grows from keep to keep+block-1, then drops back to keep in one
+    step, so the stripped prefix (and the server's prompt cache) changes once every `block` steps.
+    Monotonic in m: a message once stripped stays stripped."""
+    if keep <= 0:
+        return m
+    if m <= keep:
+        return 0
+    if block <= 0:
+        return m - keep
+    return (m - keep) // block * block
+
+
+def _reasoning_keep_set(messages, keep, block):
+    """Indices of the assistant messages whose reasoning is kept: those of the current turn (after
+    the latest real user message) past the first stripped_in_turn() of them."""
     last_user = -1
     for i, m in enumerate(messages):
         if isinstance(m, dict) and _is_turn_boundary(m):
             last_user = i
-    kept = set()
-    for i in range(len(messages) - 1, last_user, -1):
-        if len(kept) >= keep:
-            break
-        m = messages[i]
-        if isinstance(m, dict) and m.get("role") == "assistant":
-            kept.add(i)
-    return kept
+    turn = [i for i in range(last_user + 1, len(messages))
+            if isinstance(messages[i], dict) and messages[i].get("role") == "assistant"]
+    return set(turn[stripped_in_turn(len(turn), keep, block):])
 
 
 def _strip_reasoning_msg(m):
@@ -132,18 +156,23 @@ def _strip_reasoning_msg(m):
     out = {k: v for k, v in m.items() if k != "reasoning_content"}
     if c2 is not c:
         out["content"] = c2
+    if out.get("content") is None and not out.get("tool_calls"):
+        out["content"] = ""      # a reasoning-only reply: never send an empty null-content message
     return out
 
 
-def request_view(messages, keep):
-    """The messages to put on the wire: reasoning kept only on the last `keep` assistant messages
-    of the current turn (keep < 0: everything, returns `messages` itself). The input list and its
-    dicts are never modified -- the history and the saved session keep all reasoning. Stripping
-    is a pure function of the history, and the keep window only moves forward, so a message once
-    stripped stays stripped (stable prompt-cache prefix)."""
+def request_view(messages, keep, block=None):
+    """The messages to put on the wire: reasoning kept only on the recent assistant messages of
+    the current turn -- `keep`, growing to keep+block-1 before the oldest `block` are stripped at
+    once (stripped_in_turn; block None: INFER_KEEP_REASONING_BLOCK). keep < 0: everything, returns
+    `messages` itself. The input list and its dicts are never modified -- the history and the
+    saved session keep all reasoning. Stripping is a pure function of the history and monotonic,
+    so a message once stripped stays stripped: the request prefix only changes once per block."""
     if keep is None or keep < 0 or not isinstance(messages, list):
         return messages
-    kept = _reasoning_keep_set(messages, keep)
+    if block is None:
+        block = keep_block_from_env()
+    kept = _reasoning_keep_set(messages, keep, block)
     out = []
     for i, m in enumerate(messages):
         if isinstance(m, dict) and m.get("role") == "assistant" and i not in kept:
@@ -188,9 +217,10 @@ def trim_messages(messages, max_bytes=60000, keep_recent_full=4, tool_stub_chars
     if keep_reasoning is None:
         keep_reasoning = keep_reasoning_from_env()
 
-    # Stage 0: strip old reasoning (never sent anyway when keep_reasoning >= 0).
+    # Stage 0: strip old reasoning down to the strict window (no hysteresis block: trimming
+    # breaks the prompt cache anyway, and the history is changed for good).
     if keep_reasoning >= 0:
-        messages = request_view(messages, keep_reasoning)
+        messages = request_view(messages, keep_reasoning, block=0)
         if sum(_trim_msg_size(m) for m in messages) <= max_bytes:
             return messages
 

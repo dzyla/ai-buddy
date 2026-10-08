@@ -80,18 +80,22 @@ def _assert_pairs(msgs):
 
 
 # ── end to end, both engines ─────────────────────────────────────────────────
-def test_default_keeps_reasoning_of_last_two_assistant_messages(tmp_path, engine):
+def test_default_keeps_reasoning_of_recent_assistant_messages(tmp_path, engine):
+    """Default N=2, block B=4: request k keeps reasoning on the turn's assistant messages past the
+    first stripped_in_turn(k, 2, 4) -- 0..5 kept for k <= 5, then 4 are stripped at once."""
     root = Root(tmp_path)
     r, reqs = _run_chain(root, engine)
     assert len(reqs) == 8
+    assert [S.stripped_in_turn(k, 2, 4) for k in range(8)] == [0, 0, 0, 0, 0, 0, 4, 4]
     for k, req in enumerate(reqs):
         asst = _assistants(req["messages"])
         assert len(asst) == k
+        cut = S.stripped_in_turn(k, 2, 4)
         with_r = [i for i, m in enumerate(asst) if _has_reasoning(m)]
-        assert with_r == list(range(max(0, k - 2), k)), (k, with_r)
-        for m in asst[:max(0, k - 2)]:
+        assert with_r == list(range(cut, k)), (k, with_r)
+        for m in asst[:cut]:
             assert "REASON-" not in json.dumps(m) and "INLINE-" not in json.dumps(m)
-        for i, m in enumerate(asst[max(0, k - 2):], max(0, k - 2) + 1):
+        for i, m in enumerate(asst[cut:], cut + 1):
             assert ("REASON-%d:" % i) in (m.get("reasoning_content") or "")
         _assert_pairs(req["messages"])
     # inline thinking is stripped from the text, the visible part stays
@@ -99,17 +103,30 @@ def test_default_keeps_reasoning_of_last_two_assistant_messages(tmp_path, engine
     assert step3["content"] == "visible-3"
 
 
-def test_request_prefix_is_stable_between_requests(tmp_path, engine):
-    """Once stripped, a message stays stripped: every message of request j that is not one of
-    its last two assistant messages is byte-identical (as serialised) in request j+1."""
+def _cache_breaks(reqs):
+    """Indices j where request j+1 does not start with every message of request j (byte-identical
+    as serialised): the points where the server's prompt cache prefix breaks."""
+    out = []
+    for j, (a, b) in enumerate(zip(reqs, reqs[1:])):
+        ma, mb = a["messages"], b["messages"]
+        if [json.dumps(m) for m in ma] != [json.dumps(m) for m in mb[:len(ma)]]:
+            out.append(j)
+    return out
+
+
+def test_request_prefix_is_stable_within_a_block(tmp_path, engine):
+    """Block hysteresis: across consecutive requests the prefix up to (excluding) the newest
+    assistant message is byte-identical; it breaks exactly where the turn reaches N+B assistant
+    messages (request index 6 at N=2, B=4) -- once over the 8-step chain, not on every step."""
     root = Root(tmp_path)
     r, reqs = _run_chain(root, engine)
-    for a, b in zip(reqs, reqs[1:]):
-        ma, mb = a["messages"], b["messages"]
-        asst_idx = [i for i, m in enumerate(ma) if m["role"] == "assistant"]
-        stable_upto = asst_idx[-2] if len(asst_idx) >= 2 else len(ma)
-        for i in range(stable_upto):
-            assert json.dumps(ma[i]) == json.dumps(mb[i]), i
+    assert _cache_breaks(reqs) == [5]               # request 6 -> 7: 4 reasoning blocks stripped at once
+    for j in range(5):                              # requests 0..5: one stable prefix
+        assert len(reqs[j + 1]["messages"]) == len(reqs[j]["messages"]) + 2
+    r, reqs = _run_chain(root, engine, extra_env={"INFER_KEEP_REASONING_BLOCK": "0"})
+    assert _cache_breaks(reqs) == [2, 3, 4, 5, 6]  # strict sliding window: a break every step past N
+    r, reqs = _run_chain(root, engine, extra_env={"INFER_KEEP_REASONING_BLOCK": "2"})
+    assert _cache_breaks(reqs) == [3, 5]
 
 
 def test_keep_zero_and_n(tmp_path, engine):
@@ -117,6 +134,8 @@ def test_keep_zero_and_n(tmp_path, engine):
     r, reqs = _run_chain(root, engine, extra_env={"INFER_KEEP_REASONING": "0"})
     assert not any(_has_reasoning(m) for q in reqs for m in _assistants(q["messages"]))
     r, reqs = _run_chain(root, engine, extra_env={"INFER_KEEP_REASONING": "3"})
+    assert [sum(map(_has_reasoning, _assistants(q["messages"]))) for q in reqs] == [0, 1, 2, 3, 4, 5, 6, 3]
+    r, reqs = _run_chain(root, engine, extra_env={"INFER_KEEP_REASONING": "3", "INFER_KEEP_REASONING_BLOCK": "0"})
     assert [sum(map(_has_reasoning, _assistants(q["messages"]))) for q in reqs] == [0, 1, 2, 3, 3, 3, 3, 3]
 
 
@@ -124,7 +143,8 @@ def test_preserve_thinking_flag_keeps_all_unless_explicit(tmp_path, engine):
     root = Root(tmp_path)
     r, reqs = _run_chain(root, engine, extra_env={"INFER_PRESERVE_THINKING": "1"})
     assert sum(map(_has_reasoning, _assistants(reqs[-1]["messages"]))) == 7
-    r, reqs = _run_chain(root, engine, extra_env={"INFER_PRESERVE_THINKING": "1", "INFER_KEEP_REASONING": "1"})
+    r, reqs = _run_chain(root, engine, extra_env={"INFER_PRESERVE_THINKING": "1", "INFER_KEEP_REASONING": "1",
+                                                  "INFER_KEEP_REASONING_BLOCK": "0"})
     assert sum(map(_has_reasoning, _assistants(reqs[-1]["messages"]))) == 1
 
 
@@ -170,7 +190,7 @@ def test_trim_trigger_measures_the_request_not_the_history(tmp_path, engine):
     """Old reasoning that is never sent must not trigger trimming: a trim threshold the full
     history exceeds but the request does not leaves every tool output untouched."""
     root = Root(tmp_path)
-    r, reqs = _run_chain(root, engine, extra_env={"INFER_TRIM_THRESHOLD": "60000",
+    r, reqs = _run_chain(root, engine, extra_env={"INFER_TRIM_THRESHOLD": "60000", "INFER_KEEP_REASONING_BLOCK": "0",
                                                   "INFER_STUB_THRESHOLD": "70000"}, words=3000)
     last = reqs[-1]["messages"]
     assert len(json.dumps(reqs[-1]["messages"])) < 60000
@@ -192,10 +212,15 @@ def test_request_size_reduction_3000_token_reasoning(tmp_path, engine):
     big = {"INFER_TRIM_THRESHOLD": "10000000", "INFER_STUB_THRESHOLD": "10000000"}   # no trimming either way
     _, full = _run_chain(root, engine, extra_env=dict(big, INFER_KEEP_REASONING="all"), words=3000)
     _, kept = _run_chain(root, engine, extra_env=big, words=3000)
-    a, b = len(json.dumps(full[-1]["messages"])), len(json.dumps(kept[-1]["messages"]))
-    sys.stderr.write("[measure %s] last request messages: all=%d keep2=%d (-%.0f%%)\n"
-                     % (engine, a, b, 100.0 * (a - b) / a))
-    assert b < a * 0.45
+    _, strict = _run_chain(root, engine, extra_env=dict(big, INFER_KEEP_REASONING_BLOCK="0"), words=3000)
+    size = lambda q: len(json.dumps(q["messages"]))  # noqa: E731
+    a, b, c = size(full[-1]), size(kept[-1]), size(strict[-1])
+    ta, tb, tc = (sum(map(size, x)) for x in (full, kept, strict))
+    sys.stderr.write("[measure %s] last request: all=%d keep2/B4=%d (-%.0f%%) keep2/B0=%d (-%.0f%%); "
+                     "sum of 8 requests: all=%d B4=%d (-%.0f%%) B0=%d (-%.0f%%); cache breaks B4=%d B0=%d\n"
+                     % (engine, a, b, 100.0 * (a - b) / a, c, 100.0 * (a - c) / a, ta, tb, 100.0 * (ta - tb) / ta,
+                        tc, 100.0 * (ta - tc) / ta, len(_cache_breaks(kept)), len(_cache_breaks(strict))))
+    assert b < a * 0.55 and c < a * 0.45
 
 
 # ── unit: shared Python helpers ──────────────────────────────────────────────
@@ -235,7 +260,7 @@ def test_request_view_keep_all_is_identity_and_history_untouched():
     h = _hist()
     before = json.dumps(h)
     assert S.request_view(h, -1) is h
-    v = S.request_view(h, 2)
+    v = S.request_view(h, 2, 0)
     assert json.dumps(h) == before                      # history keeps every reasoning
     kept = [m for m in v if m.get("reasoning_content")]
     assert [m["reasoning_content"][:2] for m in kept] == ["R4", "R5"]
@@ -244,7 +269,7 @@ def test_request_view_keep_all_is_identity_and_history_untouched():
 
 def test_request_view_current_turn_only():
     h = _hist(n_steps=5, user2=True)                    # real user turn before step 4
-    v = S.request_view(h, 3)
+    v = S.request_view(h, 3, 0)
     assert [m["reasoning_content"][:2] for m in v if m.get("reasoning_content")] == ["R4", "R5"]
     h.insert(len(h) - 2, {"role": "user", "content": "Your previous reply got stuck repeating"})
     v = S.request_view(h, 3)                            # an internal nudge is not a turn boundary
@@ -290,8 +315,66 @@ def test_trim_messages_cli_takes_keep_argument(tmp_path):
 
 
 def test_c_mirrors_the_turn_boundary_prefixes():
-    """ai.c keeps its own copy of the internal user-message prefixes (no Python call per request)."""
+    """ai.c keeps its own copy of the internal user-message prefixes (no Python call per request):
+    the same set as RETENTION_INTERNAL_PREFIXES."""
+    import re
     with open(os.path.join(REPO, "ai.c"), encoding="utf-8", errors="replace") as f:
         src = f.read()
-    for p in S.RETENTION_INTERNAL_PREFIXES:
-        assert json.dumps(p) in src, p
+    body = re.search(r"reasoning_internal_prefixes\[\] = \{(.*?)NULL", src, re.S).group(1)
+    c_list = [json.loads('"%s"' % x) for x in re.findall(r'"((?:[^"\\]|\\.)*)"', body)]
+    assert len(c_list) == len(set(c_list))
+    assert set(c_list) == set(S.RETENTION_INTERNAL_PREFIXES)
+
+
+def test_every_engine_nudge_is_a_listed_prefix():
+    """Every user message the Python engine injects (nudge constants and literal appends) starts
+    with a listed internal prefix, so none of them resets the reasoning turn or the trim anchor."""
+    import re
+    from agent import loop
+    for name in ("RUNAWAY_NUDGE", "RUNAWAY_CAP_NUDGE", "RUNAWAY_FAILED", "LENGTH_NUDGE"):
+        assert getattr(loop, name).startswith(S._TRIM_INTERNAL_USER_PREFIXES), name
+    with open(loop.__file__, encoding="utf-8") as f:
+        src = f.read()
+    literals = re.findall(r'\{"role": "user", "content": "((?:[^"\\]|\\.)*)"', src)
+    assert len(literals) >= 8
+    for lit in literals:
+        assert lit.startswith(S.RETENTION_INTERNAL_PREFIXES), lit
+
+
+def test_reasoning_only_reply_is_sent_with_empty_content():
+    h = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"},
+         {"role": "assistant", "content": None, "reasoning_content": "long thought"},
+         {"role": "user", "content": "Your last response was cut off by the token limit."},
+         {"role": "assistant", "reasoning_content": "again"},
+         {"role": "user", "content": "Please call task_complete with your final answer."},
+         {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+                                                               "function": {"name": "x", "arguments": "{}"}}],
+          "reasoning_content": "r"},
+         {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+         {"role": "assistant", "content": None}]                     # nothing to strip: untouched
+    v = S.request_view(h, 0, 0)
+    assert v[2] == {"role": "assistant", "content": ""}
+    assert v[4] == {"role": "assistant", "content": ""}
+    assert v[6]["content"] is None and "reasoning_content" not in v[6]   # tool_calls: null stays
+    assert v[8] is h[8]
+
+
+def test_parity_reasoning_only_length_reply(tmp_path):
+    """A reasoning-only reply cut off at the token limit, once stripped: both engines send it with
+    content "" (never a null-content assistant message without tool_calls). keep=0 so it is
+    stripped in every request: while kept, the engines store it differently (C content null,
+    Python "" -- pre-existing, outside this feature)."""
+    seq = [{"content": "", "reasoning": "LEN-thought " * 20, "finish_reason": "length"},
+           {"calls": [_call("read_file", {"path": "notes.txt"})], "reasoning": "R2"},
+           {"calls": [_call("read_file", {"path": "notes.txt"})], "reasoning": "R3"},
+           {"calls": [_call("task_complete", {"summary": "ok"})], "reasoning": "R4"}]
+
+    def scenario(root, engine):
+        root.reset(_setup)
+        return [root.run(engine, ["go"], {"MOCK_TOOL_SEQ": json.dumps(seq)},
+                         extra_env={"INFER_KEEP_REASONING": "0"})]   # stripped from its first request on
+    out = _both(tmp_path, scenario)
+    for eng in ("c", "py"):
+        last = out[eng][0][1][-1]["messages"]
+        first = _assistants(last)[0]
+        assert first.get("content") == "" and "reasoning_content" not in first and not first.get("tool_calls"), (eng, first)

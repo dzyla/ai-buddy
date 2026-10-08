@@ -841,7 +841,8 @@ static char  *reasoning_effort_val  = NULL;
 static int   thinking_budget_val   = -1;   /* set via :budget, --budget, or INFER_REASONING_BUDGET */
 static int   preserve_thinking_val  = 0;
 static char *g_wire_msgs = NULL; /* the messages of the request in flight (reasoning_request_view) */
-int g_keep_reasoning = -2; /* INFER_KEEP_REASONING: reasoning kept on the last N assistant messages of the current turn (-1 all, -2 unset -> 2, or all with --preserve-thinking). Mirrors aitools/sessions.py request_view. */
+int g_keep_reasoning = -2;
+static int g_keep_reasoning_block = 4; /* INFER_KEEP_REASONING_BLOCK: hysteresis block, see stripped_in_turn() */ /* INFER_KEEP_REASONING: reasoning kept on the last N assistant messages of the current turn (-1 all, -2 unset -> 2, or all with --preserve-thinking). Mirrors aitools/sessions.py request_view. */
 static char  *mode_preset_val       = NULL; /* --mode <xhigh|normal|low|instruct> */
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
 static int   step_max_tokens_val    = 32768; /* Per-step completion cap sent as max_tokens (the smaller positive of the two). INFER_STEP_MAX_TOKENS; an explicit INFER_MAX_TOKENS also sets it. Mirrored by agent/cli.py Options.sent_max_tokens. */
@@ -3786,26 +3787,50 @@ static int reasoning_is_turn_boundary(cJSON *m) {
     return !internal;
 }
 
+/* How many of the current turn's first `m` assistant messages lose their reasoning: keep 0 -> all;
+   block 0 -> strict sliding window; else block hysteresis (the kept count grows from keep to
+   keep+block-1, then drops back to keep), so the request prefix changes once every `block` steps.
+   Monotonic in m. Same as aitools/sessions.py stripped_in_turn. */
+static int stripped_in_turn(int m, int keep, int block) {
+    if (keep <= 0) return m;
+    if (m <= keep) return 0;
+    if (block <= 0) return m - keep;
+    return (m - keep) / block * block;
+}
+
+static int is_assistant_msg(cJSON *m) {
+    cJSON *role = cJSON_IsObject(m) ? cJSON_GetObjectItemCaseSensitive(m, "role") : NULL;
+    return cJSON_IsString(role) && strcmp(role->valuestring, "assistant") == 0;
+}
+
 /* The messages array as sent: reasoning_content and inline <think> stripped from every assistant
-   message except the last `keep` after the latest real user message. The history itself (and so
-   the saved session) keeps all reasoning. Returns a new JSON string, or NULL to send
-   messages_json unchanged (keep < 0, or it does not parse). */
+   message except the recent ones of the current turn (after the latest real user message; see
+   stripped_in_turn). The history itself (and so the saved session) keeps all reasoning. Returns a
+   new JSON string, or NULL to send messages_json unchanged (keep < 0, or it does not parse). */
 static char *reasoning_request_view(const char *messages_json, int keep) {
     if (keep < 0 || !messages_json) return NULL;
     cJSON *arr = cJSON_Parse(messages_json);
-    if (!arr || !cJSON_IsArray(arr)) { cJSON_Delete(arr); return NULL; }
-    int n = cJSON_GetArraySize(arr), last_user = -1, i = 0;
+    if (!arr || !cJSON_IsArray(arr)) {
+        cJSON_Delete(arr);
+        if (getenv("INFER_DEBUG"))
+            fprintf(stderr, "[debug] reasoning retention: the history did not parse; sending it unstripped\n");
+        return NULL;
+    }
+    int last_user = -1, i = 0, turn_asst = 0;
     cJSON *m;
     cJSON_ArrayForEach(m, arr) {
-        if (cJSON_IsObject(m) && reasoning_is_turn_boundary(m)) last_user = i;
+        if (cJSON_IsObject(m) && reasoning_is_turn_boundary(m)) { last_user = i; turn_asst = 0; }
+        else if (is_assistant_msg(m)) turn_asst++;
         i++;
     }
-    int kept = 0;
-    for (i = n - 1; i >= 0; i--) {
-        m = cJSON_GetArrayItem(arr, i);
-        cJSON *role = cJSON_IsObject(m) ? cJSON_GetObjectItemCaseSensitive(m, "role") : NULL;
-        if (!cJSON_IsString(role) || strcmp(role->valuestring, "assistant") != 0) continue;
-        if (i > last_user && kept < keep) { kept++; continue; }
+    int strip_in_turn = stripped_in_turn(turn_asst, keep, g_keep_reasoning_block);
+    int seen_in_turn = 0;
+    i = 0;
+    cJSON_ArrayForEach(m, arr) {
+        int idx = i++;
+        if (!is_assistant_msg(m)) continue;
+        if (idx > last_user && seen_in_turn++ >= strip_in_turn) continue;   /* kept */
+        int changed = cJSON_GetObjectItemCaseSensitive(m, "reasoning_content") != NULL;
         cJSON_DeleteItemFromObjectCaseSensitive(m, "reasoning_content");
         cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
         if (cJSON_IsString(c)) {
@@ -3813,7 +3838,16 @@ static char *reasoning_request_view(const char *messages_json, int keep) {
             if (stripped) {
                 cJSON_ReplaceItemInObjectCaseSensitive(m, "content", cJSON_CreateString(stripped));
                 free(stripped);
+                changed = 1;
             }
+        }
+        if (!changed) continue;
+        c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+        int has_calls = tc && !cJSON_IsNull(tc) && !(cJSON_IsArray(tc) && cJSON_GetArraySize(tc) == 0);
+        if ((!c || cJSON_IsNull(c)) && !has_calls) {   /* reasoning-only reply: send "" not null */
+            if (c) cJSON_ReplaceItemInObjectCaseSensitive(m, "content", cJSON_CreateString(""));
+            else cJSON_AddStringToObject(m, "content", "");
         }
     }
     char *out = cJSON_PrintUnformatted(arr);
@@ -3823,7 +3857,7 @@ static char *reasoning_request_view(const char *messages_json, int keep) {
 
 /* Size of the messages as they will be sent (old reasoning stripped): every trim/stub/compact
    decision measures the request, not the full history. */
-static size_t request_messages_len(const char *messages_json) {
+size_t request_messages_len(const char *messages_json) {
     char *v = reasoning_request_view(messages_json, g_keep_reasoning);
     if (!v) return strlen(messages_json);
     size_t n = strlen(v);
@@ -4922,6 +4956,13 @@ int main(int argc, char **argv) {
     /* explicit INFER_KEEP_REASONING wins; else --preserve-thinking keeps all; else 2 */
     g_keep_reasoning = parse_keep_reasoning(getenv("INFER_KEEP_REASONING"));
     if (g_keep_reasoning == -2) g_keep_reasoning = preserve_thinking_val ? -1 : 2;
+    {
+        const char *b = getenv("INFER_KEEP_REASONING_BLOCK");
+        char *end = NULL;
+        long bv = (b && *b) ? strtol(b, &end, 10) : -1;
+        while (end && isspace((unsigned char)*end)) end++;
+        if (b && *b && end && !*end && bv >= 0 && bv <= 1000000) g_keep_reasoning_block = (int)bv;
+    }
     char *env_maxtok = getenv("INFER_MAX_TOKENS");
     if (env_maxtok && *env_maxtok) max_tokens_val = step_max_tokens_val = atoi(env_maxtok);
     char *env_stepmax = getenv("INFER_STEP_MAX_TOKENS");

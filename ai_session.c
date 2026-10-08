@@ -18,6 +18,7 @@ extern int g_compact_dot_timer;
 extern char *g_system_message_json;
 extern int g_private_mode;
 extern int g_keep_reasoning;
+extern size_t request_messages_len(const char *messages_json);
 
 void disable_raw_mode(void);
 char* json_escape(const char *str);
@@ -322,7 +323,7 @@ char* compact_session(char *messages_json, const char *mcp_script, CURL *curl_ha
     if (out_success) *out_success = 0;
     if (!messages_json || !mcp_script) return messages_json;
 
-    size_t before = strlen(messages_json);
+    size_t before = request_messages_len(messages_json);   /* the request, as Python _compact */
     /* Force a real reduction: aim below the current size even when the
        history is already under the auto-trim threshold. */
     int target = target_bytes;
@@ -332,7 +333,7 @@ char* compact_session(char *messages_json, const char *mcp_script, CURL *curl_ha
     /* maybe_trim_messages frees the old buffer only when it returns a new
        one; on failure it hands back the SAME pointer, which must not be freed. */
     char *trimmed = maybe_trim_messages(messages_json, mcp_script, target);
-    if (trimmed == messages_json || !trimmed || strlen(trimmed) >= before) {
+    if (trimmed == messages_json || !trimmed || request_messages_len(trimmed) >= before) {
         fprintf(stderr, "\033[1;33m[ai] Compact: nothing could be removed (history already minimal).\033[0m\n");
         return trimmed ? trimmed : messages_json;
     }
