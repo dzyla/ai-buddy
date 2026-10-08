@@ -401,3 +401,46 @@ def test_install_copies_the_proxy_to_local_bin(tmp_path):
     assert os.access(dst, os.X_OK)
     # the running proxy is never restarted or stopped by the installer
     assert "llama-proxy" not in (sd_log.read_text() if sd_log.exists() else "")
+
+
+def _load_proxy_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("llama_proxy_mod", PROXY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_upstream_timeout_default_allows_a_long_silent_prefill(monkeypatch):
+    monkeypatch.delenv("LLAMA_PROXY_UPSTREAM_TIMEOUT", raising=False)
+    assert _load_proxy_module().UPSTREAM_TIMEOUT == 900
+
+
+def test_failure_reason_prefers_the_error_block():
+    mod = _load_proxy_module()
+    lines = PREFLIGHT_LOG.splitlines()
+    reason = mod.failure_reason(lines, "fallback")
+    assert reason.startswith("ERROR: model will not fit") and "Aborting" in reason
+    assert "Main process exited" not in reason
+    assert mod.failure_reason(["plain line", "llama-server: error: bad flag"], "x").startswith("llama-server: error")
+    assert mod.failure_reason([], "the unit is failed") == "the unit is failed"
+
+
+def test_prompt_progress_chunks_are_forwarded_as_they_arrive(tmp_path):
+    """llama.cpp's prompt_progress chunks during prefill must reach the client one by one, or the
+    client's idle timeout fires during a long prefill (the fake backend streams one event / 0.4 s)."""
+    with Proxy(tmp_path, mode="ok") as px:
+        px.request("POST", CHAT, {"model": "m", "messages": []})
+        c = http.client.HTTPConnection("127.0.0.1", px.port, timeout=30)
+        c.request("POST", CHAT, body=json.dumps({"stream": True, "return_progress": True, "n_chunks": 5,
+                                                 "gap": 0.4}), headers={"Content-Type": "application/json"})
+        r = c.getresponse()
+        stamps = []
+        t0 = time.monotonic()
+        while True:
+            b = r.read1(65536)
+            if not b:
+                break
+            stamps.append(time.monotonic() - t0)
+        c.close()
+    assert len(stamps) >= 4 and stamps[0] < 1.0, stamps

@@ -4207,8 +4207,13 @@ static void load_from_profiles(char **url, char **key, char **model) {
 
 /* Fail fast when the model server is down (mirrors agent/llm.py): INFER_SERVER_WAIT seconds
    (default 30) of retries while a local server refuses connections; a streaming chat request that
-   receives no byte for INFER_FIRST_BYTE_TIMEOUT seconds (default 300, 0 = off) is abandoned. */
+   receives no byte for g_low_speed_time seconds is abandoned: max(INFER_IDLE_TIMEOUT (alias
+   INFER_FIRST_BYTE_TIMEOUT; default 300, 0 = off), ~prompt tokens / INFER_PREFILL_TPS (default 300))
+   -- llama.cpp sends nothing during prompt processing unless the request has "return_progress"
+   (sent to local servers, INFER_RETURN_PROGRESS=auto|1|0). Unlike agent/llm.py the larger
+   first-byte allowance also applies between chunks (curl has one low-speed window). */
 static int g_server_failed = 0;   /* a request failed because the server is down -> exit status 1 */
+static long g_low_speed_time = 0; /* the no-data window of the chat request in flight (s) */
 #define SERVER_FIX_HINT "check `ai-backend status`"
 
 static double env_seconds(const char *name, double def) {
@@ -4227,13 +4232,28 @@ static void server_base_url(const char *api_url, char *out, size_t n) {
     if (k && k > out) *k = '\0';
 }
 
+static double idle_timeout_seconds(void) {
+    const char *v = getenv("INFER_IDLE_TIMEOUT");
+    if (v && *v) return env_seconds("INFER_IDLE_TIMEOUT", 300);
+    return env_seconds("INFER_FIRST_BYTE_TIMEOUT", 300);
+}
+
+static int return_progress_enabled(const char *api_url) {
+    const char *v = getenv("INFER_RETURN_PROGRESS");
+    if (v && (!strcasecmp(v, "0") || !strcasecmp(v, "off") || !strcasecmp(v, "false") || !strcasecmp(v, "no")))
+        return 0;
+    if (v && (!strcasecmp(v, "1") || !strcasecmp(v, "on") || !strcasecmp(v, "true") || !strcasecmp(v, "yes")))
+        return 1;
+    return api_url && (strstr(api_url, "localhost") || strstr(api_url, "127.0.0.1"));
+}
+
 static void print_server_failure(CURLcode res, const char *api_url) {
     char base[1024];
     server_base_url(api_url, base, sizeof(base));
     if (res == CURLE_OPERATION_TIMEDOUT) {
-        fprintf(stderr, "\033[1;31m[ai] no response from the model server at %s within %gs "
-                        "(INFER_FIRST_BYTE_TIMEOUT); " SERVER_FIX_HINT ".\033[0m\n",
-                base, env_seconds("INFER_FIRST_BYTE_TIMEOUT", 300));
+        fprintf(stderr, "\033[1;31m[ai] no data from the model server at %s for %gs "
+                        "(INFER_IDLE_TIMEOUT); " SERVER_FIX_HINT ".\033[0m\n",
+                base, (double)g_low_speed_time);
     } else if (res == CURLE_COULDNT_CONNECT || res == CURLE_COULDNT_RESOLVE_HOST) {
         fprintf(stderr, "\033[1;31m[ai] cannot reach the model server at %s (%s); is it running? "
                         "Check `ai-backend status`.\033[0m\n", base, curl_easy_strerror(res));
@@ -6043,6 +6063,10 @@ step_limit_check:
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"preserve_thinking\":true");
                 }
+                if (return_progress_enabled(api_url)) {   /* llama.cpp: prompt_progress chunks during prefill */
+                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                        ",\"return_progress\":true");
+                }
 
                 char *esc_model = json_escape(model);
                 char *payload = NULL;
@@ -6086,9 +6110,13 @@ step_limit_check:
                 clock_gettime(CLOCK_MONOTONIC, &t_req_start);
                 {
                     /* no byte (first, or between SSE chunks) for this long -> CURLE_OPERATION_TIMEDOUT */
-                    long fbt = (long)env_seconds("INFER_FIRST_BYTE_TIMEOUT", 300);
-                    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, fbt > 0 ? 1L : 0L);
-                    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, fbt > 0 ? fbt : 0L);
+                    double idle = idle_timeout_seconds();
+                    double tps = env_seconds("INFER_PREFILL_TPS", 300);
+                    if (tps <= 0) tps = 300;
+                    double first = strlen(payload) / 4.0 / tps;
+                    g_low_speed_time = idle > 0 ? (long)(first > idle ? first + 0.5 : idle) : 0;
+                    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, g_low_speed_time > 0 ? 1L : 0L);
+                    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, g_low_speed_time);
                 }
                 debug_dir_begin(payload);
                 CURLcode res = perform_curl_with_retry(c, &chunk, stream_retry_reset, &s_ctx);
@@ -6213,6 +6241,10 @@ step_limit_check:
 
                 free_stream_context(&s_ctx);
 
+                curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 0L);
+                curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 0L);
+                debug_dir_end();
+
                 /* ESC pressed during LLM request */
                 if (g_esc_requested) {
                     fprintf(stderr, "\n\033[1;31m[ai] Interrupted by user (ESC).\033[0m\n");
@@ -6221,10 +6253,6 @@ step_limit_check:
                     has_more = 0;
                     break;
                 }
-
-                curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 0L);
-                curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 0L);
-                debug_dir_end();
                 if (res != CURLE_OK || !chunk.data) {
                     if (res != CURLE_OK) print_server_failure(res, api_url);
                     else fprintf(stderr, "Request failed: empty response from the model server.\n");

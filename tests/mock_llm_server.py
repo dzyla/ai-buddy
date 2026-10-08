@@ -35,6 +35,9 @@ The reply is controlled by env vars:
                         that status and JSON body (e.g. llama-proxy's 503 backend_unavailable)
   MOCK_STALL          — seconds to wait before answering a chat POST (nothing is sent meanwhile: a
                         server that accepted the request but produces no first byte)
+  MOCK_PREFILL        — JSON {"seconds": N, "interval": s}: simulated prompt processing before every
+                        streamed chat reply. A request with "return_progress": true gets llama.cpp-style
+                        prompt_progress chunks every `interval` meanwhile; otherwise nothing is sent.
 
 Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 """
@@ -53,6 +56,44 @@ def _usage():
 
 
 class Handler(BaseHTTPRequestHandler):
+    _hdr_done = False   # headers already sent (by the MOCK_PREFILL progress stream)
+
+    def send_response(self, *a, **k):
+        if not self._hdr_done:
+            super().send_response(*a, **k)
+
+    def send_header(self, *a, **k):
+        if not self._hdr_done:
+            super().send_header(*a, **k)
+
+    def end_headers(self):
+        if not self._hdr_done:
+            super().end_headers()
+
+    def _prefill(self, body):
+        spec = json.loads(os.environ.get("MOCK_PREFILL") or "null")
+        if not spec or not body.get("stream"):
+            return
+        secs, step = float(spec.get("seconds", 0)), float(spec.get("interval", 0.5))
+        if not body.get("return_progress"):
+            time.sleep(secs)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self._hdr_done = True
+        t0, total = time.time(), 100000
+        while time.time() - t0 < secs:
+            done = int(total * (time.time() - t0) / max(secs, 0.001))
+            chunk = {"choices": [{"finish_reason": None, "index": 0,
+                                  "delta": {"role": "assistant", "content": None}}],
+                     "created": 0, "id": "chatcmpl-mock", "model": "mock", "object": "chat.completion.chunk",
+                     "prompt_progress": {"total": total, "cache": 0, "processed": done,
+                                         "time_ms": (time.time() - t0) * 1000}}
+            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            self.wfile.flush()
+            time.sleep(step)
+
     _seq_idx = 0  # index into MOCK_TOOL_SEQ for the current server process
     _req_no = 0   # chat requests received so far
     _last_len = 0  # body size of the request being answered
@@ -114,6 +155,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
         stream = bool(body.get("stream"))
+        self._prefill(body)
         runaway = json.loads(os.environ.get("MOCK_RUNAWAY_SEQ") or "[]")
         if stream and Handler._req_no <= len(runaway) and runaway[Handler._req_no - 1]:
             self._runaway(runaway[Handler._req_no - 1])

@@ -4,13 +4,17 @@
 chat(messages, tools, stream=True, on_chunk=None, client=None) -> dict
     {"message": assistant message, "finish_reason": str|None, "usage": {...}, "status": http status,
      "error": str|None (transport/HTTP failure, message is then empty), "interrupted": bool}
-    plus, on a failure: "connect_failed", "first_byte_timeout" (seconds), "unavailable" (the
+    plus, on a failure: "connect_failed", "first_byte_timeout" (seconds; set for any idle timeout), "unavailable" (the
     llama-proxy's 503 backend_unavailable: the backend failed to start; never retried).
 failure_line(res, url) -> the one-line error the engine prints for such a result.
 
 Fail fast: a local server that refuses connections is waited for INFER_SERVER_WAIT seconds
-(default 30, a server that is still starting up); a streaming request that gets no byte for
-INFER_FIRST_BYTE_TIMEOUT seconds (default 300, 0 = no limit) is abandoned, not retried.
+(default 30, a server that is still starting up). Streaming requests to a local server ask for
+"return_progress": true (INFER_RETURN_PROGRESS=auto|1|0): llama.cpp then streams prompt_progress
+chunks during prompt processing (otherwise it sends nothing until the first token), so
+INFER_IDLE_TIMEOUT (alias INFER_FIRST_BYTE_TIMEOUT; default 300, 0 = no limit) is a real idle
+timeout. Until the first byte the allowance is max(idle, ~prompt tokens / INFER_PREFILL_TPS
+(default 300)) for servers that ignore return_progress. A timeout is never retried.
 
 INFER_DEBUG_DIR=<dir>: every chat request overwrites <dir>/last_request.json (the payload) and
 <dir>/last_response.raw (the HTTP status line, then the raw response bytes, flushed as they
@@ -43,9 +47,36 @@ def server_wait():
     return _env_float("INFER_SERVER_WAIT", 30)
 
 
-def first_byte_timeout():
-    """INFER_FIRST_BYTE_TIMEOUT: seconds a streaming request may go without receiving a byte."""
+def idle_timeout():
+    """INFER_IDLE_TIMEOUT (or its old name INFER_FIRST_BYTE_TIMEOUT): seconds a streaming request
+    may go without receiving a byte."""
+    if os.environ.get("INFER_IDLE_TIMEOUT"):
+        return _env_float("INFER_IDLE_TIMEOUT", 300)
     return _env_float("INFER_FIRST_BYTE_TIMEOUT", 300)
+
+
+first_byte_timeout = idle_timeout   # old name
+
+
+def first_byte_allowance(body_len, idle=None):
+    """Seconds to wait for the FIRST byte: max(idle, estimated prompt tokens (bytes/4) at
+    INFER_PREFILL_TPS tokens/s), for servers that send nothing during prompt processing."""
+    idle = idle_timeout() if idle is None else idle
+    if idle <= 0:
+        return 0
+    tps = _env_float("INFER_PREFILL_TPS", 300) or 300
+    return max(idle, round(body_len / 4.0 / tps))
+
+
+def return_progress_enabled(url):
+    """INFER_RETURN_PROGRESS: auto (default: local servers only; hosted APIs may reject unknown
+    fields), 1/on, 0/off."""
+    v = (os.environ.get("INFER_RETURN_PROGRESS") or "auto").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return False
+    if v in ("1", "on", "true", "yes"):
+        return True
+    return _is_local(url)
 
 
 def _local_tries():
@@ -62,7 +93,7 @@ def failure_line(res, url):
     base = _base_of(url)
     err = " ".join(str(res.get("error") or "").split())
     if res.get("first_byte_timeout"):
-        return ("[ai] no response from the model server at %s within %gs (INFER_FIRST_BYTE_TIMEOUT); %s."
+        return ("[ai] no data from the model server at %s for %gs (INFER_IDLE_TIMEOUT); %s."
                 % (base, res["first_byte_timeout"], FIX_HINT))
     if res.get("unavailable"):
         line = "[ai] model server unavailable (HTTP %s): %s" % (res.get("status") or 503, err or "backend down")
@@ -82,7 +113,7 @@ def _c2(x):
     return float("%.2f" % struct.unpack("f", struct.pack("f", x))[0])
 
 
-def build_payload(model, messages, tools, opts, stream=True):
+def build_payload(model, messages, tools, opts, stream=True, return_progress=False):
     """The request body ai.c builds (field set, order and "%.2f" float rounding)."""
     p = {"model": model, "stream": bool(stream)}
     if stream:
@@ -107,6 +138,8 @@ def build_payload(model, messages, tools, opts, stream=True):
         p["reasoning_budget"] = opts.reasoning_budget
     if opts.preserve_thinking:
         p["preserve_thinking"] = True
+    if stream and return_progress:
+        p["return_progress"] = True
     p["messages"] = messages
     if tools:
         p["tools"] = tools
@@ -466,6 +499,7 @@ class Client:
         self._conn = None
         self._lock = threading.Lock()
         self._interrupted = False
+        self._timeout_used = 0
 
     def interrupt(self):
         self._interrupted = True
@@ -512,7 +546,8 @@ class Client:
         """guard: a zero-arg factory returning a fresh RunawayGuard per attempt (streaming only).
         A tripped guard ends the request early: the result then carries "guard" (the trip dict)
         and the partial message, which the caller should discard."""
-        payload = build_payload(self.model, messages, tools, opts or self.opts, stream=stream)
+        payload = build_payload(self.model, messages, tools, opts or self.opts, stream=stream,
+                                return_progress=stream and return_progress_enabled(self.api_url))
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
         if self.debug:
             self.log("[debug] Loop %s payload: %s\n" % (debug_tag, body.decode("utf-8", "replace")))
@@ -527,7 +562,7 @@ class Client:
             except (OSError, http.client.HTTPException) as e:
                 if self._interrupted:
                     return self._done(acc, stream, interrupted=True)
-                fbt = first_byte_timeout() if stream else 0
+                fbt = self._timeout_used if stream else 0
                 if isinstance(e, socket.timeout) and fbt > 0:
                     # the server took the request but sent nothing for fbt seconds: a retry would
                     # only queue behind the stuck generation
@@ -590,9 +625,12 @@ class Client:
         return res
 
     def _post(self, body, acc, stream):
-        # streaming: a socket timeout = no byte (first, or between chunks) for that long
-        fbt = first_byte_timeout() if stream else 0
-        conn, path = self._open(self.api_url, timeout=fbt if fbt > 0 else None)
+        # streaming: a socket timeout = no byte for that long; the first byte gets the larger
+        # prompt-size allowance, later bytes (tokens, prompt_progress chunks) the idle timeout
+        idle = idle_timeout() if stream else 0
+        first = first_byte_allowance(len(body), idle) if idle > 0 else 0
+        self._timeout_used = first
+        conn, path = self._open(self.api_url, timeout=first if first > 0 else None)
         with self._lock:
             self._conn = conn
         raw_log = _debug_files(body)
@@ -603,6 +641,9 @@ class Client:
             _debug_write(raw_log, b"HTTP %d\n" % r.status)
             err = None
             if stream and r.status < 400:
+                if idle > 0 and conn.sock is not None:
+                    conn.sock.settimeout(idle)
+                    self._timeout_used = idle
                 while True:
                     chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
                     if not chunk:

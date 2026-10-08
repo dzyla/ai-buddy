@@ -24,7 +24,7 @@ LLAMA_IDLE_TIMEOUT seconds without activity.
 
 Environment (all optional): LLAMA_PROXY_HOST, LLAMA_PROXY_PORT, LLAMA_PROXY_BACKEND_HOST,
 LLAMA_PROXY_BACKEND_PORT, LLAMA_PROXY_SERVICE (unit name), LLAMA_PROXY_START_TIMEOUT,
-LLAMA_PROXY_UPSTREAM_TIMEOUT (seconds without upstream data before giving up, default 300),
+LLAMA_PROXY_UPSTREAM_TIMEOUT (seconds without upstream data before giving up, default 900),
 LLAMA_PROXY_FAIL_CACHE.
 """
 
@@ -53,7 +53,9 @@ BACKEND_HOST = os.environ.get("LLAMA_PROXY_BACKEND_HOST") or "127.0.0.1"
 BACKEND_PORT = _env_num("LLAMA_PROXY_BACKEND_PORT", 8081, int)
 SYSTEMD_SERVICE = os.environ.get("LLAMA_PROXY_SERVICE") or "llama-server.service"
 STARTUP_TIMEOUT = _env_num("LLAMA_PROXY_START_TIMEOUT", 180)   # model load into VRAM: 15-60 s typical
-UPSTREAM_TIMEOUT = _env_num("LLAMA_PROXY_UPSTREAM_TIMEOUT", 300)
+# no upstream byte for this long -> give up; generous because a llama-server that was not asked for
+# "return_progress" sends nothing during prompt processing (a cold 128K prefill: minutes)
+UPSTREAM_TIMEOUT = _env_num("LLAMA_PROXY_UPSTREAM_TIMEOUT", 900)
 FAIL_CACHE_SECONDS = _env_num("LLAMA_PROXY_FAIL_CACHE", 10)
 JOURNAL_LINES = 30
 FIX_HINT = "Check `ai-backend status` and `journalctl --user -u %s -n 50`." % SYSTEMD_SERVICE
@@ -145,7 +147,7 @@ def failure_reason(lines, fallback):
     start = None
     for i, line in enumerate(lines):
         low = line.lower()
-        if "[llama-wrapper]" in line and "error" in low or "error:" in low:
+        if ("[llama-wrapper]" in line and "error" in low) or "error:" in low:
             start = i
     if start is not None:
         block = [clean(x) for x in lines[start:start + 12]
