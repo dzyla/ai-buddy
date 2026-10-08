@@ -167,3 +167,31 @@ def test_main_dispatches_profile(ab, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(ab.sys, "argv", ["ai-backend", "profile"])
     ab.main()
     assert "profile" in capsys.readouterr().out.lower()
+
+
+@pytest.mark.parametrize("mode", ["thinking", "normal", "low", "instruct"])
+def test_mode_presets_agree_with_the_profile_on_presence(ab, tmp_path, mode):
+    """Ruling H-2: `mode` presets write presence 1.5 to both the client and the server key, so a
+    later `use` of a Qwen-family model sees no conflicting user value and nothing flips to 0."""
+    owner_env(ab)
+    ab.cmd_mode(mode)
+    env = ab.load_env()
+    assert env["LLAMA_PRESENCE_PENALTY"] == "1.5" and env["INFER_PRESENCE_PENALTY"] == "1.5"
+    ab.apply_model_path(model(ab, tmp_path, "Qwen3.8-27B-Q4.gguf", "qwen35"))
+    env = ab.load_env()
+    assert env["LLAMA_PRESENCE_PENALTY"] == "1.5" and env["INFER_PRESENCE_PENALTY"] == "1.5"
+
+
+@pytest.mark.parametrize("bad", ['{"written": [1, 2], "previous": "x", "profile": "qwen35-thinking"}',
+                                 '["not", "a", "dict"]', '{"written": null}', "not json"])
+def test_corrupt_sidecar_is_treated_as_empty(ab, tmp_path, bad):
+    owner_env(ab)
+    ab.PROFILE_FILE.write_text(bad)
+    ab.apply_model_path(model(ab, tmp_path, "Qwen3.8-27B-Q4.gguf", "qwen35"))
+    env = ab.load_env()
+    assert env["INFER_PRESENCE_PENALTY"] == "1.5" and env["LLAMA_PRESENCE_PENALTY"] == "1.5"
+    side = json.loads(ab.PROFILE_FILE.read_text())
+    assert isinstance(side["written"], dict) and isinstance(side["previous"], dict)
+    ab.cmd_profile("show")
+    ab.cmd_profile("off")
+    assert ab.load_env()["LLAMA_PRESENCE_PENALTY"] == "0.0"

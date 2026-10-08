@@ -1078,15 +1078,22 @@ def _same_value(a, b):
 
 
 def load_profile_state():
+    """The sidecar, validated: anything malformed (not a dict, written/previous not dicts of
+    strings) is treated as empty rather than crashing `use`."""
+    st = None
     try:
         st = json.loads(PROFILE_FILE.read_text())
-        if isinstance(st, dict):
-            st.setdefault("written", {})
-            st.setdefault("previous", {})
-            return st
     except (OSError, ValueError):
         pass
-    return {"profile": None, "disabled": False, "written": {}, "previous": {}}
+    if not isinstance(st, dict):
+        st = {}
+    for k in ("written", "previous"):
+        v = st.get(k)
+        st[k] = {str(a): b for a, b in v.items() if b is None or isinstance(b, str)} if isinstance(v, dict) else {}
+    st["disabled"] = st.get("disabled") is True
+    if not isinstance(st.get("profile"), str):
+        st["profile"] = None
+    return st
 
 
 def save_profile_state(st):
@@ -2300,14 +2307,17 @@ def cmd_tune(target=None):
 
 
 def cmd_mode(mode_name=None):
-    """Configure recommended settings for thinking vs instruct mode (e.g. for Qwen3.8)."""
+    """Configure recommended settings for thinking vs instruct mode (e.g. for Qwen3.8).
+    Every preset writes the Qwen recipe's presence_penalty 1.5 to both the server
+    (LLAMA_PRESENCE_PENALTY) and the client (INFER_PRESENCE_PENALTY, which overrides the server
+    per request) so it agrees with the qwen35-thinking sampling profile."""
     if not mode_name:
         env_vars = load_env()
         print("Current mode settings:")
-        for k in ("INFER_TEMPERATURE", "INFER_TOP_P", "INFER_TOP_K", "INFER_MIN_P", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "INFER_REASONING_EFFORT"):
+        for k in ("INFER_TEMPERATURE", "INFER_TOP_P", "INFER_TOP_K", "INFER_MIN_P", "LLAMA_REPEAT_PENALTY", "LLAMA_PRESENCE_PENALTY", "INFER_PRESENCE_PENALTY", "INFER_REASONING_EFFORT"):
             print(f"  {k:<22} = {env_vars.get(k, '(default)')}")
         print("\nUsage:")
-        print("  ai-backend mode thinking   # Qwen3.8 thinking defaults (temp 1.0, top_p 0.95, top_k 20, pres_pen 0.0, repeat_pen 1.0, effort xhigh)")
+        print("  ai-backend mode thinking   # Qwen3.8 thinking defaults (temp 1.0, top_p 0.95, top_k 20, pres_pen 1.5, repeat_pen 1.0, effort xhigh)")
         print("  ai-backend mode xhigh      # same as thinking: deepest reasoning (effort xhigh)")
         print("  ai-backend mode normal     # thinking, medium effort (balanced speed/accuracy)")
         print("  ai-backend mode low        # thinking, low effort (fastest, cost-optimised)")
@@ -2321,12 +2331,13 @@ def cmd_mode(mode_name=None):
             "INFER_TOP_K": "20",
             "INFER_MIN_P": "0.0",
             "LLAMA_REPEAT_PENALTY": "1.0",
-            "LLAMA_PRESENCE_PENALTY": "0.0",
+            "LLAMA_PRESENCE_PENALTY": "1.5",
+            "INFER_PRESENCE_PENALTY": "1.5",
             "LLAMA_FREQUENCY_PENALTY": "0.0",
             "INFER_REASONING_EFFORT": "xhigh",
         })
         print("Applied Qwen3.8 thinking mode settings:")
-        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=xhigh")
+        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=1.5  repeat_penalty=1.0  reasoning_effort=xhigh")
     elif mode_name in ("normal", "medium"):
         persist_env_changes({
             "INFER_TEMPERATURE": "1.0",
@@ -2334,12 +2345,13 @@ def cmd_mode(mode_name=None):
             "INFER_TOP_K": "20",
             "INFER_MIN_P": "0.0",
             "LLAMA_REPEAT_PENALTY": "1.0",
-            "LLAMA_PRESENCE_PENALTY": "0.0",
+            "LLAMA_PRESENCE_PENALTY": "1.5",
+            "INFER_PRESENCE_PENALTY": "1.5",
             "LLAMA_FREQUENCY_PENALTY": "0.0",
             "INFER_REASONING_EFFORT": "medium",
         })
         print("Applied Qwen3.8 normal (medium) mode settings:")
-        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=medium")
+        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=1.5  repeat_penalty=1.0  reasoning_effort=medium")
     elif mode_name in ("low",):
         persist_env_changes({
             "INFER_TEMPERATURE": "1.0",
@@ -2347,12 +2359,13 @@ def cmd_mode(mode_name=None):
             "INFER_TOP_K": "20",
             "INFER_MIN_P": "0.0",
             "LLAMA_REPEAT_PENALTY": "1.0",
-            "LLAMA_PRESENCE_PENALTY": "0.0",
+            "LLAMA_PRESENCE_PENALTY": "1.5",
+            "INFER_PRESENCE_PENALTY": "1.5",
             "LLAMA_FREQUENCY_PENALTY": "0.0",
             "INFER_REASONING_EFFORT": "low",
         })
         print("Applied Qwen3.8 low (fast thinking) mode settings:")
-        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0  repeat_penalty=1.0  reasoning_effort=low")
+        print("  temperature=1.0  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=1.5  repeat_penalty=1.0  reasoning_effort=low")
     elif mode_name in ("instruct", "non-thinking", "chat"):
         persist_env_changes({
             "INFER_TEMPERATURE": "0.7",
@@ -2361,6 +2374,7 @@ def cmd_mode(mode_name=None):
             "INFER_MIN_P": "0.0",
             "LLAMA_REPEAT_PENALTY": "1.0",
             "LLAMA_PRESENCE_PENALTY": "1.5",
+            "INFER_PRESENCE_PENALTY": "1.5",
             "LLAMA_FREQUENCY_PENALTY": "0.0",
             "INFER_REASONING_EFFORT": "none",
         })

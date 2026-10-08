@@ -10,7 +10,8 @@ The reply is controlled by env vars:
   MOCK_REPLY_CONTENT  — assistant text to return (default: "MOCK_OK")
   MOCK_CAPTURE        — file to append each request body to (JSON per line)
   MOCK_TOOL_SEQ       — JSON list of tool calls, one per request (an item may
-                        itself be a list = parallel tool calls in one turn; an
+                        itself be a list = parallel tool calls in one turn, or
+                        {"calls": [...], "finish_reason": "length"}; an
                         object without "function", e.g. {"content": "...",
                         "finish_reason": "length"}, is a plain text reply)
   MOCK_N_CTX          — if set, GET /props reports this n_ctx
@@ -115,6 +116,10 @@ class Handler(BaseHTTPRequestHandler):
         elif tool_call_env and not last_is_tool:
             tc = json.loads(tool_call_env)
 
+        tc_finish = "tool_calls"
+        if isinstance(tc, dict) and "calls" in tc:
+            # {"calls": [...], "finish_reason": "length"}: tool calls cut off by the token limit
+            tc, tc_finish = tc["calls"], tc.get("finish_reason", "tool_calls")
         if isinstance(tc, dict) and "function" not in tc:
             # A scripted plain reply (e.g. a truncated answer with finish_reason "length").
             text, finish = tc.get("content", ""), tc.get("finish_reason", "stop")
@@ -154,13 +159,13 @@ class Handler(BaseHTTPRequestHandler):
                                                "function": {"name": fn.get("name", ""), "arguments": ""}}]})
                     self._sse({"tool_calls": [{"index": idx,
                                "function": {"arguments": fn.get("arguments", "")}}]})
-                self._sse({}, finish="tool_calls")
+                self._sse({}, finish=tc_finish)
                 self.wfile.write(b"data: [DONE]\n\n")
             else:
                 self.send_header("Content-Type", "application/json")
                 resp = {
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": tcs}, "finish_reason": "tool_calls"}],
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": tcs}, "finish_reason": tc_finish}],
                     "usage": _usage(),
                 }
                 payload = json.dumps(resp).encode()

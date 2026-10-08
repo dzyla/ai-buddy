@@ -562,8 +562,11 @@ def test_slash_commands_in_bridge(tmp_path):
     bridge.handle_message({"type": "private", "sender_email": "owner@example.com", "content": "/history"})
     assert any("Recent Zulip Chat Memory" in m["content"] for m in client.sent_messages)
 
-    # Test /debug
-    bridge.handle_message({"type": "private", "sender_email": "owner@example.com", "content": "/debug"})
+    # Test /debug (its server probe must never reach the developer's live model server)
+    import requests
+    with patch("zulip_bridge.memory.requests.get", side_effect=requests.ConnectionError("offline")) as probe:
+        bridge.handle_message({"type": "private", "sender_email": "owner@example.com", "content": "/debug"})
+    assert probe.called
     assert any("Zulip AI Bridge Diagnostics" in m["content"] for m in client.sent_messages)
 
 

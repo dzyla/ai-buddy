@@ -63,7 +63,7 @@ class Options:
     top_k: int = -1
     min_p: float = -1.0
     max_tokens: int = 32768
-    step_max_tokens: int = 16384      # per-step completion cap (INFER_STEP_MAX_TOKENS), see sent_max_tokens
+    step_max_tokens: int = 32768      # per-step completion cap (INFER_STEP_MAX_TOKENS), see sent_max_tokens
     repetition_guard: bool = True     # stream repetition detector (INFER_REPETITION_GUARD=0 disables)
     frequency_penalty: float = 0.10
     presence_penalty: float = 0.05

@@ -99,6 +99,15 @@ LEGIT = {
     "json_array": json_array,
     "log_lines": log_lines,
     "banners": lambda: "".join("=" * 120 + "\n" + prose(600, seed=k) + "\n" + "-" * 300 + "\n" for k in range(6)),
+    # review round 1: data-like and templated repeats that a real answer contains
+    "csv_zero_rows": lambda: "date,open,close\n" + "2026-10-01,0.00,0.00\n" * 40,
+    "tbd_table": lambda: "| item | owner | state |\n|---|---|---|\n" + "| TBD | TBD | pending |\n" * 30,
+    "todo_list": lambda: "## Checklist\n" + "- [ ] TODO: fill in later\n" * 12,
+    "same_asserts": lambda: "Add these checks:\n\n" + "    assert result == expected_value\n" * 10,
+    "zero_matrix": lambda: "M = [\n" + "    [0, 0, 0, 0, 0, 0, 0, 0],\n" * 24 + "]\n",
+    "templated_paragraph": lambda: ("Section notes: this part of the report is intentionally left as a placeholder "
+                                    "until the measurements are in; see the appendix for the method.\n\n") * 4,
+    "html_td_rows": lambda: "```html\n<table>\n" + "  <tr><td>0</td><td>pending</td></tr>\n" * 300 + "</table>\n```\n",
 }
 
 
@@ -121,28 +130,61 @@ def test_generated_file_in_write_file_arguments_does_not_trip():
     assert trip is None, trip
 
 
+ZERO_CSV = "0,0,0,0\n" * 800                       # 6.4 KB
+LEVEL_MAP = "".join("#" + "." * 60 + "#\n" for _ in range(80))
+B64_ZEROS = "A" * 8000
+
+
+@pytest.mark.parametrize("content", [ZERO_CSV, LEVEL_MAP, B64_ZEROS, "all work and no play. " * 400],
+                         ids=["zero_csv", "level_map", "base64_zeros", "looping_text"])
+def test_tool_arguments_are_exempt_from_the_repetition_detector(content):
+    """Only the step cap applies to tool arguments: data files are legitimately repetitive."""
+    assert len(json.dumps(content)) >= 5000
+    g = llm.RunawayGuard(max_tokens=0)
+    trip, _ = feed(g, json.dumps({"path": "data.csv", "content": content}), "args0", step=3)
+    assert trip is None, trip
+    g = llm.RunawayGuard(max_tokens=500)                     # the cap still applies
+    trip, _ = feed(g, json.dumps({"path": "data.csv", "content": content}), "args0", step=4)
+    assert trip and trip["kind"] == "step_cap"
+
+
+TOK_PER_S = 50     # a slow local decode rate: "within seconds" is checked against it
+
+
 def test_reasoning_loop_trips_within_the_loop_window():
     g = llm.RunawayGuard(max_tokens=0)
     head = prose(2000)
     trip, used = feed(g, head + LOOP_UNIT * 200, "reasoning")
     assert trip and trip["kind"] == "repetition" and trip["channel"] == "reasoning"
-    # caught after ~4 repeats of the loop (+ the check interval), not after the 9,600-token timeout
-    assert used - len(head) <= 5 * len(LOOP_UNIT) + 256, used - len(head)
+    # caught after ~8 repeats of the loop (+ the check interval), not after the 9,600-token timeout
+    loop_chars = used - len(head)
+    assert loop_chars <= 9 * len(LOOP_UNIT) + 256, loop_chars
+    assert loop_chars / 4 / TOK_PER_S < 10                 # ~5 s of decoding at 50 tok/s
+
+
+def test_counter_loop_trips_on_digit_normalised_text():
+    """A loop whose only change is a counter ("item 17", "item 18", ...) is caught too."""
+    g = llm.RunawayGuard(max_tokens=0)
+    head = prose(1000)
+    loop = "".join("Let me check item %d again before I continue with the next step of the plan.\n" % (100 + i)
+                   for i in range(200))
+    trip, used = feed(g, head + "\n" + loop, "reasoning")
+    assert trip and trip["kind"] == "repetition", trip
+    assert (used - len(head)) / 4 / TOK_PER_S < 10
 
 
 def test_short_identical_lines_trip():
     g = llm.RunawayGuard(max_tokens=0)
     trip, used = feed(g, prose(500) + "\n" + "I will call task_complete now.\n" * 50, "content")
     assert trip and trip["kind"] == "repetition"
-    assert used <= 500 + 1 + 8 * 31, used
+    assert used <= 500 + 1 + 17 * 31, used
 
 
-def test_loop_inside_tool_arguments_trips_on_a_full_window():
-    g = llm.RunawayGuard(max_tokens=0)
-    args = '{"path": "a.txt", "content": "' + ("all work and no play makes the agent loop forever. " * 400)
-    trip, used = feed(g, args, "args0")
-    assert trip and trip["kind"] == "repetition" and trip["channel"] == "args0"
-    assert used <= 4096 + 2 * 51 + 256
+def test_reasoning_cap_from_the_reasoning_budget():
+    g = llm.RunawayGuard(max_tokens=0, reasoning_max_tokens=100, repetition=False)
+    assert feed(g, prose(5000), "content")[0] is None        # content does not count
+    trip, used = feed(g, prose(5000), "reasoning")
+    assert trip and trip["kind"] == "reasoning_cap" and used == 101 * 4
 
 
 def test_step_cap_trips_on_varying_text():
@@ -174,12 +216,12 @@ def _payload(env, args=("x",)):
 
 def test_step_cap_default_and_explicit_values():
     cfg, p = _payload({})
-    assert cfg.opts.step_max_tokens == 16384 and p["max_tokens"] == 16384
+    assert cfg.opts.step_max_tokens == 32768 and p["max_tokens"] == 32768      # ruling H-1
     _, p = _payload({"INFER_STEP_MAX_TOKENS": "2048"})
     assert p["max_tokens"] == 2048
     # an explicit INFER_MAX_TOKENS wins over the new default cap (explicit settings win)
-    cfg, p = _payload({"INFER_MAX_TOKENS": "32768"})
-    assert p["max_tokens"] == 32768 and cfg.opts.step_max_tokens == 32768
+    cfg, p = _payload({"INFER_MAX_TOKENS": "65536"})
+    assert p["max_tokens"] == 65536 and cfg.opts.step_max_tokens == 65536
     _, p = _payload({"INFER_MAX_TOKENS": "32768", "INFER_STEP_MAX_TOKENS": "8000"})
     assert p["max_tokens"] == 8000
     _, p = _payload({"INFER_MAX_TOKENS": "4096"})
@@ -253,14 +295,15 @@ def test_second_abort_ends_the_step_with_an_error_the_model_sees(tmp_path):
 
 
 def test_step_cap_aborts_a_server_that_ignores_max_tokens(tmp_path):
-    varying = {"channel": "content", "prefix": "", "unit": "step {i}: the value grows to {i}{i} and on. ",
-               "vary": True, "count": 100000, "delay": 0}
+    varying = {"channel": "content", "prefix": prose(60000), "unit": "", "count": 0, "delay": 0}
     r, reqs, discs, _ = _run(tmp_path, [varying], {"INFER_STEP_MAX_TOKENS": "600"})
     assert r.returncode == 0, r.stderr[-3000:]
     assert reqs[0]["max_tokens"] == 600
     assert len(reqs) == 2 and discs[0]["closed"]
     assert discs[0]["sent_chars"] < 600 * 4 + 65536 * 2
     assert "token cap" in r.stderr
+    nudge = reqs[1]["messages"][-1]["content"]
+    assert "token limit" in nudge and "repeating" not in nudge         # its own nudge
 
 
 def test_legit_long_stream_is_not_aborted(tmp_path):
@@ -281,7 +324,7 @@ def test_both_engines_send_the_step_cap(tmp_path, eng):
                                                            "INFER_STEP_MAX_TOKENS": "3000"})
         reqs = srv.requests()
     assert r.returncode == 0 and r2.returncode == 0, r.stderr[-2000:] + r2.stderr[-2000:]
-    assert reqs[0]["max_tokens"] == 16384
+    assert reqs[0]["max_tokens"] == 32768
     assert reqs[-1]["max_tokens"] == 3000
 
 
@@ -293,5 +336,33 @@ def test_guard_nudges_are_internal_for_resume_and_trim():
             {"role": "user", "content": loop.RUNAWAY_FAILED % "repetition in reasoning"},
             {"role": "assistant", "content": "3 todos"}]
     assert [m["content"] for m in sessions.session_transcript(msgs)] == ["count the todos", "3 todos"]
-    for text in (loop.RUNAWAY_NUDGE, loop.RUNAWAY_FAILED):
+    for text in (loop.RUNAWAY_NUDGE, loop.RUNAWAY_CAP_NUDGE, loop.RUNAWAY_FAILED):
         assert text.startswith(sessions._TRIM_INTERNAL_USER_PREFIXES)
+
+
+# ── finish_reason "length": a cut-off tool call is never executed (both engines) ──
+def test_truncated_tool_call_is_not_executed(tmp_path, engine):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "big.txt").write_text("ORIGINAL CONTENT\n")
+    ok_call = {"id": "c1", "type": "function",
+               "function": {"name": "write_file", "arguments": json.dumps({"path": "small.txt", "content": "fine\n"})}}
+    broken = {"id": "c2", "type": "function",          # invalid JSON that repair_json would "fix"
+              "function": {"name": "write_file", "arguments": '{"path": "other.txt", "content": "x\n'}}
+    cut = {"id": "c3", "type": "function",
+           "function": {"name": "write_file", "arguments": '{"path": "big.txt", "content": "line 1\\nline 2\\nli'}}
+    seq = [{"calls": [ok_call, broken, cut], "finish_reason": "length"}]
+    cap = str(tmp_path / "cap.jsonl")
+    with MockServer(cap, MOCK_TOOL_SEQ=json.dumps(seq)) as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["write the files"])
+        reqs = srv.requests()
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert (work / "big.txt").read_text() == "ORIGINAL CONTENT\n"      # untouched, not truncated
+    assert not (work / "other.txt").exists()
+    assert (work / "small.txt").read_text() == "fine\n"                # complete earlier call ran
+    tool_msgs = {m["tool_call_id"]: m["content"] for m in reqs[1]["messages"] if m.get("role") == "tool"}
+    assert set(tool_msgs) == {"c1", "c2", "c3"}                         # every call answered
+    for cid in ("c2", "c3"):
+        assert "cut off at the token limit and was NOT executed" in tool_msgs[cid], tool_msgs[cid]
+    assert "NOT executed" not in tool_msgs["c1"]
+    assert "cut off" in r.stderr

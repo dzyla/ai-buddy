@@ -1,5 +1,6 @@
 import os
 import shutil
+import socket
 import tempfile
 
 import pytest
@@ -69,9 +70,70 @@ def _isolate_home():
     return scratch
 
 
+# ---------------------------------------------------------------------------------------------
+# Live model server / systemd isolation (tests/test_isolation_guard.py). A test reaching the live
+# llama-proxy (:8080) starts the on-demand llama-server, which rewrites ~/.local/share/ai/env; a
+# test running `systemctl --user restart llama-server.service` restarts it. So:
+#  * the default model URL (environment + scratch-HOME env file) is unroutable; tests that need a
+#    server set their own INFER_BASE_URL (the mock);
+#  * `systemctl` is a no-op logging shim first on PATH (subprocesses included);
+#  * in-process TCP connects to 127.0.0.1/localhost:8080/8081 are refused and recorded (a recorded
+#    attempt fails the session); AI_TEST_ALLOW_LIVE_PORTS=1 opts out explicitly.
+# ---------------------------------------------------------------------------------------------
+DEAD_BASE_URL = "http://127.0.0.1:9/v1/"
+_LIVE_PORTS = (8080, 8081)
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0", "::ffff:127.0.0.1")
+
+
+def _isolate_services(scratch):
+    env_dir = os.path.join(scratch, ".local", "share", "ai")
+    os.makedirs(env_dir, exist_ok=True)
+    with open(os.path.join(env_dir, "env"), "w") as f:
+        f.write("# test-run default: an unroutable model server\n"
+                'export INFER_BASE_URL="%s"\n' % DEAD_BASE_URL)
+    os.environ["INFER_BASE_URL"] = DEAD_BASE_URL
+    bindir = os.path.join(scratch, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    shim = os.path.join(bindir, "systemctl")
+    with open(shim, "w") as f:
+        f.write('#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' % os.path.join(scratch, "systemctl_calls.log"))
+    os.chmod(shim, 0o755)
+    os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+    os.environ["AI_TEST_SCRATCH_HOME"] = scratch
+
+
+def _install_live_port_guard():
+    violations = socket._ai_test_live_port_violations = []
+    orig_connect, orig_connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def _blocked(address):
+        if not (isinstance(address, tuple) and len(address) >= 2 and address[1] in _LIVE_PORTS
+                and str(address[0]) in _LOCAL_HOSTS):
+            return False
+        if os.environ.get("AI_TEST_ALLOW_LIVE_PORTS") == "1":
+            return False
+        violations.append((str(address[0]), address[1], os.environ.get("PYTEST_CURRENT_TEST", "?")))
+        return True
+
+    def connect(self, address):
+        if _blocked(address):
+            raise ConnectionRefusedError(111, "test isolation: connection to the live model server port "
+                                              "%s:%s refused" % address[:2])
+        return orig_connect(self, address)
+
+    def connect_ex(self, address):
+        if _blocked(address):
+            return 111
+        return orig_connect_ex(self, address)
+
+    socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
+
+
 _GUARD_ON = os.environ.get("AI_TEST_HOME_GUARD", "1") != "0"
 _REAL_HOME_BEFORE = _snapshot_real_home() if _GUARD_ON else {}
 _SCRATCH_HOME = _isolate_home()
+_isolate_services(_SCRATCH_HOME)
+_install_live_port_guard()
 # also exported so tests (and the guard self-test) can see what the original HOME was
 os.environ["AI_TEST_ORIG_HOME"] = _ORIG_HOME
 
@@ -83,8 +145,28 @@ def _real_home_changes():
     return changed, removed
 
 
+def _report(session, msg):
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+    if tr is not None:
+        tr.write_line(msg, red=True)
+    else:
+        print(msg)
+
+
 def pytest_sessionfinish(session, exitstatus):
     try:
+        hits = socket._ai_test_live_port_violations
+        if hits:
+            _report(session, "\nLIVE-PORT GUARD: tests tried to reach the live model server:\n" +
+                    "\n".join("  %s:%s  from %s" % h for h in hits[:30]))
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        try:
+            with open(os.path.join(_SCRATCH_HOME, "systemctl_calls.log")) as f:
+                calls = f.read().splitlines()
+        except OSError:
+            calls = []
+        if calls and os.environ.get("AI_TEST_SHOW_SYSTEMCTL"):
+            print("\nsystemctl shim: %d call(s) intercepted" % len(calls))
         if _GUARD_ON and os.path.realpath(_ORIG_HOME) != os.path.realpath(_SCRATCH_HOME):
             changed, removed = _real_home_changes()
             if changed or removed:

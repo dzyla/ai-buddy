@@ -555,9 +555,11 @@ class Engine:
 
     def _guard_factory(self):
         o = self.cfg.opts
-        if o.step_max_tokens <= 0 and not o.repetition_guard:
+        if o.step_max_tokens <= 0 and not o.repetition_guard and o.reasoning_budget <= 0:
             return None
-        return lambda: llm.RunawayGuard(o.step_max_tokens, o.repetition_guard)
+        # a server-side reasoning budget is enforced by the server; 2x it is the client backstop
+        r_cap = 2 * o.reasoning_budget if o.reasoning_budget > 0 else 0
+        return lambda: llm.RunawayGuard(o.step_max_tokens, o.repetition_guard, reasoning_max_tokens=r_cap)
 
     def _recover_runaway(self, res, loop_count, on_chunk, guard, t0):
         """The stream was aborted (repetition loop or step token cap): drop the partial reply,
@@ -571,7 +573,8 @@ class Engine:
                                     if (o.reasoning_effort or "").lower() in ("none", "low", "minimal") else "low")
         self.err("\n\033[1;33m[ai] runaway generation stopped (%s); retrying with presence_penalty %.1f, "
                  "reasoning %s.\033[0m\n" % (_describe_trip(trip), retry.presence_penalty, retry.reasoning_effort))
-        self.messages.append({"role": "user", "content": RUNAWAY_NUDGE})
+        self.messages.append({"role": "user", "content": RUNAWAY_NUDGE if trip.get("kind") == "repetition"
+                              else RUNAWAY_CAP_NUDGE})
         self.ch.send("status", s="request")
         res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count, opts=retry,
                                guard=guard)
@@ -663,7 +666,17 @@ class Engine:
         calls = msg.get("tool_calls") or []
         if calls:
             content = msg.get("content") if isinstance(msg.get("content"), str) else None
-            for call in calls:
+            truncated = res.get("finish_reason") == "length"
+            for i, call in enumerate(calls):
+                if truncated and (i == len(calls) - 1 or not _strict_json_args(call)):
+                    # The reply was cut off at the token limit: the last call's arguments are
+                    # incomplete (and the JSON repair would "close" them -> a truncated file).
+                    fn = call.get("function") or {}
+                    self.err("\033[1;33m[ai] tool call %s was cut off at the token limit; not executed.\033[0m\n"
+                             % (fn.get("name") or "?"))
+                    self.messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                          "content": TRUNCATED_CALL_ERROR})
+                    continue
                 done = self._tool_call(call, content, loop_count, completion_tokens)
                 if ((call.get("function") or {}).get("name") or "").strip(" \t\r\n"):
                     content = None  # ai.c hands the turn's text only to the first executed call
@@ -1131,6 +1144,28 @@ RUNAWAY_PRESENCE = 1.5     # presence_penalty floor for the retry after a runawa
 RUNAWAY_STEP_CAP = 3       # consecutive doubly-aborted steps before the task is stopped
 RUNAWAY_NUDGE = ("Your previous reply got stuck repeating itself. Reply now with the next tool call or "
                  "task_complete; keep reasoning brief.")
+RUNAWAY_CAP_NUDGE = ("Your previous reply ran past the per-step token limit and was discarded. Reply now with the "
+                     "next tool call or task_complete; keep reasoning short and write large files in parts "
+                     "(write_file the first part, then append/edit_file the rest).")
+TRUNCATED_CALL_ERROR = ("Error: Your tool call was cut off at the token limit and was NOT executed. Write large files "
+                        "in parts (write_file the first part, then append/edit_file the rest) and keep reasoning "
+                        "short.")
+
+
+def _strict_json_args(call):
+    """The call's arguments parse as JSON as-is (no repair); empty arguments count as {}."""
+    a = (call.get("function") or {}).get("arguments")
+    if a is None or (isinstance(a, str) and not a.strip()):
+        return True
+    if not isinstance(a, str):
+        return True
+    try:
+        json.loads(a)
+        return True
+    except ValueError:
+        return False
+
+
 RUNAWAY_FAILED = ("[GENERATION ABORTED] Your reply was aborted again (%s) and discarded. Do not repeat it: "
                   "make one short, different next step -- a single tool call, or task_complete with your "
                   "best answer so far.")
@@ -1139,6 +1174,8 @@ RUNAWAY_FAILED = ("[GENERATION ABORTED] Your reply was aborted again (%s) and di
 def _describe_trip(trip):
     if trip.get("kind") == "step_cap":
         return "step token cap of %d reached in %s" % (trip.get("limit", 0), trip.get("channel"))
+    if trip.get("kind") == "reasoning_cap":
+        return "reasoning token cap of %d (2x the reasoning budget) reached" % trip.get("limit", 0)
     return "repetition in %s, %d-char unit x%d, ~%d tokens" % (
         trip.get("channel"), trip.get("period", 0), trip.get("repeats", 0), trip.get("tokens", 0))
 

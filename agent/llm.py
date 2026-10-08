@@ -60,20 +60,44 @@ def build_payload(model, messages, tools, opts, stream=True):
 # ── runaway-generation guard ─────────────────────────────────────────────────
 GUARD_WINDOW = 4096        # chars of each channel's tail that are examined
 GUARD_MIN_PERIOD = 40      # a loop unit is at least this long ...
-GUARD_MAX_PERIOD = 1024    # ... and at most this long
-GUARD_REPEATS = 4          # prose: the unit repeated this many times back to back
-GUARD_MIN_UNIT_PERIOD = 8  # prose: units that are themselves a <8-char pattern (banners, "0, 0, ")
-                           # need the full window, like code
-GUARD_SAME_LINES = 6       # prose: this many identical (non-trivial) lines in a row
+GUARD_MAX_PERIOD = 512     # ... and at most this long (8 repeats must fit the window)
+GUARD_REPEATS = 8          # the unit repeated this many times back to back
+GUARD_MIN_UNIT_PERIOD = 8  # units that are themselves a <8-char pattern ("-----") need the full window
+GUARD_SAME_LINES = 16      # this many identical (non-trivial, non-data) lines in a row
+GUARD_PROSE_LETTERS = 0.6  # digit-normalised (counter) loops: the unit must be mostly letters
 GUARD_CHECK_EVERY = 64     # chars between checks of one channel
+_DATA_CHARS = set("0123456789,.;:-+*/=_#|[](){}<>'\" \t")
 
 
-def _periodic(t, p):
-    """True when the last 4*p chars of t are one p-char unit repeated (cheap char probe first)."""
+def data_like(line):
+    """A table/CSV/matrix row: starts with '|' or is mostly digits and punctuation."""
+    t = line.strip()
+    if not t:
+        return True
+    if t.startswith("|"):
+        return True
+    return sum(c in _DATA_CHARS for c in t) >= 0.7 * len(t)
+
+
+def _unit_is_data(tail, p):
+    """The repeating unit (the last p chars) is data rows. The unit is a rotation that may start
+    mid-line, so judge the complete lines of the last two units."""
+    seg = tail[-2 * p:]
+    lines = seg.split("\n")[1:-1]
+    return all(data_like(ln) for ln in (lines or [seg]))
+
+
+def _letter_ratio(unit):
+    t = [c for c in unit if not c.isspace()]
+    return sum(c.isalpha() for c in t) / len(t) if t else 0.0
+
+
+def _periodic(t, p, repeats=GUARD_REPEATS):
+    """True when the last repeats*p chars of t are one p-char unit repeated (cheap probes first)."""
     n = len(t)
-    if n < GUARD_REPEATS * p or t[-1] != t[-1 - p]:
+    if n < repeats * p or t[-1] != t[-1 - p] or t[-p:] != t[-2 * p:-p]:
         return False
-    s = t[-GUARD_REPEATS * p:]
+    s = t[-repeats * p:]
     return s[p:] == s[:-p]
 
 
@@ -84,50 +108,65 @@ def _min_period(unit):
     return len(unit)
 
 
-def find_loop(tail, code=False):
-    """A degenerate repetition at the end of `tail`: (period, repeats) or None.
+def find_loop(tail, counter=False):
+    """A degenerate repetition at the end of prose `tail`: (period, repeats) or None.
 
-    Prose: some 40..1024-char unit repeats >= 4 times back to back at the very end (exact text).
-    Code (inside a ``` fence, or tool-call arguments) is allowed far more regularity -- a zero
-    matrix, a run of similar rows -- so it only trips when the WHOLE 4 KB window is one repeated
-    unit of <= 1024 chars. The same full-window rule covers prose units that are themselves a
-    tiny pattern (a 300-char "-----" rule is legitimate, 4 KB of it is not)."""
+    Some 40..512-char unit repeated >= 8 times back to back at the very end (exact text), unless the
+    unit is data (table/CSV/matrix rows) or itself a tiny pattern; a fully periodic 4 KB window
+    (any unit, data excluded) also counts. counter=True: `tail` is digit-normalised, so only
+    letter-heavy units count (a counting loop, not a log or a table)."""
     n = len(tail)
-    if not code:
-        for p in range(GUARD_MIN_PERIOD, min(GUARD_MAX_PERIOD, n // GUARD_REPEATS) + 1):
-            if _periodic(tail, p) and _min_period(tail[-p:]) >= GUARD_MIN_UNIT_PERIOD:
-                return p, GUARD_REPEATS
-    if n >= GUARD_WINDOW:
-        for p in range(1, GUARD_MAX_PERIOD + 1):
+    for p in range(GUARD_MIN_PERIOD, min(GUARD_MAX_PERIOD, n // GUARD_REPEATS) + 1):
+        if _periodic(tail, p):
+            unit = tail[-p:]
+            if _min_period(unit) < GUARD_MIN_UNIT_PERIOD or _unit_is_data(tail, p):
+                continue
+            if counter and _letter_ratio(unit) < GUARD_PROSE_LETTERS:
+                continue
+            return p, GUARD_REPEATS
+    if n >= GUARD_WINDOW and not counter:
+        for p in range(1, 1025):
             if tail[-1] == tail[-1 - p] and tail[p:] == tail[:-p]:
+                if _unit_is_data(tail, p):
+                    return None
                 return p, n // p
     return None
 
 
-def same_lines(tail, k=GUARD_SAME_LINES):
-    """The last k complete lines are identical and non-trivial (>= 8 chars with a letter or digit)."""
+def same_lines(tail, k=GUARD_SAME_LINES, counter=False):
+    """The last k complete lines are identical, non-trivial (>= 8 chars with a letter) and not data."""
     lines = tail[:tail.rfind("\n") + 1].split("\n")[:-1]     # complete lines only
     if len(lines) < k:
         return False
     last = lines[-k:]
     ln = last[0]
-    return (all(x == ln for x in last) and len(ln.strip()) >= 8 and any(c.isalnum() for c in ln))
+    if not all(x == ln for x in last) or len(ln.strip()) < 8 or data_like(ln):
+        return False
+    if counter and _letter_ratio(ln) < GUARD_PROSE_LETTERS:
+        return False
+    return any(c.isalpha() for c in ln)
+
+
+_DIGITS = str.maketrans("0123456789", "0000000000")
 
 
 class RunawayGuard:
     """Watches one streamed reply. observe(channel, text) -> a trip dict once the reply is runaway:
-    {"kind": "step_cap"|"repetition", "channel", "tokens", ...}; None otherwise.
+    {"kind": "step_cap"|"reasoning_cap"|"repetition", "channel", "tokens", ...}; None otherwise.
 
-    channel: "content", "reasoning", or "args<N>" (tool call N's arguments, always treated as code).
-    Tokens are estimated as max(text events, chars / 4): llama.cpp streams ~one token per event, a
-    batching server is counted by size. max_tokens <= 0 disables the cap; repetition=False the
+    channel: "content", "reasoning", or "args<N>" (tool call N's arguments). Only prose -- content
+    and reasoning outside a ``` fence -- is checked for repetition; tool arguments and fenced code
+    (generated files, data) only count toward the caps. Tokens are estimated as
+    max(text events, chars / 4): llama.cpp streams ~one token per event, a batching server is
+    counted by size. max_tokens / reasoning_max_tokens <= 0 disable the caps; repetition=False the
     loop detector."""
 
-    def __init__(self, max_tokens=0, repetition=True):
+    def __init__(self, max_tokens=0, repetition=True, reasoning_max_tokens=0):
         self.max_tokens = max_tokens
+        self.reasoning_max_tokens = reasoning_max_tokens
         self.repetition = repetition
-        self.events = 0
-        self.chars = 0
+        self.events = self.chars = 0
+        self.r_events = self.r_chars = 0
         self.tripped = None
         self._tail = {}
         self._since = {}
@@ -146,7 +185,15 @@ class RunawayGuard:
             self.tripped = {"kind": "step_cap", "channel": channel, "tokens": self.tokens,
                             "limit": self.max_tokens}
             return self.tripped
-        if not self.repetition:
+        if channel == "reasoning":
+            self.r_events += 1
+            self.r_chars += len(text)
+            r_tokens = max(self.r_events, self.r_chars // 4)
+            if 0 < self.reasoning_max_tokens < r_tokens:
+                self.tripped = {"kind": "reasoning_cap", "channel": channel, "tokens": r_tokens,
+                                "limit": self.reasoning_max_tokens}
+                return self.tripped
+        if not self.repetition or channel.startswith("args"):
             return None
         prev = self._tail.get(channel, "")
         joined = prev[-2:] + text          # a ``` fence split across two events still counts
@@ -158,14 +205,22 @@ class RunawayGuard:
             self._since[channel] = since
             return None
         self._since[channel] = 0
-        code = channel.startswith("args") or self._fences[channel] % 2 == 1
-        hit = find_loop(tail, code=code)
-        if hit is None and not code and same_lines(tail):
-            hit = (len(tail[:tail.rfind("\n")].rsplit("\n", 1)[-1]) + 1, GUARD_SAME_LINES)
+        if self._fences[channel] % 2 == 1:   # inside a code block
+            return None
+        hit = self._check(tail, False) or self._check(tail.translate(_DIGITS), True)
         if hit:
             self.tripped = {"kind": "repetition", "channel": channel, "tokens": self.tokens,
-                            "period": hit[0], "repeats": hit[1]}
+                            "period": hit[0], "repeats": hit[1], "counter": hit[2]}
         return self.tripped
+
+    @staticmethod
+    def _check(tail, counter):
+        hit = find_loop(tail, counter=counter)
+        if hit:
+            return hit[0], hit[1], counter
+        if same_lines(tail, counter=counter):
+            return len(tail[:tail.rfind("\n")].rsplit("\n", 1)[-1]) + 1, GUARD_SAME_LINES, counter
+        return None
 
 
 # ── SSE ──────────────────────────────────────────────────────────────────────

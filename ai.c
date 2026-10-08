@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <curl/curl.h>
 #include "jsmn.h"
+#include "cJSON.h"
 
 #include <strings.h>
 #include <dirent.h>
@@ -841,7 +842,7 @@ static int   thinking_budget_val   = -1;   /* set via :budget, --budget, or INFE
 static int   preserve_thinking_val  = 0;
 static char  *mode_preset_val       = NULL; /* --mode <xhigh|normal|low|instruct> */
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
-static int   step_max_tokens_val    = 16384; /* Per-step completion cap sent as max_tokens (the smaller positive of the two): a reasoning model stuck in a repetition loop otherwise generates until the request timeout. INFER_STEP_MAX_TOKENS; an explicit INFER_MAX_TOKENS also sets it. Mirrored by agent/cli.py Options.sent_max_tokens. */
+static int   step_max_tokens_val    = 32768; /* Per-step completion cap sent as max_tokens (the smaller positive of the two). INFER_STEP_MAX_TOKENS; an explicit INFER_MAX_TOKENS also sets it. Mirrored by agent/cli.py Options.sent_max_tokens. */
 static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops (0=off, INFER_FREQ_PENALTY) */
 static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
 static int   no_tools_mode          = 0;
@@ -1375,6 +1376,22 @@ static int mkdir_p(const char *path) {
 }
 
 static char* json_escape(const char *src);
+
+/* A reply cut off by the token limit (finish_reason "length"): its last tool call's arguments
+   are incomplete, and the Python-side JSON repair would "close" them (a truncated file on
+   write_file). Such a call -- and any earlier one whose arguments are not valid JSON as-is -- is
+   answered with this error instead of being executed. Mirrored by agent/loop.py. */
+#define TRUNCATED_CALL_ERROR "Error: Your tool call was cut off at the token limit and was NOT executed. " \
+    "Write large files in parts (write_file the first part, then append/edit_file the rest) and keep reasoning short."
+static int args_strict_json(const char *a) {
+    if (!a) return 1;
+    while (*a == ' ' || *a == '\t' || *a == '\r' || *a == '\n') a++;
+    if (!*a) return 1;
+    cJSON *j = cJSON_Parse(a);
+    if (!j) return 0;
+    cJSON_Delete(j);
+    return 1;
+}
 
 static void log_job(const char *prompt, const char *pipe_writer, const char *response, int interactive) {
     if (g_private_mode) return;
@@ -6182,6 +6199,25 @@ step_limit_check:
                               }
 
                               char *tool_output = NULL;
+
+                              if (finish_reason_length && (tc == num_calls - 1 || !args_strict_json(unescaped_args))) {
+                                  fprintf(stderr, "\033[1;33m[ai] tool call %s was cut off at the token limit; not executed.\033[0m\n",
+                                          unescaped_name ? unescaped_name : "?");
+                                  char *esc_id = json_escape(unescaped_id ? unescaped_id : "");
+                                  size_t rlen = strlen(esc_id ? esc_id : "") + sizeof(TRUNCATED_CALL_ERROR) + 64;
+                                  char *trunc_resp = malloc(rlen);
+                                  if (trunc_resp) {
+                                      snprintf(trunc_resp, rlen, "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"%s\"}",
+                                               esc_id ? esc_id : "", TRUNCATED_CALL_ERROR);
+                                      messages_json = append_message(messages_json, trunc_resp);
+                                      free(trunc_resp);
+                                  }
+                                  free(esc_id);
+                                  if (unescaped_id) free(unescaped_id);
+                                  if (unescaped_name) free(unescaped_name);
+                                  if (unescaped_args) free(unescaped_args);
+                                  goto end_tool_iter;
+                              }
 
                               if (!unescaped_name || !*unescaped_name || strspn(unescaped_name, " \t\r\n") == strlen(unescaped_name)) {
                                   if (debug_mode) {
