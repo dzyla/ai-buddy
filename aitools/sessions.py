@@ -1,6 +1,8 @@
 """Message trimming (trim-messages), resume transcripts (session-transcript) and the sessions
 index (state db `sessions` table)."""
 import json
+import os
+import re
 import time
 
 from . import state
@@ -45,6 +47,111 @@ _TRIM_INTERNAL_USER_PREFIXES = (
 _TRIM_NOTE = "\n\n[CONTEXT NOTE: older conversation messages were trimmed to fit the model's context window.]"
 
 
+# ── Reasoning retention (INFER_KEEP_REASONING) ──
+# A turn boundary is a real user message; these harness-injected user messages are not (ai.c
+# mirrors this tuple in reasoning_internal_prefixes[] -- keep both in sync).
+RETENTION_INTERNAL_PREFIXES = _TRIM_INTERNAL_USER_PREFIXES + (
+    "[User note mid-task", "Here is the image file",
+)
+KEEP_REASONING_DEFAULT = 2
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
+
+
+def parse_keep_reasoning(value):
+    """INFER_KEEP_REASONING: "all" or a negative number -> -1 (keep everything), N >= 0 -> N;
+    unset, empty or unparsable -> None (caller's default)."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if not v:
+        return None
+    if v == "all":
+        return -1
+    try:
+        n = int(v)
+    except ValueError:
+        return None
+    return -1 if n < 0 else n
+
+
+def keep_reasoning_from_env(preserve_thinking=False, environ=None):
+    """The effective setting: an explicit INFER_KEEP_REASONING wins; else --preserve-thinking /
+    INFER_PRESERVE_THINKING (the user asked the template to keep past thinking) means all;
+    else KEEP_REASONING_DEFAULT."""
+    env = os.environ if environ is None else environ
+    n = parse_keep_reasoning(env.get("INFER_KEEP_REASONING"))
+    if n is not None:
+        return n
+    return -1 if preserve_thinking else KEEP_REASONING_DEFAULT
+
+
+def strip_think(text):
+    """Drop inline thinking from assistant text: every <think>...</think> block, then anything up
+    to a remaining unmatched </think> (templates that open the block in the prompt). Leading
+    whitespace left behind is removed. ai.c strip_think_inline() is the same algorithm."""
+    if not isinstance(text, str) or "think>" not in text:
+        return text
+    out = _THINK_BLOCK.sub("", text)
+    k = out.rfind("</think>")
+    if k >= 0:
+        out = out[k + len("</think>"):]
+    if out == text:
+        return text
+    return out.lstrip(" \t\r\n")
+
+
+def _is_turn_boundary(m):
+    return (m.get("role") == "user"
+            and not _trim_text(m).lstrip().startswith(RETENTION_INTERNAL_PREFIXES))
+
+
+def _reasoning_keep_set(messages, keep):
+    """Indices of the assistant messages whose reasoning is kept: the last `keep` assistant
+    messages after the latest real user message."""
+    last_user = -1
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and _is_turn_boundary(m):
+            last_user = i
+    kept = set()
+    for i in range(len(messages) - 1, last_user, -1):
+        if len(kept) >= keep:
+            break
+        m = messages[i]
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            kept.add(i)
+    return kept
+
+
+def _strip_reasoning_msg(m):
+    """The message without reasoning_content and inline <think> blocks; the same object when
+    there is nothing to strip (so unchanged messages serialise identically)."""
+    c = m.get("content")
+    c2 = strip_think(c)
+    if "reasoning_content" not in m and c2 is c:
+        return m
+    out = {k: v for k, v in m.items() if k != "reasoning_content"}
+    if c2 is not c:
+        out["content"] = c2
+    return out
+
+
+def request_view(messages, keep):
+    """The messages to put on the wire: reasoning kept only on the last `keep` assistant messages
+    of the current turn (keep < 0: everything, returns `messages` itself). The input list and its
+    dicts are never modified -- the history and the saved session keep all reasoning. Stripping
+    is a pure function of the history, and the keep window only moves forward, so a message once
+    stripped stays stripped (stable prompt-cache prefix)."""
+    if keep is None or keep < 0 or not isinstance(messages, list):
+        return messages
+    kept = _reasoning_keep_set(messages, keep)
+    out = []
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "assistant" and i not in kept:
+            m = _strip_reasoning_msg(m)
+        out.append(m)
+    return out
+
+
 def _trim_msg_size(m):
     return len(json.dumps(m, ensure_ascii=False))
 
@@ -58,7 +165,7 @@ def _trim_text(m):
     return ""
 
 
-def trim_messages(messages, max_bytes=60000, keep_recent_full=4, tool_stub_chars=800):
+def trim_messages(messages, max_bytes=60000, keep_recent_full=4, tool_stub_chars=800, keep_reasoning=None):
     """Shrink an OpenAI messages array to <= max_bytes (JSON chars) WITHOUT
     breaking the protocol or losing the task:
       - leading system message(s) are always kept;
@@ -67,7 +174,10 @@ def trim_messages(messages, max_bytes=60000, keep_recent_full=4, tool_stub_chars
       - an assistant message with tool_calls and its tool replies are kept or
         dropped as one unit, so no tool message is ever orphaned (API 400);
       - older tool outputs are shortened before whole units are dropped;
-      - the newest unit is always kept.
+      - the newest unit is always kept;
+      - old reasoning goes first: reasoning_content / inline <think> of every assistant message
+        but the last `keep_reasoning` of the current turn is stripped before any tool output is
+        shortened (keep_reasoning None: INFER_KEEP_REASONING / default; < 0 ("all"): never).
     Below the budget the array is returned unchanged (keeps the server's KV /
     prompt cache prefix stable)."""
     if not isinstance(messages, list) or not messages:
@@ -75,6 +185,14 @@ def trim_messages(messages, max_bytes=60000, keep_recent_full=4, tool_stub_chars
     total = sum(_trim_msg_size(m) for m in messages)
     if total <= max_bytes:
         return messages
+    if keep_reasoning is None:
+        keep_reasoning = keep_reasoning_from_env()
+
+    # Stage 0: strip old reasoning (never sent anyway when keep_reasoning >= 0).
+    if keep_reasoning >= 0:
+        messages = request_view(messages, keep_reasoning)
+        if sum(_trim_msg_size(m) for m in messages) <= max_bytes:
+            return messages
 
     head = []
     i = 0

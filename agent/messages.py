@@ -51,13 +51,20 @@ def size(messages):
     return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace"))
 
 
-def trim(messages, max_bytes, log=None):
-    """aitools.sessions.trim_messages: keeps the system prompt, the first and latest real user turn
-    and whole assistant(tool_calls)+tool units; returns the input unchanged when under budget or
-    when trimming fails (fail-open, reported through `log`)."""
+def request_view(messages, keep):
+    """aitools.sessions.request_view: the history as sent, reasoning kept only on the last `keep`
+    assistant messages of the current turn (keep < 0: the history itself)."""
+    from aitools.sessions import request_view as view
+    return view(messages, keep)
+
+
+def trim(messages, max_bytes, log=None, keep_reasoning=None):
+    """aitools.sessions.trim_messages: strips old reasoning first, then keeps the system prompt,
+    the first and latest real user turn and whole assistant(tool_calls)+tool units; returns the
+    input unchanged when under budget or when trimming fails (fail-open, reported through `log`)."""
     from aitools.sessions import trim_messages
     try:
-        out = trim_messages(messages, max(2000, int(max_bytes)))
+        out = trim_messages(messages, max(2000, int(max_bytes)), keep_reasoning=keep_reasoning)
     except Exception as e:
         if log:
             log("\033[33m[ai] warning: trimming the history failed (%s: %s); sending it untrimmed.\033[0m\n"

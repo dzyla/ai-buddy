@@ -840,6 +840,8 @@ static float min_p_val              = -1.0f;
 static char  *reasoning_effort_val  = NULL;
 static int   thinking_budget_val   = -1;   /* set via :budget, --budget, or INFER_REASONING_BUDGET */
 static int   preserve_thinking_val  = 0;
+static char *g_wire_msgs = NULL; /* the messages of the request in flight (reasoning_request_view) */
+int g_keep_reasoning = -2; /* INFER_KEEP_REASONING: reasoning kept on the last N assistant messages of the current turn (-1 all, -2 unset -> 2, or all with --preserve-thinking). Mirrors aitools/sessions.py request_view. */
 static char  *mode_preset_val       = NULL; /* --mode <xhigh|normal|low|instruct> */
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
 static int   step_max_tokens_val    = 32768; /* Per-step completion cap sent as max_tokens (the smaller positive of the two). INFER_STEP_MAX_TOKENS; an explicit INFER_MAX_TOKENS also sets it. Mirrored by agent/cli.py Options.sent_max_tokens. */
@@ -3681,6 +3683,154 @@ static void reconstruct_final_json(struct stream_context *ctx) {
     free(safe_content);
 }
 
+/* ── Reasoning retention (INFER_KEEP_REASONING), same rules as aitools/sessions.py ──
+   Harness-injected user messages that are not a turn boundary (RETENTION_INTERNAL_PREFIXES in
+   aitools/sessions.py -- keep both lists in sync; tests/test_reasoning_retention.py checks it). */
+static const char *reasoning_internal_prefixes[] = {
+    "Please call task_complete", "Your last response was empty", "[TIMEOUT]",
+    "Your last response was cut off", "[SYSTEM]", "[SYSTEM ", "[HARD STOP]",
+    "[STALL]", "[INTERRUPTED", "[CONTEXT",
+    "Your previous reply got stuck", "Your previous reply ran past",
+    "[GENERATION ABORTED]",
+    "[User note mid-task", "Here is the image file",
+    NULL
+};
+
+/* "all" or a negative number -> -1, N >= 0 -> N, unset/empty/unparsable -> -2. */
+static int parse_keep_reasoning(const char *v) {
+    if (!v) return -2;
+    while (*v && isspace((unsigned char)*v)) v++;
+    size_t n = strlen(v);
+    while (n > 0 && isspace((unsigned char)v[n - 1])) n--;
+    if (n == 0) return -2;
+    if (n == 3 && strncasecmp(v, "all", 3) == 0) return -1;
+    char buf[32];
+    if (n >= sizeof(buf)) return -2;
+    memcpy(buf, v, n);
+    buf[n] = '\0';
+    char *end = NULL;
+    long k = strtol(buf, &end, 10);
+    if (!end || *end || end == buf) return -2;
+    if (k < 0) return -1;
+    return k > 1000000 ? 1000000 : (int)k;
+}
+
+/* Inline thinking removed from assistant text: every <think>...</think> block, then anything up
+   to a remaining unmatched </think>, then leading whitespace. Returns a new string, or NULL when
+   nothing changed. Same algorithm as aitools/sessions.py strip_think. */
+static char *strip_think_inline(const char *s) {
+    if (!s || !strstr(s, "think>")) return NULL;
+    size_t len = strlen(s);
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    const char *p = s;
+    for (;;) {
+        const char *open = strstr(p, "<think>");
+        const char *close = open ? strstr(open + 7, "</think>") : NULL;
+        if (!open || !close) break;
+        memcpy(out + o, p, (size_t)(open - p));
+        o += (size_t)(open - p);
+        p = close + 8;
+    }
+    size_t rest = strlen(p);
+    memcpy(out + o, p, rest);
+    o += rest;
+    out[o] = '\0';
+    char *last = NULL, *q = out;
+    while ((q = strstr(q, "</think>")) != NULL) { last = q; q += 8; }
+    char *start = last ? last + 8 : out;
+    if (o == len && !last) { free(out); return NULL; }   /* nothing removed */
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+    memmove(out, start, strlen(start) + 1);
+    return out;
+}
+
+static int reasoning_is_turn_boundary(cJSON *m) {
+    cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role");
+    if (!cJSON_IsString(role) || strcmp(role->valuestring, "user") != 0) return 0;
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+    const char *text = "";
+    char *joined = NULL;
+    if (cJSON_IsString(c)) {
+        text = c->valuestring;
+    } else if (cJSON_IsArray(c)) {   /* multimodal: text parts joined by spaces, as _trim_text */
+        size_t cap = 1, n = 0;
+        cJSON *part;
+        cJSON_ArrayForEach(part, c) {
+            cJSON *t = cJSON_GetObjectItemCaseSensitive(part, "text");
+            if (cJSON_IsObject(part)) cap += (cJSON_IsString(t) ? strlen(t->valuestring) : 0) + 1;
+        }
+        joined = malloc(cap);
+        if (!joined) return 1;
+        cJSON_ArrayForEach(part, c) {
+            if (!cJSON_IsObject(part)) continue;
+            cJSON *t = cJSON_GetObjectItemCaseSensitive(part, "text");
+            const char *ts = cJSON_IsString(t) ? t->valuestring : "";
+            if (n > 0) joined[n++] = ' ';
+            memcpy(joined + n, ts, strlen(ts));
+            n += strlen(ts);
+        }
+        joined[n] = '\0';
+        text = joined;
+    }
+    while (*text && isspace((unsigned char)*text)) text++;
+    int internal = 0;
+    for (int i = 0; reasoning_internal_prefixes[i]; i++) {
+        if (strncmp(text, reasoning_internal_prefixes[i], strlen(reasoning_internal_prefixes[i])) == 0) {
+            internal = 1;
+            break;
+        }
+    }
+    free(joined);
+    return !internal;
+}
+
+/* The messages array as sent: reasoning_content and inline <think> stripped from every assistant
+   message except the last `keep` after the latest real user message. The history itself (and so
+   the saved session) keeps all reasoning. Returns a new JSON string, or NULL to send
+   messages_json unchanged (keep < 0, or it does not parse). */
+static char *reasoning_request_view(const char *messages_json, int keep) {
+    if (keep < 0 || !messages_json) return NULL;
+    cJSON *arr = cJSON_Parse(messages_json);
+    if (!arr || !cJSON_IsArray(arr)) { cJSON_Delete(arr); return NULL; }
+    int n = cJSON_GetArraySize(arr), last_user = -1, i = 0;
+    cJSON *m;
+    cJSON_ArrayForEach(m, arr) {
+        if (cJSON_IsObject(m) && reasoning_is_turn_boundary(m)) last_user = i;
+        i++;
+    }
+    int kept = 0;
+    for (i = n - 1; i >= 0; i--) {
+        m = cJSON_GetArrayItem(arr, i);
+        cJSON *role = cJSON_IsObject(m) ? cJSON_GetObjectItemCaseSensitive(m, "role") : NULL;
+        if (!cJSON_IsString(role) || strcmp(role->valuestring, "assistant") != 0) continue;
+        if (i > last_user && kept < keep) { kept++; continue; }
+        cJSON_DeleteItemFromObjectCaseSensitive(m, "reasoning_content");
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(c)) {
+            char *stripped = strip_think_inline(c->valuestring);
+            if (stripped) {
+                cJSON_ReplaceItemInObjectCaseSensitive(m, "content", cJSON_CreateString(stripped));
+                free(stripped);
+            }
+        }
+    }
+    char *out = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    return out;
+}
+
+/* Size of the messages as they will be sent (old reasoning stripped): every trim/stub/compact
+   decision measures the request, not the full history. */
+static size_t request_messages_len(const char *messages_json) {
+    char *v = reasoning_request_view(messages_json, g_keep_reasoning);
+    if (!v) return strlen(messages_json);
+    size_t n = strlen(v);
+    free(v);
+    return n;
+}
+
 static char* append_message(char *messages_json, const char *msg_to_append) {
     size_t orig_len = strlen(messages_json);
     if (orig_len < 2) return messages_json;
@@ -4769,6 +4919,9 @@ int main(int argc, char **argv) {
     if (env_preserve_think && (strcmp(env_preserve_think, "1") == 0 || strcasecmp(env_preserve_think, "true") == 0)) {
         preserve_thinking_val = 1;
     }
+    /* explicit INFER_KEEP_REASONING wins; else --preserve-thinking keeps all; else 2 */
+    g_keep_reasoning = parse_keep_reasoning(getenv("INFER_KEEP_REASONING"));
+    if (g_keep_reasoning == -2) g_keep_reasoning = preserve_thinking_val ? -1 : 2;
     char *env_maxtok = getenv("INFER_MAX_TOKENS");
     if (env_maxtok && *env_maxtok) max_tokens_val = step_max_tokens_val = atoi(env_maxtok);
     char *env_stepmax = getenv("INFER_STEP_MAX_TOKENS");
@@ -5306,10 +5459,10 @@ int main(int argc, char **argv) {
     while (keep_going) {
         if (interactive_mode && (!run_query_this_turn || !first_turn)) {
             /* Auto-compact when context grows very large */
-            if (strlen(messages_json) > (size_t)(trim_threshold * 3)) {
+            if (request_messages_len(messages_json) > (size_t)(trim_threshold * 3)) {
                 fprintf(stderr,
                     "\033[2m[ai] Context is large (%zu KB). Auto-compacting...\033[0m\n",
-                    strlen(messages_json) / 1024);
+                    request_messages_len(messages_json) / 1024);
                 messages_json = compact_session(messages_json, mcp_script, c, model, NULL, trim_threshold * 6 / 10);
             }
 
@@ -5620,7 +5773,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (strcmp(user_input, ":status") == 0) {
-                    size_t ctx_bytes = strlen(messages_json);
+                    size_t ctx_bytes = request_messages_len(messages_json);
                     printf("\n\033[1;36mSession status:\033[0m\n");
                     printf("  Model          : %s\n", model);
                     printf("  Context size   : %zu KB\n", ctx_bytes / 1024);
@@ -5712,16 +5865,17 @@ step_limit_check:
                 /* Size-gated trim with hysteresis: only when the history exceeds
                    trim_threshold, and then down to ~60% of it, so the server's
                    prompt-cache prefix stays stable between iterations. */
-                if (trim_threshold > 0 && strlen(messages_json) > (size_t)trim_threshold)
+                /* sizes are of the request (old reasoning stripped), not of the full history */
+                if (trim_threshold > 0 && request_messages_len(messages_json) > (size_t)trim_threshold)
                     messages_json = maybe_trim_messages(messages_json, mcp_script, trim_threshold * 6 / 10);
                 /* The server's own token count said the last prompt was near the window: the
                    ~3 chars/token guess is off for this content, so trim by the measured ratio. */
                 if (force_trim_to > 0) {
-                    if (strlen(messages_json) > force_trim_to)
+                    if (request_messages_len(messages_json) > force_trim_to)
                         messages_json = maybe_trim_messages(messages_json, mcp_script, (int)force_trim_to);
                     force_trim_to = 0;
                 }
-                req_msgs_len = strlen(messages_json);
+                req_msgs_len = request_messages_len(messages_json);
 
                 /* Inject any :btw note typed by the user during the previous iteration */
                 if (g_btw_available && !g_esc_requested) {
@@ -5787,14 +5941,19 @@ step_limit_check:
 
                 char *esc_model = json_escape(model);
                 char *payload = NULL;
-                size_t plen = strlen(esc_model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
+                /* the messages as sent: old reasoning stripped (INFER_KEEP_REASONING); the
+                   history in messages_json and the saved session keep all of it */
+                free(g_wire_msgs);
+                g_wire_msgs = reasoning_request_view(messages_json, g_keep_reasoning);
+                const char *send_msgs = g_wire_msgs ? g_wire_msgs : messages_json;
+                size_t plen = strlen(esc_model) + strlen(send_msgs) + (tools_json ? strlen(tools_json) : 0) + 512;
                 payload = malloc(plen);
                 if (tools_json && strlen(tools_json) > 10) {
                     snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
-                             esc_model, opt_fields, messages_json, tools_json, tool_choice_val);
+                             esc_model, opt_fields, send_msgs, tools_json, tool_choice_val);
                 } else {
                     snprintf(payload, plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s}",
-                             esc_model, opt_fields, messages_json);
+                             esc_model, opt_fields, send_msgs);
                 }
                 free(esc_model);
 
@@ -5879,14 +6038,14 @@ step_limit_check:
                             curl_easy_setopt(c, CURLOPT_WRITEDATA, (void *)&s_ctx);
                             
                             free(payload);
-                            size_t new_plen = strlen(model) + strlen(messages_json) + (tools_json ? strlen(tools_json) : 0) + 512;
+                            size_t new_plen = strlen(model) + strlen(send_msgs) + (tools_json ? strlen(tools_json) : 0) + 512;
                             payload = malloc(new_plen);
                             if (tools_json && strlen(tools_json) > 10) {
                                 snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s,\"tools\":%s,\"tool_choice\":\"%s\"}",
-                                         model, opt_fields, messages_json, tools_json, tool_choice_val);
+                                         model, opt_fields, send_msgs, tools_json, tool_choice_val);
                             } else {
                                 snprintf(payload, new_plen, "{\"model\":\"%s\",\"stream\":true,\"stream_options\":{\"include_usage\":true}%s,\"messages\":%s}",
-                                         model, opt_fields, messages_json);
+                                         model, opt_fields, send_msgs);
                             }
                             curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
                             
@@ -6058,7 +6217,7 @@ step_limit_check:
                         || (err_msg && (strstr(err_msg, "context size") || strstr(err_msg, "context length")));
                     if (ctx_overflow && !ctx_retry_used) {
                         ctx_retry_used = 1;
-                        size_t cur = strlen(messages_json);
+                        size_t cur = request_messages_len(messages_json);
                         size_t target = (size_t)(trim_threshold > 0 ? trim_threshold : 100000) * 3 / 10;
                         if (target > cur / 2) target = cur / 2;
                         fprintf(stderr, "\033[1;33m[ai] request exceeded the model's context window; trimming history "
@@ -7310,7 +7469,7 @@ step_limit_check:
                               }
 
                               /* If total context is already large, stub this result */
-                              if ((int)strlen(messages_json) > stub_threshold) {
+                              if ((int)request_messages_len(messages_json) > stub_threshold) {
                                   free(tool_output);
                                   tool_output = strdup("[context limit reached \xe2\x80\x94 result omitted to preserve model focus]");
                               }

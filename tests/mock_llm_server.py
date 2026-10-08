@@ -13,7 +13,9 @@ The reply is controlled by env vars:
                         itself be a list = parallel tool calls in one turn, or
                         {"calls": [...], "finish_reason": "length"}; an
                         object without "function", e.g. {"content": "...",
-                        "finish_reason": "length"}, is a plain text reply)
+                        "finish_reason": "length"}, is a plain text reply). Both object forms
+                        take "reasoning": str (streamed as reasoning_content before the reply)
+                        and the calls form takes "content": str (text alongside the calls).
   MOCK_N_CTX          — if set, GET /props reports this n_ctx
   MOCK_TIMES          — file to append each request's arrival time (epoch secs) to
   MOCK_CTX_ERROR_AT   — 1-based request number(s), comma-separated, answered with llama.cpp's HTTP 400
@@ -117,8 +119,11 @@ class Handler(BaseHTTPRequestHandler):
             tc = json.loads(tool_call_env)
 
         tc_finish = "tool_calls"
+        reasoning = tc.get("reasoning") if isinstance(tc, dict) else None
+        tc_text = None
         if isinstance(tc, dict) and "calls" in tc:
             # {"calls": [...], "finish_reason": "length"}: tool calls cut off by the token limit
+            tc_text = tc.get("content")
             tc, tc_finish = tc["calls"], tc.get("finish_reason", "tool_calls")
         if isinstance(tc, dict) and "function" not in tc:
             # A scripted plain reply (e.g. a truncated answer with finish_reason "length").
@@ -128,13 +133,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 self._sse({"role": "assistant", "content": ""})
+                if reasoning:
+                    self._sse({"reasoning_content": reasoning})
                 self._sse({"content": text})
                 self._sse({}, finish=finish)
                 self.wfile.write(b"data: [DONE]\n\n")
             else:
+                rmsg = {"role": "assistant", "content": text}
+                if reasoning:
+                    rmsg["reasoning_content"] = reasoning
                 resp = {"id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                                     "finish_reason": finish}]}
+                        "choices": [{"index": 0, "message": rmsg, "finish_reason": finish}]}
                 payload = json.dumps(resp).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -151,6 +160,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
+                if reasoning:
+                    self._sse({"role": "assistant", "content": None, "reasoning_content": reasoning})
+                if tc_text:
+                    self._sse({"content": tc_text})
                 for idx, one in enumerate(tcs):
                     fn = one.get("function", {})
                     self._sse({"role": "assistant", "content": None,
@@ -165,7 +178,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 resp = {
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": "mock",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": tcs}, "finish_reason": tc_finish}],
+                    "choices": [{"index": 0, "message": dict({"role": "assistant", "content": tc_text, "tool_calls": tcs},
+                                                             **({"reasoning_content": reasoning} if reasoning else {})),
+                                 "finish_reason": tc_finish}],
                     "usage": _usage(),
                 }
                 payload = json.dumps(resp).encode()

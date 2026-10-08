@@ -22,7 +22,7 @@ from .render import render_markdown
 from .scheduler import run_scheduler_loop
 from .selfimprove import (lessons_for, metrics_lesson_sync, record_failure, record_recovery, self_improve_status,
                           session_recap)
-from .sessions import session_transcript, trim_messages
+from .sessions import parse_keep_reasoning, session_transcript, trim_messages
 from . import learning, state
 
 
@@ -257,7 +257,9 @@ def _main(argv):
                     max_bytes = max(2000, int(argv[3]))
                 except Exception:
                     pass
-            print(json.dumps(trim_messages(messages, max_bytes)))
+            # Optional INFER_KEEP_REASONING value (ai.c passes its effective setting).
+            keep = parse_keep_reasoning(argv[4]) if len(argv) > 4 else None
+            print(json.dumps(trim_messages(messages, max_bytes, keep_reasoning=keep)))
         except Exception:
             print("[]")
         sys.exit(0)

@@ -268,8 +268,8 @@ class Engine:
     def _interactive_turn(self):
         """Prompt once. True: a task should run; False: nothing to run; None: leave."""
         cfg = self.cfg
-        if M.size(self.messages) > cfg.budget.trim * 3:
-            self.err("\033[2m[ai] Context is large (%d KB). Auto-compacting...\033[0m\n" % (M.size(self.messages) // 1024))
+        if self._req_size() > cfg.budget.trim * 3:
+            self.err("\033[2m[ai] Context is large (%d KB). Auto-compacting...\033[0m\n" % (self._req_size() // 1024))
             self._compact(cfg.budget.trim * 6 // 10)
         self.turn_count += 1
         pct = 0
@@ -299,13 +299,24 @@ class Engine:
             self.messages[0] = self.system_message
         return True
 
+    def _wire(self):
+        """The history as sent: old reasoning stripped (INFER_KEEP_REASONING); self.messages and
+        the saved session keep all of it."""
+        return M.request_view(self.messages, self.cfg.opts.keep_reasoning)
+
+    def _req_size(self):
+        return M.size(self._wire())
+
+    def _trim(self, target):
+        return M.trim(self.messages, target, self.err, keep_reasoning=self.cfg.opts.keep_reasoning)
+
     def _compact(self, target):
-        before = M.size(self.messages)
+        before = self._req_size()
         if target <= 0 or target >= before:
             target = before // 2
         target = max(target, 2000)
-        out = M.trim(self.messages, target, self.err)
-        if out is self.messages or M.size(out) >= before:
+        out = self._trim(target)
+        if out is self.messages or M.size(M.request_view(out, self.cfg.opts.keep_reasoning)) >= before:
             self.err("\033[1;33m[ai] Compact: nothing could be removed (history already minimal).\033[0m\n")
             return False
         self.messages = out
@@ -401,7 +412,7 @@ class Engine:
         if line == ":agents":
             return self._agents_md()
         if line == ":status":
-            ctx = M.size(self.messages)
+            ctx = self._req_size()
             t = cfg.budget.trim
             s = "\n\033[1;36mSession status:\033[0m\n  Model          : %s\n  Context size   : %d KB\n" % (cfg.model, ctx // 1024)
             if cfg.context_window > 0:
@@ -525,7 +536,7 @@ class Engine:
                 self.ch.send("status", s="toolcall")
         guard = self._guard_factory()
         t0 = time.monotonic()
-        res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count, guard=guard)
+        res = self.client.chat(self._wire(), self.tools, on_chunk=on_chunk, debug_tag=loop_count, guard=guard)
         if res.get("connect_failed") and not res.get("interrupted"):
             p_url, p_key, p_model = load_from_profiles()
             if p_url:
@@ -545,7 +556,7 @@ class Engine:
                         cfg.context_window = llm.detect_context_window(self.client)
                     self.ch.send("status", s="request")
                     t0 = time.monotonic()
-                    res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count,
+                    res = self.client.chat(self._wire(), self.tools, on_chunk=on_chunk, debug_tag=loop_count,
                                            guard=guard)
         if res.get("guard") and not res.get("interrupted") and not self.esc.is_set():
             res = self._recover_runaway(res, loop_count, on_chunk, guard, t0)
@@ -576,7 +587,7 @@ class Engine:
         self.messages.append({"role": "user", "content": RUNAWAY_NUDGE if trip.get("kind") == "repetition"
                               else RUNAWAY_CAP_NUDGE})
         self.ch.send("status", s="request")
-        res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count, opts=retry,
+        res = self.client.chat(self._wire(), self.tools, on_chunk=on_chunk, debug_tag=loop_count, opts=retry,
                                guard=guard)
         if not res.get("guard") or res.get("interrupted") or self.esc.is_set():
             return res
@@ -599,15 +610,16 @@ class Engine:
     def _iteration(self, loop_count, step_limit, length_nudges):
         """One loop iteration. Returns (has_more, loop_count, length_nudges, stop_inner_loop)."""
         cfg = self.cfg
-        if cfg.budget.trim > 0 and M.size(self.messages) > cfg.budget.trim:
-            self.messages = M.trim(self.messages, cfg.budget.trim * 6 // 10, self.err)
+        # Sizes are of the request (old reasoning stripped), not of the full history.
+        if cfg.budget.trim > 0 and self._req_size() > cfg.budget.trim:
+            self.messages = self._trim(cfg.budget.trim * 6 // 10)
         # The server's token count said the last prompt was near the window: the ~3 chars/token
         # guess is off for this content, so trim by the measured ratio.
         if self.force_trim_to > 0:
-            if M.size(self.messages) > self.force_trim_to:
-                self.messages = M.trim(self.messages, self.force_trim_to, self.err)
+            if self._req_size() > self.force_trim_to:
+                self.messages = self._trim(self.force_trim_to)
             self.force_trim_to = 0
-        req_size = M.size(self.messages)
+        req_size = self._req_size()
         while not self.ch.btw.empty() and not self.esc.is_set():
             note = self.ch.btw.get()
             self.messages.append({"role": "user", "content": "[User note mid-task: %s]" % note})
@@ -640,10 +652,10 @@ class Engine:
                 # Recoverable once: the prompt overflowed the server's context -> trim to half the
                 # usual target and retry.
                 self.ctx_retry_used = True
-                target = min((cfg.budget.trim if cfg.budget.trim > 0 else 100000) * 3 // 10, M.size(self.messages) // 2)
+                target = min((cfg.budget.trim if cfg.budget.trim > 0 else 100000) * 3 // 10, self._req_size() // 2)
                 self.err("\033[1;33m[ai] request exceeded the model's context window; trimming history to ~%d KB "
                          "and retrying once.\033[0m\n" % (target // 1024))
-                self.messages = M.trim(self.messages, target, self.err)
+                self.messages = self._trim(target)
                 return True, loop_count, length_nudges, False
             self.err("\n\033[1;31m[ai Error]\033[0m %s\n" % e)
             return False, loop_count, length_nudges, True
@@ -820,7 +832,7 @@ class Engine:
                           "head/tail, line-range read_file), or run the command with pagination, or proceed with "
                           "the truncated context.]" % (orig, cap))
             output = out_bytes[:shown].decode("utf-8", "ignore") + suffix
-        if M.size(self.messages) > cfg.budget.stub:
+        if self._req_size() > cfg.budget.stub:
             output = "[context limit reached \u2014 result omitted to preserve model focus]"
 
         if name == "reset_context":

@@ -17,6 +17,7 @@ extern int g_compact_in_progress;
 extern int g_compact_dot_timer;
 extern char *g_system_message_json;
 extern int g_private_mode;
+extern int g_keep_reasoning;
 
 void disable_raw_mode(void);
 char* json_escape(const char *str);
@@ -295,7 +296,9 @@ char* maybe_trim_messages(char *messages_json, const char *mcp_script, int max_b
     fputs(messages_json, fp);
     fclose(fp);
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s %d", mcp_script, tmpfile, max_bytes > 0 ? max_bytes : 60000);
+    /* old reasoning is stripped first (aitools.sessions.trim_messages); -1 = "all" (legacy) */
+    snprintf(cmd, sizeof(cmd), "python3 %s trim-messages %s %d %d", mcp_script, tmpfile, max_bytes > 0 ? max_bytes : 60000,
+             g_keep_reasoning < 0 ? -1 : g_keep_reasoning);
     char *trimmed = run_shell_command(cmd, NULL);
     unlink(tmpfile);
     if (trimmed) {
