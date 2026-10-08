@@ -162,6 +162,21 @@ def service_report():
 SERVICES = ["auth", "billing", "search", "mailer", "gateway", "cache", "queue", "indexer", "scheduler", "exporter"]
 
 
+MODULES = ["parser", "lexer", "config", "cli", "server", "client", "cache", "models", "views", "utils", "auth",
+           "export"]
+ACTIONS = ["install the dependencies", "build the wheel", "run the unit tests", "lint the sources",
+           "type-check the package", "build the docs", "start the dev server", "run the smoke test",
+           "tag the release", "upload to the index", "update the changelog", "clean the workspace"]
+
+
+def irregular_report(odd=None, extra=None):
+    """10-item status report where one item differs ("degraded") and/or has an extra line."""
+    return "".join("### Service %s\nStatus: %s\nLatency within budget\n%sNo errors in logs\n\n"
+                   % (n, "degraded" if i == odd else "OK and healthy",
+                      "Restarted once last night after deploy\n" if i == extra else "")
+                   for i, n in enumerate(SERVICES))
+
+
 LEGIT = {
     "python_file": python_file_300,
     "markdown_table": markdown_table,
@@ -187,10 +202,14 @@ LEGIT = {
     # review: >= 6-item reports with a >= 3-line boilerplate template (single-token item headers)
     "service_template": lambda: "".join("### Service %s\nStatus: OK and healthy\nLatency within budget\n"
                                         "No errors in logs\n\n" % n for n in SERVICES),
-    "module_template": lambda: "".join("**module%d.py**\n- Lint: passed cleanly\n- Tests: all passing\n"
-                                       "- Types: no errors found\n\n" % i for i in range(12)),
-    "step_template": lambda: "".join("Step %d\nRan the command successfully\nOutput matched expectation\n\n"
-                                     % (i + 1) for i in range(12)),
+    # items named by words (ruling G-1: items that differ ONLY by a number are a counting loop)
+    "module_template": lambda: "".join("**%s.py**\n- Lint: passed cleanly\n- Tests: all passing\n"
+                                       "- Types: no errors found\n\n" % m for m in MODULES),
+    "step_template": lambda: "".join("Step %d: %s\nRan the command successfully\nOutput matched expectation\n\n"
+                                     % (i + 1, a) for i, a in enumerate(ACTIONS)),
+    "service_report_degraded": lambda: irregular_report(odd=4),
+    "service_report_extra_line": lambda: irregular_report(extra=6),
+    "service_report_both": lambda: irregular_report(odd=2, extra=7),
 }
 
 
@@ -508,12 +527,55 @@ def test_recurrence_ignores_fenced_code_and_tool_arguments():
     assert feed(g, json.dumps({"path": "out.md", "content": text}), "args0", step=5)[0] is None
 
 
-@pytest.mark.parametrize("name", ["service_template", "module_template", "step_template"])
+@pytest.mark.parametrize("name", ["service_template", "module_template", "step_template",
+                                  "service_report_degraded", "service_report_extra_line", "service_report_both"])
 def test_templated_final_answer_is_not_cut(name):
     """Templated reports alone as the whole answer (no prose around them), both channels."""
     for channel in ("content", "reasoning"):
         g = llm.RunawayGuard(max_tokens=0)
         assert feed(g, LEGIT[name](), channel)[0] is None, (name, channel)
+
+
+# ruling G-1 (reviewer's adversarial cases): loops that differ only by a counter, exactly
+# periodic and multi-line, must trip well before the step cap -- they are not templates.
+COUNTER_LOOPS = {
+    "attempt_3line": lambda i: "Attempt %d\nI'll end my turn now.\nThe task is complete.\n\n" % i,
+    "attempt_noblank": lambda i: "Attempt %d\nI'll end my turn now.\nThe task is complete.\n" % i,
+    "attempt_colon": lambda i: "Attempt %d:\nI'll end my turn now.\nThe task is complete.\n\n" % i,
+    "bold_attempt": lambda i: "**Attempt %d**\nI'll end my turn now.\nThe task is complete.\nCalling task_complete.\n\n" % i,
+    "wait_short": lambda i: "Wait %d.\nActually the answer is 13.\n" % i,
+    "iter_2line": lambda i: "Iteration %d\nChecking the value again now.\n" % i,
+    "iter_3line": lambda i: "Iteration %d\nChecking the value again now.\nStill the same result here.\n" % i,
+    "numbered_para": lambda i: ("%d. Let me re-check the output file once more.\nThe output looks correct to me.\n"
+                                "So the count is 13.\n\n" % i),
+    "count_inline3": lambda i: "Now count %d.\nThat makes %d items.\nNext one please.\n" % (i, i),
+    "try_header_prose": lambda i: ("Try #%d - recount the lines.\nI count the lines again and get 13.\n"
+                                   "So it must be 13 then.\n" % i),
+    "numbered_steps_only": lambda i: "Step %d\nRan the command successfully\nOutput matched expectation\n\n" % i,
+}
+
+
+@pytest.mark.parametrize("name", sorted(COUNTER_LOOPS))
+@pytest.mark.parametrize("channel", ["content", "reasoning"])
+def test_counter_loops_are_not_templates(name, channel):
+    loop = "".join(COUNTER_LOOPS[name](i) for i in range(1, 400))
+    for head in ("", prose(1500) + "\n\n"):
+        g = llm.RunawayGuard(max_tokens=0)
+        trip, used = feed(g, head + loop, channel, step=5)
+        assert trip and trip["kind"] == "repetition", (name, bool(head))
+        assert used - len(head) <= 2048, (name, used - len(head))
+
+
+def test_template_exemption_ends_at_25_items():
+    names = ["%s-%s" % (a, b) for a in ("north", "south", "east", "west", "core", "edge")
+             for b in ("alpha", "beta", "gamma", "delta", "omega")]
+    report = "".join("### Service %s\nStatus: OK and healthy\nLatency within budget\nNo errors in logs\n\n" % n
+                     for n in names)
+    g = llm.RunawayGuard(max_tokens=0)
+    trip, used = feed(g, report, "content")
+    assert trip and trip["detector"] == "recurrence", trip
+    # the 25th item ends the exemption; recurrence is checked every 256 chars (~3 items here)
+    assert 25 <= report[:used].count("No errors in logs\n") <= 28, used
 
 
 def _ornith_run(tmp_path, toolcall_first=False):

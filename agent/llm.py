@@ -164,6 +164,9 @@ GUARD_RECUR_UNIQUE = 0.4    # ... while at most this fraction of the lines since
 GUARD_RECUR_LINES = 40      # or: at least this many lines in the window ...
 GUARD_RECUR_DISTINCT = 0.3  # ... of which at most this fraction are distinct
 GUARD_RECUR_EVERY = 256     # chars between recurrence checks of one channel
+GUARD_TEMPLATE_MAX = 24     # a template (N-item report) is exempt up to this many items
+GUARD_TEMPLATE_SLACK = 2    # template item length may vary by this many lines ...
+GUARD_TEMPLATE_DEVIANT = 0.25  # ... and this fraction of items may deviate further
 _DATA_CHARS = set("0123456789,.;:-+*/=_#|[](){}<>'\" \t")
 
 
@@ -212,16 +215,16 @@ def find_loop(tail, counter=False):
     Some 40..512-char unit repeated >= 8 times back to back at the very end (exact text), unless the
     unit is data (table/CSV/matrix rows) or itself a tiny pattern; a fully periodic 4 KB window
     (any unit, data excluded) also counts. counter=True: `tail` is digit-normalised, so only
-    letter-heavy units of at most two lines count (a counting loop, not a log, a table or a
-    numbered "Step N" template)."""
+    letter-heavy units count (a counting loop, not a log or a table; a block that differs only
+    by its number -- "Attempt 7 / I'll end my turn now." -- is a loop by ruling G-1)."""
     n = len(tail)
     for p in range(GUARD_MIN_PERIOD, min(GUARD_MAX_PERIOD, n // GUARD_REPEATS) + 1):
         if _periodic(tail, p):
             unit = tail[-p:]
             if _min_period(unit) < GUARD_MIN_UNIT_PERIOD or _unit_is_data(tail, p):
                 continue
-            if counter and (_letter_ratio(unit) < GUARD_PROSE_LETTERS or unit.count("\n") > 2):
-                continue        # counter loops are short thoughts; a numbered multi-line block is a template
+            if counter and _letter_ratio(unit) < GUARD_PROSE_LETTERS:
+                continue
             return p, GUARD_REPEATS
     if n >= GUARD_WINDOW and not counter:
         for p in range(1, 1025):
@@ -267,12 +270,23 @@ def _recur_key(line):
 
 
 def _template(js, seq, raw_n):
-    """The occurrences js of a recurring line are a template, not a loop: evenly spaced, and
-    every gap holds at least one unique line (an item's own name/header)."""
-    gaps = {b - a for a, b in zip(js, js[1:])}
-    if len(gaps) != 1:
+    """The occurrences js of a recurring line are a template (an N-item report), not a loop
+    (controller ruling G-1): at most GUARD_TEMPLATE_MAX items; the gaps between occurrences
+    within +-GUARD_TEMPLATE_SLACK lines of the median and each holding a unique line (the item's
+    own name), with up to GUARD_TEMPLATE_DEVIANT of the gaps exempt (one item "degraded" or
+    with an extra line); and the unique lines differ by real words -- gap lines that differ
+    only by numbers ("Attempt 7", "Wait 8.") are a counting loop."""
+    if len(js) > GUARD_TEMPLATE_MAX:
         return False
-    return all(any(raw_n[seq[j][1]] == 1 for j in range(a + 1, b)) for a, b in zip(js, js[1:]))
+    gaps = [b - a for a, b in zip(js, js[1:])]
+    med = sorted(gaps)[len(gaps) // 2]
+    deviant, norms = 0, set()
+    for a, b in zip(js, js[1:]):
+        uniq = [seq[j][3] for j in range(a + 1, b) if raw_n[seq[j][1]] == 1]
+        norms.update(uniq)
+        if not uniq or abs(b - a - med) > GUARD_TEMPLATE_SLACK:
+            deviant += 1
+    return deviant <= GUARD_TEMPLATE_DEVIANT * len(gaps) and len(norms) > 1
 
 
 def find_recurrence(text, in_fence=False, at_start=True):
@@ -284,8 +298,9 @@ def find_recurrence(text, in_fence=False, at_start=True):
     digit normalisation: a log excerpt with varying timestamps does not count) and at most
     GUARD_RECUR_UNIQUE of the lines from its first use on are unique, exactly (a loop only
     rewords), or when >= GUARD_RECUR_LINES lines hold at most GUARD_RECUR_DISTINCT distinct
-    ones (exact, not digit-normalised). A templated report -- the recurring lines evenly spaced
-    with a unique line (the item's name) in every gap -- is exempt (_template). first / cut:
+    ones (exact, not digit-normalised). A templated report -- the recurring lines (nearly) evenly
+    spaced with a unique, not merely renumbered, line in every gap -- is exempt up to 24 items
+    (_template); the qualifying recurring lines vote. first / cut:
     offsets in `text` of the first / second occurrence of the earliest line that recurs >= 3
     times -- the loop's first pass ends at cut."""
     lines = text.split("\n")
@@ -304,16 +319,18 @@ def find_recurrence(text, in_fence=False, at_start=True):
             prev = None
             continue
         if raw != prev:
-            seq.append((k, " ".join(raw.split()), start))
+            r = " ".join(raw.split())
+            seq.append((k, r, start, r.translate(_DIGITS)))
         prev = raw
     if len(seq) < GUARD_RECUR_COUNT:
         return None
-    occ, raw_n = {}, {}
-    for j, (k, raw, start) in enumerate(seq):
+    occ, raw_n, norm_n = {}, {}, {}
+    for j, (k, raw, start, norm) in enumerate(seq):
         if k:
             occ.setdefault(k, []).append(j)
         raw_n[raw] = raw_n.get(raw, 0) + 1
-    hit = None
+        norm_n[norm] = norm_n.get(norm, 0) + 1
+    loops, templates = [], 0
     for k, js in occ.items():
         if len(js) < GUARD_RECUR_COUNT:
             continue
@@ -323,12 +340,18 @@ def find_recurrence(text, in_fence=False, at_start=True):
         if max(variants.values()) < GUARD_RECUR_COUNT // 2:      # mostly distinct raw lines
             continue
         span = seq[js[0]:]
-        unique = sum(1 for _, raw, _ in span if raw_n[raw] == 1)
-        if unique <= GUARD_RECUR_UNIQUE * len(span) and not _template(js, seq, raw_n):
-            hit = len(js)
-            break
+        # unique after digit normalisation: "Wait 7." / "Wait 8." are the same line
+        unique = sum(1 for e in span if norm_n[e[3]] == 1)
+        if unique > GUARD_RECUR_UNIQUE * len(span):
+            continue
+        if _template(js, seq, raw_n):
+            templates += 1
+        else:
+            loops.append(len(js))
+    # the recurring lines vote: a report's boilerplate lines are mostly template-like
+    hit = max(loops) if loops and len(loops) > templates else None
     if hit is None and len(seq) >= GUARD_RECUR_LINES \
-            and len({raw for _, raw, _ in seq}) <= GUARD_RECUR_DISTINCT * len(seq) \
+            and len({e[1] for e in seq}) <= GUARD_RECUR_DISTINCT * len(seq) \
             and not all(_template(js, seq, raw_n) for js in occ.values() if len(js) >= 3):
         hit = max(len(js) for js in occ.values())
     if hit is None:

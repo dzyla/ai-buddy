@@ -105,6 +105,8 @@ def test_signals_to_a_foreign_llama_server_are_refused_and_recorded(monkeypatch,
         assert log[n:] and log[n][0] == pid
         with pytest.raises(PermissionError):
             os.killpg(pid, signal.SIGKILL)
+        with pytest.raises(PermissionError):
+            os.kill(-1, signal.SIGTERM)                    # "every process I may signal"
         os.kill(pid, 0)                                    # still alive; probes are allowed
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "llama-server"])
         os.kill(child.pid, signal.SIGKILL)                 # our own child: allowed

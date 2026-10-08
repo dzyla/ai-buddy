@@ -181,6 +181,9 @@ def _install_live_kill_guard():
 
     def kill(pid, sig):
         if isinstance(pid, int):
+            if pid == -1 and sig != 0 and os.environ.get("AI_TEST_ALLOW_LIVE_KILL") != "1":
+                violations.append((-1, "every process of the user", os.environ.get("PYTEST_CURRENT_TEST", "?")))
+                raise PermissionError(1, "test isolation: refusing os.kill(-1, %s)" % sig)
             _check([pid] if pid > 0 else (_group(-pid) if pid < -1 else []), sig, "signal")
         return orig_kill(pid, sig)
 

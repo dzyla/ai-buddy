@@ -239,3 +239,29 @@ def test_use_clears_a_draft_of_another_model_family(env, monkeypatch, capsys):
     ab.apply_model_path(gemma)
     assert "LLAMA_MTP_DRAFT_PATH" not in ab.load_env()
     assert "a draft for another model" in capsys.readouterr().err
+
+
+def test_use_clears_a_mismatched_dspark_style_draft_too(env, monkeypatch, capsys):
+    ab = env["ab"]
+    monkeypatch.setattr(ab, "apply_sampling_profile", lambda *a, **k: None)
+    monkeypatch.setattr(ab, "SYSTEMD_SERVICE", env["models"].parent / "no.service")
+    _set(ab, LLAMA_DRAFT_MODEL_PATH=env["dflash"])
+    ab.apply_model_path(_gguf(env["models"] / "Gemma4-31B-Q4_K_M.gguf", 20))
+    assert "LLAMA_DRAFT_MODEL_PATH" not in ab.load_env()
+
+
+def test_mtp_draft_with_a_dflash_file_routes_to_spec_dflash(env, capsys):
+    ab = env["ab"]
+    _set(ab, LLAMA_MODEL_PATH=env["main"])
+    ab.cmd_mtp("draft", env["dflash"], auto_restart=False)
+    e = ab.load_env()
+    assert e["LLAMA_SPEC_TYPE"] == "draft-dflash" and e["LLAMA_MTP_DRAFT_PATH"] == os.path.realpath(env["dflash"])
+
+
+def test_mtp_status_does_not_show_an_ignored_dflash_path(env, capsys):
+    ab = env["ab"]
+    _set(ab, LLAMA_MODEL_PATH=env["main"], LLAMA_MTP="1", LLAMA_SPEC_TYPE="draft-mtp",
+         LLAMA_MTP_DRAFT_PATH=env["dflash"])
+    ab.cmd_mtp(None)
+    out = capsys.readouterr().out
+    assert "DFlash" not in out and "internal/auto" in out

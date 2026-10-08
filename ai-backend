@@ -370,10 +370,13 @@ def apply_model_path(model_path):
 
     # A speculative draft belongs to one model family: a draft whose name prefix does not match
     # the new main model would be attached to it by the next serve (explicit drafts always win).
-    draft = load_env().get("LLAMA_MTP_DRAFT_PATH")
-    if draft and _model_prefix(draft) != _model_prefix(model_path):
-        print(f"Note: clearing LLAMA_MTP_DRAFT_PATH={draft} (a draft for another model).", file=sys.stderr)
-        persist_env_changes({"LLAMA_MTP_DRAFT_PATH": None}, auto_restart=False)
+    env_now = load_env()
+    stale = {k: None for k in ("LLAMA_MTP_DRAFT_PATH", "LLAMA_DRAFT_MODEL_PATH")
+             if env_now.get(k) and _model_prefix(env_now[k]) != _model_prefix(model_path)}
+    for k in stale:
+        print(f"Note: clearing {k}={env_now[k]} (a draft for another model).", file=sys.stderr)
+    if stale:
+        persist_env_changes(stale, auto_restart=False)
 
     write_env(f"http://localhost:{PORT}/v1/", "llama", str(model_path))
     print(f"Switched active backend to llama-server (http://localhost:{PORT}/v1/)")
@@ -2084,7 +2087,7 @@ def cmd_mtp(target=None, extra=None, auto_restart=True):
         env_vars = load_env()
         mtp = env_vars.get("LLAMA_MTP", "off")
         spec_n = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "3")
-        draft = env_vars.get("LLAMA_MTP_DRAFT_PATH") or find_mtp_draft()
+        draft = find_mtp_draft()          # what serve would attach (an ignored DFlash path is not shown)
         print(f"MTP state: {mtp} (spec-type: {spec_type_setting(env_vars)}, spec-draft-n-max: {spec_n}, "
               f"draft: {draft or 'internal/auto'})")
         return
@@ -2100,6 +2103,8 @@ def cmd_mtp(target=None, extra=None, auto_restart=True):
         if not p.exists():
             print(f"MTP draft file not found: {p}", file=sys.stderr)
             sys.exit(1)
+        if _is_dflash(p):                     # a DFlash draft needs spec-type draft-dflash
+            return cmd_mtp("dflash", str(p), auto_restart=auto_restart)
         persist_env_changes({"LLAMA_MTP": "1", "LLAMA_MTP_DRAFT_PATH": str(p), "LLAMA_SPEC_TYPE": "draft-mtp"}, auto_restart=auto_restart)
         print(f"MTP draft model set: {p}")
     elif target == "dflash":
