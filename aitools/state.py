@@ -28,8 +28,10 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 3  # 2: pinned memories, vectors + embed_queue, item_fts + triggers (Task 5b);
+SCHEMA_VERSION = 4  # 2: pinned memories, vectors + embed_queue, item_fts + triggers (Task 5b);
                     # 3: embed_queue.attempts, triggers recreated (named columns, PK range delete)
+                    # 4: ledger/chat_audit import_key (unique): legacy re-import is idempotent;
+                    #    the upgrade dedupes exact duplicate rows (lowest id kept)
 BUSY_TIMEOUT_MS = 5000
 LEDGER_MAX_ROWS = 5000
 CHAT_AUDIT_RETENTION_DAYS = 90
@@ -46,7 +48,7 @@ _SCHEMA = (
     # kind/signature/phase extend the brief's ledger columns: the error-chain logic needs the
     # failure|recovery kind and the normalised signature (recurrence counting) per row.
     "CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY, ts REAL, chain_id TEXT, tool TEXT, "
-    "args_hash TEXT, ok INT, error TEXT, kind TEXT, signature TEXT, phase TEXT)",
+    "args_hash TEXT, ok INT, error TEXT, kind TEXT, signature TEXT, phase TEXT, import_key TEXT)",
     "CREATE INDEX IF NOT EXISTS ledger_signature ON ledger(signature)",
     "CREATE INDEX IF NOT EXISTS ledger_chain ON ledger(chain_id)",
     "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, started REAL, ended REAL, path TEXT, "
@@ -56,7 +58,7 @@ _SCHEMA = (
     # session_id/status/meta_json extend the brief's chat_audit columns: the bridge's diagnostics
     # filter on status and look records up by session id; meta_json keeps the full summary record.
     "CREATE TABLE IF NOT EXISTS chat_audit(id INTEGER PRIMARY KEY, ts REAL, source TEXT, sender TEXT, "
-    "prompt TEXT, reply TEXT, session_id TEXT, status TEXT, meta_json TEXT)",
+    "prompt TEXT, reply TEXT, session_id TEXT, status TEXT, meta_json TEXT, import_key TEXT)",
     "CREATE INDEX IF NOT EXISTS chat_audit_ts ON chat_audit(ts)",
     # Semantic memory (aitools/search.py). Embeddings as float16 blobs, each L2-normalised at its
     # own dim (Matryoshka 128-d prefix for the coarse pass, full 768-d for the rerank). hash
@@ -71,6 +73,13 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS embed_queue(item_type TEXT, item_id TEXT, enqueued REAL, "
     "attempts INT DEFAULT 0, PRIMARY KEY(item_type, item_id))",
 )
+# import_key: set only on rows imported from the legacy files (a hash over every non-id column,
+# _row_key), NULL on rows written live. The unique index makes a re-import of a restored legacy
+# file a no-op (INSERT OR IGNORE) without ever merging two live events.
+_KEYED = {
+    "ledger": ("ts", "chain_id", "tool", "args_hash", "ok", "error", "kind", "signature", "phase"),
+    "chat_audit": ("ts", "source", "sender", "prompt", "reply", "session_id", "status", "meta_json"),
+}
 _NOW_SQL = "((julianday('now') - 2440587.5) * 86400.0)"
 # The former ~/.config/ai/memory.db tables (remember/recall FTS and the vault note index). They
 # hold long free-text documents searched by FTS, which the 4 KB always-injected `memory` table
@@ -112,6 +121,34 @@ def _trigger_sql():
                    "DELETE FROM embed_queue WHERE item_type = '%s' AND item_id = CAST(old.id AS TEXT); END"
                    % (table, table, code, typ, typ))
     return out
+
+
+def _row_key(table, values):
+    """import_key of a row: hash of the table name and its non-id column values (as stored)."""
+    blob = json.dumps([table] + list(values), ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def _key_and_dedupe(conn):
+    """Schema v4 upgrade: give every existing ledger/chat_audit row its import_key, deleting exact
+    duplicates (same key; the lowest id is kept), then add the unique index. Existing rows cannot
+    be told apart into imported and live ones, so all of them are keyed."""
+    removed = {}
+    for table, cols in _KEYED.items():
+        conn.execute("DROP INDEX IF EXISTS %s_import_key" % table)
+        seen, dupes, keys = set(), [], []
+        for row in conn.execute("SELECT id, %s FROM %s ORDER BY id" % (", ".join(cols), table)).fetchall():
+            k = _row_key(table, row[1:])
+            if k in seen:
+                dupes.append((row[0],))
+            else:
+                seen.add(k)
+                keys.append((k, row[0]))
+        conn.executemany("DELETE FROM %s WHERE id = ?" % table, dupes)
+        conn.executemany("UPDATE %s SET import_key = ? WHERE id = ?" % table, keys)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS %s_import_key ON %s(import_key)" % (table, table))
+        removed[table] = len(dupes)
+    return removed
 
 
 def _item_fts_fill(conn):
@@ -289,6 +326,11 @@ def _init_schema(conn, path):
         return
     _retry(lambda: conn.execute("PRAGMA journal_mode=WAL").fetchone(), conn.lock_budget)
     with _tx(conn):
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            old_version = int(row[0]) if row else 0
+        except (sqlite3.OperationalError, TypeError, ValueError):
+            old_version = 0
         for stmt in _SCHEMA:
             conn.execute(stmt)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
@@ -296,6 +338,9 @@ def _init_schema(conn, path):
             conn.execute("ALTER TABLE memory ADD COLUMN pinned INT DEFAULT 0")
         if "attempts" not in {r[1] for r in conn.execute("PRAGMA table_info(embed_queue)")}:  # v2 -> v3
             conn.execute("ALTER TABLE embed_queue ADD COLUMN attempts INT DEFAULT 0")
+        for table in _KEYED:                                 # v3 -> v4
+            if "import_key" not in {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}:
+                conn.execute("ALTER TABLE %s ADD COLUMN import_key TEXT" % table)
         for stmt in _FTS_SCHEMA:
             try:
                 conn.execute(stmt)
@@ -307,6 +352,11 @@ def _init_schema(conn, path):
             _item_fts_fill(conn)
         except sqlite3.OperationalError:  # pragma: no cover - sqlite built without FTS5
             pass
+        if old_version < 4:
+            # after the triggers exist: deleting a duplicate also drops its search-index rows
+            removed = _key_and_dedupe(conn)
+            if any(removed.values()):
+                _meta_set(conn, "dedupe_v4", json.dumps(dict(removed, at=time.time())))
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
                      (str(SCHEMA_VERSION),))
     if key is not None:
@@ -533,16 +583,21 @@ def _args_hash(args):
 
 
 def ledger_append(tool, ok, error="", chain_id="", args="", kind=None, signature="", phase="",
-                  ts=None, max_rows=LEDGER_MAX_ROWS, conn=None):
+                  ts=None, max_rows=LEDGER_MAX_ROWS, conn=None, imported=False):
     """Append one ledger row (args are stored only as a hash). Keeps the ledger bounded: past
-    max_rows the oldest rows are dropped down to 80% of max_rows. Returns the new row id."""
+    max_rows the oldest rows are dropped down to 80% of max_rows. Returns the new row id.
+    imported=True (legacy import): the row gets its import_key and an identical imported row
+    already present makes this a no-op returning None."""
     kind = kind or ("success" if ok else "failure")
     ts = time.time() if ts is None else float(ts)
+    vals = (ts, chain_id or "", tool or "", _args_hash(args), 1 if ok else 0, (error or "")[:300], kind,
+            signature or "", phase or "")
     with _conn(conn) as c, _tx(c):
-        cur = c.execute("INSERT INTO ledger(ts, chain_id, tool, args_hash, ok, error, kind, signature, "
-                        "phase) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (ts, chain_id or "", tool or "", _args_hash(args), 1 if ok else 0,
-                         (error or "")[:300], kind, signature or "", phase or ""))
+        cur = c.execute("INSERT OR IGNORE INTO ledger(ts, chain_id, tool, args_hash, ok, error, kind, "
+                        "signature, phase, import_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        vals + (_row_key("ledger", vals) if imported else None,))
+        if not cur.rowcount:
+            return None
         rid = cur.lastrowid
         if max_rows and c.execute("SELECT count(*) FROM ledger").fetchone()[0] > max_rows:
             _ledger_keep_newest(c, max(1, max_rows * 8 // 10))
@@ -681,14 +736,17 @@ def task_list(conn=None):
 
 # ── chat audit ───────────────────────────────────────────────────────────────
 def chat_audit_add(source, sender, prompt, reply, ts=None, session_id=None, status=None, meta=None,
-                   conn=None):
-    """Append one chat audit row (e.g. one Zulip exchange); returns its id."""
+                   conn=None, imported=False):
+    """Append one chat audit row (e.g. one Zulip exchange); returns its id. imported=True (legacy
+    import): keyed like ledger_append, None when the identical imported row is already present."""
     ts = time.time() if ts is None else float(ts)
+    vals = (ts, source, sender, prompt, reply, session_id, status,
+            json.dumps(meta, ensure_ascii=False) if meta is not None else None)
     with _conn(conn) as c, _tx(c):
-        return c.execute("INSERT INTO chat_audit(ts, source, sender, prompt, reply, session_id, status, "
-                         "meta_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                         (ts, source, sender, prompt, reply, session_id, status,
-                          json.dumps(meta, ensure_ascii=False) if meta is not None else None)).lastrowid
+        cur = c.execute("INSERT OR IGNORE INTO chat_audit(ts, source, sender, prompt, reply, session_id, "
+                        "status, meta_json, import_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        vals + (_row_key("chat_audit", vals) if imported else None,))
+        return cur.lastrowid if cur.rowcount else None
 
 
 def chat_audit_recent(limit=10, exclude_status=(), session_id=None, source=None, conn=None):
@@ -913,12 +971,12 @@ def _mig_ledger(c, home, counts, renames):
             counts["ledger_skipped"] += 1
             continue
         kind = rec.get("kind") or "failure"
-        ledger_append(tool=rec.get("tool", ""), ok=(kind == "recovery"),
-                      error=rec.get("error") or rec.get("prior_error") or "",
-                      chain_id=rec.get("chain_id", ""), args=rec.get("args") or rec.get("approach") or "",
-                      kind=kind, signature=rec.get("signature", ""), phase=rec.get("phase", ""),
-                      ts=_parse_ts(rec.get("ts"), default), max_rows=0, conn=c)
-        counts["ledger"] += 1
+        rid = ledger_append(tool=rec.get("tool", ""), ok=(kind == "recovery"),
+                            error=rec.get("error") or rec.get("prior_error") or "",
+                            chain_id=rec.get("chain_id", ""), args=rec.get("args") or rec.get("approach") or "",
+                            kind=kind, signature=rec.get("signature", ""), phase=rec.get("phase", ""),
+                            ts=_parse_ts(rec.get("ts"), default), max_rows=0, conn=c, imported=True)
+        counts["ledger" if rid is not None else "ledger_duplicates"] += 1
     _ledger_keep_newest(c, LEDGER_MAX_ROWS)
     renames.append(path)
 
@@ -1002,10 +1060,10 @@ def _mig_chats(c, home, counts, renames):
             if key in seen:
                 continue
             seen.add(key)
-            chat_audit_add("zulip", rec.get("sender_email"), rec.get("query"), rec.get("reply_snippet"),
-                           ts=_parse_ts(rec.get("timestamp"), default), session_id=rec.get("session_id"),
-                           status=rec.get("status"), meta=rec, conn=c)
-            counts["chat_audit"] += 1
+            rid = chat_audit_add("zulip", rec.get("sender_email"), rec.get("query"), rec.get("reply_snippet"),
+                                 ts=_parse_ts(rec.get("timestamp"), default), session_id=rec.get("session_id"),
+                                 status=rec.get("status"), meta=rec, conn=c, imported=True)
+            counts["chat_audit" if rid is not None else "chat_audit_duplicates"] += 1
         renames.append(path)
 
 
@@ -1069,8 +1127,8 @@ _SOURCES = (
 )
 SOURCE_NAMES = tuple(n for n, _ in _SOURCES)
 _COUNT_KEYS = ("memory", "memories", "vault", "lessons", "lessons_skipped", "ledger", "ledger_skipped",
-               "scheduled_tasks", "scheduled_tasks_skipped", "chat_audit", "chat_audit_skipped",
-               "sessions", "renamed", "errors")
+               "ledger_duplicates", "scheduled_tasks", "scheduled_tasks_skipped", "chat_audit",
+               "chat_audit_skipped", "chat_audit_duplicates", "sessions", "renamed", "errors")
 
 
 def _bak_name(path):
