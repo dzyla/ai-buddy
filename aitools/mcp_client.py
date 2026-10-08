@@ -355,6 +355,7 @@ class McpSession:
         self.cfg_key = json.dumps(cfg, sort_keys=True)
         self.inflight = 0      # McpPool bookkeeping (guarded by the pool lock)
         self.retired = False   # replaced in the pool; closed when the last in-flight call ends
+        self._closing = False  # one caller (outside the pool lock) closes a retired session
         self.proc = start_server(cfg, environ)
         if not self.proc:
             raise ConnectionError("Failed to start server")
@@ -447,13 +448,16 @@ class McpPool:
         with self._lock:
             nlock = self._name_locks.setdefault(name, threading.Lock())
         with nlock:
+            to_close = None
             with self._lock:
                 sess = self._sessions.get(name)
                 if sess is not None and sess.alive() and sess.cfg_key == key:
                     sess.inflight += 1
                     return sess, False
-                if sess is not None:
-                    self._retire_locked(name, sess)
+                if sess is not None and self._retire_locked(name, sess):
+                    to_close = sess
+            if to_close is not None:
+                to_close.close()                  # outside the pool lock (up to ~2.5 s)
             new = McpSession(name, cfg, environ)  # outside the pool lock
             with self._lock:
                 new.inflight += 1
@@ -461,19 +465,29 @@ class McpPool:
             return new, True
 
     def _retire_locked(self, name, sess):
+        """Retire `sess` (caller holds the pool lock). True when the caller must close it, which
+        it does AFTER releasing the lock: McpSession.close() can take ~2.5 s (terminate/kill
+        waits) and must not stall every other server's calls. Exactly one caller gets True: the
+        session is out of the pool, so its inflight count only goes down."""
         if self._sessions.get(name) is sess:
             del self._sessions[name]
         sess.retired = True
-        if sess.inflight == 0:
-            sess.close()
+        if sess.inflight == 0 and not sess._closing:
+            sess._closing = True
+            return True
+        return False
 
     def _release(self, sess, drop=False):
+        close = False
         with self._lock:
             sess.inflight -= 1
             if drop:
-                self._retire_locked(sess.name, sess)
-            elif sess.retired and sess.inflight == 0:
-                sess.close()
+                close = self._retire_locked(sess.name, sess)
+            elif sess.retired and sess.inflight == 0 and not sess._closing:
+                sess._closing = True
+                close = True
+        if close:
+            sess.close()
 
     def call_tool(self, name, cfg, tool_name, arguments, timeout=60.0, environ=None):
         """Like call_tool(): the MCP result dict, or {"error": ...}. Raises TimeoutError (the

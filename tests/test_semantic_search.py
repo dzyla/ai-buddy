@@ -332,6 +332,31 @@ def test_weak_vector_hit_needs_fts_agreement(fake, monkeypatch):
         assert [r["match"] for r in search.search_memory(q)] == ([["fts"]] if fts_agrees else [])
 
 
+def test_search_memory_tool_uses_a_looser_gate_than_auto_recall(fake, monkeypatch):
+    """A weak vector hit without FTS agreement: auto-recall (strict) drops it; the explicit
+    search_memory tool (loose: absolute floor INFER_SEARCH_TOOL_MIN_SIM, no FTS-agreement rule,
+    no top-delta window) returns it, ranked."""
+    doc = "Ansible deploys every server nightly"
+    state.memory_add(doc)
+    state.memory_add("The office plant needs water on Fridays")
+    search.index_items()
+    q = "deploying servers"
+    cos = _cos(q, doc)
+    monkeypatch.setenv("INFER_SEARCH_MIN_SIM", "%.4f" % (cos - 0.02))       # weak for the strict gate
+    monkeypatch.setenv("INFER_SEARCH_TOOL_MIN_SIM", "%.4f" % (cos - 0.02))
+    assert search.search(q)[0] == [] and search.search_memory(q) == []
+    assert search.recall_section(q) == ""
+    loose = search.search(q, loose=True)[0]
+    assert loose and loose[0]["text"] == doc and loose[0]["match"] == ["vec"]
+    # the tool handler takes the loose path
+    from aitools import handlers
+    assert doc in handlers.h_search_memory({"query": q})
+    # the loose floor still applies
+    monkeypatch.setenv("INFER_SEARCH_TOOL_MIN_SIM", "%.4f" % (cos + 0.01))
+    assert search.search(q, loose=True)[0] == []
+    assert 0.58 < search.TOOL_MIN_SIM_DEFAULT < search.MIN_SIM_DEFAULT
+
+
 def test_overflow_memory_is_recall_eligible(fake):
     state.memory_add("The backup NAS lives in rack seven of the basement")
     state.memory_add("Always reply in metric units", pinned=True)
@@ -497,7 +522,7 @@ def test_search_memory_tool_registered_and_dispatchable(fake):
                             {"query": "deploying servers", "sources": "memory", "k": 2})
     assert "Ansible" in out and "memory" in out
     assert "Missing required" in registry.dispatch("search_memory", "search_memory", {})
-    out = registry.dispatch("search_memory", "search_memory", {"query": "zzzqqq nothing"})
+    out = registry.dispatch("search_memory", "search_memory", {"query": "xylophone quokka"})  # no hash collision with the corpus
     assert "No matching" in out
 
 

@@ -8,6 +8,7 @@ index when a commit is skipped or blocked.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -124,3 +125,32 @@ def test_blocked_commit_restores_index(repo, tmp_path, engine):
     _run_cmd_in(repo, tmp_path, ["--git"])
     assert _commits(repo) == 1
     assert _git(repo, "diff", "--cached", "--name-only").strip() == ""
+
+
+# ── CI canary: the checker can't pass vacuously ──────────────────────────────
+def test_self_test_flags_every_canary():
+    assert privacy_check.self_test() == []
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "privacy_check.py"), "--self-test"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_self_test_fails_when_the_checker_is_broken(monkeypatch):
+    monkeypatch.setattr(privacy_check, "GENERIC", [])
+    monkeypatch.setattr(privacy_check, "IPV4", re.compile(r"(?!)"))
+    missed = privacy_check.self_test()
+    assert "private key" in missed and "public IP" in missed and "home path" in missed
+    assert privacy_check.main(["--self-test"]) == 1
+
+
+def test_all_refuses_when_no_files_are_tracked(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "privacy_check.py"), "--all"],
+                       cwd=str(tmp_path), capture_output=True, text=True,
+                       env={**os.environ, "AI_PRIVATE_PATTERNS": os.devnull})
+    assert r.returncode == 2 and "no tracked files" in r.stderr
+
+
+def test_ci_runs_the_canary_before_the_scan():
+    ci = open(os.path.join(REPO, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
+    assert ci.index("privacy_check.py --self-test") < ci.index("privacy_check.py --all")

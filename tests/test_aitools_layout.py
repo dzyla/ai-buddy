@@ -303,3 +303,17 @@ def test_installed_lib_precedes_site_packages(tmp_path, shim, pkg):
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr[-2000:]
     assert r.stdout.strip().startswith(str(lib / pkg)), r.stdout
+
+
+def test_install_copies_lib_packages_before_replacing_shims():
+    """install.sh installs aitools/zulip_bridge/agent/trader into ~/.local/share/ai/lib BEFORE it
+    replaces the shims and the binary in ~/.local/bin, so a process started mid-install never pairs
+    a new shim with an old or missing package."""
+    src = open(os.path.join(REPO, "install.sh"), encoding="utf-8").read()
+    pkgs = src.index('for pkg in aitools zulip_bridge agent trader; do')
+    for shim in ('cp "${SCRIPT_DIR}/ai"             "${BIN_DIR}/ai"',
+                 'cp "${SCRIPT_DIR}/ai_mcp.py"      "${BIN_DIR}/ai_mcp.py"',
+                 'cp "${SCRIPT_DIR}/zulip_ai_bridge.py" "${BIN_DIR}/zulip_ai_bridge.py"'):
+        assert pkgs < src.index(shim), shim
+    # no second, later copy of a package (it would reopen the window)
+    assert src.count('cp -r "${SCRIPT_DIR}/aitools"') == 0 and src.count('cp -r "${SCRIPT_DIR}/trader"') == 0

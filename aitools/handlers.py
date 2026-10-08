@@ -337,7 +337,8 @@ def h_search_memory(arguments):
     except (TypeError, ValueError):
         k = 8
     try:
-        results, info = search.search(query, sources=arguments.get("sources"), since=arguments.get("since"), k=k)
+        results, info = search.search(query, sources=arguments.get("sources"), since=arguments.get("since"), k=k,
+                                      loose=True)  # the tool's looser gate; auto-recall stays strict
     except ValueError as e:
         return f"Error: {e}"
     except Exception as e:

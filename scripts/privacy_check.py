@@ -11,6 +11,9 @@ Scans staged changes (default) or every tracked file (--all) for:
 
 A line containing the marker  privacy-ok  is exempt.
 Exit status 1 when anything is found. Used by .githooks/pre-commit.
+--all refuses (exit 2) when `git ls-files` lists nothing, so it can never pass vacuously.
+--self-test checks the checker flags known-bad canary lines (exit 1 if any is missed); CI runs it
+before --all.
 """
 import ipaddress
 import os
@@ -129,11 +132,43 @@ def tracked():
             continue
 
 
+# Canary lines every working checker must flag (built from parts so this file stays clean).
+CANARIES = (
+    ("private key", "-----BEGIN " + "RSA PRIVATE KEY-----"),
+    ("public IP", 'URL = "http://' + ".".join(("93", "184", "216", "34")) + ':8080"'),
+    ("e-mail", "contact: jane.doe" + "@" + "university.edu"),
+    ("home path", 'open("/' + "home" + '/alice/data.txt")'),
+    ("API key", "sk-" + "abcdefghij" * 3),
+)
+
+
+def self_test():
+    """Return the canaries the checker failed to flag (empty list: the checker works)."""
+    missed = []
+    for kind, line in CANARIES:
+        hits = scan_line(line, [])
+        if not any(kind.split()[0].lower() in h.lower() for h in hits):
+            missed.append(kind)
+    if check_name("data/results.xlsx") == []:
+        missed.append("data file name")
+    return missed
+
+
 def main(argv):
+    if "--self-test" in argv:
+        missed = self_test()
+        if missed:
+            print("privacy_check: SELF-TEST FAILED, canaries not flagged: " + ", ".join(missed), file=sys.stderr)
+            return 1
+        print(f"privacy_check: self-test ok ({len(CANARIES) + 1} canaries flagged)")
+        return 0
     personal = load_personal()
     source = tracked() if "--all" in argv else staged()
     problems = []
+    files = 0
     for path, ln, text in source:
+        if text is None:
+            files += 1
         if path == "scripts/privacy_check.py":
             continue
         hits = check_name(path) if text is None else scan_line(text, personal)
@@ -146,6 +181,9 @@ def main(argv):
         print("Fix it, move the value to env/config, or append 'privacy-ok' to an\n"
               "intentional line. Bypass once with: git commit --no-verify", file=sys.stderr)
         return 1
+    if "--all" in argv and files == 0:
+        print("privacy_check: --all found no tracked files (not a git checkout?): refusing to pass", file=sys.stderr)
+        return 2
     return 0
 
 

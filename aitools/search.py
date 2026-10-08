@@ -52,6 +52,12 @@ NUMPY_MIN_ROWS = 20000
 MIN_SIM_DEFAULT = 0.68   # $INFER_SEARCH_MIN_SIM
 DELTA_DEFAULT = 0.08     # $INFER_SEARCH_DELTA
 WEAK_MARGIN = 0.05
+# The explicit search_memory TOOL (the model asked, results are ranked and it judges them) uses a
+# looser gate than auto-recall (which injects unasked into every prompt): an absolute floor only
+# (no top-DELTA window) and no FTS-agreement requirement for weak hits. 0.62 sits above the
+# non-target median (0.58; 0.55 would return near-random items for every query) and below the
+# strict floor and the target minimum (0.675).
+TOOL_MIN_SIM_DEFAULT = 0.62   # $INFER_SEARCH_TOOL_MIN_SIM
 RECALL_K_DEFAULT = 6
 RECALL_BUDGET_BYTES = 1536   # the additive recall block; the memory render keeps its own 4 KB
 PINNED_BUDGET_BYTES = 1024
@@ -290,9 +296,10 @@ def _dot_scores(blobs, qv, dim):
     return [sp(fmt.unpack(b), qv) for b in blobs]
 
 
-def _vector_hits(c, qvec, types, since):
+def _vector_hits(c, qvec, types, since, loose=False):
     """Ranked [(doc key, best chunk item_id, cosine)] by cosine (coarse v128 over all, rerank top
-    v768), relevance-gated: cos >= max(min_sim(), top - delta())."""
+    v768), relevance-gated: cos >= max(min_sim(), top - delta()); loose (the search_memory
+    tool): cos >= tool_min_sim()."""
     q128 = embed.truncate(qvec, embed.COARSE_DIM)
     q768 = embed.truncate(qvec, embed.DIM)
     sql = ("SELECT item_type, item_id, v128 FROM vectors WHERE model=? AND item_type IN (%s)"
@@ -323,7 +330,7 @@ def _vector_hits(c, qvec, types, since):
     ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
     if not ranked:
         return []
-    floor = max(min_sim(), ranked[0][1][0] - delta())
+    floor = tool_min_sim() if loose else max(min_sim(), ranked[0][1][0] - delta())
     return [(k, v[1], v[0]) for k, v in ranked if v[0] >= floor]
 
 
@@ -342,8 +349,14 @@ def delta():
     return _env_float("INFER_SEARCH_DELTA", DELTA_DEFAULT)
 
 
-def search(query, sources=None, since=None, k=8, use_vectors=True, exclude=()):
-    """search_memory plus info: returns (results, {"vector": bool, "fts": int, "vec": int})."""
+def tool_min_sim():
+    return _env_float("INFER_SEARCH_TOOL_MIN_SIM", TOOL_MIN_SIM_DEFAULT)
+
+
+def search(query, sources=None, since=None, k=8, use_vectors=True, exclude=(), loose=False):
+    """search_memory plus info: returns (results, {"vector": bool, "fts": int, "vec": int}).
+    loose=True (the explicit search_memory tool): looser vector gate, see TOOL_MIN_SIM_DEFAULT;
+    auto-recall keeps the strict default."""
     types = parse_sources(sources)
     since_ts = parse_since(since)
     k = max(1, min(int(k or 8), 50))
@@ -354,14 +367,15 @@ def search(query, sources=None, since=None, k=8, use_vectors=True, exclude=()):
     now = time.time()
     with state._conn(read=True) as c, _history_conn() as h:
         fts = _fts_hits(c, h, query, types)
-        vec = _vector_hits(c, qvec, types, since_ts) if qvec else []
+        vec = _vector_hits(c, qvec, types, since_ts, loose=loose) if qvec else []
         fused, chunk_of, via = {}, {}, {}
         for rank, key in enumerate(fts, 1):
             fused[key] = fused.get(key, 0.0) + 1.0 / (RRF_K + rank)
             via.setdefault(key, []).append("fts")
         weak = min_sim() + WEAK_MARGIN
         fts_set = set(fts)
-        vec = [v for v in vec if v[2] >= weak or v[0] in fts_set]  # weak hits need FTS agreement
+        if not loose:
+            vec = [v for v in vec if v[2] >= weak or v[0] in fts_set]  # weak hits need FTS agreement
         for rank, (key, iid, _) in enumerate(vec, 1):
             fused[key] = fused.get(key, 0.0) + 1.0 / (RRF_K + rank)
             via.setdefault(key, []).append("vec")

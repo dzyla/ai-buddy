@@ -171,6 +171,9 @@ def test_migrate_legacy_imports_renames_and_is_idempotent(tmp_path):
     assert conn.execute("SELECT value FROM meta WHERE key='migrated_v1'").fetchone()[0]
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 1
+    # the stored report carries the real rename count (it is written after the renames)
+    report = json.loads(conn.execute("SELECT value FROM meta WHERE key='migration_report'").fetchone()[0])
+    assert report["renamed"] == counts["renamed"] and counts["renamed"] >= 8
     conn.close()
 
     # second run: no-op, nothing duplicated
@@ -569,6 +572,28 @@ def test_session_index_writes_stop_after_first_lock_failure(monkeypatch):
     monkeypatch.setattr(state, "session_upsert", locked)
     assert [sessions.record_session("s%d" % i) for i in range(5)] == [False] * 5
     assert len(calls) == 1
+
+
+def test_session_index_retries_after_the_backoff(monkeypatch):
+    """A long-lived process (py engine, tool server) retries the sessions index after the backoff."""
+    from aitools import sessions
+    monkeypatch.setattr(sessions, "_session_index_down", [0.0])
+    clock = [1000.0]
+    monkeypatch.setattr(sessions.time, "monotonic", lambda: clock[0])
+    calls, fail = [], [True]
+
+    def upsert(*a, **k):
+        calls.append(1)
+        if fail[0]:
+            raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(state, "session_upsert", upsert)
+    assert sessions.record_session("a") is False and len(calls) == 1
+    clock[0] += 30
+    assert sessions.record_session("b") is False and len(calls) == 1      # still backing off
+    clock[0] += sessions.SESSION_INDEX_RETRY_S
+    fail[0] = False
+    assert sessions.record_session("c") is True and len(calls) == 2       # retried, works again
+    assert sessions.record_session("d") is True and len(calls) == 3
 
 
 def test_session_recap_stays_fast_while_a_writer_holds_the_lock(tmp_path):

@@ -47,6 +47,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Privacy checker canary (must flag known-bad samples; fails if it is broken)
+        run: python3 scripts/privacy_check.py --self-test
       - name: Scan every tracked file (generic patterns only, no personal denylist)
         env:
           AI_PRIVATE_PATTERNS: /dev/null

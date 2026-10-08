@@ -164,14 +164,16 @@ def vault_write(title, content, links=""):
         with open(path, "w") as f:
             f.write(full_content)
             
-        # Update SQLite index
+        # Update SQLite index: one BEGIN IMMEDIATE transaction (lock retry), connection always closed
         conn = _state_conn()
-        _ensure_vault_schema(conn)
-        conn.execute("DELETE FROM vault_fts WHERE title = ?", (title,))
-        conn.execute("INSERT INTO vault_fts(title, content) VALUES (?, ?)", (title, full_content))
-        conn.commit()
-        _enqueue(conn, "v:" + title)
-        conn.close()
+        try:
+            _ensure_vault_schema(conn)
+            with state.transaction(conn):
+                conn.execute("DELETE FROM vault_fts WHERE title = ?", (title,))
+                conn.execute("INSERT INTO vault_fts(title, content) VALUES (?, ?)", (title, full_content))
+                _enqueue(conn, "v:" + title)
+        finally:
+            conn.close()
         return f"Successfully wrote note '{title}' to vault."
     except Exception as e:
         return f"Error writing to vault: {e}"
@@ -235,14 +237,16 @@ def vault_backlinks(title):
         if title.endswith(".md"):
             title = title[:-3] # Remove .md for backlink search
         conn = _state_conn()
-        _ensure_vault_schema(conn)
-        # Search for [[title]] using exact phrase match
-        safe_query = f'"{title}"' 
-        rows = conn.execute(
-            "SELECT title FROM vault_fts WHERE content MATCH ? LIMIT 20",
-            (safe_query,),
-        ).fetchall()
-        conn.close()
+        try:
+            _ensure_vault_schema(conn)
+            # Search for [[title]] using exact phrase match
+            safe_query = f'"{title}"'
+            rows = conn.execute(
+                "SELECT title FROM vault_fts WHERE content MATCH ? LIMIT 20",
+                (safe_query,),
+            ).fetchall()
+        finally:
+            conn.close()
         
         if not rows:
             return f"No backlinks found for '{title}'."
@@ -256,19 +260,21 @@ def vault_backlinks(title):
 def remember(content, metadata=""):
     """Save a piece of information to the FTS5 memory database with optional metadata."""
     try:
-        conn = _state_conn()
-        _ensure_memories_schema(conn)
         if len(content) > 4000:
             content = content[-4000:]
         if metadata:
             metadata = str(metadata)[:200]
-        cur = conn.execute(
-            "INSERT INTO memories(content, metadata) VALUES (?, ?)",
-            (content, metadata),
-        )
-        conn.commit()
-        _enqueue(conn, "r%d" % cur.lastrowid)
-        conn.close()
+        conn = _state_conn()
+        try:
+            _ensure_memories_schema(conn)
+            with state.transaction(conn):   # BEGIN IMMEDIATE + lock retry, rolled back on error
+                cur = conn.execute(
+                    "INSERT INTO memories(content, metadata) VALUES (?, ?)",
+                    (content, metadata),
+                )
+                _enqueue(conn, "r%d" % cur.lastrowid)
+        finally:
+            conn.close()
         return f"Remembered: {content[:80]}{'...' if len(content) > 80 else ''}"
     except Exception as e:
         return f"Error saving memory: {e}"
@@ -278,34 +284,36 @@ def recall(query):
     """Search memories using FTS5 full-text search with fallback to LIKE search."""
     try:
         conn = _state_conn()
-        _ensure_memories_schema(conn)
+        try:
+            _ensure_memories_schema(conn)
         
-        # Extract alphanumeric words for safe FTS query
-        words = re.findall(r'\w+', query)
-        fts_query = " OR ".join(words) if words else query
+            # Extract alphanumeric words for safe FTS query
+            words = re.findall(r'\w+', query)
+            fts_query = " OR ".join(words) if words else query
         
-        rows = []
-        if fts_query:
-            try:
+            rows = []
+            if fts_query:
+                try:
+                    rows = conn.execute(
+                        "SELECT content, metadata FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT 10",
+                        (fts_query,),
+                    ).fetchall()
+                except sqlite3.Error:
+                    rows = []
+
+            if not rows and words:
+                # Fallback to LIKE search for key words
+                like_clauses = " OR ".join(["content LIKE ? OR metadata LIKE ?" for _ in words[:5]])
+                like_params = []
+                for w in words[:5]:
+                    like_params.extend([f"%{w}%", f"%{w}%"])
                 rows = conn.execute(
-                    "SELECT content, metadata FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT 10",
-                    (fts_query,),
+                    f"SELECT content, metadata FROM memories WHERE {like_clauses} LIMIT 10",
+                    tuple(like_params),
                 ).fetchall()
-            except sqlite3.Error:
-                rows = []
 
-        if not rows and words:
-            # Fallback to LIKE search for key words
-            like_clauses = " OR ".join(["content LIKE ? OR metadata LIKE ?" for _ in words[:5]])
-            like_params = []
-            for w in words[:5]:
-                like_params.extend([f"%{w}%", f"%{w}%"])
-            rows = conn.execute(
-                f"SELECT content, metadata FROM memories WHERE {like_clauses} LIMIT 10",
-                tuple(like_params),
-            ).fetchall()
-
-        conn.close()
+        finally:
+            conn.close()
         if not rows:
             return "No memories found matching that query."
         results = []

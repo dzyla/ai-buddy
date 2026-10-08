@@ -1154,7 +1154,8 @@ def migrate_legacy(home=None, conn=None, retry=False):
                 counts["errors"] += 1
                 errors.append("rename %s: %s" % (p, e))
         _restart_schedulers(live)
-        if errors:
+        if errors or counts["renamed"]:
+            # the report stored inside the transaction predates the renames: record the real count
             with _tx(c):
                 _meta_set(c, "migration_report", json.dumps(dict(counts, error_details=errors)))
         return counts

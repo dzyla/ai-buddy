@@ -1,26 +1,36 @@
 """Message trimming (trim-messages), resume transcripts (session-transcript) and the sessions
 index (state db `sessions` table)."""
 import json
+import time
 
 from . import state
 
 
-_session_index_down = [False]   # set after the first failed write: skip the rest this process
+# monotonic time of the last failed write (falsy: index up). While it is recent, writes are skipped;
+# after SESSION_INDEX_RETRY_S they are retried, so a long-lived process (py engine, tool server)
+# does not stay without a sessions index for its whole life after one transient lock.
+_session_index_down = [0.0]
+SESSION_INDEX_RETRY_S = 60.0
 
 
 def record_session(session_id, path=None, ended=None, summary=None, started=None):
     """Upsert one row of the sessions index (id, started, ended, path, summary). Called when the
     history indexer (re)indexes a saved session file; never raises. After one failure (e.g. the
     db is locked past the caller's lock budget) further calls in this process are skipped, so a
-    sync over many files cannot multiply the lock wait (rows are refreshed on a later sync)."""
-    if not session_id or session_id == "last" or _session_index_down[0]:
+    sync over many files cannot multiply the lock wait (rows are refreshed on a later sync).
+    Writes are retried SESSION_INDEX_RETRY_S after the failure."""
+    if not session_id or session_id == "last":
+        return False
+    down = _session_index_down[0]
+    if down and time.monotonic() - down < SESSION_INDEX_RETRY_S:
         return False
     try:
         state.session_upsert(session_id, started=started, ended=ended, path=path,
                              summary=(summary or "")[:300] or None)
+        _session_index_down[0] = 0.0
         return True
     except Exception:
-        _session_index_down[0] = True
+        _session_index_down[0] = time.monotonic() or 1e-9
         return False
 
 # ── Context trimming (called by ai.c when messages_json exceeds the budget) ──

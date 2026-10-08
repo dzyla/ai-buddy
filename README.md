@@ -28,7 +28,7 @@ cd ai
 ./install.sh
 ```
 
-`install.sh` builds with `make` and installs into `~/.local/bin` (Python packages into `~/.local/share/ai/lib`) — no sudo required. To only build in the checkout: `make` (or `make ci`, the warning-free `-Werror` build CI uses). To uninstall (this will also cleanly stop and remove systemd service and socket files if you installed llama):
+`install.sh` builds with `make` and installs into `~/.local/bin` (Python packages into `~/.local/share/ai/lib`, copied before the shims and binary are replaced) — no sudo required. It does not run the state migration (that happens lazily on first use) and does not restart services: if the Zulip bridge is running, restart it after an install (`systemctl --user restart zulip-ai-bridge`). To only build in the checkout: `make` (or `make ci`, the warning-free `-Werror` build CI uses). To uninstall (this will also cleanly stop and remove systemd service and socket files if you installed llama):
 
 ```bash
 ./install.sh uninstall
@@ -565,7 +565,8 @@ flowchart LR
 - **Integrations**: `zulip_ai_bridge.py` (Zulip in, runs `ai` per message), `zulip_mcp_server.py`
   and `pubmed_mcp_server.py` (MCP servers), `gcal.py` (Google Calendar), `deep_research.py`.
 - **Trader** (`trader/`, `robinhood_trader.py`) is deployed separately from the working tree:
-  `bash trader/deploy.sh` builds a versioned release from the committed tree (tests must pass)
+  `bash trader/deploy.sh [--ref <commit>]` builds a versioned release from a committed tree
+  (HEAD of a clean tree, or any commit with `--ref`; every trader test must pass on that commit)
   and repoints `~/.local/share/ai-trader/current`, which `services/robinhood-trader.service`
   runs. See [`docs/robinhood_trader.md`](docs/robinhood_trader.md).
 - **Config**: personal config is never tracked; `config/*.example*` are templates that

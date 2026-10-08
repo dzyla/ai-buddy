@@ -299,6 +299,36 @@ fi
 (cd "${SCRIPT_DIR}" && make clean && make)
 echo "==> Built: ${SCRIPT_DIR}/ai and libremote_harness.so"
 
+# ── 1b. Library packages FIRST (~/.local/share/ai/lib) ───────────────────────
+# The shims (ai_mcp.py, zulip_ai_bridge.py, robinhood_trader.py) and the ai binary look next to
+# their realpath first (a checkout), then in ~/.local/share/ai/lib. Copying the packages before
+# the shims/binary are replaced means a process started mid-install never pairs a new shim with
+# an old (or missing) package. Each package is staged next to its destination and swapped in with
+# two renames, so the window in which it is absent is a few microseconds rather than a full copy.
+# NOTE: install.sh does not run `ai_mcp.py state-migrate` (the legacy-file migration runs lazily
+# on the first state-store connect) and never restarts the Zulip bridge or the trading daemon:
+# restart a running bridge yourself after an install (`systemctl --user restart zulip-ai-bridge`).
+AITOOLS_LIB="${DATA_DIR}/lib"
+mkdir -p "${AITOOLS_LIB}"
+install_pkg() {  # install_pkg <name>: atomically-ish replace ${AITOOLS_LIB}/<name> with the checkout's copy
+    local name="$1" dst="${AITOOLS_LIB}/$1" stage="${AITOOLS_LIB}/.$1.new.$$" old="${AITOOLS_LIB}/.$1.old.$$"
+    [ -d "${SCRIPT_DIR}/${name}" ] || return 0
+    rm -rf "$stage" "$old"
+    cp -r "${SCRIPT_DIR}/${name}" "$stage"
+    find "$stage" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    if [ -e "$dst" ]; then mv "$dst" "$old"; fi
+    mv "$stage" "$dst"
+    rm -rf "$old"
+    echo "==> Installed ${name} package to ${dst}"
+}
+# aitools: ai_mcp.py's package. zulip_bridge: zulip_ai_bridge.py's. agent: the Python engine (the
+# default; INFER_ENGINE=c is the legacy C loop) -- the installed ~/.local/bin/ai runs
+# `python3 ~/.local/share/ai/lib/agent --frontend-fd 3 ...`, which imports aitools from the same
+# lib dir. trader: robinhood_trader.py's (the live daemon runs a versioned release, not this copy).
+for pkg in aitools zulip_bridge agent trader; do
+    install_pkg "$pkg"
+done
+
 # ── 2. Install to ~/.local/bin and ~/.local/lib ─────────────────────────────
 echo "==> Installing to ${BIN_DIR}..."
 mkdir -p "${BIN_DIR}"
@@ -322,27 +352,9 @@ mkdir -p "${HOME}/.local/share/ai"
 cp "${SCRIPT_DIR}/dev/probe_mtp.py" "${HOME}/.local/share/ai/probe_mtp.py" 2>/dev/null || true
 chmod +x "${BIN_DIR}/ai" "${BIN_DIR}/ai_mcp.py" "${BIN_DIR}/gcal.py" "${BIN_DIR}/zulip_mcp_server.py" "${BIN_DIR}/ai-backend" "${BIN_DIR}/ai-model" "${BIN_DIR}/pubmed_mcp_server.py" "${BIN_DIR}/deep_research.py"
 echo "==> Installed: ai  libremote_harness.so  ai_mcp.py  gcal.py  zulip_mcp_server.py  ai-backend (single model tool)  pubmed_mcp_server.py  deep_research.py  probe_mtp.py"
-# ai_mcp.py is a shim over the aitools/ package: it looks next to its realpath first (a checkout),
-# then in ~/.local/share/ai/lib, so the installed ~/.local/bin/ai_mcp.py uses this copy.
-AITOOLS_LIB="${DATA_DIR}/lib"
-mkdir -p "${AITOOLS_LIB}"
-rm -rf "${AITOOLS_LIB}/aitools"
-cp -r "${SCRIPT_DIR}/aitools" "${AITOOLS_LIB}/aitools"
-find "${AITOOLS_LIB}/aitools" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-echo "==> Installed aitools package to ${AITOOLS_LIB}/aitools"
-# zulip_ai_bridge.py is likewise a shim over the zulip_bridge/ package (same lookup order).
+# zulip_ai_bridge.py is a shim over the zulip_bridge/ package (installed above, same lookup order).
 cp "${SCRIPT_DIR}/zulip_ai_bridge.py" "${BIN_DIR}/zulip_ai_bridge.py"
 chmod +x "${BIN_DIR}/zulip_ai_bridge.py"
-rm -rf "${AITOOLS_LIB}/zulip_bridge"
-cp -r "${SCRIPT_DIR}/zulip_bridge" "${AITOOLS_LIB}/zulip_bridge"
-find "${AITOOLS_LIB}/zulip_bridge" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-echo "==> Installed zulip_bridge package to ${AITOOLS_LIB}/zulip_bridge"
-# The Python agent engine (the default; INFER_ENGINE=c is the legacy C loop): the installed ~/.local/bin/ai runs
-# `python3 ~/.local/share/ai/lib/agent --frontend-fd 3 ...`, which imports aitools from the same lib dir.
-rm -rf "${AITOOLS_LIB}/agent"
-cp -r "${SCRIPT_DIR}/agent" "${AITOOLS_LIB}/agent"
-find "${AITOOLS_LIB}/agent" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-echo "==> Installed agent engine to ${AITOOLS_LIB}/agent"
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
@@ -407,14 +419,7 @@ fi
 # ── 7. Trader package + user unit (installed only; the daemon is NEVER restarted here) ──
 # robinhood_trader.py finds the package next to itself first, then in ~/.local/share/ai/lib.
 # The live daemon runs a versioned release (bash trader/deploy.sh), not this copy.
-TRADER_LIB="${DATA_DIR}/lib"
-if [ -d "${SCRIPT_DIR}/trader" ]; then
-    mkdir -p "${TRADER_LIB}"
-    rm -rf "${TRADER_LIB}/trader"
-    cp -r "${SCRIPT_DIR}/trader" "${TRADER_LIB}/trader"
-    find "${TRADER_LIB}/trader" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-    echo "==> Installed trader package to ${TRADER_LIB}/trader"
-fi
+# (the trader package itself is copied in step 1b, before any shim is replaced)
 if [ -f "${SCRIPT_DIR}/services/robinhood-trader.service" ] && command -v systemctl &>/dev/null; then
     if [ -e "${HOME}/.local/share/ai-trader/current" ]; then
         mkdir -p "${SYSTEMD_DIR}"
