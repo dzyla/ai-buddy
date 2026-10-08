@@ -31,6 +31,11 @@ The reply is controlled by env vars:
   MOCK_DISCONNECTS    — file: one JSON line per runaway stream, {"req", "sent_chars", "closed"} where
                         closed=true means the client dropped the connection before the stream ended
 
+  MOCK_HTTP_ERROR     — JSON {"status": int, "body": obj}: every request (GET and POST) is answered with
+                        that status and JSON body (e.g. llama-proxy's 503 backend_unavailable)
+  MOCK_STALL          — seconds to wait before answering a chat POST (nothing is sent meanwhile: a
+                        server that accepted the request but produces no first byte)
+
 Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 """
 import json
@@ -67,6 +72,19 @@ class Handler(BaseHTTPRequestHandler):
             with open(cap, "a") as f:
                 f.write(line + "\n")
 
+    def _http_error(self):
+        spec = os.environ.get("MOCK_HTTP_ERROR")
+        if not spec:
+            return False
+        spec = json.loads(spec)
+        payload = json.dumps(spec.get("body") or {}).encode()
+        self.send_response(int(spec.get("status", 503)))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        return True
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
@@ -74,6 +92,10 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.environ["MOCK_TIMES"], "a") as f:
                 f.write("%.6f\n" % time.time())
         self._capture(raw)
+        if self._http_error():
+            return
+        if os.environ.get("MOCK_STALL"):
+            time.sleep(float(os.environ["MOCK_STALL"]))
         Handler._req_no += 1
         Handler._last_len = len(raw)
         err_at = [int(x) for x in (os.environ.get("MOCK_CTX_ERROR_AT") or "").split(",") if x.strip()]
@@ -288,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # /v1/models or health probe. MOCK_N_CTX makes /props report a
         # llama.cpp-style runtime context window (n_ctx).
+        if self._http_error():
+            return
         n_ctx = os.environ.get("MOCK_N_CTX")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

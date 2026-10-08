@@ -56,6 +56,7 @@ class Engine:
         self.session_tokens = 0
         self.ctx_retry_used = False     # one trim-and-retry per context-overflow 400
         self.runaway_failures = 0       # consecutive steps whose reply was aborted twice by the guard
+        self.server_failed = False      # a request failed because the model server is down/unreachable
         self.force_trim_to = 0          # set when usage.prompt_tokens > 80% of n_ctx
         self.turn_count = 0
         self.tool_count = 0             # tool calls this session (the answer footer / Ctrl-O redraw)
@@ -256,6 +257,8 @@ class Engine:
                     break
         finally:
             self._finish()
+        if self.server_failed and not cfg.interactive:
+            code = code or 1      # the model server was down / failed: never a silent success
         return code
 
     def _finish(self):
@@ -641,7 +644,8 @@ class Engine:
             return True, loop_count, length_nudges, False
         self.runaway_failures = 0
         if res.get("status", 0) == 0 and res.get("error"):
-            self.err("Request failed: %s\n" % res["error"])
+            self.err("\033[1;31m%s\033[0m\n" % llm.failure_line(res, self.client.api_url))
+            self.server_failed = True
             return True, loop_count, length_nudges, True
         if res.get("status", 200) >= 400:
             e = res.get("error") or "Unknown server error."
@@ -659,7 +663,11 @@ class Engine:
                          "and retrying once.\033[0m\n" % (target // 1024))
                 self.messages = self._trim(target)
                 return True, loop_count, length_nudges, False
-            self.err("\n\033[1;31m[ai Error]\033[0m %s\n" % e)
+            if res.get("unavailable") or res.get("status", 0) >= 500:
+                self.err("\n\033[1;31m%s\033[0m\n" % llm.failure_line(res, self.client.api_url))
+                self.server_failed = True
+            else:
+                self.err("\n\033[1;31m[ai Error]\033[0m %s\n" % e)
             return False, loop_count, length_nudges, True
         self.ctx_retry_used = False
 

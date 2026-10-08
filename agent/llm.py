@@ -4,6 +4,13 @@
 chat(messages, tools, stream=True, on_chunk=None, client=None) -> dict
     {"message": assistant message, "finish_reason": str|None, "usage": {...}, "status": http status,
      "error": str|None (transport/HTTP failure, message is then empty), "interrupted": bool}
+    plus, on a failure: "connect_failed", "first_byte_timeout" (seconds), "unavailable" (the
+    llama-proxy's 503 backend_unavailable: the backend failed to start; never retried).
+failure_line(res, url) -> the one-line error the engine prints for such a result.
+
+Fail fast: a local server that refuses connections is waited for INFER_SERVER_WAIT seconds
+(default 30, a server that is still starting up); a streaming request that gets no byte for
+INFER_FIRST_BYTE_TIMEOUT seconds (default 300, 0 = no limit) is abandoned, not retried.
 """
 import http.client
 import json
@@ -16,6 +23,52 @@ import urllib.parse
 from .cli import Options
 
 RETRY_BASE = 1.0   # seconds before the first retry of a transient server failure (doubles each time)
+FIX_HINT = "check `ai-backend status`"
+
+
+def _env_float(name, default):
+    try:
+        v = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return float(default)
+    return v if v >= 0 else float(default)
+
+
+def server_wait():
+    """INFER_SERVER_WAIT: seconds to keep retrying a local server that refuses connections."""
+    return _env_float("INFER_SERVER_WAIT", 30)
+
+
+def first_byte_timeout():
+    """INFER_FIRST_BYTE_TIMEOUT: seconds a streaming request may go without receiving a byte."""
+    return _env_float("INFER_FIRST_BYTE_TIMEOUT", 300)
+
+
+def _local_tries():
+    return max(1, int(server_wait() * 2))   # one try per 0.5 s
+
+
+def _base_of(url):
+    k = url.find("chat/completions")
+    return url[:k] if k > 0 else url
+
+
+def failure_line(res, url):
+    """One line naming the cause and the fix for a failed request result."""
+    base = _base_of(url)
+    err = " ".join(str(res.get("error") or "").split())
+    if res.get("first_byte_timeout"):
+        return ("[ai] no response from the model server at %s within %gs (INFER_FIRST_BYTE_TIMEOUT); %s."
+                % (base, res["first_byte_timeout"], FIX_HINT))
+    if res.get("unavailable"):
+        line = "[ai] model server unavailable (HTTP %s): %s" % (res.get("status") or 503, err or "backend down")
+        return line if "ai-backend status" in line else "%s; %s." % (line.rstrip(". "), FIX_HINT)
+    if res.get("connect_failed"):
+        return ("[ai] cannot reach the model server at %s (%s); is it running? %s."
+                % (base, err or "connection failed", FIX_HINT[0].upper() + FIX_HINT[1:]))
+    if res.get("status", 0) >= 500:
+        return "[ai] model server error (HTTP %d) at %s: %s; %s." % (res["status"], base, err, FIX_HINT)
+    return "[ai] request to the model server at %s failed: %s; %s." % (base, err or "unknown error", FIX_HINT)
 
 
 # ── payload ──────────────────────────────────────────────────────────────────
@@ -431,7 +484,8 @@ class Client:
 
     def get_json_text(self, url, timeout=10):
         """GET url -> body text, or None (with ai.c's local-server startup retries)."""
-        for attempt in range(60 if _is_local(url) else 1):
+        tries = _local_tries() if _is_local(url) else 1
+        for attempt in range(tries):
             try:
                 conn, path = self._open(url, timeout=timeout)
                 try:
@@ -445,7 +499,7 @@ class Client:
                     continue
                 return body
             except (OSError, http.client.HTTPException):
-                if not _is_local(url) or attempt == 59:
+                if not _is_local(url) or attempt >= tries - 1:
                     return None
                 time.sleep(0.5)
         return None
@@ -469,9 +523,16 @@ class Client:
             except (OSError, http.client.HTTPException) as e:
                 if self._interrupted:
                     return self._done(acc, stream, interrupted=True)
-                transient = isinstance(e, (ConnectionRefusedError, ConnectionResetError, socket.timeout,
+                fbt = first_byte_timeout() if stream else 0
+                if isinstance(e, socket.timeout) and fbt > 0:
+                    # the server took the request but sent nothing for fbt seconds: a retry would
+                    # only queue behind the stuck generation
+                    return {"message": {"role": "assistant", "content": None}, "finish_reason": None,
+                            "usage": {}, "error": "no response within %gs" % fbt, "first_byte_timeout": fbt,
+                            "connect_failed": False, "interrupted": False, "status": 0}
+                transient = isinstance(e, (ConnectionRefusedError, ConnectionResetError,
                                            http.client.RemoteDisconnected, BrokenPipeError))
-                if local and local_tries < 60 and transient:
+                if local and local_tries < _local_tries() and transient:
                     local_tries += 1
                     if not warned:
                         self.log("\033[2m[ai] Local server is starting up, waiting...\033[0m\n")
@@ -495,7 +556,8 @@ class Client:
                     self.log("\033[2m[ai] Local server model is loading, waiting...\033[0m\n")
                 time.sleep(0.5)
                 continue
-            if status in (502, 503, 504) and server_tries < 3:   # transient gateway/overload only
+            unavailable = status == 503 and b"backend_unavailable" in acc.raw
+            if status in (502, 503, 504) and server_tries < 3 and not unavailable:   # transient gateway/overload only
                 server_tries += 1
                 time.sleep(RETRY_BASE * 2 ** (server_tries - 1))
                 continue
@@ -505,6 +567,8 @@ class Client:
                 res["guard"] = dict(acc.tripped)
             if status >= 400:
                 res["error"] = err or ("HTTP %d" % status)
+            if unavailable:
+                res["unavailable"] = True
             if self.debug:
                 self.log("[debug] Loop %s response: %s\n" % (debug_tag, json.dumps(res)))
             return res
@@ -522,7 +586,9 @@ class Client:
         return res
 
     def _post(self, body, acc, stream):
-        conn, path = self._open(self.api_url, timeout=None)
+        # streaming: a socket timeout = no byte (first, or between chunks) for that long
+        fbt = first_byte_timeout() if stream else 0
+        conn, path = self._open(self.api_url, timeout=fbt if fbt > 0 else None)
         with self._lock:
             self._conn = conn
         try:

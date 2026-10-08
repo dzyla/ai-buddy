@@ -4182,6 +4182,45 @@ static void load_from_profiles(char **url, char **key, char **model) {
     if (model && (!*model || !**model) && strlen(f_model) > 0) *model = f_model;
 }
 
+/* Fail fast when the model server is down (mirrors agent/llm.py): INFER_SERVER_WAIT seconds
+   (default 30) of retries while a local server refuses connections; a streaming chat request that
+   receives no byte for INFER_FIRST_BYTE_TIMEOUT seconds (default 300, 0 = off) is abandoned. */
+static int g_server_failed = 0;   /* a request failed because the server is down -> exit status 1 */
+#define SERVER_FIX_HINT "check `ai-backend status`"
+
+static double env_seconds(const char *name, double def) {
+    const char *v = getenv(name);
+    if (!v || !*v) return def;
+    char *end = NULL;
+    double d = strtod(v, &end);
+    if (end == v || d < 0) return def;
+    return d;
+}
+
+/* "http://host:port/v1/" of an api url ending in chat/completions */
+static void server_base_url(const char *api_url, char *out, size_t n) {
+    snprintf(out, n, "%s", api_url ? api_url : "");
+    char *k = strstr(out, "chat/completions");
+    if (k && k > out) *k = '\0';
+}
+
+static void print_server_failure(CURLcode res, const char *api_url) {
+    char base[1024];
+    server_base_url(api_url, base, sizeof(base));
+    if (res == CURLE_OPERATION_TIMEDOUT) {
+        fprintf(stderr, "\033[1;31m[ai] no response from the model server at %s within %gs "
+                        "(INFER_FIRST_BYTE_TIMEOUT); " SERVER_FIX_HINT ".\033[0m\n",
+                base, env_seconds("INFER_FIRST_BYTE_TIMEOUT", 300));
+    } else if (res == CURLE_COULDNT_CONNECT || res == CURLE_COULDNT_RESOLVE_HOST) {
+        fprintf(stderr, "\033[1;31m[ai] cannot reach the model server at %s (%s); is it running? "
+                        "Check `ai-backend status`.\033[0m\n", base, curl_easy_strerror(res));
+    } else {
+        fprintf(stderr, "\033[1;31m[ai] request to the model server at %s failed: %s; " SERVER_FIX_HINT
+                        ".\033[0m\n", base, curl_easy_strerror(res));
+    }
+    g_server_failed = 1;
+}
+
 static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk, void (*retry_cb)(void *), void *retry_userdata) {
     char *url = NULL;
     curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &url);
@@ -4193,7 +4232,8 @@ static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk, void (*
     
     CURLcode res;
     int retries = 0;
-    int max_retries = 60; // 60 retries * 500ms = 30 seconds
+    int max_retries = (int)(env_seconds("INFER_SERVER_WAIT", 30) * 2); // one try per 500ms
+    if (max_retries < 1) max_retries = 1;
     
     while (1) {
         res = curl_easy_perform(c);
@@ -4216,12 +4256,13 @@ static CURLcode perform_curl_with_retry(CURL *c, struct response *chunk, void (*
             break;
         }
         
-        if (is_local && 
-            (res == CURLE_COULDNT_CONNECT || 
-             res == CURLE_GOT_NOTHING || 
-             res == CURLE_RECV_ERROR || 
-             res == CURLE_SEND_ERROR || 
-             res == CURLE_OPERATION_TIMEDOUT) && 
+        /* not CURLE_OPERATION_TIMEDOUT: that is the first-byte timeout (a stuck server, retrying
+           would only queue behind it) */
+        if (is_local &&
+            (res == CURLE_COULDNT_CONNECT ||
+             res == CURLE_GOT_NOTHING ||
+             res == CURLE_RECV_ERROR ||
+             res == CURLE_SEND_ERROR) &&
             retries < max_retries) {
             retries++;
             if (retries == 1) {
@@ -6020,6 +6061,12 @@ step_limit_check:
                 if (interactive_mode) enable_raw_mode();
                 struct timespec t_req_start, t_req_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_req_start);
+                {
+                    /* no byte (first, or between SSE chunks) for this long -> CURLE_OPERATION_TIMEDOUT */
+                    long fbt = (long)env_seconds("INFER_FIRST_BYTE_TIMEOUT", 300);
+                    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, fbt > 0 ? 1L : 0L);
+                    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, fbt > 0 ? fbt : 0L);
+                }
                 CURLcode res = perform_curl_with_retry(c, &chunk, stream_retry_reset, &s_ctx);
                 clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                 if (interactive_mode) disable_raw_mode();
@@ -6151,8 +6198,11 @@ step_limit_check:
                     break;
                 }
 
+                curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 0L);
+                curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 0L);
                 if (res != CURLE_OK || !chunk.data) {
-                    fprintf(stderr, "Request failed: %s\n", curl_easy_strerror(res));
+                    if (res != CURLE_OK) print_server_failure(res, api_url);
+                    else fprintf(stderr, "Request failed: empty response from the model server.\n");
                     free(payload);
                     if (chunk.data) free(chunk.data);
                     break;
@@ -6282,7 +6332,20 @@ step_limit_check:
                             free(chunk.data);
                             break;
                         }
-                        fprintf(stderr, "\n\033[1;31m[ai Error]\033[0m %s\n", err_msg);
+                        long http_code = 0;
+                        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+                        if (http_code >= 500 || strstr(chunk.data, "backend_unavailable")) {
+                            /* the server (or the llama-proxy: backend failed to start) is down */
+                            for (char *q = err_msg; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+                            fprintf(stderr, "\n\033[1;31m[ai] model server %s (HTTP %ld): %s%s%s\033[0m\n",
+                                    strstr(chunk.data, "backend_unavailable") ? "unavailable" : "error",
+                                    http_code ? http_code : 503L, err_msg,
+                                    strstr(err_msg, "ai-backend status") ? "" : "; ",
+                                    strstr(err_msg, "ai-backend status") ? "" : SERVER_FIX_HINT ".");
+                            g_server_failed = 1;
+                        } else {
+                            fprintf(stderr, "\n\033[1;31m[ai Error]\033[0m %s\n", err_msg);
+                        }
                         free(err_msg);
                     } else {
                         fprintf(stderr, "\n\033[1;31m[ai Error]\033[0m Unknown server error.\n");
@@ -7870,5 +7933,5 @@ step_limit_check:
     curl_easy_cleanup(c);
     clear_tool_cache();
     fprintf(stderr, "\033[2m  session ended · resume: ai -r %s\033[0m\n", current_session_id);
-    return 0;
+    return (g_server_failed && !interactive_mode) ? 1 : 0;
 }
