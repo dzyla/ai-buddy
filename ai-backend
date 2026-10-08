@@ -1646,6 +1646,40 @@ def cmd_stop():
     kill_llama_server()
     print("[ai-backend] llama-server stopped.")
 
+def probe_health(ports):
+    """First port answering GET /health with 200 -> (port, parsed JSON body or {}), else (None, None)."""
+    for check_port in ports:
+        for host in ("127.0.0.1", "localhost"):
+            try:
+                with urllib.request.urlopen(f"http://{host}:{check_port}/health", timeout=0.8) as resp:
+                    if resp.status == 200:
+                        try:
+                            body = json.loads(resp.read() or b"{}")
+                        except ValueError:
+                            body = {}
+                        return check_port, body if isinstance(body, dict) else {}
+            except Exception:
+                pass
+    return None, None
+
+
+def describe_server(port, health, active_pid=None):
+    """-> (running, state line, health line). A llama-proxy /health (it has "proxy") answers 200
+    whatever the backend does: the model server runs only when its backend is "ready"."""
+    if port is None:
+        return False, "STOPPED", "Inactive / Not running"
+    if "proxy" in health:
+        backend = str(health.get("backend") or "unknown")
+        reason = health.get("reason") or ""
+        detail = f"backend {backend}" + (f": {reason}" if reason and backend != "ready" else "")
+        if backend == "ready":
+            state = f"RUNNING (PID: {active_pid})" if active_pid else "RUNNING"
+            return True, f"{state} · PROXY UP :{port}", f"proxy :{port} OK · {detail}"
+        return False, f"PROXY UP :{port} · {detail}", f"proxy :{port} OK · {detail}"
+    state = f"RUNNING (PID: {active_pid})" if active_pid else "RUNNING"
+    return True, state, "HTTP 200 (OK)"
+
+
 def cmd_status():
     env_vars = load_env()
     model_path = env_vars.get("LLAMA_MODEL_PATH") or os.environ.get("LLAMA_MODEL_PATH")
@@ -1675,32 +1709,22 @@ def cmd_status():
         if p not in target_ports:
             target_ports.append(p)
             
-    for check_port in target_ports:
-        for host in ("127.0.0.1", "localhost"):
-            try:
-                with urllib.request.urlopen(f"http://{host}:{check_port}/health", timeout=0.8) as resp:
-                    if resp.status == 200:
-                        llama_running = True
-                        break
-            except Exception:
-                pass
-        if llama_running:
-            break
-            
+    health_port, health = probe_health(target_ports)
+    llama_running, status_str, health_str = describe_server(health_port, health or {}, active_pid)
+
     systemd_active = is_systemd_service_active()
     
     print("=" * 68)
     print("  ai-backend Status & Configuration")
     print("=" * 68)
     
-    status_str = f"RUNNING (PID: {active_pid})" if (llama_running and active_pid) else ("RUNNING" if llama_running else "STOPPED")
     if systemd_active:
         status_str += " [systemd active]"
         
     print(f"\n● Server Status:")
     print(f"  State:         {status_str}")
     print(f"  Endpoint:      {env_vars.get('INFER_BASE_URL', f'http://127.0.0.1:{PORT}/v1/')}")
-    print(f"  Health:        {'HTTP 200 (OK)' if llama_running else 'Inactive / Not running'}")
+    print(f"  Health:        {health_str}")
     
     # 2. Active Model Details
     if model_path and os.path.exists(model_path):
