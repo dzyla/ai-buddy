@@ -197,6 +197,8 @@ def serve_stubs(ab, hermetic, monkeypatch):
     synthetic model and no real subprocess is launched."""
     monkeypatch.setattr(ab, "find_dspark_draft", lambda *a, **k: None)
     monkeypatch.setattr(ab, "find_mtp_draft", lambda *a, **k: None)
+    # kill_llama_server() SIGKILLs every llama-server on the host -- the developer's live one too
+    monkeypatch.setattr(ab, "kill_llama_server", lambda: None)
     monkeypatch.setattr(ab, "resolve_serve_gpu", lambda *a, **k: "1")
     monkeypatch.setattr(ab, "restart_systemd_service", lambda: None)
     monkeypatch.setattr(ab, "list_gpu_info",

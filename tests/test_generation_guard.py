@@ -508,7 +508,8 @@ def test_looping_final_answer_is_salvaged_not_retried(tmp_path):
     r, reqs, discs, elapsed = _ornith_run(tmp_path)
     assert r.returncode == 0, r.stderr[-3000:]
     assert len(reqs) == 1, [q["messages"][-1] for q in reqs]          # no nudge, no retry
-    assert discs and discs[0]["closed"] is True and discs[0]["sent_chars"] < 20000, discs
+    # cut mid-stream (the guard trips at ~1.4 KB; socket buffers let the server write more first)
+    assert discs and discs[0]["closed"] is True and discs[0]["sent_chars"] < 100000, discs
     assert "kept the answer before the loop" in r.stderr
     assert "retrying" not in r.stderr
     sess = json.loads((tmp_path / "home" / ".cache" / "ai" / "sessions" / "last.json").read_text())

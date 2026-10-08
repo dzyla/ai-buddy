@@ -129,11 +129,49 @@ def _install_live_port_guard():
     socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
 
 
+def _descendant_of_us(pid):
+    me, seen = os.getpid(), 0
+    while pid > 1 and seen < 64:
+        if pid == me:
+            return True
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        seen += 1
+    return False
+
+
+def _install_live_kill_guard():
+    """Refuse in-process signals to a llama-server/llama-proxy the test run did not start:
+    ai-backend's kill_llama_server() SIGKILLs every llama-server on the host (the developer's live
+    one included) when a serve test forgets to stub it."""
+    violations = os._ai_test_live_kill_violations = []
+    orig_kill = os.kill
+
+    def kill(pid, sig):
+        if sig != 0 and isinstance(pid, int) and pid > 1 and pid != os.getpid() \
+                and os.environ.get("AI_TEST_ALLOW_LIVE_KILL") != "1":
+            try:
+                with open("/proc/%d/cmdline" % pid, "rb") as f:
+                    cmdline = f.read().decode("utf-8", "replace")
+            except OSError:
+                cmdline = ""
+            if ("llama-server" in cmdline or "llama-proxy" in cmdline) and not _descendant_of_us(pid):
+                violations.append((pid, cmdline.replace("\0", " ")[:120], os.environ.get("PYTEST_CURRENT_TEST", "?")))
+                raise PermissionError(1, "test isolation: refusing to signal live process %d" % pid)
+        return orig_kill(pid, sig)
+
+    os.kill = kill
+
+
 _GUARD_ON = os.environ.get("AI_TEST_HOME_GUARD", "1") != "0"
 _REAL_HOME_BEFORE = _snapshot_real_home() if _GUARD_ON else {}
 _SCRATCH_HOME = _isolate_home()
 _isolate_services(_SCRATCH_HOME)
 _install_live_port_guard()
+_install_live_kill_guard()
 # also exported so tests (and the guard self-test) can see what the original HOME was
 os.environ["AI_TEST_ORIG_HOME"] = _ORIG_HOME
 
@@ -159,6 +197,11 @@ def pytest_sessionfinish(session, exitstatus):
         if hits:
             _report(session, "\nLIVE-PORT GUARD: tests tried to reach the live model server:\n" +
                     "\n".join("  %s:%s  from %s" % h for h in hits[:30]))
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        kills = getattr(os, "_ai_test_live_kill_violations", [])
+        if kills:
+            _report(session, "\nLIVE-KILL GUARD: tests tried to signal a live llama-server/proxy:\n" +
+                    "\n".join("  pid %s %s  from %s" % k for k in kills[:30]))
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
         try:
             with open(os.path.join(_SCRATCH_HOME, "systemctl_calls.log")) as f:

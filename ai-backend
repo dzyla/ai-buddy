@@ -953,39 +953,93 @@ def find_dspark_draft(main_path=None):
     return None
 
 
-def find_mtp_draft(main_path=None):
-    """Locate an MTP draft model for the active main model if separate.
-    Check order: explicit LLAMA_MTP_DRAFT_PATH / LLAMA_DRAFT_MODEL_PATH ->
-    sibling MTP GGUF (matching model prefix)."""
+# A separate speculative draft is a small model: anything at least this fraction of the main
+# model's size is a full model (e.g. "Qwen3.8-27B-...-mtp.gguf", a main model WITH built-in MTP
+# heads), never a draft, and is never auto-picked.
+DRAFT_MAX_FRACTION = 1 / 3
+
+
+def spec_type_setting(env_vars=None):
+    env_vars = load_env() if env_vars is None else env_vars
+    return (env_vars.get("LLAMA_SPEC_TYPE") or os.environ.get("LLAMA_SPEC_TYPE") or "draft-mtp").strip()
+
+
+def _small_enough_for_draft(cand, main_path):
+    main_gb = split_total_size(main_path)
+    cand_gb = split_total_size(cand)
+    return main_gb > 0 and 0 < cand_gb < main_gb * DRAFT_MAX_FRACTION
+
+
+def explicit_mtp_draft(main_path=None, env_vars=None, spec_type=None):
+    """The configured MTP/DFlash draft path (exists or not), or None.
+
+    LLAMA_MTP_DRAFT_PATH always counts. LLAMA_DRAFT_MODEL_PATH (the dspark key) counts for a
+    non-DeepSeek main model when it is not a dspark file and either names itself an MTP/DFlash
+    draft or LLAMA_SPEC_TYPE is draft-dflash."""
+    env_vars = load_env() if env_vars is None else env_vars
+    d = env_vars.get("LLAMA_MTP_DRAFT_PATH") or os.environ.get("LLAMA_MTP_DRAFT_PATH")
+    if d:
+        return d
+    d = env_vars.get("LLAMA_DRAFT_MODEL_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH")
+    if not d or "dspark" in os.path.basename(d).lower():
+        return None
+    if main_path and is_deepseek_model(main_path):
+        return None
+    spec_type = spec_type or spec_type_setting(env_vars)
+    name = os.path.basename(d).lower()
+    if "mtp" in name or "dflash" in name or spec_type == "draft-dflash":
+        return d
+    return None
+
+
+def find_mtp_draft(main_path=None, spec_type=None):
+    """Locate the separate draft model for MTP / DFlash speculative decoding, or None.
+
+    1. An explicit LLAMA_MTP_DRAFT_PATH (or an MTP/DFlash LLAMA_DRAFT_MODEL_PATH, see
+       explicit_mtp_draft) ALWAYS wins; when it is set but missing, nothing is auto-picked.
+    2. Otherwise a sibling GGUF (model dir, then MODEL_DIR) is auto-picked only when it is a
+       draft for the active model: the model-name prefix matches, it is smaller than
+       DRAFT_MAX_FRACTION of the main model (a full "...-mtp.gguf" model is not a draft), and its
+       name matches the spec type -- "mtp" for draft-mtp, "dflash" for draft-dflash (an MTP file
+       is never auto-picked for DFlash: llama-server aborts with "DFlash model has no
+       target_layer_ids")."""
     env_vars = load_env()
     if not main_path:
         main_path = env_vars.get("LLAMA_MODEL_PATH") or os.environ.get("LLAMA_MODEL_PATH")
     if not main_path:
         return None
-    d = env_vars.get("LLAMA_MTP_DRAFT_PATH") or env_vars.get("LLAMA_DRAFT_MODEL_PATH") or os.environ.get("LLAMA_MTP_DRAFT_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH")
-    if d and os.path.exists(d) and "mtp" in os.path.basename(d).lower():
-        return d
+    spec_type = spec_type or spec_type_setting(env_vars)
+    d = explicit_mtp_draft(main_path, env_vars, spec_type)
+    if d:
+        if os.path.exists(d):
+            return d
+        print(f"[llama-wrapper] WARNING: configured draft {d} does not exist; no draft is attached "
+              f"(not auto-picking another file).", file=sys.stderr)
+        return None
 
+    marker = "dflash" if spec_type == "draft-dflash" else "mtp"
     main_base = os.path.basename(str(main_path)).lower()
     prefix = main_base.split("-")[0] if "-" in main_base else main_base.split(".")[0]
+    if not prefix or len(prefix) < 3:
+        return None
 
     candidates = []
-    if main_path:
-        main_dir = os.path.dirname(os.path.abspath(str(main_path)))
-        try:
-            for f in sorted(os.listdir(main_dir)):
-                if "mtp" in f.lower() and f.endswith(".gguf") and f.lower() != main_base:
-                    candidates.append(os.path.join(main_dir, f))
-        except Exception:
-            pass
-    if MODEL_DIR.exists() and (not main_path or str(MODEL_DIR) != os.path.dirname(os.path.abspath(str(main_path)))):
-        for p in sorted(MODEL_DIR.iterdir()):
-            if p.suffix == ".gguf" and "mtp" in p.name.lower() and p.name.lower() != main_base:
-                candidates.append(str(p))
+    main_dir = os.path.dirname(os.path.abspath(str(main_path)))
+    try:
+        for f in sorted(os.listdir(main_dir)):
+            candidates.append(os.path.join(main_dir, f))
+    except Exception:
+        pass
+    if MODEL_DIR.exists() and str(MODEL_DIR) != main_dir:
+        candidates += [str(p) for p in sorted(MODEL_DIR.iterdir())]
 
     for cand in candidates:
         cand_base = os.path.basename(cand).lower()
-        if prefix and len(prefix) >= 3 and prefix in cand_base:
+        if not cand_base.endswith(".gguf") or cand_base == main_base or marker not in cand_base:
+            continue
+        if marker == "mtp" and "dflash" in cand_base:
+            continue
+        if prefix in cand_base and _small_enough_for_draft(cand, main_path):
             return cand
     return None
 
@@ -1260,6 +1314,28 @@ def sync_gpu_to_systemd(cuda_dev):
     except Exception as e:
         print(f"Warning syncing systemd GPU config: {e}", file=sys.stderr)
 
+CACHE_RAM_LARGE_CTX = 65536     # ctx at/above which the prompt cache RAM gets a conservative cap
+CACHE_RAM_LARGE_CTX_MIB = 4096
+
+
+def resolve_cache_ram(env_vars, ctx_size):
+    """--cache-ram value (MiB) or None (llama.cpp default). LLAMA_CACHE_RAM wins when set (any
+    llama.cpp value: -1 unlimited, 0 off); else ctx >= CACHE_RAM_LARGE_CTX -> 4096."""
+    v = env_vars.get("LLAMA_CACHE_RAM", os.environ.get("LLAMA_CACHE_RAM", ""))
+    if v is not None and str(v).strip():
+        try:
+            return int(str(v).strip())
+        except ValueError:
+            print(f"[llama-wrapper] WARNING: ignoring LLAMA_CACHE_RAM={v!r} (not an integer MiB value).",
+                  file=sys.stderr)
+    try:
+        if int(ctx_size) >= CACHE_RAM_LARGE_CTX:
+            return CACHE_RAM_LARGE_CTX_MIB
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def cmd_serve(target=None, foreground=False):
     if target:
         cmd_use(target)
@@ -1293,7 +1369,8 @@ def cmd_serve(target=None, foreground=False):
         # it will be (correctly) ignored. Surface this so it's not puzzling why
         # speculative decoding is off.
         legacy_draft = env_vars.get("LLAMA_DRAFT_MODEL_PATH", os.environ.get("LLAMA_DRAFT_MODEL_PATH"))
-        if legacy_draft and not is_deepseek_model(model_path) and "mtp" not in legacy_draft.lower():
+        if legacy_draft and not is_deepseek_model(model_path) and legacy_draft != mtp_draft_path \
+                and "mtp" not in legacy_draft.lower():
             print(f"[llama-wrapper] NOTE: LLAMA_DRAFT_MODEL_PATH is set ({legacy_draft}) but the active "
                   f"model ({os.path.basename(model_path)}) is not DeepSeek — ignoring the dspark draft "
                   f"(it is DeepSeek V4-specific). Run `ai-backend draft off` to clear it.", file=sys.stderr)
@@ -1336,6 +1413,9 @@ def cmd_serve(target=None, foreground=False):
         spec_type = env_vars.get("LLAMA_SPEC_TYPE", os.environ.get("LLAMA_SPEC_TYPE", "draft-mtp"))
         spec_draft_n_max = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", os.environ.get("LLAMA_SPEC_DRAFT_N_MAX", "3"))
         extra_args.extend(["--spec-type", spec_type, "--spec-draft-n-max", str(spec_draft_n_max)])
+        if spec_type == "draft-dflash" and not mtp_draft_path:
+            print("[llama-wrapper] WARNING: LLAMA_SPEC_TYPE=draft-dflash but no DFlash draft is configured; set one "
+                  "with `ai-backend spec dflash <path>`.", file=sys.stderr)
         if mtp_draft_path:
             extra_args.extend(["-md", mtp_draft_path])
             print(f"[llama-wrapper] Enabling Multi-Token Prediction (MTP) with draft {os.path.basename(mtp_draft_path)} (spec-type={spec_type}, draft-n-max={spec_draft_n_max}).", file=sys.stderr)
@@ -1496,6 +1576,13 @@ def cmd_serve(target=None, foreground=False):
         "--cache-type-k", cache_type_k,
         "--cache-type-v", cache_type_v,
     ]
+    # Host-RAM prompt cache (llama.cpp --cache-ram, MiB). Its default (8192) let llama-server get
+    # SIGKILLed at ~94K tokens on Qwen3.8-27B while evicting a 3.6 GB entry; an explicit
+    # LLAMA_CACHE_RAM always wins, otherwise a large context gets a conservative cap.
+    cache_ram = resolve_cache_ram(env_vars, ctx_size)
+    if cache_ram is not None:
+        cmd.extend(["--cache-ram", str(cache_ram)])
+        print(f"[llama-wrapper] Prompt cache RAM cap: --cache-ram {cache_ram} MiB", file=sys.stderr)
     if use_mtp or draft_path or mtp_draft_path:
         cache_type_k_draft = env_vars.get("LLAMA_CACHE_TYPE_K_DRAFT", os.environ.get("LLAMA_CACHE_TYPE_K_DRAFT", cache_type_k))
         cache_type_v_draft = env_vars.get("LLAMA_CACHE_TYPE_V_DRAFT", os.environ.get("LLAMA_CACHE_TYPE_V_DRAFT", cache_type_v))
@@ -1952,6 +2039,9 @@ def cmd_draft(target=None):
     if not p.exists():
         print(f"Draft model not found: {p}", file=sys.stderr)
         sys.exit(1)
+    if "dflash" in p.name.lower():       # a DFlash draft is not a dspark draft
+        cmd_mtp("dflash", str(p))
+        return
     persist_env_changes({"LLAMA_DRAFT_MODEL_PATH": str(p)})
     print(f"Draft model set: {p}")
 
@@ -1963,7 +2053,8 @@ def cmd_mtp(target=None, extra=None, auto_restart=True):
         mtp = env_vars.get("LLAMA_MTP", "off")
         spec_n = env_vars.get("LLAMA_SPEC_DRAFT_N_MAX", "3")
         draft = env_vars.get("LLAMA_MTP_DRAFT_PATH") or find_mtp_draft()
-        print(f"MTP state: {mtp} (spec-draft-n-max: {spec_n}, draft: {draft or 'internal/auto'})")
+        print(f"MTP state: {mtp} (spec-type: {spec_type_setting(env_vars)}, spec-draft-n-max: {spec_n}, "
+              f"draft: {draft or 'internal/auto'})")
         return
     if target in ("off", "0", "disable", "clear", "unset"):
         persist_env_changes({"LLAMA_MTP": "0", "LLAMA_MTP_DRAFT_PATH": None}, auto_restart=auto_restart)
@@ -1978,11 +2069,22 @@ def cmd_mtp(target=None, extra=None, auto_restart=True):
             sys.exit(1)
         persist_env_changes({"LLAMA_MTP": "1", "LLAMA_MTP_DRAFT_PATH": str(p), "LLAMA_SPEC_TYPE": "draft-mtp"}, auto_restart=auto_restart)
         print(f"MTP draft model set: {p}")
+    elif target == "dflash":
+        if not extra:
+            print("Usage: ai-backend spec dflash <draft.gguf>", file=sys.stderr)
+            sys.exit(1)
+        p = Path(extra).expanduser().resolve()
+        if not p.exists():
+            print(f"DFlash draft file not found: {p}", file=sys.stderr)
+            sys.exit(1)
+        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_MTP_DRAFT_PATH": str(p), "LLAMA_SPEC_TYPE": "draft-dflash"},
+                            auto_restart=auto_restart)
+        print(f"DFlash speculative decoding enabled with draft {p} (spec-type=draft-dflash).")
     elif target.isdigit():
         persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_DRAFT_N_MAX": target, "LLAMA_SPEC_TYPE": "draft-mtp"}, auto_restart=auto_restart)
         print(f"MTP speculative tokens set to {target} (draft-n-max={target}).")
     else:
-        print("Usage: ai-backend mtp <on|off|1|2|3|draft <path>>", file=sys.stderr)
+        print("Usage: ai-backend mtp <on|off|1|2|3|draft <path>|dflash <path>>", file=sys.stderr)
 
 
 
@@ -2878,9 +2980,11 @@ Usage:
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
   ai-backend budget <tokens|off> [msg]  Set server-side reasoning token budget (e.g. 4096)
   ai-backend mtp <on|off|tokens|draft>  Configure Multi-Token Prediction speculative decoding
+  ai-backend spec dflash <draft.gguf>   DFlash speculative decoding (LLAMA_SPEC_TYPE=draft-dflash + that draft;
+                                         `spec off` disables; an explicit draft path always beats auto-detection)
   ai-backend probe [url]                 Streaming decode-speed A/B probe (dev/probe_mtp.py); baseline vs MTP
   ai-backend tune [model]                Auto-tune context, KV cache, and MTP draft tokens for max throughput
-  ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup
+  ai-backend draft <path|auto|off>      Set/clear the dspark draft model for speedup (a *DFlash* file -> spec dflash)
   ai-backend gpu-layers <n|auto>        Set or clear GPU offload layer count
   ai-backend gpus [all|<devs>|auto|split <p>]   Select GPUs (single vs multi-GPU split)
   ai-backend serve                      Run llama-server with auto context sizing
@@ -2894,6 +2998,7 @@ Examples:
   ai-backend use qwen3.8-2.4t           # use Qwen3.8-2.4T-A95B
   ai-backend mode thinking              # recommended Qwen3.8 thinking parameters
   ai-backend mtp on                     # enable MTP speculative decoding
+  ai-backend spec dflash ~/.local/share/ai/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf   # DFlash draft
   ai-backend ctx 262144                 # full 256K context for Qwen3.8
   ai-backend gpus all                   # spread a >1-GPU model across every card
 """)

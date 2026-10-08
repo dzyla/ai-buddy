@@ -6,7 +6,8 @@ the on-demand server, which rewrites ~/.local/share/ai/env. The root conftest th
     recorded attempt fails the session; AI_TEST_ALLOW_LIVE_PORTS=1 opts out explicitly;
   * points INFER_BASE_URL (environment and the scratch-HOME env file) at an unroutable
     http://127.0.0.1:9/v1/, so code that falls back to "the configured server" hits nothing;
-  * puts a no-op logging `systemctl` first on PATH, so no subprocess restarts a real unit.
+  * puts a no-op logging `systemctl` first on PATH, so no subprocess restarts a real unit;
+  * refuses (and records) os.kill of a llama-server/llama-proxy the run did not start.
 """
 import os
 import shutil
@@ -75,3 +76,35 @@ def test_zulip_debug_does_not_reach_the_live_server(tmp_path):
     n = len(log)
     ZulipMemoryManager(storage_dir=str(tmp_path / "z")).get_diagnostics()
     assert log[n:] == []
+
+
+def test_signals_to_a_foreign_llama_server_are_refused_and_recorded(monkeypatch, tmp_path):
+    """ai-backend's kill_llama_server() SIGKILLs every llama-server on the host; in a test run it
+    may only reach processes the run started itself."""
+    import signal
+    import sys
+    import time
+    monkeypatch.delenv("AI_TEST_ALLOW_LIVE_KILL", raising=False)
+    pidfile = tmp_path / "pid"
+    # double fork: the sleeper is reparented away from pytest, like a live server
+    subprocess.run(["sh", "-c", '%s -c "import time; time.sleep(30)" llama-server --model x & echo $! > %s'
+                    % (sys.executable, pidfile)], check=True)
+    for _ in range(50):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.05)
+    pid = int(pidfile.read_text())
+    log = os._ai_test_live_kill_violations
+    n = len(log)
+    try:
+        with pytest.raises(PermissionError):
+            os.kill(pid, signal.SIGKILL)
+        assert log[n:] and log[n][0] == pid
+        os.kill(pid, 0)                                    # still alive; probes are allowed
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "llama-server"])
+        os.kill(child.pid, signal.SIGKILL)                 # our own child: allowed
+        child.wait(5)
+    finally:
+        del log[n:]          # deliberate attempt: don't fail the session
+        monkeypatch.setenv("AI_TEST_ALLOW_LIVE_KILL", "1")
+        os.kill(pid, signal.SIGKILL)
