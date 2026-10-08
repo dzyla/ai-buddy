@@ -355,6 +355,15 @@ echo "==> Installed: ai  libremote_harness.so  ai_mcp.py  gcal.py  zulip_mcp_ser
 # zulip_ai_bridge.py is a shim over the zulip_bridge/ package (installed above, same lookup order).
 cp "${SCRIPT_DIR}/zulip_ai_bridge.py" "${BIN_DIR}/zulip_ai_bridge.py"
 chmod +x "${BIN_DIR}/zulip_ai_bridge.py"
+# The on-demand llama-server trigger proxy (llama-proxy.service runs ${BIN_DIR}/llama-proxy.py).
+# Staged + renamed so a starting proxy never reads a half-copied file; a running proxy keeps the
+# old code until you restart it: systemctl --user restart llama-proxy.service
+if [ -f "${SCRIPT_DIR}/services/llama-proxy.py" ]; then
+    cp "${SCRIPT_DIR}/services/llama-proxy.py" "${BIN_DIR}/.llama-proxy.py.new.$$"
+    chmod +x "${BIN_DIR}/.llama-proxy.py.new.$$"
+    mv -f "${BIN_DIR}/.llama-proxy.py.new.$$" "${BIN_DIR}/llama-proxy.py"
+    echo "==> Installed llama-proxy.py (a running llama-proxy.service is not restarted)"
+fi
 
 # ── 3. Python optional deps ───────────────────────────────────────────────────
 echo "==> Installing optional Python deps (curl-cffi, playwright-stealth)..."
