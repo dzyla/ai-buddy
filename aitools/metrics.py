@@ -25,7 +25,8 @@ def record_tool_metric(tool_name, duration_ms, out, crashed=False):
     return success, err
 
 
-def log_metric(tool_name, duration_ms, success=True, error=None):
+def log_metric(tool_name, duration_ms, success=True, error=None, extra=None):
+    """Append one metrics row; extra: further fields for the row (e.g. {"action": "salvaged"})."""
     if os.environ.get("INFER_PRIVATE_MODE") in ("1", "true"):
         return
     try:
@@ -40,6 +41,8 @@ def log_metric(tool_name, duration_ms, success=True, error=None):
         }
         if not success and error:
             entry["error"] = str(error)[:200]
+        for k, v in (extra or {}).items():
+            entry.setdefault(k, v)
         with open(metrics_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:

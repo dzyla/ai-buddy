@@ -27,7 +27,10 @@ The reply is controlled by env vars:
                         max_tokens like a broken server would): {"channel": "reasoning"|"content",
                         "prefix": str, "unit": str, "count": int, "vary": bool ("{i}" in unit is
                         replaced by the repeat index), "delay": secs per chunk, "chunk": chars per SSE
-                        event (default 4)}. A finished stream ends with finish_reason "length".
+                        event (default 4), "chunks_file": path of a recorded stream (chunks separated
+                        by \x1f, one SSE event each; replaces prefix/unit), "reasoning": str sent first,
+                        "toolcall_first": bool (a tool-call delta before the text)}. A finished stream
+                        ends with finish_reason "length".
   MOCK_DISCONNECTS    — file: one JSON line per runaway stream, {"req", "sent_chars", "closed"} where
                         closed=true means the client dropped the connection before the stream ended
 
@@ -308,18 +311,31 @@ class Handler(BaseHTTPRequestHandler):
             unit = spec.get("unit", "")
             for i in range(int(spec.get("count", 1000))):
                 yield unit.replace("{i}", str(i)) if spec.get("vary") else unit
+
+        def events():
+            if spec.get("chunks_file"):          # a recorded stream: one SSE event per chunk
+                with open(spec["chunks_file"], encoding="utf-8") as f:
+                    yield from f.read().split("\x1f")
+                return
+            for piece in text():
+                for j in range(0, len(piece), step):
+                    yield piece[j:j + step]
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             self._sse({"role": "assistant", "content": None})
-            for piece in text():
-                for j in range(0, len(piece), step):
-                    self._sse({key: piece[j:j + step]})
-                    self.wfile.flush()
-                    sent += len(piece[j:j + step])
-                    if delay:
-                        time.sleep(delay)
+            if spec.get("reasoning"):
+                self._sse({"reasoning_content": spec["reasoning"]})
+            if spec.get("toolcall_first"):       # a tool call delta before the looping text
+                self._sse({"tool_calls": [{"index": 0, "id": "call_loop_1", "type": "function",
+                                           "function": {"name": "list_directory", "arguments": "{}"}}]})
+            for ev in events():
+                self._sse({key: ev})
+                self.wfile.flush()
+                sent += len(ev)
+                if delay:
+                    time.sleep(delay)
             self._sse({}, finish="length")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()

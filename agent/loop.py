@@ -564,7 +564,7 @@ class Engine:
                     res = self.client.chat(self._wire(), self.tools, on_chunk=on_chunk, debug_tag=loop_count,
                                            guard=guard)
         if res.get("guard") and not res.get("interrupted") and not self.esc.is_set():
-            res = self._recover_runaway(res, loop_count, on_chunk, guard, t0)
+            res = self._salvage_final(res, t0) or self._recover_runaway(res, loop_count, on_chunk, guard, t0)
         res["elapsed"] = time.monotonic() - t0
         self.ch.send("status", s="response", reasoning=res["message"].get("reasoning_content") or "")
         return res
@@ -576,6 +576,27 @@ class Engine:
         # a server-side reasoning budget is enforced by the server; 2x it is the client backstop
         r_cap = 2 * o.reasoning_budget if o.reasoning_budget > 0 else 0
         return lambda: llm.RunawayGuard(o.step_max_tokens, o.repetition_guard, reasoning_max_tokens=r_cap)
+
+    def _salvage_final(self, res, t0):
+        """A final answer (content only, no tool call) that ran into a repetition loop after
+        answering: keep the content up to the end of the loop's first pass and finish the turn
+        as if the model had stopped there (no nudge, no retry). None when not applicable."""
+        trip = res["guard"]
+        msg = res.get("message") or {}
+        content = msg.get("content")
+        cut = trip.get("cut")
+        if (trip.get("kind") != "repetition" or trip.get("channel") != "content" or cut is None
+                or msg.get("tool_calls") or not isinstance(content, str)):
+            return None
+        kept = content[:cut].rstrip()
+        if not kept.strip():
+            return None
+        self._log_guard(trip, 1, t0, action="salvaged")
+        self.err("\n\033[1;33m[ai] runaway repetition in the final answer (%s); kept the answer before the loop "
+                 "(%d of %d chars).\033[0m\n" % (_describe_trip(trip), len(kept), len(content)))
+        res = dict(res, message=dict(msg, content=kept), finish_reason="stop", salvaged=dict(trip))
+        res.pop("guard", None)
+        return res
 
     def _recover_runaway(self, res, loop_count, on_chunk, guard, t0):
         """The stream was aborted (repetition loop or step token cap): drop the partial reply,
@@ -597,18 +618,20 @@ class Engine:
         if not res.get("guard") or res.get("interrupted") or self.esc.is_set():
             return res
         trip = res["guard"]
-        self._log_guard(trip, 2, t0)
+        self._log_guard(trip, 2, t0, action="ended_step")
         self.err("\n\033[1;31m[ai] runaway generation stopped again (%s); ending this step.\033[0m\n"
                  % _describe_trip(trip))
         self.messages.append({"role": "user", "content": RUNAWAY_FAILED % _describe_trip(trip)})
         return {"message": {"role": "assistant", "content": None}, "finish_reason": None, "usage": {},
                 "error": None, "interrupted": False, "status": 200, "runaway_failed": True}
 
-    def _log_guard(self, trip, attempt, t0):
+    def _log_guard(self, trip, attempt, t0, action="retry"):
         try:
             from aitools import metrics
-            metrics.log_metric("generation_guard", (time.monotonic() - t0) * 1000, success=False,
-                               error="%s attempt=%d" % (_describe_trip(trip), attempt))
+            metrics.log_metric("generation_guard", (time.monotonic() - t0) * 1000, success=action == "salvaged",
+                               error="%s attempt=%d" % (_describe_trip(trip), attempt),
+                               extra={"action": action, "detector": trip.get("detector") or trip.get("kind"),
+                                      "trip": _describe_trip(trip)})
         except Exception:
             pass
 
@@ -1198,6 +1221,9 @@ def _describe_trip(trip):
         return "step token cap of %d reached in %s" % (trip.get("limit", 0), trip.get("channel"))
     if trip.get("kind") == "reasoning_cap":
         return "reasoning token cap of %d (2x the reasoning budget) reached" % trip.get("limit", 0)
+    if trip.get("detector") == "recurrence":
+        return "repetition in %s, recurring lines (one x%d), ~%d tokens" % (
+            trip.get("channel"), trip.get("repeats", 0), trip.get("tokens", 0))
     return "repetition in %s, %d-char unit x%d, ~%d tokens" % (
         trip.get("channel"), trip.get("period", 0), trip.get("repeats", 0), trip.get("tokens", 0))
 

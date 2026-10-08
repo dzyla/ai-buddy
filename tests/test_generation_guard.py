@@ -93,6 +93,72 @@ def log_lines(n=500):
                    % (i // 60 % 60, i % 60, i % 4, i, 50 + i % 13, 3 + i % 17) for i in range(n))
 
 
+def readme_repeated_headings():
+    out = ["# rtool", "", "A small CLI for resizing and converting images in bulk.", ""]
+    topics = [("resize a folder", "rtool resize --width 800 photos/", "Every image is scaled to 800 px wide."),
+              ("convert to webp", "rtool convert --to webp photos/", "Originals are kept next to the output."),
+              ("strip metadata", "rtool strip photos/*.jpg", "EXIF and GPS tags are removed in place."),
+              ("dry run", "rtool resize --dry-run photos/", "Prints what would change without writing."),
+              ("parallel jobs", "rtool convert -j 8 --to png raw/", "Eight workers share the queue.")]
+    for title, cmd, note in topics:
+        out += ["## Example", "", "How to %s." % title, "", "```bash", cmd, "```", "", note,
+                "See the options table below for every flag.", ""]
+    out += ["## Options", "", "| flag | meaning |", "|---|---|", "| -j | jobs |", "| --dry-run | no writes |", ""]
+    return "\n".join(out)
+
+
+def similar_test_file():
+    names = ["header", "body", "footer", "empty", "unicode", "crlf", "tabs", "bom", "long_line", "nested",
+             "quoted", "escaped", "trailing_space", "comment", "blank_lines", "mixed_case"]
+    out = ['"""Tests for the config parser."""', "import pytest", "from app.config import parse, ParseError", ""]
+    for i, n in enumerate(names):
+        out += ["", "def test_parse_%s():" % n,
+                "    text = load_fixture(\"%s.ini\")" % n,
+                "    result = parse(text)",
+                "    assert result.ok, result.errors",
+                "    assert result.sections[0].name == \"%s\"" % n,
+                "    assert len(result.sections) == %d" % (1 + i % 3)]
+    return "\n".join(out) + "\n"
+
+
+def log_summary():
+    out = ["## Log summary for app.log (2,431 lines)", "",
+           "- 13 ERROR, 52 WARN, 2,366 INFO lines", "- First error at 12:03:11, last at 12:45:09", "",
+           "Error lines:", ""]
+    msgs = ["db: connection refused (pool exhausted)", "worker-3: job 4411 timed out after 30s",
+            "auth: token signature mismatch for client mobile"]
+    for i in range(13):
+        out.append("- 12:%02d:%02d ERROR %s" % (3 + 3 * i, (11 + 17 * i) % 60, msgs[i % 3]))
+    out += ["", "Most errors come from the database pool; raising pool_size from 10 to 25 should fix them.",
+            "The auth failures all come from one client version and stopped after the 12:30 deploy."]
+    return "\n".join(out) + "\n"
+
+
+def changelog():
+    items = ["crash when the config file is empty", "wrong exit code on network errors",
+             "progress bar flicker on narrow terminals", "slow startup with many plugins",
+             "unicode file names on Windows", "memory leak in the watcher", "race in the job queue",
+             "help text for the --jobs flag", "timezone handling in the scheduler", "duplicate log lines"]
+    out = ["# Changelog", ""]
+    for v in range(8):
+        out += ["## [1.%d.0] - 2026-0%d-01" % (8 - v, 1 + v), "", "### Fixed"]
+        out += ["- Fixed %s (#%d)" % (items[(v * 3 + j) % len(items)], 400 - v * 10 - j) for j in range(4)]
+        out += ["", "### Added", "- Added option %d for the exporter" % (20 - v), ""]
+    return "\n".join(out)
+
+
+def service_report():
+    svc = ["nginx", "postgres", "redis", "worker", "scheduler", "api-gateway", "auth", "billing", "search",
+           "mailer"]
+    desc = ["serves static assets and proxies the API", "primary database, nightly backups configured",
+            "cache for sessions and rate limits", "runs the import queue", "cron-style scheduler for reports",
+            "routes external traffic and terminates TLS", "issues tokens and handles password resets",
+            "payment webhooks and invoice generation", "full-text index for the catalog",
+            "sends transactional email via the SMTP relay"]
+    return "Status of every service on the host:\n\n" + "".join(
+        "### %s\n- Status: running\n- Restart policy: always\n- Notes: %s\n\n" % (n, d) for n, d in zip(svc, desc))
+
+
 LEGIT = {
     "python_file": python_file_300,
     "markdown_table": markdown_table,
@@ -108,6 +174,13 @@ LEGIT = {
     "templated_paragraph": lambda: ("Section notes: this part of the report is intentionally left as a placeholder "
                                     "until the measurements are in; see the appendix for the method.\n\n") * 4,
     "html_td_rows": lambda: "```html\n<table>\n" + "  <tr><td>0</td><td>pending</td></tr>\n" * 300 + "</table>\n```\n",
+    # recurrence detector: recurring lines in legitimate documents
+    "readme_repeated_headings": readme_repeated_headings,
+    "test_file_unfenced": similar_test_file,
+    "test_file_fenced": lambda: "```python\n" + similar_test_file() + "```\n",
+    "log_summary": log_summary,
+    "changelog": changelog,
+    "service_report": service_report,
 }
 
 
@@ -366,3 +439,92 @@ def test_truncated_tool_call_is_not_executed(tmp_path, engine):
         assert "cut off at the token limit and was NOT executed" in tool_msgs[cid], tool_msgs[cid]
     assert "NOT executed" not in tool_msgs["c1"]
     assert "cut off" in r.stderr
+
+
+# ── recurrence: a drifting loop in a final answer (recorded from Ornith-1.5-35B-A3B) ──
+# The model answered correctly, then kept re-answering for 113 K chars: "[Source: ...]" pairs,
+# "## Sources / - app.log / - count.txt" blocks and reworded "The task is complete" / "I'll end my
+# turn now" paragraphs -- never one exact unit back to back, so only recurrence catches it.
+ORNITH = os.path.join(HERE, "fixtures", "ornith_final_answer_loop.tokens")   # content chunks, \x1f-separated
+ORNITH_LOOP_START = 664      # the first "[Source: ...]" pair ends here; everything after it re-answers
+
+
+def ornith_chunks():
+    with open(ORNITH, encoding="utf-8") as f:
+        return f.read().split("\x1f")
+
+
+def test_recorded_final_answer_loop_trips_early_with_a_cut_after_the_answer():
+    chunks = ornith_chunks()
+    text = "".join(chunks)
+    assert len(text) > 100000
+    g = llm.RunawayGuard(max_tokens=0)
+    used = 0
+    for c in chunks:                         # the recorded token boundaries
+        used += len(c)
+        trip = g.observe("content", c)
+        if trip:
+            break
+    assert trip and trip["kind"] == "repetition" and trip["detector"] == "recurrence", trip
+    assert used - ORNITH_LOOP_START <= 4096, used        # within ~1 KB of the loop in practice
+    assert trip["cut"] == ORNITH_LOOP_START
+    kept = text[:trip["cut"]]
+    assert "13 ERROR lines" in kept and "count.txt" in kept and kept.count("[Source:") == 2
+
+
+def test_recorded_loop_without_the_source_lines_still_trips():
+    """The same stream minus its exact "[Source: ...]" lines: only the reworded paragraphs and the
+    recurring "## Sources" block remain."""
+    text = "".join(ln for ln in "".join(ornith_chunks()).splitlines(True) if not ln.startswith("[Source"))
+    g = llm.RunawayGuard(max_tokens=0)
+    trip, used = feed(g, text, "content", step=3)
+    assert trip and trip["detector"] == "recurrence", trip
+    assert used <= 8192, used
+    kept = text[:trip["cut"]]
+    assert "13" in kept and "count.txt" in kept and kept.count("## Sources") == 1
+
+
+def test_recurrence_in_reasoning_trips_too():
+    g = llm.RunawayGuard(max_tokens=0)
+    trip, used = feed(g, "".join(ornith_chunks()), "reasoning", step=5)
+    assert trip and trip["channel"] == "reasoning" and used <= 8192
+
+
+def test_recurrence_ignores_fenced_code_and_tool_arguments():
+    text = "".join(ornith_chunks())[:20000]
+    g = llm.RunawayGuard(max_tokens=0)
+    assert feed(g, "```text\n" + text + "\n```\n", "content", step=5)[0] is None
+    g = llm.RunawayGuard(max_tokens=0)
+    assert feed(g, json.dumps({"path": "out.md", "content": text}), "args0", step=5)[0] is None
+
+
+def _ornith_run(tmp_path, toolcall_first=False):
+    spec = {"channel": "content", "chunks_file": ORNITH, "toolcall_first": toolcall_first, "delay": 0,
+            "reasoning": "The count is 13, and count.txt contains 13. Task done.\n"}
+    return _run(tmp_path, [spec])
+
+
+def test_looping_final_answer_is_salvaged_not_retried(tmp_path):
+    r, reqs, discs, elapsed = _ornith_run(tmp_path)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert len(reqs) == 1, [q["messages"][-1] for q in reqs]          # no nudge, no retry
+    assert discs and discs[0]["closed"] is True and discs[0]["sent_chars"] < 20000, discs
+    assert "kept the answer before the loop" in r.stderr
+    assert "retrying" not in r.stderr
+    sess = json.loads((tmp_path / "home" / ".cache" / "ai" / "sessions" / "last.json").read_text())
+    final = [m for m in sess if m.get("role") == "assistant"][-1]["content"]
+    assert "13" in final and "count.txt" in final and final.count("[Source:") == 2, final
+    assert len(final) <= ORNITH_LOOP_START
+    assert not any("stuck repeating" in json.dumps(m) for m in sess if isinstance(m, dict))
+    metrics = tmp_path / "home" / ".cache" / "ai" / "metrics.jsonl"
+    rows = [json.loads(x) for x in metrics.read_text().splitlines()]
+    row = [x for x in rows if x.get("tool") == "generation_guard"][-1]
+    assert row["action"] == "salvaged" and row["detector"] == "recurrence" and row["success"] is True, row
+
+
+def test_looping_reply_with_a_tool_call_is_still_retried(tmp_path):
+    r, reqs, discs, _ = _ornith_run(tmp_path, toolcall_first=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert len(reqs) == 2 and discs[0]["closed"]
+    assert "stuck repeating itself" in reqs[1]["messages"][-1]["content"]
+    assert "kept the answer" not in r.stderr
