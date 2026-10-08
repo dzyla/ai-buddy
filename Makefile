@@ -15,7 +15,7 @@ $(SHARED_LIB): remote_harness.c remote_harness.h cJSON.c
 	$(CC) $(CFLAGS) -shared -o $@ remote_harness.c cJSON.c $(LDFLAGS)
 
 $(TARGET): $(SRCS) $(HDRS) $(SHARED_LIB)
-	$(CC) $(CFLAGS) -o $@ $(SRCS) -L. -Wl,--no-as-needed -lremote_harness -Wl,-rpath,. -Wl,-rpath,$(HOME)/.local/lib $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) -L. -Wl,--no-as-needed -lremote_harness -Wl,-rpath,. -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(HOME)/.local/lib $(LDFLAGS)
 
 # CI build: clean rebuild of the library, the binary and the harness test with -Werror
 # (the sources are kept warning-free under -Wall -Wextra; tests/test_build.py checks it).

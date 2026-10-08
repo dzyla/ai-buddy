@@ -238,7 +238,11 @@ enum { EX_OK = 0, EX_NOT_SENT = 1, EX_LOST = 2, EX_INTERRUPTED = 3, EX_DEADLINE 
  * the connection was reset before any answer byte. On AF_UNIX a reset means the server closed
  * with our request still unread in its receive queue (a dying listener's backlog, or a server
  * killed before reading); a server that read the line and then died gives EOF instead.
- * EX_LOST: the request was consumed and no answer came: the call may have run. */
+ * EX_LOST: the request was consumed and no answer came: the call may have run.
+ * Invariants the no-resend rule relies on (aitools/server.py _Handler.handle keeps the server side):
+ * one request per connection; no client write after the newline; the server reads the whole line
+ * before dispatching (readline, no size limit); Linux AF_UNIX semantics (closing a socket with
+ * unread data resets the peer, a close after reading gives EOF). */
 static int tc_exchange(int fd, const char *req, int timeout_s, char **line)
 {
     *line = NULL;
@@ -288,6 +292,7 @@ static const char *tc_str(cJSON *o, const char *k)
 
 /* Answers the server gives BEFORE running anything (aitools/server.py REFUSALS): only these,
  * a failed connect and an unsent request may fall back to popen. */
+/* Mirrors aitools/server.py REFUSALS (tests/test_list_drift.py keeps them equal). */
 static int tc_refusal(const char *err)
 {
     static const char *refusals[] = {"stale", "mismatch", "unsupported", "bad request"};

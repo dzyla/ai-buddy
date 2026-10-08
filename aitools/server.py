@@ -64,6 +64,7 @@ MCP_CALL_TIMEOUT = 60.0
 DRAIN_ENV_KEYS = ("INFER_EMBED_AUTODRAIN", "AI_STATE_DB", "AI_EMBED_URL", "AI_EMBED_MODEL", "AI_EMBED_BIN",
                   "HOME", "PATH", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME")
 # Errors answered BEFORE anything ran; the client may fall back to the subprocess path only on these.
+# Mirrored in ai_toolclient.c tc_refusal(); tests/test_list_drift.py keeps them equal.
 REFUSALS = ("stale", "mismatch", "unsupported", "bad request")  # call-tool's tools/call wait (mcp_client.call_tool)
 PKG_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -391,6 +392,14 @@ class _Handler(socketserver.StreamRequestHandler):
         app = self.server.app
         if not app.peer_ok(self.connection):
             return
+        # No-resend safety (ai_toolclient.c falls back to popen only when nothing can have run)
+        # relies on these invariants; keep them when changing this loop:
+        #  - one request per connection: the client sends one buffer (request + "\n"), writes
+        #    nothing after the newline, reads one answer line and closes;
+        #  - the full line is consumed BEFORE dispatch (readline without a size limit), so a server
+        #    that died after reading gives the client EOF ("may have run"), while one that died
+        #    with the request unread gives a reset on Linux AF_UNIX ("never ran", safe fallback);
+        #  - an unterminated line (client died mid-send) is never executed.
         for line in iter(self.rfile.readline, b""):
             if not line.endswith(b"\n"):
                 return  # a request cut off by a dying client is never executed

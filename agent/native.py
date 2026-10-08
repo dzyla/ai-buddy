@@ -20,6 +20,7 @@ SYSTEM_WARNING_TIMEOUT = ("\n[SYSTEM WARNING: Command timed out after %d seconds
                           "intrinsically slow.]\n")
 
 # Tools that change persistent state (need approval in manual / unapproved-plan mode).
+# Mirrored in ai.c tool_is_mutating()/tool_is_readonly(); tests/test_list_drift.py keeps them equal.
 MUTATING = frozenset((
     "execute_command", "execute_remote_command", "remote_exec",
     "write_file", "edit_file", "patch_file", "save_memory", "remember",
@@ -221,8 +222,13 @@ def run_shell(cmd, timeout, interrupted, log):
         kill_tree(p.pid)
 
     fd = p.stdout.fileno()
+    eof = False
     try:
         while True:
+            # After stdout EOF keep honouring the timeout and the interrupt until the shell exits:
+            # a command may close its stdout and keep running (`exec >&-; sleep 30`).
+            if eof and p.poll() is not None:
+                break
             if timeout > 0 and time.time() - t0 > timeout:
                 _kill()
                 buf += (SYSTEM_WARNING_TIMEOUT % timeout).encode()
@@ -234,11 +240,15 @@ def run_shell(cmd, timeout, interrupted, log):
                 status = 130
                 log("\n\033[1;31m[ai] Tool execution interrupted by ESC key.\033[0m\n")
                 break
+            if eof:
+                time.sleep(0.05)
+                continue
             r, _, _ = select.select([fd], [], [], 0.1)
             if r:
                 chunk = os.read(fd, 65536)
                 if not chunk:
-                    break
+                    eof = True
+                    continue
                 buf += chunk
     finally:
         try:

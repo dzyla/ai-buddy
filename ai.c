@@ -1121,7 +1121,8 @@ static int prompt_user_ok(const char *title, const char *detail) {
 }
 
 /* True if a tool changes persistent state and therefore needs approval
-   in manual or unapproved-plan mode. Read-only investigation tools return 0. */
+   in manual or unapproved-plan mode. Read-only investigation tools return 0.
+   Mirrored in agent/native.py MUTATING/READONLY; tests/test_list_drift.py keeps them equal. */
 static int tool_is_mutating(const char *name) {
     if (!name) return 0;
     static const char *mut[] = {
@@ -2776,6 +2777,32 @@ static void kill_command_subprocess(void) {
     }
 }
 
+/* Children of this task (/proc/self/task/<tid>/children): fills up to `cap` pids, returns the count. */
+static int list_own_children(pid_t *out, int cap) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/children", getpid(), getpid());
+    FILE *cf = fopen(path, "r");
+    int n = 0;
+    if (!cf) return 0;
+    pid_t child;
+    while (n < cap && fscanf(cf, "%d", &child) == 1) out[n++] = child;
+    fclose(cf);
+    return n;
+}
+
+/* The one child that is in `after` but not in `before` (the popen() shell), else 0 (unknown). */
+static pid_t new_child(const pid_t *before, int nb, const pid_t *after, int na) {
+    pid_t found = 0;
+    for (int i = 0; i < na; i++) {
+        int seen = 0;
+        for (int j = 0; j < nb && !seen; j++) seen = (after[i] == before[j]);
+        if (seen) continue;
+        if (found) return 0; /* more than one new child (an orphan reparented meanwhile): unknown */
+        found = after[i];
+    }
+    return found;
+}
+
 static char* run_shell_command_timeout(const char *cmd, int *exit_status, int timeout_sec) {
     int started_raw = 0;
     if (!raw_mode_active && isatty(STDIN_FILENO)) {
@@ -2783,12 +2810,19 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
         started_raw = 1;
     }
 
+    pid_t kids_before[256], kids_after[256];
+    int nb = list_own_children(kids_before, 256);
     FILE *fp = popen(cmd, "r");
     if (!fp) {
         if (started_raw) disable_raw_mode();
         if (exit_status) *exit_status = -1;
         return strdup("Error: failed to run command");
     }
+    /* The shell's pid lets the loop keep honouring the timeout and ESC after stdout EOF: a
+       command can close its stdout and keep running (`exec >&-; sleep 30`), and pclose() alone
+       would then wait for it unboundedly. 0 = unknown: fall back to pclose() at EOF. */
+    pid_t sh_pid = new_child(kids_before, nb, kids_after, list_own_children(kids_after, 256));
+    int pipe_eof = 0;
     
     int pipe_fd = fileno(fp);
     int fd_flags = fcntl(pipe_fd, F_GETFL, 0);
@@ -2808,6 +2842,13 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
     time_t start_time = time(NULL);
     int interrupted = 0;
     while (1) {
+        if (pipe_eof) {
+            /* stdout is closed; wait (bounded) for the shell to exit without reaping it (pclose does) */
+            siginfo_t si;
+            memset(&si, 0, sizeof(si));
+            if (waitid(P_PID, (id_t)sh_pid, &si, WEXITED | WNOHANG | WNOWAIT) != 0 || si.si_pid != 0)
+                break;
+        }
         if (timeout_sec > 0 && time(NULL) - start_time > timeout_sec) {
             interrupted = 2;
             kill_command_subprocess();
@@ -2832,7 +2873,7 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
 
         fd_set fds;
         FD_ZERO(&fds);
-        FD_SET(pipe_fd, &fds);
+        if (!pipe_eof) FD_SET(pipe_fd, &fds);
         if (raw_mode_active) {
             FD_SET(STDIN_FILENO, &fds);
         }
@@ -2864,7 +2905,7 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
         }
 
         // Read from pipe
-        if (FD_ISSET(pipe_fd, &fds)) {
+        if (!pipe_eof && FD_ISSET(pipe_fd, &fds)) {
             char tmp[1024];
             ssize_t n = read(pipe_fd, tmp, sizeof(tmp) - 1);
             if (n > 0) {
@@ -2885,7 +2926,8 @@ static char* run_shell_command_timeout(const char *cmd, int *exit_status, int ti
                 len += n;
                 buf[len] = '\0';
             } else if (n == 0) {
-                break; // EOF
+                if (sh_pid <= 0) break; // EOF, shell pid unknown: pclose() below
+                pipe_eof = 1;           // EOF: keep the timeout/ESC checks until the shell exits
             } else {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     break;
