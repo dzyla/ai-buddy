@@ -8,7 +8,7 @@ import subprocess
 
 from .config import load_env_file
 from .runner import run_ai_subprocess, extract_session_fallback
-from .text import clean_response
+from .text import clean_response, clean_stderr
 
 logger = logging.getLogger("ZulipBridge")
 
@@ -172,10 +172,12 @@ class MessageHandlerMixin:
             else:
                 if raw_stdout.strip():
                     response_text = clean_response(raw_stdout)
-                    if raw_stderr.strip():
-                        response_text += f"\n\n*Stderr:*\n```\n{raw_stderr.strip()}\n```"
+                    shown_err = clean_stderr(raw_stderr)
+                    if shown_err:
+                        response_text += f"\n\n*Stderr:*\n```\n{shown_err}\n```"
                 else:
-                    response_text = f"⚠️ Agent returned error (exit code {exit_code}):\n```\n{raw_stderr.strip()}\n```" if raw_stderr.strip() else ""
+                    shown_err = clean_stderr(raw_stderr)
+                    response_text = f"⚠️ Agent returned error (exit code {exit_code}):\n```\n{shown_err}\n```" if shown_err else ""
 
             if not response_text:
                 fallback_text, fallback_status, reasoning_snip = extract_session_fallback(

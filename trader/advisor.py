@@ -316,6 +316,14 @@ class AgentAdvisor:
                 timeout=timeout_sec,
                 env=env
             )
+            if res.returncode != 0:
+                # the agent failed (e.g. the model server is down: `ai` exits 1 with one error line);
+                # whatever it printed is not a briefing -> callers use the deterministic fallback
+                err = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", res.stderr or "")
+                lines = [x.strip() for x in err.splitlines()
+                         if x.strip() and "session ended" not in x and "deprecated" not in x]
+                why = next((x for x in lines if x.startswith("[ai]")), lines[-1] if lines else "")
+                return f"(AI Agent invocation error: exit {res.returncode}: {why[:300]})"
             out = res.stdout.strip()
             if out:
                 out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()

@@ -1441,3 +1441,31 @@ def test_check_placeholder_zuliprc_is_not_configured(check_env):
     assert rc == 1
     assert "not configured" in out and "placeholder" in out
     assert "Credentials: bot email" not in out
+
+
+def test_error_stderr_shown_in_zulip_is_clean(monkeypatch):
+    """A failed run's stderr goes to the chat without ANSI escapes or the
+    "session ended · resume" / "[thinking]..." chatter."""
+    from unittest.mock import patch
+    from zulip_ai_bridge import ZulipAiBridge
+    from zulip_bridge.text import clean_stderr
+
+    monkeypatch.delenv("BRIDGE_AI_MODE", raising=False)
+    client = _ModeClient()
+    bridge = ZulipAiBridge(client=client)
+    err = ("\x1b[2m[thinking]...\x1b[0m\r\x1b[2K\x1b[1;31m[ai] model server unavailable (HTTP 503): model will "
+           "not fit in VRAM; check `ai-backend status`.\x1b[0m\n\x1b[2m  session ended · resume: ai -r sess_1\x1b[0m\n")
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = err
+        return R()
+
+    with patch("zulip_ai_bridge.run_ai_subprocess", side_effect=fake_run):
+        bridge._process_message({"type": "private", "sender_email": "owner@example.com", "content": "hi"}, "hi")
+    sent = client.last_sent["content"]
+    assert "model will not fit in VRAM" in sent and "exit code 1" in sent
+    assert "\x1b" not in sent and "session ended" not in sent and "[thinking]" not in sent
+    assert clean_stderr("") == ""

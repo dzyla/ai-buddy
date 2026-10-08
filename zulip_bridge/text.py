@@ -52,3 +52,19 @@ def clean_response(text):
     # Join wrapped lines in prose while preserving code & tables
     clean = normalize_text(clean)
     return clean.strip()
+
+
+_ANSI = re.compile(r'\x1b(?:\[[0-9;?]*[a-zA-Z]|\]\d*;[^\x07]*\x07|[@-Z\\-_])')
+# stderr chatter of `ai` that means nothing in a chat reply
+_STDERR_NOISE = ("session ended \u00b7 resume", "session ended · resume", "[thinking]...")
+
+
+def clean_stderr(text):
+    """`ai` stderr for a Zulip message: no ANSI escapes / carriage returns, no
+    "session ended · resume: ai -r ..." or "[thinking]..." lines."""
+    if not text:
+        return ""
+    clean = _ANSI.sub("", text).replace("\r", "\n")
+    lines = [ln.rstrip() for ln in clean.splitlines()]
+    lines = [ln for ln in lines if ln.strip() and not any(n in ln for n in _STDERR_NOISE)]
+    return "\n".join(lines).strip()
