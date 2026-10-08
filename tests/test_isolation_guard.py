@@ -86,20 +86,25 @@ def test_signals_to_a_foreign_llama_server_are_refused_and_recorded(monkeypatch,
     import time
     monkeypatch.delenv("AI_TEST_ALLOW_LIVE_KILL", raising=False)
     pidfile = tmp_path / "pid"
-    # double fork: the sleeper is reparented away from pytest, like a live server
-    subprocess.run(["sh", "-c", '%s -c "import time; time.sleep(30)" llama-server --model x & echo $! > %s'
-                    % (sys.executable, pidfile)], check=True)
-    for _ in range(50):
+    # setsid -f: the sleeper runs in its own session/process group, reparented away from pytest
+    # (like a live server); it writes its own pid once it runs there.
+    code = "import os, time; open(%r, 'w').write(str(os.getpid())); time.sleep(30)" % str(pidfile)
+    subprocess.run(["setsid", "-f", sys.executable, "-c", code, "llama-server", "--model", "x"], check=True)
+    for _ in range(100):
         if pidfile.exists() and pidfile.read_text().strip():
             break
         time.sleep(0.05)
     pid = int(pidfile.read_text())
+    # never let a broken guard turn the killpg below into SIGKILL of the test run's own group
+    assert os.getpgid(pid) == pid != os.getpgid(0)
     log = os._ai_test_live_kill_violations
     n = len(log)
     try:
         with pytest.raises(PermissionError):
             os.kill(pid, signal.SIGKILL)
         assert log[n:] and log[n][0] == pid
+        with pytest.raises(PermissionError):
+            os.killpg(pid, signal.SIGKILL)
         os.kill(pid, 0)                                    # still alive; probes are allowed
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "llama-server"])
         os.kill(child.pid, signal.SIGKILL)                 # our own child: allowed

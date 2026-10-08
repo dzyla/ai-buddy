@@ -368,6 +368,13 @@ def apply_model_path(model_path):
         except Exception as e:
             print(f"Warning updating systemd service: {e}", file=sys.stderr)
 
+    # A speculative draft belongs to one model family: a draft whose name prefix does not match
+    # the new main model would be attached to it by the next serve (explicit drafts always win).
+    draft = load_env().get("LLAMA_MTP_DRAFT_PATH")
+    if draft and _model_prefix(draft) != _model_prefix(model_path):
+        print(f"Note: clearing LLAMA_MTP_DRAFT_PATH={draft} (a draft for another model).", file=sys.stderr)
+        persist_env_changes({"LLAMA_MTP_DRAFT_PATH": None}, auto_restart=False)
+
     write_env(f"http://localhost:{PORT}/v1/", "llama", str(model_path))
     print(f"Switched active backend to llama-server (http://localhost:{PORT}/v1/)")
     print(f"Active Model: {model_path}")
@@ -970,6 +977,15 @@ def _small_enough_for_draft(cand, main_path):
     return main_gb > 0 and 0 < cand_gb < main_gb * DRAFT_MAX_FRACTION
 
 
+def _model_prefix(path):
+    base = os.path.basename(str(path)).lower()
+    return base.split("-")[0] if "-" in base else base.split(".")[0]
+
+
+def _is_dflash(path):
+    return "dflash" in os.path.basename(str(path)).lower()
+
+
 def explicit_mtp_draft(main_path=None, env_vars=None, spec_type=None):
     """The configured MTP/DFlash draft path (exists or not), or None.
 
@@ -977,7 +993,13 @@ def explicit_mtp_draft(main_path=None, env_vars=None, spec_type=None):
     non-DeepSeek main model when it is not a dspark file and either names itself an MTP/DFlash
     draft or LLAMA_SPEC_TYPE is draft-dflash."""
     env_vars = load_env() if env_vars is None else env_vars
+    spec_type = spec_type or spec_type_setting(env_vars)
     d = env_vars.get("LLAMA_MTP_DRAFT_PATH") or os.environ.get("LLAMA_MTP_DRAFT_PATH")
+    if d and spec_type == "draft-mtp" and _is_dflash(d):
+        # a stale DFlash draft left behind by `spec dflash` must not ride along with draft-mtp
+        print(f"[llama-wrapper] WARNING: ignoring LLAMA_MTP_DRAFT_PATH={d}: a DFlash draft with "
+              f"LLAMA_SPEC_TYPE=draft-mtp (run `ai-backend spec dflash <path>` to use it).", file=sys.stderr)
+        return None
     if d:
         return d
     d = env_vars.get("LLAMA_DRAFT_MODEL_PATH") or os.environ.get("LLAMA_DRAFT_MODEL_PATH")
@@ -985,7 +1007,8 @@ def explicit_mtp_draft(main_path=None, env_vars=None, spec_type=None):
         return None
     if main_path and is_deepseek_model(main_path):
         return None
-    spec_type = spec_type or spec_type_setting(env_vars)
+    if spec_type == "draft-mtp" and _is_dflash(d):
+        return None
     name = os.path.basename(d).lower()
     if "mtp" in name or "dflash" in name or spec_type == "draft-dflash":
         return d
@@ -1019,7 +1042,7 @@ def find_mtp_draft(main_path=None, spec_type=None):
 
     marker = "dflash" if spec_type == "draft-dflash" else "mtp"
     main_base = os.path.basename(str(main_path)).lower()
-    prefix = main_base.split("-")[0] if "-" in main_base else main_base.split(".")[0]
+    prefix = _model_prefix(main_path)
     if not prefix or len(prefix) < 3:
         return None
 
@@ -2046,6 +2069,15 @@ def cmd_draft(target=None):
     print(f"Draft model set: {p}")
 
 
+def _drop_dflash_draft():
+    """Switching to draft-mtp: a DFlash LLAMA_MTP_DRAFT_PATH left by `spec dflash` is removed."""
+    d = load_env().get("LLAMA_MTP_DRAFT_PATH")
+    if d and _is_dflash(d):
+        print(f"Note: clearing the DFlash draft {d} (MTP uses its own heads or an MTP draft).")
+        return {"LLAMA_MTP_DRAFT_PATH": None}
+    return {}
+
+
 def cmd_mtp(target=None, extra=None, auto_restart=True):
     """Set, clear, or report MTP (Multi-Token Prediction) speculative decoding."""
     if target is None:
@@ -2060,7 +2092,8 @@ def cmd_mtp(target=None, extra=None, auto_restart=True):
         persist_env_changes({"LLAMA_MTP": "0", "LLAMA_MTP_DRAFT_PATH": None}, auto_restart=auto_restart)
         print("MTP speculative decoding disabled.")
     elif target in ("on", "enable"):
-        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_TYPE": "draft-mtp"}, auto_restart=auto_restart)
+        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_TYPE": "draft-mtp", **_drop_dflash_draft()},
+                            auto_restart=auto_restart)
         print("MTP speculative decoding enabled (spec-type=draft-mtp).")
     elif target == "draft" and extra:
         p = Path(extra).expanduser().resolve()
@@ -2081,7 +2114,8 @@ def cmd_mtp(target=None, extra=None, auto_restart=True):
                             auto_restart=auto_restart)
         print(f"DFlash speculative decoding enabled with draft {p} (spec-type=draft-dflash).")
     elif target.isdigit():
-        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_DRAFT_N_MAX": target, "LLAMA_SPEC_TYPE": "draft-mtp"}, auto_restart=auto_restart)
+        persist_env_changes({"LLAMA_MTP": "1", "LLAMA_SPEC_DRAFT_N_MAX": target, "LLAMA_SPEC_TYPE": "draft-mtp",
+                             **_drop_dflash_draft()}, auto_restart=auto_restart)
         print(f"MTP speculative tokens set to {target} (draft-n-max={target}).")
     else:
         print("Usage: ai-backend mtp <on|off|1|2|3|draft <path>|dflash <path>>", file=sys.stderr)

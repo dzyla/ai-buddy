@@ -212,15 +212,16 @@ def find_loop(tail, counter=False):
     Some 40..512-char unit repeated >= 8 times back to back at the very end (exact text), unless the
     unit is data (table/CSV/matrix rows) or itself a tiny pattern; a fully periodic 4 KB window
     (any unit, data excluded) also counts. counter=True: `tail` is digit-normalised, so only
-    letter-heavy units count (a counting loop, not a log or a table)."""
+    letter-heavy units of at most two lines count (a counting loop, not a log, a table or a
+    numbered "Step N" template)."""
     n = len(tail)
     for p in range(GUARD_MIN_PERIOD, min(GUARD_MAX_PERIOD, n // GUARD_REPEATS) + 1):
         if _periodic(tail, p):
             unit = tail[-p:]
             if _min_period(unit) < GUARD_MIN_UNIT_PERIOD or _unit_is_data(tail, p):
                 continue
-            if counter and _letter_ratio(unit) < GUARD_PROSE_LETTERS:
-                continue
+            if counter and (_letter_ratio(unit) < GUARD_PROSE_LETTERS or unit.count("\n") > 2):
+                continue        # counter loops are short thoughts; a numbered multi-line block is a template
             return p, GUARD_REPEATS
     if n >= GUARD_WINDOW and not counter:
         for p in range(1, 1025):
@@ -249,30 +250,44 @@ _DIGITS = str.maketrans("0123456789", "0000000000")
 
 
 def _recur_key(line):
-    """The normalised form of a prose line for the recurrence check, or None when the line does
-    not count: short (< 8 chars), a single word, data (table/CSV), indented or ending like code
-    (``:;{}(,=\\``), a fence, or a rule / ornament (< 4 letters). Lowercase, whitespace
-    collapsed, digits -> 0."""
+    """The normalised form of a prose line for the recurrence check: a key (lowercase,
+    whitespace collapsed, digits -> 0), "" for a minor line (short or a single word -- a
+    "**file.py**" or "Step 3" header: never a recurring key, but it counts as a line, unique or
+    not), or None when the line does not count at all: data (table/CSV), indented or ending like
+    code (``:;{}(,=\\``), a fence, or a rule / ornament (< 2 letters)."""
     s = line.strip()
-    if len(s) < 8 or line[:1] in " \t" or s.startswith(("```", "~~~")) or sum(c.isalpha() for c in s) < 4:
+    if len(s) < 3 or line[:1] in " \t" or s.startswith(("```", "~~~")) or sum(c.isalpha() for c in s) < 2:
         return None
     if s[-1] in ":;{}(,=\\" or data_like(s):
         return None
     k = " ".join(s.lower().split())
-    return k.translate(_DIGITS) if " " in k else None
+    if len(s) < 8 or sum(c.isalpha() for c in s) < 4 or " " not in k:
+        return ""
+    return k.translate(_DIGITS)
+
+
+def _template(js, seq, raw_n):
+    """The occurrences js of a recurring line are a template, not a loop: evenly spaced, and
+    every gap holds at least one unique line (an item's own name/header)."""
+    gaps = {b - a for a, b in zip(js, js[1:])}
+    if len(gaps) != 1:
+        return False
+    return all(any(raw_n[seq[j][1]] == 1 for j in range(a + 1, b)) for a, b in zip(js, js[1:]))
 
 
 def find_recurrence(text, in_fence=False, at_start=True):
-    """A drifting loop in prose `text` (a channel's last ~16 KB): (cut, count) or None.
+    """A drifting loop in prose `text` (a channel's last ~16 KB): (cut, count, first) or None.
 
     Lines are normalised (_recur_key); fenced code, the partial first line (unless at_start) and
     the unfinished last line are skipped, and a run of identical adjacent lines counts once.
     Runaway when one line recurs >= GUARD_RECUR_COUNT times as true repeats (not only after
     digit normalisation: a log excerpt with varying timestamps does not count) and at most
-    GUARD_RECUR_UNIQUE of the lines from its first use on are unique, exactly (a templated report has
-    a unique name per item; a loop only rewords), or when >= GUARD_RECUR_LINES lines hold at
-    most GUARD_RECUR_DISTINCT distinct ones (exact, not digit-normalised). cut: offset in `text` of the second occurrence of
-    the earliest line that recurs >= 3 times -- the loop's first pass ends there."""
+    GUARD_RECUR_UNIQUE of the lines from its first use on are unique, exactly (a loop only
+    rewords), or when >= GUARD_RECUR_LINES lines hold at most GUARD_RECUR_DISTINCT distinct
+    ones (exact, not digit-normalised). A templated report -- the recurring lines evenly spaced
+    with a unique line (the item's name) in every gap -- is exempt (_template). first / cut:
+    offsets in `text` of the first / second occurrence of the earliest line that recurs >= 3
+    times -- the loop's first pass ends at cut."""
     lines = text.split("\n")
     pos, seq, prev, fence = 0, [], None, in_fence
     for i, ln in enumerate(lines[:-1]):
@@ -295,7 +310,8 @@ def find_recurrence(text, in_fence=False, at_start=True):
         return None
     occ, raw_n = {}, {}
     for j, (k, raw, start) in enumerate(seq):
-        occ.setdefault(k, []).append(j)
+        if k:
+            occ.setdefault(k, []).append(j)
         raw_n[raw] = raw_n.get(raw, 0) + 1
     hit = None
     for k, js in occ.items():
@@ -308,16 +324,20 @@ def find_recurrence(text, in_fence=False, at_start=True):
             continue
         span = seq[js[0]:]
         unique = sum(1 for _, raw, _ in span if raw_n[raw] == 1)
-        if unique <= GUARD_RECUR_UNIQUE * len(span):
+        if unique <= GUARD_RECUR_UNIQUE * len(span) and not _template(js, seq, raw_n):
             hit = len(js)
             break
     if hit is None and len(seq) >= GUARD_RECUR_LINES \
-            and len({raw for _, raw, _ in seq}) <= GUARD_RECUR_DISTINCT * len(seq):
+            and len({raw for _, raw, _ in seq}) <= GUARD_RECUR_DISTINCT * len(seq) \
+            and not all(_template(js, seq, raw_n) for js in occ.values() if len(js) >= 3):
         hit = max(len(js) for js in occ.values())
     if hit is None:
         return None
-    seconds = [js[1] for js in occ.values() if len(js) >= 3]
-    return (seq[min(seconds)][2] if seconds else None), hit
+    rec = [js for js in occ.values() if len(js) >= 3]
+    if not rec:
+        return None, hit, None
+    js = min(rec, key=lambda x: x[1])
+    return seq[js[1]][2], hit, seq[js[0]][2]
 
 
 def _loop_cut(tail, p):
@@ -350,8 +370,8 @@ class RunawayGuard:
     max(text events, chars / 4): llama.cpp streams ~one token per event, a batching server is
     counted by size. max_tokens / reasoning_max_tokens <= 0 disable the caps; repetition=False the
     loop detector. A repetition trip also names its "detector" (loop | same_lines | recurrence)
-    and "cut": the channel offset where the loop's first pass ends (None when unknown), so a
-    looping final answer can be kept up to there."""
+    and "cut" / "first": the channel offsets where the loop's first pass ends / begins (None when
+    unknown), so a looping final answer can be kept up to the cut."""
 
     def __init__(self, max_tokens=0, repetition=True, reasoning_max_tokens=0):
         self.max_tokens = max_tokens
@@ -415,23 +435,26 @@ class RunawayGuard:
             rec = find_recurrence(long_tail, in_fence=open_at_start, at_start=total == len(long_tail))
             if rec:
                 base = total - len(long_tail)
-                hit = (0, rec[1], False, "recurrence", rec[0])
+                hit = (0, rec[1], False, "recurrence", rec[0], rec[2])
         if hit:
             self.tripped = {"kind": "repetition", "channel": channel, "tokens": self.tokens,
                             "period": hit[0], "repeats": hit[1], "counter": hit[2], "detector": hit[3],
-                            "cut": base + hit[4] if hit[4] is not None else None}
+                            "cut": base + hit[4] if hit[4] is not None else None,
+                            "first": base + hit[5] if hit[5] is not None else None}
         return self.tripped
 
     @staticmethod
     def _check(tail, counter):
-        """(period, repeats, counter, detector, cut-in-tail or None) or None."""
+        """(period, repeats, counter, detector, cut, first) or None; cut / first (offsets in
+        tail, or None): where the loop's first pass ends / begins."""
         hit = find_loop(tail, counter=counter)
         if hit:
             cut = _loop_cut(tail, hit[0]) if hit[1] == GUARD_REPEATS else None
-            return hit[0], hit[1], counter, "loop", cut
+            return hit[0], hit[1], counter, "loop", cut, (cut - hit[0] if cut is not None else None)
         if same_lines(tail, counter=counter):
-            return (len(tail[:tail.rfind("\n")].rsplit("\n", 1)[-1]) + 1, GUARD_SAME_LINES, counter,
-                    "same_lines", _same_lines_cut(tail))
+            cut = _same_lines_cut(tail)
+            period = len(tail[:tail.rfind("\n")].rsplit("\n", 1)[-1]) + 1
+            return period, GUARD_SAME_LINES, counter, "same_lines", cut, (cut - period if cut is not None else None)
         return None
 
 

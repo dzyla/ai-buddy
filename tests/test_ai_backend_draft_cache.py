@@ -73,10 +73,18 @@ def test_explicit_dflash_draft_wins_over_an_mtp_sibling(env):
 def test_explicit_draft_wins_even_for_draft_mtp_without_mtp_in_the_name(env):
     ab = env["ab"]
     small = _gguf(env["models"] / "Qwen3.8-27B-MTP-draft.gguf", 1)      # an auto-detectable alternative
-    _set(ab, LLAMA_MODEL_PATH=env["main"], LLAMA_SPEC_TYPE="draft-mtp", LLAMA_MTP_DRAFT_PATH=env["dflash"])
-    assert ab.find_mtp_draft(env["main"]) == env["dflash"]
+    plain = _gguf(env["models"] / "Qwen3.8-27B-draft-Q8_0.gguf", 1)
+    _set(ab, LLAMA_MODEL_PATH=env["main"], LLAMA_SPEC_TYPE="draft-mtp", LLAMA_MTP_DRAFT_PATH=plain)
+    assert ab.find_mtp_draft(env["main"]) == plain
     _set(ab, LLAMA_MTP_DRAFT_PATH=None)
     assert ab.find_mtp_draft(env["main"]) == small
+
+
+def test_dflash_draft_is_ignored_under_draft_mtp(env, capsys):
+    ab = env["ab"]
+    _set(ab, LLAMA_MODEL_PATH=env["main"], LLAMA_SPEC_TYPE="draft-mtp", LLAMA_MTP_DRAFT_PATH=env["dflash"])
+    assert ab.find_mtp_draft(env["main"]) is None
+    assert "ignoring LLAMA_MTP_DRAFT_PATH" in capsys.readouterr().err
 
 
 def test_dflash_never_auto_picks_an_mtp_file(env):
@@ -149,10 +157,12 @@ def serve(env, monkeypatch):
     monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
 
     def run(**kv):
-        _set(ab, LLAMA_MODEL_PATH=env["main"], **kv)
+        kv.setdefault("LLAMA_MODEL_PATH", ab.load_env().get("LLAMA_MODEL_PATH") or env["main"])
+        _set(ab, **kv)
         with pytest.raises(SystemExit):
             ab.cmd_serve()
         return captured["cmd"]
+    run.captured = captured
     return run
 
 
@@ -180,3 +190,52 @@ def test_serve_cache_ram_absent_for_small_ctx(serve):
 def test_serve_cache_ram_explicit_value_wins(serve, value):
     assert _after(serve(LLAMA_CTX_SIZE="131072", LLAMA_CACHE_RAM=value), "--cache-ram") == value
     assert _after(serve(LLAMA_CTX_SIZE="8192", LLAMA_CACHE_RAM=value), "--cache-ram") == value
+
+
+# ── switching back from DFlash to built-in MTP (owner's files and sizes) ────
+GB = 1 << 30
+
+
+@pytest.mark.parametrize("switch", ["on", "3"])
+def test_switch_back_from_dflash_to_builtin_mtp(env, serve, monkeypatch, capsys, switch):
+    ab = env["ab"]
+    models = env["models"]
+    for f in models.iterdir():
+        f.unlink()
+    iq2 = _gguf(models / "Qwen3.8-27B-IQ2_XXS.gguf", 8.9 * 1024)
+    builtin_mtp = _gguf(models / "Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf", 11.6 * 1024)
+    dflash = _gguf(models / "Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1.2 * 1024)
+    monkeypatch.setattr(ab, "apply_sampling_profile", lambda *a, **k: None)
+    monkeypatch.setattr(ab, "SYSTEMD_SERVICE", models.parent / "no.service")
+
+    ab.apply_model_path(iq2)
+    ab.cmd_mtp("dflash", dflash, auto_restart=False)
+    cmd = serve()
+    assert _after(cmd, "-md") == os.path.realpath(dflash) and _after(cmd, "--spec-type") == "draft-dflash"
+
+    ab.apply_model_path(builtin_mtp)                 # same family: the draft path survives `use`
+    ab.cmd_mtp(switch, auto_restart=False)          # ... but `spec on` / a digit drops the DFlash draft
+    assert "LLAMA_MTP_DRAFT_PATH" not in ab.load_env()
+    cmd = serve()
+    assert _after(cmd, "--model") == os.path.realpath(builtin_mtp)
+    assert _after(cmd, "--spec-type") == "draft-mtp"
+    assert "-md" not in cmd and not any("DFlash" in str(a) for a in cmd), cmd
+
+
+def test_stale_dflash_path_with_draft_mtp_is_not_attached(env, serve):
+    """Belt and braces: even with the key left in the env file, draft-mtp never attaches a DFlash file."""
+    cmd = serve(LLAMA_MTP="1", LLAMA_SPEC_TYPE="draft-mtp", LLAMA_MTP_DRAFT_PATH=env["dflash"],
+                LLAMA_CTX_SIZE="32768")
+    assert _after(cmd, "--spec-type") == "draft-mtp" and "-md" not in cmd
+
+
+def test_use_clears_a_draft_of_another_model_family(env, monkeypatch, capsys):
+    ab = env["ab"]
+    monkeypatch.setattr(ab, "apply_sampling_profile", lambda *a, **k: None)
+    monkeypatch.setattr(ab, "SYSTEMD_SERVICE", env["models"].parent / "no.service")
+    gemma = _gguf(env["models"] / "Gemma4-31B-Q4_K_M.gguf", 20)
+    ab.apply_model_path(env["main"])
+    ab.cmd_mtp("dflash", env["dflash"], auto_restart=False)
+    ab.apply_model_path(gemma)
+    assert "LLAMA_MTP_DRAFT_PATH" not in ab.load_env()
+    assert "a draft for another model" in capsys.readouterr().err

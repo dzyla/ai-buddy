@@ -584,12 +584,16 @@ class Engine:
         trip = res["guard"]
         msg = res.get("message") or {}
         content = msg.get("content")
-        cut = trip.get("cut")
+        cut, first = trip.get("cut"), trip.get("first")
         if (trip.get("kind") != "repetition" or trip.get("channel") != "content" or cut is None
-                or msg.get("tool_calls") or not isinstance(content, str)):
+                or first is None or msg.get("tool_calls") or not isinstance(content, str)):
             return None
+        # Only a real answer is kept: substantive text (>= SALVAGE_MIN_CHARS, at least one complete
+        # paragraph) before the loop's first pass, not ending in a lead-in ("I'll write it now:").
+        # Anything less -- "Let me check each file." + a loop -- is retried, not taken as final.
+        before = content[:first].strip()
         kept = content[:cut].rstrip()
-        if not kept.strip():
+        if len(before) < SALVAGE_MIN_CHARS or "\n\n" not in before or kept.endswith(":"):
             return None
         self._log_guard(trip, 1, t0, action="salvaged")
         self.err("\n\033[1;33m[ai] runaway repetition in the final answer (%s); kept the answer before the loop "
@@ -1186,6 +1190,7 @@ class Engine:
 
 
 RUNAWAY_PRESENCE = 1.5     # presence_penalty floor for the retry after a runaway abort
+SALVAGE_MIN_CHARS = 200    # answer text needed before a looping final reply's first pass to keep it
 RUNAWAY_STEP_CAP = 3       # consecutive doubly-aborted steps before the task is stopped
 RUNAWAY_NUDGE = ("Your previous reply got stuck repeating itself. Reply now with the next tool call or "
                  "task_complete; keep reasoning brief.")

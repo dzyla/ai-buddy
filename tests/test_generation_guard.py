@@ -159,6 +159,9 @@ def service_report():
         "### %s\n- Status: running\n- Restart policy: always\n- Notes: %s\n\n" % (n, d) for n, d in zip(svc, desc))
 
 
+SERVICES = ["auth", "billing", "search", "mailer", "gateway", "cache", "queue", "indexer", "scheduler", "exporter"]
+
+
 LEGIT = {
     "python_file": python_file_300,
     "markdown_table": markdown_table,
@@ -181,6 +184,13 @@ LEGIT = {
     "log_summary": log_summary,
     "changelog": changelog,
     "service_report": service_report,
+    # review: >= 6-item reports with a >= 3-line boilerplate template (single-token item headers)
+    "service_template": lambda: "".join("### Service %s\nStatus: OK and healthy\nLatency within budget\n"
+                                        "No errors in logs\n\n" % n for n in SERVICES),
+    "module_template": lambda: "".join("**module%d.py**\n- Lint: passed cleanly\n- Tests: all passing\n"
+                                       "- Types: no errors found\n\n" % i for i in range(12)),
+    "step_template": lambda: "".join("Step %d\nRan the command successfully\nOutput matched expectation\n\n"
+                                     % (i + 1) for i in range(12)),
 }
 
 
@@ -498,10 +508,52 @@ def test_recurrence_ignores_fenced_code_and_tool_arguments():
     assert feed(g, json.dumps({"path": "out.md", "content": text}), "args0", step=5)[0] is None
 
 
+@pytest.mark.parametrize("name", ["service_template", "module_template", "step_template"])
+def test_templated_final_answer_is_not_cut(name):
+    """Templated reports alone as the whole answer (no prose around them), both channels."""
+    for channel in ("content", "reasoning"):
+        g = llm.RunawayGuard(max_tokens=0)
+        assert feed(g, LEGIT[name](), channel)[0] is None, (name, channel)
+
+
 def _ornith_run(tmp_path, toolcall_first=False):
     spec = {"channel": "content", "chunks_file": ORNITH, "toolcall_first": toolcall_first, "delay": 0,
             "reasoning": "The count is 13, and count.txt contains 13. Task done.\n"}
     return _run(tmp_path, [spec])
+
+
+def drifting_loop(n=600, seed=3):
+    """A reworded loop: one recurring line at irregular gaps among a few rotating phrasings."""
+    rnd = random.Random(seed)
+    pool = ["The value looks fine, so the next file is the one to check.",
+            "Nothing wrong there either; moving on to the next file now.",
+            "That file is fine as well, I will continue with the others.",
+            "No issue found in this one, continuing with the remaining files."]
+    out = []
+    for _ in range(n):
+        out.append("Checking the configuration file for the service again.")
+        out += [rnd.choice(pool) for _ in range(rnd.randint(1, 3))]
+    return "\n".join(out) + "\n"
+
+
+# a loop with no real answer before it is not a final answer: abort -> nudge -> retry
+NON_ANSWERS = {
+    "lead_in_then_line_loop": {"channel": "content", "prefix": "I'll write the config now:\n",
+                               "unit": "The config sets the port and the host for the web service.\n",
+                               "count": 2000, "delay": 0.0005},
+    "short_intro_then_recurrence": {"channel": "content", "prefix": "Let me check each file.\n" + drifting_loop(),
+                                    "unit": "", "count": 0, "delay": 0.0005},
+}
+
+
+@pytest.mark.parametrize("name", sorted(NON_ANSWERS))
+def test_loop_without_a_real_answer_is_retried_not_salvaged(tmp_path, name):
+    r, reqs, discs, _ = _run(tmp_path, [NON_ANSWERS[name]])
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert discs and discs[0]["closed"], discs
+    assert len(reqs) == 2, [q["messages"][-1] for q in reqs]
+    assert "stuck repeating itself" in reqs[1]["messages"][-1]["content"]
+    assert "kept the answer" not in r.stderr
 
 
 def test_looping_final_answer_is_salvaged_not_retried(tmp_path):

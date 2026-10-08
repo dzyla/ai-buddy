@@ -144,26 +144,52 @@ def _descendant_of_us(pid):
 
 
 def _install_live_kill_guard():
-    """Refuse in-process signals to a llama-server/llama-proxy the test run did not start:
+    """Refuse in-process signals (os.kill, os.killpg) to a llama-server/llama-proxy the test run did not start:
     ai-backend's kill_llama_server() SIGKILLs every llama-server on the host (the developer's live
     one included) when a serve test forgets to stub it."""
     violations = os._ai_test_live_kill_violations = []
-    orig_kill = os.kill
+    orig_kill, orig_killpg = os.kill, os.killpg
 
-    def kill(pid, sig):
-        if sig != 0 and isinstance(pid, int) and pid > 1 and pid != os.getpid() \
-                and os.environ.get("AI_TEST_ALLOW_LIVE_KILL") != "1":
-            try:
-                with open("/proc/%d/cmdline" % pid, "rb") as f:
-                    cmdline = f.read().decode("utf-8", "replace")
-            except OSError:
-                cmdline = ""
+    def _cmdline(pid):
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _check(pids, sig, what):
+        if sig == 0 or os.environ.get("AI_TEST_ALLOW_LIVE_KILL") == "1":
+            return
+        for pid in pids:
+            if pid <= 1 or pid == os.getpid():
+                continue
+            cmdline = _cmdline(pid)
             if ("llama-server" in cmdline or "llama-proxy" in cmdline) and not _descendant_of_us(pid):
                 violations.append((pid, cmdline.replace("\0", " ")[:120], os.environ.get("PYTEST_CURRENT_TEST", "?")))
-                raise PermissionError(1, "test isolation: refusing to signal live process %d" % pid)
+                raise PermissionError(1, "test isolation: refusing to %s live process %d" % (what, pid))
+
+    def _group(pgid):
+        members = []
+        for d in os.listdir("/proc"):
+            if d.isdigit():
+                try:
+                    if os.getpgid(int(d)) == pgid:
+                        members.append(int(d))
+                except OSError:
+                    pass
+        return members
+
+    def kill(pid, sig):
+        if isinstance(pid, int):
+            _check([pid] if pid > 0 else (_group(-pid) if pid < -1 else []), sig, "signal")
         return orig_kill(pid, sig)
 
-    os.kill = kill
+    def killpg(pgid, sig):
+        if isinstance(pgid, int) and pgid > 1:
+            _check(_group(pgid), sig, "signal the process group of")
+        return orig_killpg(pgid, sig)
+
+    os.kill, os.killpg = kill, killpg
 
 
 _GUARD_ON = os.environ.get("AI_TEST_HOME_GUARD", "1") != "0"
