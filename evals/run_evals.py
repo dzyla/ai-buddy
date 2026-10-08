@@ -13,7 +13,8 @@ workdir with an isolated HOME, then is scored by the task's checks:
 Any check takes "not": true to invert it.
 
 Task file fields: id, prompt, checks, optional files {relpath: content} (workdir), home_files
-{relpath: content} (eval HOME), env {VAR: value}, timeout (s), and mock {"steps": [...],
+{relpath: content} (eval HOME), env {VAR: value}, timeout (s; default per tier on live runs: easy
+300, medium 600, hard 1800; 60 with --mock; all scaled by --timeout-scale), and mock {"steps": [...],
 "final": "..."}. A mock step is {"tool", "args"[, "expect_error": true]} or a list of them
 (parallel calls in one turn); "final" becomes the task_complete summary.
 
@@ -43,6 +44,13 @@ medium = 2-4 steps or recovery, hard = multi-file reasoning, debugging, long con
 printed after the table. --repeat N runs every task N times and reports pass@1 (mean pass rate).
 Tokens come from the session's usage records when present, else ~chars/4 of the session (marked ~).
 
+Progress: one line per task as it finishes ("[i/N] PASS id  steps=S  12.3s"). A failed task's
+temp dir is kept and its line lists the artifacts: stdout.txt / stderr.txt (full), session.json
+(the saved conversation, when the run got that far) and debug/last_request.json +
+debug/last_response.raw (the last request payload and the raw streamed reply, written by the
+engine via INFER_DEBUG_DIR as it arrives, so a timed-out stall still shows what the model was
+generating).
+
 Optional task field `generate`: [{"kind", "path", ...}] writes seeded synthetic files into the
 workdir at setup (see evals/generators.py), for inputs too big to embed in the task JSON.
 """
@@ -69,6 +77,9 @@ TASKS_DIR = os.path.join(HERE, "tasks")
 AI_BIN = os.path.join(REPO, "ai")
 MOCK_SERVER = os.path.join(REPO, "tests", "mock_llm_server.py")
 TIERS = ("easy", "medium", "hard")
+# Live default timeouts per tier (s): thinking models at long context need far more than 300 s.
+TIER_TIMEOUTS = {"easy": 300, "medium": 600, "hard": 1800}
+MOCK_TIMEOUT = 60
 CHECK_TYPES = ("answer_contains", "file_exists", "file_contains", "tool_used", "max_steps",
                "tool_result_contains")
 _STATE_RE = re.compile(r"^\[CURRENT STATE step \d+\] \S+ -> (\w+)")
@@ -234,6 +245,34 @@ class MockServer:
 
 
 # ── running one task ─────────────────────────────────────────────────────────
+def task_timeout(task, live, scale=1.0):
+    """Seconds a task may run: its own `timeout`, else the tier default (live) / 60 s (--mock),
+    times --timeout-scale."""
+    base = task.get("timeout")
+    if base is None:
+        base = TIER_TIMEOUTS.get(task.get("tier"), TIER_TIMEOUTS["easy"]) if live else MOCK_TIMEOUT
+    return max(1, int(round(float(base) * scale)))
+
+
+def _save_artifacts(root, home, out, err):
+    """Keep what is needed to diagnose a failed run; -> {name: path} of the files that exist."""
+    art = {}
+    for name, text in (("stdout", out), ("stderr", err)):
+        p = os.path.join(root, name + ".txt")
+        with open(p, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text or "")
+        art[name] = p
+    sess = os.path.join(home, ".cache", "ai", "sessions", "last.json")
+    if os.path.exists(sess):
+        art["session"] = os.path.join(root, "session.json")
+        shutil.copyfile(sess, art["session"])
+    for name, fn in (("last_request", "last_request.json"), ("last_response", "last_response.raw")):
+        p = os.path.join(root, "debug", fn)
+        if os.path.exists(p):
+            art[name] = p
+    return art
+
+
 def _run_ai(cmd, cwd, env, timeout):
     """Run `ai` in its own process group so a timeout kills the whole tree."""
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
@@ -387,8 +426,9 @@ def run_check(check, ctx):
     return ok, label, detail
 
 
-def run_task(task, endpoint, engine, keep=False):
-    """endpoint: (base_url, model, api_key) or None for --mock."""
+def run_task(task, endpoint, engine, keep=False, timeout_scale=1.0):
+    """endpoint: (base_url, model, api_key) or None for --mock. A failed task's temp dir is kept
+    (result["kept"]) with its artifacts (result["artifacts"])."""
     root = tempfile.mkdtemp(prefix="ai_eval_%s_" % task["id"])
     work, home = os.path.join(root, "work"), os.path.join(root, "home")
     os.makedirs(work)
@@ -410,18 +450,20 @@ def run_task(task, endpoint, engine, keep=False):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(text)
-    timeout = int(task.get("timeout", 300 if endpoint else 60))
+    timeout = task_timeout(task, endpoint is not None, timeout_scale)
     cmd = [AI_BIN, "-y", task["prompt"]]
     t0 = time.time()
     capture = os.path.join(root, "requests.jsonl")
+    debug = {"INFER_DEBUG_DIR": os.path.join(root, "debug")}
+    failed = True
     try:
         if endpoint is None:
             with MockServer(task, capture) as srv:
-                env = agent_env(home, srv.base_url, "mock", "mock", engine, task.get("env"))
+                env = agent_env(home, srv.base_url, "mock", "mock", engine, dict(task.get("env") or {}, **debug))
                 env["INFER_TOOL_CHOICE"] = "auto"
                 timed_out, rc, out, err = _run_ai(cmd, work, env, timeout)
         else:
-            env = agent_env(home, *endpoint, engine=engine, extra=task.get("env"))
+            env = agent_env(home, *endpoint, engine=engine, extra=dict(task.get("env") or {}, **debug))
             timed_out, rc, out, err = _run_ai(cmd, work, env, timeout)
         session = _session(home)
         tools = _tool_names(session)
@@ -443,20 +485,39 @@ def run_task(task, endpoint, engine, keep=False):
         if endpoint is None and session is not None:
             checks.extend(_mock_error_checks(task, results))
         passed = bool(checks) and all(ok for ok, _, _ in checks)
+        failed = not passed
         tokens, tokens_est = session_tokens(session)
         wall = round(time.time() - t0, 2)
-        return {"id": task["id"], "tier": task.get("tier", "?"), "passed": passed, "steps": steps,
+        extra = {}
+        if failed:
+            extra = {"kept": root, "artifacts": _save_artifacts(root, home, out, err), "exit_code": rc,
+                     "timeout_s": timeout}
+        return dict({"id": task["id"], "tier": task.get("tier", "?"), "passed": passed, "steps": steps,
                 "duration_s": wall, "wall_time_s": wall, "tokens": tokens,
                 "tokens_estimated": tokens_est, "tools": tools,
                 "tool_errors": [c[-300:] for _, _, c in results if tool_result_is_error(c)],
                 "answer": ctx["answer"][:500],
                 "checks": [{"ok": bool(ok), "check": label, "detail": str(detail)}
-                           for ok, label, detail in checks]}
+                           for ok, label, detail in checks]}, **extra)
     finally:
         if keep:
             print("kept %s: %s" % (task["id"], root), file=sys.stderr)
-        else:
+        elif not failed:
             shutil.rmtree(root, ignore_errors=True)
+
+
+def progress_line(i, n, r):
+    """One line per finished task, plus where a failure's artifacts are."""
+    line = "[%d/%d] %s %s  steps=%d  %.1fs" % (i, n, "PASS" if r["passed"] else "FAIL", r["id"], r["steps"],
+                                             r["duration_s"])
+    if not r["passed"]:
+        bad = [c for c in r["checks"] if not c["ok"]]
+        if bad:
+            line += "  (%s: %s)" % (bad[0]["check"], bad[0]["detail"][:80].replace("\n", " "))
+        if r.get("kept"):
+            line += "\n      artifacts: %s" % r["kept"]
+            line += "".join("\n        %-13s %s" % (k, p) for k, p in (r.get("artifacts") or {}).items())
+    return line
 
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -521,7 +582,10 @@ def main(argv=None):
                     help="tasks run in parallel (default: 4 with --mock, 1 otherwise)")
     ap.add_argument("--min-pass", type=float, default=None,
                     help="exit 1 below this pass %% (default: 100 with --mock, 0 otherwise)")
-    ap.add_argument("--keep", action="store_true", help="keep the temp workdirs")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep every temp workdir (failed tasks' are always kept)")
+    ap.add_argument("--timeout-scale", type=float, default=1.0,
+                    help="multiply every task timeout (tier defaults: easy 300, medium 600, hard 1800 s)")
     ap.add_argument("--retrieval", action="store_true",
                     help="run the search_memory retrieval eval (evals/retrieval/) instead of the agent tasks")
     ap.add_argument("--fake", action="store_true",
@@ -548,8 +612,9 @@ def main(argv=None):
             return 2
     tiers = [x.strip() for x in args.tier.split(",") if x.strip()]
     bad = [x for x in tiers if x not in TIERS]
-    if bad or args.repeat < 1:
-        print("ERROR: --tier takes %s and --repeat must be >= 1" % ",".join(TIERS), file=sys.stderr)
+    if bad or args.repeat < 1 or args.timeout_scale <= 0:
+        print("ERROR: --tier takes %s, --repeat must be >= 1 and --timeout-scale > 0" % ",".join(TIERS),
+              file=sys.stderr)
         return 2
     tasks = load_tasks([x.strip() for x in args.only.split(",") if x.strip()], args.tasks_dir,
                        tiers)
@@ -557,9 +622,15 @@ def main(argv=None):
         print("ERROR: no tasks selected", file=sys.stderr)
         return 2
     jobs = args.jobs or (4 if args.mock else 1)
+    runs = [t for t in tasks for _ in range(args.repeat)]
+    results = [None] * len(runs)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        results = list(pool.map(lambda t: run_task(t, endpoint, args.engine, args.keep),
-                                [t for t in tasks for _ in range(args.repeat)]))
+        futs = {pool.submit(run_task, t, endpoint, args.engine, args.keep, args.timeout_scale): i
+                for i, t in enumerate(runs)}
+        for done, fut in enumerate(concurrent.futures.as_completed(futs), 1):
+            results[futs[fut]] = r = fut.result()
+            print(progress_line(done, len(runs), r), flush=True)
+    print()
     seen = {}
     for r in results:
         seen[r["id"]] = r["run"] = seen.get(r["id"], 0) + 1

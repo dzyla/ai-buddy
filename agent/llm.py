@@ -11,6 +11,10 @@ failure_line(res, url) -> the one-line error the engine prints for such a result
 Fail fast: a local server that refuses connections is waited for INFER_SERVER_WAIT seconds
 (default 30, a server that is still starting up); a streaming request that gets no byte for
 INFER_FIRST_BYTE_TIMEOUT seconds (default 300, 0 = no limit) is abandoned, not retried.
+
+INFER_DEBUG_DIR=<dir>: every chat request overwrites <dir>/last_request.json (the payload) and
+<dir>/last_response.raw (the HTTP status line, then the raw response bytes, flushed as they
+arrive, so a run killed mid-stream still leaves the partial stream). Used by evals/run_evals.py.
 """
 import http.client
 import json
@@ -591,21 +595,25 @@ class Client:
         conn, path = self._open(self.api_url, timeout=fbt if fbt > 0 else None)
         with self._lock:
             self._conn = conn
+        raw_log = _debug_files(body)
         try:
             conn.request("POST", path, body=body, headers={
                 "Content-Type": "application/json", "Authorization": "Bearer %s" % self.api_key})
             r = conn.getresponse()
+            _debug_write(raw_log, b"HTTP %d\n" % r.status)
             err = None
             if stream and r.status < 400:
                 while True:
                     chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
                     if not chunk:
                         break
+                    _debug_write(raw_log, chunk)
                     acc.feed(chunk)
                     if self._interrupted or acc.tripped:
                         break
             else:
                 data = r.read()
+                _debug_write(raw_log, data)
                 acc.raw += data
                 if r.status >= 400:
                     err = _error_message(data)
@@ -616,6 +624,31 @@ class Client:
             with self._lock:
                 self._conn = None
             conn.close()
+            if raw_log is not None:
+                raw_log.close()
+
+
+def _debug_files(body):
+    """INFER_DEBUG_DIR: write last_request.json, return last_response.raw opened for writing."""
+    d = os.environ.get("INFER_DEBUG_DIR")
+    if not d:
+        return None
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "last_request.json"), "wb") as f:
+            f.write(body)
+        return open(os.path.join(d, "last_response.raw"), "wb")
+    except OSError:
+        return None
+
+
+def _debug_write(f, data):
+    if f is not None:
+        try:
+            f.write(data)
+            f.flush()
+        except OSError:
+            pass
 
 
 def _error_message(data):

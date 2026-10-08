@@ -404,3 +404,93 @@ def test_session_tokens(rev):
                                                                          "completion_tokens": 1}}]) == (10, False)
     tok, est = rev.session_tokens([{"role": "user", "content": "x" * 400}])
     assert est and tok > 90
+
+
+# ── diagnosability: progress lines, per-tier timeouts, failure artifacts ────
+def test_tier_default_timeouts_and_scale(rev):
+    assert rev.task_timeout({"tier": "easy"}, live=True) == 300
+    assert rev.task_timeout({"tier": "medium"}, live=True) == 600
+    assert rev.task_timeout({"tier": "hard"}, live=True) == 1800
+    assert rev.task_timeout({"tier": "hard"}, live=True, scale=2) == 3600
+    assert rev.task_timeout({"tier": "easy", "timeout": 900}, live=True) == 900    # explicit wins
+    assert rev.task_timeout({"tier": "easy", "timeout": 900}, live=True, scale=0.5) == 450
+    assert rev.task_timeout({"tier": "hard"}, live=False) == 60                   # --mock default
+    assert rev.task_timeout({"tier": "?"}, live=True) == 300
+
+
+def _sleep_task(tid, seconds, timeout=None, final="slept"):
+    t = {"id": tid, "tier": "easy", "prompt": "sleep a bit",
+         "checks": [{"type": "answer_contains", "text": final}],
+         "mock": {"steps": [{"tool": "execute_command", "args": {"command": "python3 -c 'import time; time.sleep(%s)'" % seconds}}],
+                  "final": final}}
+    if timeout:
+        t["timeout"] = timeout
+    return t
+
+
+def test_progress_line_printed_as_each_task_finishes(tmp_path):
+    if not os.path.exists(os.path.join(REPO, "ai")):
+        pytest.skip("ai binary not built")
+    import time
+    tdir = tmp_path / "tasks"
+    tdir.mkdir()
+    (tdir / "01_quick.json").write_text(json.dumps(_sleep_task("quick", 0)))
+    (tdir / "02_slow.json").write_text(json.dumps(_sleep_task("slow", 6)))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INFER_") or k in ("INFER_TOOL_SERVER", "INFER_ENGINE", "INFER_ENGINE_STRICT")}
+    p = subprocess.Popen([sys.executable, RUNNER, "--mock", "--jobs", "1", "--tasks-dir", str(tdir)], cwd="/",
+                         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        first = p.stdout.readline()
+        still_running = p.poll() is None
+        rest, err = p.communicate(timeout=300)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    assert first.startswith("[1/2]") and "quick" in first and "PASS" in first, first + err
+    assert "steps=" in first and first.rstrip().endswith("s"), first
+    assert still_running, "the progress line must appear while later tasks still run"
+    assert "[2/2]" in rest and "slow" in rest
+    assert rest.index("[2/2]") < rest.index("failed checks")      # progress before the table
+
+
+def test_failure_keeps_full_stderr_session_and_raw_response(tmp_path):
+    with open(_tasks()[1], encoding="utf-8") as f:  # create_file
+        task = json.load(f)
+    task["mock"]["steps"] = []
+    r, res = _run_custom(tmp_path, [task])
+    got = res[task["id"]]
+    assert got["passed"] is False
+    art = got["artifacts"]
+    try:
+        for k in ("stderr", "stdout", "session", "last_response", "last_request"):
+            assert os.path.exists(art[k]), (k, art)
+            assert art[k] in r.stdout or os.path.dirname(art[k]) in r.stdout
+        assert "data: " in open(art["last_response"]).read()           # the raw SSE stream
+        assert json.load(open(art["last_request"]))["messages"]
+        assert isinstance(json.load(open(art["session"])), list)
+    finally:
+        import shutil
+        shutil.rmtree(got["kept"], ignore_errors=True)
+
+
+def test_timed_out_task_keeps_the_partial_raw_response(tmp_path):
+    task = _sleep_task("stall", 30, timeout=4)
+    r, res = _run_custom(tmp_path, [task])
+    got = res["stall"]
+    try:
+        assert got["passed"] is False
+        assert any(c["detail"] == "timeout" for c in got["checks"])
+        assert os.path.exists(got["artifacts"]["last_response"]), got["artifacts"]
+        assert os.path.exists(got["artifacts"]["stderr"])
+        assert "artifacts:" in r.stdout
+    finally:
+        import shutil
+        shutil.rmtree(got["kept"], ignore_errors=True)
+
+
+def test_timeout_scale_flag(tmp_path):
+    with open(_tasks()[0], encoding="utf-8") as f:
+        first = json.load(f)["id"]
+    r = _run_args("--only", first, "--timeout-scale", "1.5")
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert _run_args("--timeout-scale", "0").returncode == 2

@@ -3544,9 +3544,32 @@ static void process_sse_line(struct stream_context *ctx, const char *line, size_
     }
 }
 
+/* INFER_DEBUG_DIR (mirrors agent/llm.py): the chat payload goes to <dir>/last_request.json and the
+   raw response bytes to <dir>/last_response.raw, flushed as they arrive. */
+static FILE *g_debug_raw = NULL;
+
+static void debug_dir_begin(const char *payload) {
+    const char *d = getenv("INFER_DEBUG_DIR");
+    if (g_debug_raw) { fclose(g_debug_raw); g_debug_raw = NULL; }
+    if (!d || !*d) return;
+    char path[4096];
+    mkdir(d, 0755);
+    snprintf(path, sizeof(path), "%s/last_request.json", d);
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(payload ? payload : "", f); fclose(f); }
+    snprintf(path, sizeof(path), "%s/last_response.raw", d);
+    g_debug_raw = fopen(path, "wb");
+}
+
+static void debug_dir_end(void) {
+    if (g_debug_raw) { fclose(g_debug_raw); g_debug_raw = NULL; }
+}
+
 static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     size_t realsize = size * nmemb;
     struct stream_context *ctx = (struct stream_context *)userdata;
+
+    if (g_debug_raw) { fwrite(ptr, 1, realsize, g_debug_raw); fflush(g_debug_raw); }
 
     buf_append_str(&ctx->line_buf, &ctx->line_len, &ctx->line_cap, (const char *)ptr, realsize);
 
@@ -6067,6 +6090,7 @@ step_limit_check:
                     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, fbt > 0 ? 1L : 0L);
                     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, fbt > 0 ? fbt : 0L);
                 }
+                debug_dir_begin(payload);
                 CURLcode res = perform_curl_with_retry(c, &chunk, stream_retry_reset, &s_ctx);
                 clock_gettime(CLOCK_MONOTONIC, &t_req_end);
                 if (interactive_mode) disable_raw_mode();
@@ -6200,6 +6224,7 @@ step_limit_check:
 
                 curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 0L);
                 curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 0L);
+                debug_dir_end();
                 if (res != CURLE_OK || !chunk.data) {
                     if (res != CURLE_OK) print_server_failure(res, api_url);
                     else fprintf(stderr, "Request failed: empty response from the model server.\n");

@@ -116,3 +116,17 @@ def test_failure_line_shapes():
     line = llm.failure_line({"status": 503, "error": "llama-server is unavailable: boom.",
                              "unavailable": True}, url)
     assert "boom" in line and "ai-backend status" in line and "\n" not in line
+
+
+def test_debug_dir_keeps_the_last_request_and_raw_response(tmp_path, engine):
+    """INFER_DEBUG_DIR (used by evals/run_evals.py to diagnose stalls): the last chat payload and
+    the raw streamed reply, written as it arrives."""
+    cap = str(tmp_path / "cap.jsonl")
+    d = tmp_path / "debug"
+    with MockServer(cap, MOCK_TASK_COMPLETE="debug ok") as srv:
+        r = _sandbox_run(tmp_path, srv.base_url, ["say hi"], {"INFER_ENGINE": engine, "INFER_DEBUG_DIR": str(d)})
+    assert r.returncode == 0, r.stderr[-2000:]
+    req = json.loads((d / "last_request.json").read_text())
+    assert req["messages"] and req["stream"] is True
+    raw = (d / "last_response.raw").read_text()
+    assert "data: " in raw and "debug ok" in raw
