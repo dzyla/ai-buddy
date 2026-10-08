@@ -376,7 +376,8 @@ class Sim:
                 tg, w = self.targets(prev_d, regime)
                 park = None
                 if not tg and v.park and regime != "BULL":   # parking is a BEAR-regime feature (as live)
-                    park = next((c for c in MS.park_candidates(v.park) if c in opens), None)
+                    chain = MS.park_candidates(v.park)   # hold-first, as live: a held park stays; the chain only picks a buy
+                    park = next((c for c in chain if c in self.pos), None) or next((c for c in chain if c in opens), None)
                     if park:
                         tg, w = [park], {park: 1.0}
                 eq = self.equity(opens)

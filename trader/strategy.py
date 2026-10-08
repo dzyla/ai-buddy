@@ -185,12 +185,20 @@ class MomentumStrategy:
 
     @classmethod
     def choose_park(cls, regime: str, targets: List[str],
-                    fetch: Callable[[List[str]], Dict[str, List[Dict[str, Any]]]]) -> Optional[str]:
+                    fetch: Callable[[List[str]], Dict[str, List[Dict[str, Any]]]],
+                    held_park: Optional[str] = None, primary: Optional[str] = None) -> Optional[str]:
         """The parking ETF for this rebalance, or None (cash). Only in a BEAR regime with no sleeve targets and
-        bear_park configured; a failed data fetch means cash (today's behaviour), never an error."""
-        primary = cls.bear_park()
+        bear_park configured (`primary`, read once by the caller; default: the config).
+
+        `held_park`: the park the bot already holds (still held and sellable). If it is in the fallback chain it
+        stays the park with no data check - the chain only decides what to BUY, a data failure never liquidates
+        it. With no park held, a failed fetch means cash (today's behaviour), never an error."""
+        primary = cls.clean_park(primary) if primary is not None else cls.bear_park()
         if not primary or regime != "BEAR" or targets:
             return None
+        held = cls.clean_park(held_park)
+        if held and held in cls.park_candidates(primary):
+            return held
         try:
             return cls.resolve_park(primary, fetch(cls.park_candidates(primary)))
         except Exception:  # noqa: BLE001

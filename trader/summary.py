@@ -167,7 +167,7 @@ def build_daily_summary(day: Any, account_number: Optional[str] = None) -> str:
     if sleeve:
         for s, p in sorted(sleeve.items()):
             q, px = float(p.get("quantity", 0) or 0), float(p.get("price", 0) or 0)
-            tag = " (park)" if str(state.get("park") or "").upper() == s.upper() else ""
+            tag = " (park)" if str(state.get("park") or "").upper() == s.upper() else ""   # key only when configured
             out.append(f"- {s}{tag} {q:g} sh ({_money(q * px)})")
     elif positions:
         out.append("- none (core only)")
@@ -189,8 +189,7 @@ def build_daily_summary(day: Any, account_number: Optional[str] = None) -> str:
             st = list(sh.get("targets") or [])
             if not st and isinstance(sh.get("park"), str):
                 st = [f"{sh['park']} (park)"]
-            out.append(f"- shadow targets: {', '.join(st) or 'CASH'} | live targets: "
-                       f"{(', '.join(live) or 'CASH') if live is not None else 'n/a'}")
+            out.append(f"- shadow targets: {', '.join(st) or 'CASH'} | live targets: {', '.join(live) if live is not None else 'n/a'}")
             if live is not None:
                 only_s = [s for s in st if s not in live]
                 only_l = [s for s in live if s not in st]

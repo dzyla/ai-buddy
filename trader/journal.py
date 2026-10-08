@@ -192,7 +192,7 @@ class ObsidianTradingVault:
             f"# 🧲 Momentum Sleeve Rebalance: {month}\n",
             f"- **Regime:** `{regime.get('regime', '?')}` (SPY {regime.get('close', '?')} vs SMA200 {regime.get('sma200', '?')})",
             f"- **Equity / Cash at decision:** ${state.get('equity', 0):,.2f} / ${state.get('cash', 0):,.2f}",
-            f"- **Sleeve targets:** {', '.join('[[' + t + ']]' for t in state.get('targets', [])) or 'CASH (regime gate)'}",
+            f"- **Sleeve targets:** {', '.join('[[' + t + ']]' for t in state.get('targets', [])) or (state['park'] + ' (bear park)' if state.get('park') else 'CASH (regime gate)')}",
             f"- **Hold list (never sold):** {', '.join(state.get('hold', [])) or 'none'}\n",
             "## Ranking (6-month momentum)",
             "| # | Ticker | Price | 6m return | SMA200 | Eligible |",

@@ -116,7 +116,7 @@ def test_live_default_off_is_unchanged_in_bear(broker, monkeypatch):
     _momentum_rebalance_pulse(ACC, dry_run=False)
     assert not any(o[1] == "buy" and o[0] == "BND" for o in broker.orders)
     st = _flag()
-    assert st["targets"] == [] and st.get("park") is None
+    assert st["targets"] == [] and "park" not in st and "park_requested" not in st
 
 
 def test_live_bear_park_sells_sleeve_then_buys_bond_on_next_pulse(broker, monkeypatch, tmp_path):
@@ -180,13 +180,123 @@ def test_idempotent_month_flag_and_no_midmonth_replan(broker, monkeypatch, tmp_p
     assert not any(o[0] == "BND" for o in broker.orders)
 
 
-def test_disaster_stop_exempts_park_only_when_configured(broker, monkeypatch, tmp_path):
+def _prev_flag(park="BND", month="2026-08", dry_run=False):
+    rt._save_json(rt._rebalance_flag_path(month), {"month": month, "park": park, "targets": [], "dry_run": dry_run, "done": True})
+
+
+def _hold_bnd(broker):
+    broker.positions["BND"] = {"quantity": 2.0, "average_buy_price": 74.0}
+    broker.quotes["BND"] = 75.0
+
+
+def test_held_park_with_missing_bars_is_kept_not_churned(broker, monkeypatch, tmp_path):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    _prev_flag()
+    _hold_bnd(broker)
+    broker.quotes["AGG"] = 100.0
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", _bear_hist({"AGG": bars(95, 100)}))   # BND bars missing
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert "BND" not in {o[0] for o in broker.orders if o[1] == "sell"}
+    assert not any(o[0] == "AGG" for o in broker.orders)
+    assert _flag()["park"] == "BND"
+
+
+def test_held_park_with_every_fetch_failing_is_kept(broker, monkeypatch, tmp_path):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    _prev_flag()
+    _hold_bnd(broker)
+    def boom(sym, range_period="1y", interval="1d", **kw):
+        if sym in ("BND", "AGG", "SGOV"):
+            raise RuntimeError("data outage")
+        return {"SPY": BEAR_SPY}.get(sym) or HIST.get(sym, [])
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", boom)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert "BND" not in {o[0] for o in broker.orders if o[1] == "sell"}
+    assert _flag()["park"] == "BND"
+
+
+def test_choose_park_held_wins_even_if_fetch_raises(tmp_path, monkeypatch):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    assert MS.choose_park("BEAR", [], lambda s: 1 / 0, held_park="AGG") == "AGG"      # in chain: kept
+    assert MS.choose_park("BEAR", [], lambda s: 1 / 0, held_park="XYZ") is None       # not in chain, fetch fails -> cash
+    assert MS.choose_park("BULL", [], lambda s: 1 / 0, held_park="AGG") is None       # BULL: rotate out
+    assert MS.choose_park("BEAR", ["NVDA"], lambda s: 1 / 0, held_park="AGG") is None
+
+
+def test_no_park_held_and_bnd_missing_buys_agg(broker, monkeypatch, tmp_path):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    broker.quotes["AGG"] = 100.0
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", _bear_hist({"AGG": bars(95, 100)}))
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert [o[0] for o in broker.orders if o[1] == "buy"] == ["AGG"]
+
+
+def test_user_held_bond_without_bot_park_flag_is_not_treated_as_park(broker, monkeypatch, tmp_path):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    _hold_bnd(broker)   # no previous-month flag: the bot never bought it as park
+    broker.quotes["AGG"] = 100.0
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", _bear_hist({"AGG": bars(95, 100)}))   # BND bars missing
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert "BND" in {o[0] for o in broker.orders if o[1] == "sell"}
+
+
+def test_dry_run_flag_park_is_not_a_held_park(broker, monkeypatch, tmp_path):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    _prev_flag(dry_run=True)
+    _hold_bnd(broker)
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", _bear_hist())
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    assert "BND" in {o[0] for o in broker.orders if o[1] == "sell"}
+
+
+def _stop_setup(broker, monkeypatch):
     broker.positions["BND"] = {"quantity": 2.0, "average_buy_price": 100.0}
     broker.quotes["BND"] = 70.0
     monkeypatch.setattr(MarketHours, "now_et", lambda: at(11, 0))
+
+
+def test_stop_exempts_only_the_bot_bought_park(broker, monkeypatch, tmp_path):
     _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    _stop_setup(broker, monkeypatch)
+    _risk_monitor_pulse(ACC, dry_run=False)          # user-held BND, no month flag: stop applies
+    assert [(o[0], o[1]) for o in broker.orders] == [("BND", "sell")]
+
+
+def test_stop_exemption_follows_month_flag_and_survives_config_removal(broker, monkeypatch, tmp_path):
+    _stop_setup(broker, monkeypatch)
+    rt._save_json(rt._rebalance_flag_path("2026-09"), {"month": "2026-09", "park": "BND", "targets": [], "done": True})
+    _risk_monitor_pulse(ACC, dry_run=False)          # no bear_park in config at all
+    assert broker.orders == []
+    # a different bond ETF the user holds is not exempt
+    broker.positions["AGG"] = {"quantity": 2.0, "average_buy_price": 100.0}
+    broker.quotes["AGG"] = 70.0
+    _risk_monitor_pulse(ACC, dry_run=False)
+    assert [(o[0], o[1]) for o in broker.orders] == [("AGG", "sell")]
+
+
+def test_stop_exemption_uses_previous_month_flag_until_new_month_is_planned(broker, monkeypatch, tmp_path):
+    _stop_setup(broker, monkeypatch)
+    _prev_flag()
     _risk_monitor_pulse(ACC, dry_run=False)
     assert broker.orders == []
+
+
+def test_rebalance_note_names_the_park(broker, monkeypatch, tmp_path):
+    _cfg(monkeypatch, tmp_path, {"strategy": {"bear_park": "BND"}})
+    broker.quotes["BND"] = 75.0
+    monkeypatch.setattr(MarketHours, "now_et", lambda: at(10, 5))
+    monkeypatch.setattr(FinancialData, "fetch_historical", _bear_hist({"BND": bars(70, 75)}))
+    _momentum_rebalance_pulse(ACC, dry_run=False)
+    note = open(rt.VAULT_DIR + "/retrospectives/rebalance_2026-09.md").read()
+    assert "BND (bear park)" in note and "CASH (regime gate)" not in note
 
 
 # ---------------------------------------------------------------- shadow
@@ -222,13 +332,13 @@ def test_shadow_invalid_bear_park_ignored(market, monkeypatch):
     _shadow_market(monkeypatch)
     for bad in ("VTI", 3, "no spaces!", True):
         rec = shadow.run_shadow_pulse(market, {"shadow": {"strategy": {"bear_park": bad}}}, broker=FakeBroker(), account_number="ACC1")
-        assert rec["ignored_overrides"] == ["bear_park"] and rec["park"] is None
+        assert rec["ignored_overrides"] == ["bear_park"] and "park" not in rec
 
 
 def test_shadow_without_bear_park_has_no_park(market, monkeypatch):
     _shadow_market(monkeypatch)
     rec = shadow.run_shadow_pulse(market, {"shadow": {}}, broker=FakeBroker(), account_number="ACC1")
-    assert rec["park"] is None and not any(o["symbol"] == "BND" for o in rec["planned_orders"])
+    assert "park" not in rec and not any(o["symbol"] == "BND" for o in rec["planned_orders"])
 
 
 def test_summary_shows_park_in_shadow_vs_live(market, monkeypatch):

@@ -277,6 +277,40 @@ def _rebalance_flag_path(month: str) -> str:
     return os.path.join(RISK_MONITOR_FLAGS, f"rebalance_{month}.json")
 
 
+def _prev_month(month: str) -> str:
+    y, m = int(month[:4]), int(month[5:7])
+    return f"{y - 1}-12" if m == 1 else f"{y}-{m - 1:02d}"
+
+
+def _flag_park(month: str) -> Optional[str]:
+    """The park ETF the bot chose in `month`'s rebalance flag (None: no flag, unreadable, or no park)."""
+    try:
+        with open(_rebalance_flag_path(month), encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("dry_run"):
+            return None   # a dry run bought nothing
+        val = data.get("park")
+        return val if isinstance(val, str) and val else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _held_park(month: str, pos_map: Dict[str, Any], hold: set) -> Optional[str]:
+    """The park the bot bought earlier (previous month's flag) if it is still held and sellable."""
+    sym = _flag_park(_prev_month(month))
+    if sym and sym not in hold and float((pos_map.get(sym) or {}).get("quantity", 0) or 0) > 0:
+        return sym
+    return None
+
+
+def _park_exempt(now: datetime.datetime) -> List[str]:
+    """Symbols exempt from the disaster stop: only the park the bot bought, as recorded in the month's flag
+    (falls back to the previous month's until this month is planned). Independent of the current config."""
+    month = now.strftime("%Y-%m")
+    sym = _flag_park(month) or (_flag_park(_prev_month(month)) if not os.path.exists(_rebalance_flag_path(month)) else None)
+    return [sym] if sym else []
+
+
 def _save_json(path: str, data: Dict[str, Any]) -> None:
     """Atomic write (temp file + rename): a crash mid-write must not leave a corrupt state flag."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -351,18 +385,22 @@ def _momentum_rebalance_pulse(account_number: str, dry_run: bool) -> None:
         incumbents = MomentumStrategy.sleeve_incumbents(pos_map, hold)
         rank_buffer = MomentumStrategy.rank_buffer()
         targets = MomentumStrategy.select_sleeve(ranked, regime["regime"], incumbents=incumbents, buffer=rank_buffer)
-        park = MomentumStrategy.choose_park(regime["regime"], targets, _fetch_strategy_bars)
+        park_cfg = MomentumStrategy.bear_park()   # read once per plan
+        held_park = _held_park(month, pos_map, hold) if park_cfg else None
+        park = MomentumStrategy.choose_park(regime["regime"], targets, _fetch_strategy_bars,
+                                            held_park=held_park, primary=park_cfg)
         plan = MomentumStrategy.plan_rebalance(equity, cash, pos_map, targets, hold, park=park)
         state = {
             "month": month, "date": today, "dry_run": dry_run,
             "equity": round(equity, 2), "cash": round(cash, 2),
             "regime": regime, "targets": targets, "hold": sorted(hold),
             "incumbents": incumbents, "rank_buffer": rank_buffer,
-            "park": park, "park_requested": MomentumStrategy.bear_park(),
             "ranking": ranked[:10],
             "sells_pending": plan["sells"], "buys_pending": plan["buys"],
             "sells_done": [], "buys_done": [], "done": False,
         }
+        if park_cfg:   # keys exist only when bear_park is configured (null = flag identical to before)
+            state["park"], state["park_requested"] = park, park_cfg
         _save_json(flag, state)
         _risk_log(f"STRATEGY REBALANCE {month}: regime={regime['regime']} (SPY {regime.get('close')} vs SMA200 {regime.get('sma200')}) "
                   f"targets={targets or (f'PARK {park}' if park else 'CASH')} sells={[s['symbol'] for s in plan['sells']]} "
@@ -541,7 +579,7 @@ def _risk_monitor_pulse(account_number: str, dry_run: bool,
 
     hold = MomentumStrategy.load_hold_list()
     hits = MomentumStrategy.disaster_stop_hits(positions, quotes, hold,
-                                              exempt=MomentumStrategy.park_candidates(MomentumStrategy.bear_park()))
+                                              exempt=_park_exempt(MarketHours.now_et()))
     _, pdt_reason = ComplianceAndRiskGuard.can_day_trade(account_number, equity)
     for h in hits:
         sym, qty, price, pnl_pct = h["symbol"], h["quantity"], h["price"], h["pnl_pct"]

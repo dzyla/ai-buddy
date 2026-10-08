@@ -1,0 +1,176 @@
+{
+ "flag": {
+  "buys_done": [],
+  "buys_pending": [],
+  "cash": 107.0,
+  "completed": "2026-09-08",
+  "date": "2026-09-08",
+  "done": true,
+  "dry_run": false,
+  "equity": 567.95,
+  "hold": [],
+  "incumbents": [
+   "LLY",
+   "MSFT",
+   "TSM"
+  ],
+  "month": "2026-09",
+  "rank_buffer": 2,
+  "ranking": [
+   {
+    "above_sma200": true,
+    "avg_volume_20": 1000000,
+    "eligible": true,
+    "momentum_pct": 48.0,
+    "price": 300.0,
+    "reason": "eligible",
+    "sma200": 223.17,
+    "symbol": "NVDA"
+   },
+   {
+    "above_sma200": true,
+    "avg_volume_20": 1000000,
+    "eligible": true,
+    "momentum_pct": 41.22,
+    "price": 250.0,
+    "reason": "eligible",
+    "sma200": 192.37,
+    "symbol": "PLTR"
+   },
+   {
+    "above_sma200": true,
+    "avg_volume_20": 1000000,
+    "eligible": true,
+    "momentum_pct": 32.14,
+    "price": 200.0,
+    "reason": "eligible",
+    "sma200": 161.58,
+    "symbol": "TSM"
+   },
+   {
+    "above_sma200": true,
+    "avg_volume_20": 1000000,
+    "eligible": true,
+    "momentum_pct": 8.82,
+    "price": 120.0,
+    "reason": "eligible",
+    "sma200": 112.32,
+    "symbol": "AMD"
+   }
+  ],
+  "regime": {
+   "close": 450.0,
+   "regime": "BEAR",
+   "sma200": 507.63
+  },
+  "sells_done": [
+   {
+    "quantity": 0.077,
+    "reason": "REGIME_EXIT",
+    "symbol": "LLY"
+   },
+   {
+    "quantity": 0.2157,
+    "reason": "REGIME_EXIT",
+    "symbol": "TSM"
+   },
+   {
+    "quantity": 0.0873,
+    "reason": "REGIME_EXIT",
+    "symbol": "MSFT"
+   }
+  ],
+  "sells_pending": [],
+  "targets": []
+ },
+ "orders": [
+  [
+   "LLY",
+   "sell",
+   null,
+   "0.077"
+  ],
+  [
+   "TSM",
+   "sell",
+   null,
+   "0.2157"
+  ],
+  [
+   "MSFT",
+   "sell",
+   null,
+   "0.0873"
+  ]
+ ],
+ "plan_bear": {
+  "buys": [],
+  "projected_cash": 200.0,
+  "sells": [
+   {
+    "quantity": 1.0,
+    "reason": "REGIME_EXIT",
+    "symbol": "TSM"
+   }
+  ]
+ },
+ "plan_bull": {
+  "buys": [
+   {
+    "dollar_amount": 100.0,
+    "reason": "SLEEVE_TARGET",
+    "symbol": "NVDA"
+   }
+  ],
+  "projected_cash": 100.0,
+  "sells": [
+   {
+    "quantity": 1.0,
+    "reason": "ROTATE_OUT",
+    "symbol": "TSM"
+   }
+  ]
+ },
+ "shadow": {
+  "baseline_targets": [],
+  "cash": 107.0,
+  "date": "2026-09-08",
+  "equity": 503.88,
+  "ignored_overrides": [],
+  "incumbents": [
+   "AMD",
+   "TSM"
+  ],
+  "live_targets": [],
+  "month": "2026-09",
+  "overrides": {
+   "sleeve_rank_buffer": 0
+  },
+  "planned_orders": [
+   {
+    "quantity": 0.2157,
+    "reason": "REGIME_EXIT",
+    "side": "sell",
+    "symbol": "TSM"
+   },
+   {
+    "quantity": 0.13,
+    "reason": "REGIME_EXIT",
+    "side": "sell",
+    "symbol": "AMD"
+   },
+   {
+    "dollar_amount": 36.76,
+    "reason": "CORE_TOPUP",
+    "side": "buy",
+    "symbol": "QQQ"
+   }
+  ],
+  "regime": "BEAR",
+  "status": "ok",
+  "targets": [],
+  "ts": "2026-09-08T10:30:00-04:00"
+ },
+ "shadow_mutations": 0,
+ "summary": "**Trader daily summary - 2026-09-08**\n\n- **Equity:** open $567.95, close n/a\n- **Regime:** BEAR (SPY 450.0 vs SMA200 507.63, decided 2026-09-08)\n- **Circuit breaker:** normal (tier 0)\n\n**Orders filled (3)**\n- SELL LLY 0.077 sh @ $1,115.00 (REGIME_EXIT)\n- SELL TSM 0.2157 sh @ $433.00 (REGIME_EXIT)\n- SELL MSFT 0.0873 sh @ $495.00 (REGIME_EXIT)\n\n**Sleeve holdings**\n- n/a (no close snapshot); 2026-09 live targets: n/a\n\n**Shadow vs live**\n- shadow targets: CASH | live targets: \n- only in shadow: none | only in live: none\n- shadow planned orders: 3 (SELL TSM, SELL AMD, BUY QQQ)\n- overrides: {\"sleeve_rank_buffer\": 0}\n"
+}

@@ -175,7 +175,13 @@ def run_shadow_pulse(now: Optional[datetime.datetime] = None, config: Optional[D
     base_regime = MomentumStrategy.regime(spy_bars)
     baseline = MomentumStrategy.select_sleeve(MomentumStrategy.rank(bars), base_regime["regime"],
                                               incumbents=incumbents, buffer=MomentumStrategy.rank_buffer())
-    park = strat.choose_park(regime["regime"], targets, lambda syms: _fetch_strategy_bars(syms, broker=ro))
+    park_cfg = strat.bear_park()   # read once per plan
+    held_park = None
+    if park_cfg:   # the live month's park (previous month's flag, as live) stays the park, as live would keep it
+        from .daemon import _held_park
+        held_park = _held_park(month, pos_map, hold)
+    park = strat.choose_park(regime["regime"], targets, lambda syms: _fetch_strategy_bars(syms, broker=ro),
+                             held_park=held_park, primary=park_cfg)
     plan = strat.plan_rebalance(equity, cash, pos_map, targets, hold, park=park)
     orders: List[Dict[str, Any]] = [{"side": "sell", **s} for s in plan["sells"]]
     orders += [{"side": "buy", **b} for b in plan["buys"]]
@@ -184,8 +190,10 @@ def run_shadow_pulse(now: Optional[datetime.datetime] = None, config: Optional[D
     if topup:
         orders.append({"side": "buy", **topup})
     record.update({"status": "ok", "regime": regime["regime"], "equity": round(equity, 2), "cash": round(cash, 2),
-                   "targets": targets, "park": park, "baseline_targets": baseline, "live_targets": _live_targets(month),
+                   "targets": targets, "baseline_targets": baseline, "live_targets": _live_targets(month),
                    "incumbents": incumbents, "planned_orders": orders})
+    if park_cfg:   # key exists only when bear_park is configured for the shadow run
+        record["park"] = park
     return _done()
 
 
