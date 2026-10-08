@@ -63,12 +63,20 @@ class Options:
     top_k: int = -1
     min_p: float = -1.0
     max_tokens: int = 32768
+    step_max_tokens: int = 16384      # per-step completion cap (INFER_STEP_MAX_TOKENS), see sent_max_tokens
+    repetition_guard: bool = True     # stream repetition detector (INFER_REPETITION_GUARD=0 disables)
     frequency_penalty: float = 0.10
     presence_penalty: float = 0.05
     reasoning_effort: str = None
     reasoning_budget: int = -1
     preserve_thinking: bool = False
     tool_choice: str = "required"
+
+    def sent_max_tokens(self):
+        """max_tokens put on the wire: the smaller positive of max_tokens and the step cap (ai.c
+        does the same); 0 when both are off."""
+        caps = [v for v in (self.max_tokens, self.step_max_tokens) if v > 0]
+        return min(caps) if caps else 0
 
     def apply_preset(self, name):
         """apply_mode_preset(): True when `name` is a known preset."""
@@ -327,10 +335,20 @@ def parse(argv, environ=None, stdin_tty=False):
         o.preserve_thinking = True
     if getenv("INFER_MAX_TOKENS"):
         o.max_tokens = _atoi(getenv("INFER_MAX_TOKENS"))
-    if getenv("INFER_FREQ_PENALTY"):
-        o.frequency_penalty = _atof(getenv("INFER_FREQ_PENALTY"))
-    if getenv("INFER_PRESENCE_PENALTY"):
-        o.presence_penalty = _atof(getenv("INFER_PRESENCE_PENALTY"))
+        o.step_max_tokens = o.max_tokens      # an explicit completion budget wins over the default cap
+    if getenv("INFER_STEP_MAX_TOKENS"):
+        o.step_max_tokens = _atoi(getenv("INFER_STEP_MAX_TOKENS"))
+    if getenv("INFER_REPETITION_GUARD") in ("0", "false", "off"):
+        o.repetition_guard = False
+    # Penalties: the client value always goes on the wire (> 0) and overrides the server's own
+    # --presence-penalty, so without an INFER_* value a non-neutral server-profile value
+    # (LLAMA_*_PENALTY from ai-backend) is sent instead of the client default.
+    for attr, mine, server in (("frequency_penalty", "INFER_FREQ_PENALTY", "LLAMA_FREQUENCY_PENALTY"),
+                               ("presence_penalty", "INFER_PRESENCE_PENALTY", "LLAMA_PRESENCE_PENALTY")):
+        if getenv(mine):
+            setattr(o, attr, _atof(getenv(mine)))
+        elif getenv(server) and _atof(getenv(server)) > 0.0:
+            setattr(o, attr, _atof(getenv(server)))
     if c.mode_preset:
         c.preset_ok = o.apply_preset(c.mode_preset)
 

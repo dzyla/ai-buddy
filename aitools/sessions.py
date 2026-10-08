@@ -39,6 +39,7 @@ _TRIM_INTERNAL_USER_PREFIXES = (
     "Please call task_complete", "Your last response was empty", "[TIMEOUT]",
     "Your last response was cut off", "[SYSTEM]", "[SYSTEM ", "[HARD STOP]",
     "[STALL]", "[INTERRUPTED", "[CONTEXT",
+    "Your previous reply got stuck", "[GENERATION ABORTED]",   # agent/loop.py runaway guard
 )
 _TRIM_NOTE = "\n\n[CONTEXT NOTE: older conversation messages were trimmed to fit the model's context window.]"
 
@@ -176,6 +177,7 @@ _INTERNAL_NUDGES = (
     "Please call task_complete",
     "Your last response was empty",
     "[TIMEOUT]",
+    "Your previous reply got stuck", "[GENERATION ABORTED]",
 )
 
 

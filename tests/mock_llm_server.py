@@ -19,6 +19,14 @@ The reply is controlled by env vars:
                         "exceeds the available context size" (consumes no MOCK_TOOL_SEQ item)
   MOCK_PROMPT_TOKENS  — usage.prompt_tokens reported on every reply (JSON and SSE)
   MOCK_CHARS_PER_TOKEN — report usage.prompt_tokens = request body chars / this ratio instead
+  MOCK_RUNAWAY_SEQ    — JSON list indexed by request number (item 0 = first chat request); a non-null
+                        item streams a runaway generation instead of the normal reply (SSE only, ignores
+                        max_tokens like a broken server would): {"channel": "reasoning"|"content",
+                        "prefix": str, "unit": str, "count": int, "vary": bool ("{i}" in unit is
+                        replaced by the repeat index), "delay": secs per chunk, "chunk": chars per SSE
+                        event (default 4)}. A finished stream ends with finish_reason "length".
+  MOCK_DISCONNECTS    — file: one JSON line per runaway stream, {"req", "sent_chars", "closed"} where
+                        closed=true means the client dropped the connection before the stream ended
 
 Usage: MOCK_CAPTURE=/tmp/cap.jsonl python3 mock_llm_server.py <port>
 """
@@ -81,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
         stream = bool(body.get("stream"))
+        runaway = json.loads(os.environ.get("MOCK_RUNAWAY_SEQ") or "[]")
+        if stream and Handler._req_no <= len(runaway) and runaway[Handler._req_no - 1]:
+            self._runaway(runaway[Handler._req_no - 1])
+            return
 
         content = os.environ.get("MOCK_REPLY_CONTENT", "MOCK_OK")
         summary = os.environ.get("MOCK_TASK_COMPLETE")
@@ -200,6 +212,38 @@ class Handler(BaseHTTPRequestHandler):
         if finish is not None and (os.environ.get("MOCK_PROMPT_TOKENS") or os.environ.get("MOCK_CHARS_PER_TOKEN")):
             chunk["usage"] = _usage()
         self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+
+    def _runaway(self, spec):
+        """Stream prefix + unit*count in small SSE events until done or the client disconnects."""
+        key = "reasoning_content" if spec.get("channel", "reasoning") == "reasoning" else "content"
+        step, delay = int(spec.get("chunk") or 4), float(spec.get("delay") or 0)
+        sent, closed = 0, False
+
+        def text():
+            yield spec.get("prefix", "")
+            unit = spec.get("unit", "")
+            for i in range(int(spec.get("count", 1000))):
+                yield unit.replace("{i}", str(i)) if spec.get("vary") else unit
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self._sse({"role": "assistant", "content": None})
+            for piece in text():
+                for j in range(0, len(piece), step):
+                    self._sse({key: piece[j:j + step]})
+                    self.wfile.flush()
+                    sent += len(piece[j:j + step])
+                    if delay:
+                        time.sleep(delay)
+            self._sse({}, finish="length")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            closed = True
+        if os.environ.get("MOCK_DISCONNECTS"):
+            with open(os.environ["MOCK_DISCONNECTS"], "a") as f:
+                f.write(json.dumps({"req": Handler._req_no, "sent_chars": sent, "closed": closed}) + "\n")
 
     def _respond_stream(self, summary, content):
         self.send_response(200)

@@ -841,6 +841,7 @@ static int   thinking_budget_val   = -1;   /* set via :budget, --budget, or INFE
 static int   preserve_thinking_val  = 0;
 static char  *mode_preset_val       = NULL; /* --mode <xhigh|normal|low|instruct> */
 static int   max_tokens_val         = 32768; /* Completion budget. 8192 is too small for 35B models that emit long native reasoning_content: it truncates mid-reasoning before the model ever emits its action tool call, so tasks end with zero artifacts. 32768 lets reasoning + the tool call both fit. Override via INFER_MAX_TOKENS. */
+static int   step_max_tokens_val    = 16384; /* Per-step completion cap sent as max_tokens (the smaller positive of the two): a reasoning model stuck in a repetition loop otherwise generates until the request timeout. INFER_STEP_MAX_TOKENS; an explicit INFER_MAX_TOKENS also sets it. Mirrored by agent/cli.py Options.sent_max_tokens. */
 static float frequency_penalty_val  =  0.10f; /* Break repetitive thinking loops (0=off, INFER_FREQ_PENALTY) */
 static float presence_penalty_val   =  0.05f; /* Encourage new topics (0=off, INFER_PRESENCE_PENALTY) */
 static int   no_tools_mode          = 0;
@@ -4752,7 +4753,9 @@ int main(int argc, char **argv) {
         preserve_thinking_val = 1;
     }
     char *env_maxtok = getenv("INFER_MAX_TOKENS");
-    if (env_maxtok && *env_maxtok) max_tokens_val = atoi(env_maxtok);
+    if (env_maxtok && *env_maxtok) max_tokens_val = step_max_tokens_val = atoi(env_maxtok);
+    char *env_stepmax = getenv("INFER_STEP_MAX_TOKENS");
+    if (env_stepmax && *env_stepmax) step_max_tokens_val = atoi(env_stepmax);
     char *env_freq_pen = getenv("INFER_FREQ_PENALTY");
     if (env_freq_pen && *env_freq_pen) frequency_penalty_val = (float)atof(env_freq_pen);
     char *env_pres_pen = getenv("INFER_PRESENCE_PENALTY");
@@ -5734,9 +5737,14 @@ step_limit_check:
                 if (min_p_val >= 0.0f)
                     opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
                                         ",\"min_p\":%.2f", min_p_val);
-                if (max_tokens_val > 0)
-                    opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
-                                        ",\"max_tokens\":%d", max_tokens_val);
+                {
+                    int sent_max = max_tokens_val;
+                    if (step_max_tokens_val > 0 && (sent_max <= 0 || step_max_tokens_val < sent_max))
+                        sent_max = step_max_tokens_val;
+                    if (sent_max > 0)
+                        opt_len += snprintf(opt_fields + opt_len, (int)sizeof(opt_fields) - opt_len,
+                                            ",\"max_tokens\":%d", sent_max);
+                }
                 /* frequency_penalty: penalises tokens that already appeared → breaks
                    repetitive reasoning loops in thinking models (0.0 = disabled). */
                 if (frequency_penalty_val > 0.0f)

@@ -3,6 +3,7 @@
 main(argv) is the process entry (`python3 -m agent [--frontend-fd N] args...`). Engine.run() keeps
 ai.c's order of side effects so both engines send equivalent requests; every intentional line of
 output goes to the front-end as an event (protocol.py)."""
+import dataclasses
 import json
 import os
 import signal
@@ -54,6 +55,7 @@ class Engine:
         self.plan_note = None
         self.session_tokens = 0
         self.ctx_retry_used = False     # one trim-and-retry per context-overflow 400
+        self.runaway_failures = 0       # consecutive steps whose reply was aborted twice by the guard
         self.force_trim_to = 0          # set when usage.prompt_tokens > 80% of n_ctx
         self.turn_count = 0
         self.tool_count = 0             # tool calls this session (the answer footer / Ctrl-O redraw)
@@ -521,8 +523,9 @@ class Engine:
                 self.ch.send("thinking", s=s, stream=True)
             else:
                 self.ch.send("status", s="toolcall")
+        guard = self._guard_factory()
         t0 = time.monotonic()
-        res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count)
+        res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count, guard=guard)
         if res.get("connect_failed") and not res.get("interrupted"):
             p_url, p_key, p_model = load_from_profiles()
             if p_url:
@@ -542,10 +545,53 @@ class Engine:
                         cfg.context_window = llm.detect_context_window(self.client)
                     self.ch.send("status", s="request")
                     t0 = time.monotonic()
-                    res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count)
+                    res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count,
+                                           guard=guard)
+        if res.get("guard") and not res.get("interrupted") and not self.esc.is_set():
+            res = self._recover_runaway(res, loop_count, on_chunk, guard, t0)
         res["elapsed"] = time.monotonic() - t0
         self.ch.send("status", s="response", reasoning=res["message"].get("reasoning_content") or "")
         return res
+
+    def _guard_factory(self):
+        o = self.cfg.opts
+        if o.step_max_tokens <= 0 and not o.repetition_guard:
+            return None
+        return lambda: llm.RunawayGuard(o.step_max_tokens, o.repetition_guard)
+
+    def _recover_runaway(self, res, loop_count, on_chunk, guard, t0):
+        """The stream was aborted (repetition loop or step token cap): drop the partial reply,
+        nudge, retry once with presence_penalty >= 1.5 and low reasoning effort. A second abort
+        ends the step: the model sees an error message on its next request."""
+        o = self.cfg.opts
+        trip = res["guard"]
+        self._log_guard(trip, 1, t0)
+        retry = dataclasses.replace(o, presence_penalty=max(o.presence_penalty, RUNAWAY_PRESENCE),
+                                    reasoning_effort=o.reasoning_effort
+                                    if (o.reasoning_effort or "").lower() in ("none", "low", "minimal") else "low")
+        self.err("\n\033[1;33m[ai] runaway generation stopped (%s); retrying with presence_penalty %.1f, "
+                 "reasoning %s.\033[0m\n" % (_describe_trip(trip), retry.presence_penalty, retry.reasoning_effort))
+        self.messages.append({"role": "user", "content": RUNAWAY_NUDGE})
+        self.ch.send("status", s="request")
+        res = self.client.chat(self.messages, self.tools, on_chunk=on_chunk, debug_tag=loop_count, opts=retry,
+                               guard=guard)
+        if not res.get("guard") or res.get("interrupted") or self.esc.is_set():
+            return res
+        trip = res["guard"]
+        self._log_guard(trip, 2, t0)
+        self.err("\n\033[1;31m[ai] runaway generation stopped again (%s); ending this step.\033[0m\n"
+                 % _describe_trip(trip))
+        self.messages.append({"role": "user", "content": RUNAWAY_FAILED % _describe_trip(trip)})
+        return {"message": {"role": "assistant", "content": None}, "finish_reason": None, "usage": {},
+                "error": None, "interrupted": False, "status": 200, "runaway_failed": True}
+
+    def _log_guard(self, trip, attempt, t0):
+        try:
+            from aitools import metrics
+            metrics.log_metric("generation_guard", (time.monotonic() - t0) * 1000, success=False,
+                               error="%s attempt=%d" % (_describe_trip(trip), attempt))
+        except Exception:
+            pass
 
     def _iteration(self, loop_count, step_limit, length_nudges):
         """One loop iteration. Returns (has_more, loop_count, length_nudges, stop_inner_loop)."""
@@ -568,6 +614,15 @@ class Engine:
         if self.esc.is_set() or res.get("interrupted"):
             self.err("\n\033[1;31m[ai] Interrupted by user (ESC).\033[0m\n")
             return False, loop_count, length_nudges, True
+        if res.get("runaway_failed"):
+            self.runaway_failures += 1
+            if self.runaway_failures >= RUNAWAY_STEP_CAP:
+                self.err("\033[1;31m[ai] the model's replies were aborted as runaway %d steps in a row; stopping "
+                         "the task.\033[0m\n" % self.runaway_failures)
+                self.runaway_failures = 0
+                return False, loop_count, length_nudges, True
+            return True, loop_count, length_nudges, False
+        self.runaway_failures = 0
         if res.get("status", 0) == 0 and res.get("error"):
             self.err("Request failed: %s\n" % res["error"])
             return True, loop_count, length_nudges, True
@@ -1070,6 +1125,22 @@ class Engine:
             self.err("\033[2m[ai] save_memory (%d chars)\033[0m\n" % len((_json_get_string(args, "content") or "").encode()))
         else:
             self.err("\033[2m[ai] %s::%s\033[0m\n" % (server, tool))
+
+
+RUNAWAY_PRESENCE = 1.5     # presence_penalty floor for the retry after a runaway abort
+RUNAWAY_STEP_CAP = 3       # consecutive doubly-aborted steps before the task is stopped
+RUNAWAY_NUDGE = ("Your previous reply got stuck repeating itself. Reply now with the next tool call or "
+                 "task_complete; keep reasoning brief.")
+RUNAWAY_FAILED = ("[GENERATION ABORTED] Your reply was aborted again (%s) and discarded. Do not repeat it: "
+                  "make one short, different next step -- a single tool call, or task_complete with your "
+                  "best answer so far.")
+
+
+def _describe_trip(trip):
+    if trip.get("kind") == "step_cap":
+        return "step token cap of %d reached in %s" % (trip.get("limit", 0), trip.get("channel"))
+    return "repetition in %s, %d-char unit x%d, ~%d tokens" % (
+        trip.get("channel"), trip.get("period", 0), trip.get("repeats", 0), trip.get("tokens", 0))
 
 
 LENGTH_NUDGE = ("Your last response was cut off by the token limit. This means you wrote an over-long chain of thought "

@@ -38,8 +38,8 @@ def build_payload(model, messages, tools, opts, stream=True):
         p["top_k"] = opts.top_k
     if opts.min_p >= 0.0:
         p["min_p"] = _c2(opts.min_p)
-    if opts.max_tokens > 0:
-        p["max_tokens"] = opts.max_tokens
+    if opts.sent_max_tokens() > 0:
+        p["max_tokens"] = opts.sent_max_tokens()
     if opts.frequency_penalty > 0.0:
         p["frequency_penalty"] = _c2(opts.frequency_penalty)
     if opts.presence_penalty > 0.0:
@@ -57,13 +57,127 @@ def build_payload(model, messages, tools, opts, stream=True):
     return p
 
 
+# ── runaway-generation guard ─────────────────────────────────────────────────
+GUARD_WINDOW = 4096        # chars of each channel's tail that are examined
+GUARD_MIN_PERIOD = 40      # a loop unit is at least this long ...
+GUARD_MAX_PERIOD = 1024    # ... and at most this long
+GUARD_REPEATS = 4          # prose: the unit repeated this many times back to back
+GUARD_MIN_UNIT_PERIOD = 8  # prose: units that are themselves a <8-char pattern (banners, "0, 0, ")
+                           # need the full window, like code
+GUARD_SAME_LINES = 6       # prose: this many identical (non-trivial) lines in a row
+GUARD_CHECK_EVERY = 64     # chars between checks of one channel
+
+
+def _periodic(t, p):
+    """True when the last 4*p chars of t are one p-char unit repeated (cheap char probe first)."""
+    n = len(t)
+    if n < GUARD_REPEATS * p or t[-1] != t[-1 - p]:
+        return False
+    s = t[-GUARD_REPEATS * p:]
+    return s[p:] == s[:-p]
+
+
+def _min_period(unit):
+    for q in range(1, len(unit)):
+        if len(unit) % q == 0 and unit[:q] * (len(unit) // q) == unit:
+            return q
+    return len(unit)
+
+
+def find_loop(tail, code=False):
+    """A degenerate repetition at the end of `tail`: (period, repeats) or None.
+
+    Prose: some 40..1024-char unit repeats >= 4 times back to back at the very end (exact text).
+    Code (inside a ``` fence, or tool-call arguments) is allowed far more regularity -- a zero
+    matrix, a run of similar rows -- so it only trips when the WHOLE 4 KB window is one repeated
+    unit of <= 1024 chars. The same full-window rule covers prose units that are themselves a
+    tiny pattern (a 300-char "-----" rule is legitimate, 4 KB of it is not)."""
+    n = len(tail)
+    if not code:
+        for p in range(GUARD_MIN_PERIOD, min(GUARD_MAX_PERIOD, n // GUARD_REPEATS) + 1):
+            if _periodic(tail, p) and _min_period(tail[-p:]) >= GUARD_MIN_UNIT_PERIOD:
+                return p, GUARD_REPEATS
+    if n >= GUARD_WINDOW:
+        for p in range(1, GUARD_MAX_PERIOD + 1):
+            if tail[-1] == tail[-1 - p] and tail[p:] == tail[:-p]:
+                return p, n // p
+    return None
+
+
+def same_lines(tail, k=GUARD_SAME_LINES):
+    """The last k complete lines are identical and non-trivial (>= 8 chars with a letter or digit)."""
+    lines = tail[:tail.rfind("\n") + 1].split("\n")[:-1]     # complete lines only
+    if len(lines) < k:
+        return False
+    last = lines[-k:]
+    ln = last[0]
+    return (all(x == ln for x in last) and len(ln.strip()) >= 8 and any(c.isalnum() for c in ln))
+
+
+class RunawayGuard:
+    """Watches one streamed reply. observe(channel, text) -> a trip dict once the reply is runaway:
+    {"kind": "step_cap"|"repetition", "channel", "tokens", ...}; None otherwise.
+
+    channel: "content", "reasoning", or "args<N>" (tool call N's arguments, always treated as code).
+    Tokens are estimated as max(text events, chars / 4): llama.cpp streams ~one token per event, a
+    batching server is counted by size. max_tokens <= 0 disables the cap; repetition=False the
+    loop detector."""
+
+    def __init__(self, max_tokens=0, repetition=True):
+        self.max_tokens = max_tokens
+        self.repetition = repetition
+        self.events = 0
+        self.chars = 0
+        self.tripped = None
+        self._tail = {}
+        self._since = {}
+        self._fences = {}
+
+    @property
+    def tokens(self):
+        return max(self.events, self.chars // 4)
+
+    def observe(self, channel, text):
+        if self.tripped or not text:
+            return self.tripped
+        self.events += 1
+        self.chars += len(text)
+        if self.max_tokens > 0 and self.tokens > self.max_tokens:
+            self.tripped = {"kind": "step_cap", "channel": channel, "tokens": self.tokens,
+                            "limit": self.max_tokens}
+            return self.tripped
+        if not self.repetition:
+            return None
+        prev = self._tail.get(channel, "")
+        joined = prev[-2:] + text          # a ``` fence split across two events still counts
+        self._fences[channel] = self._fences.get(channel, 0) + joined.count("```") - prev[-2:].count("```")
+        tail = (prev + text)[-GUARD_WINDOW:]
+        self._tail[channel] = tail
+        since = self._since.get(channel, 0) + len(text)
+        if since < GUARD_CHECK_EVERY and "\n" not in text:
+            self._since[channel] = since
+            return None
+        self._since[channel] = 0
+        code = channel.startswith("args") or self._fences[channel] % 2 == 1
+        hit = find_loop(tail, code=code)
+        if hit is None and not code and same_lines(tail):
+            hit = (len(tail[:tail.rfind("\n")].rsplit("\n", 1)[-1]) + 1, GUARD_SAME_LINES)
+        if hit:
+            self.tripped = {"kind": "repetition", "channel": channel, "tokens": self.tokens,
+                            "period": hit[0], "repeats": hit[1]}
+        return self.tripped
+
+
 # ── SSE ──────────────────────────────────────────────────────────────────────
 class SSEAccumulator:
     """Incremental `data:` line parser. on_event(kind, text) fires for "content", "reasoning" and
-    "toolcall" (first tool-call delta of a response, text "") as chunks arrive."""
+    "toolcall" (first tool-call delta of a response, text "") as chunks arrive. An optional
+    RunawayGuard sees every content/reasoning/argument fragment; once it trips, `tripped` is set
+    and the transport stops reading (closing the connection, which cancels the generation)."""
 
-    def __init__(self, on_event=None):
+    def __init__(self, on_event=None, guard=None):
         self.on_event = on_event
+        self.guard = guard
         self._buf = b""
         self.raw = b""
         self.content = None
@@ -138,10 +252,12 @@ class SSEAccumulator:
         if isinstance(rc, str):
             self.reasoning = (self.reasoning or "") + rc
             self._emit("reasoning", rc)
+            self._watch("reasoning", rc)
         cc = delta.get("content")
         if isinstance(cc, str):
             self.content = (self.content or "") + cc
             self._emit("content", cc)
+            self._watch("content", cc)
         tcs = delta.get("tool_calls")
         if isinstance(tcs, list):
             if not self._toolcall_seen:
@@ -167,6 +283,15 @@ class SSEAccumulator:
                     a = fn.get("arguments")
                     if isinstance(a, str) and a:
                         c["arguments"] = (c["arguments"] or "") + a
+                        self._watch("args%d" % idx, a)
+
+    def _watch(self, channel, text):
+        if self.guard is not None:
+            self.guard.observe(channel, text)
+
+    @property
+    def tripped(self):
+        return self.guard.tripped if self.guard is not None else None
 
     def flush(self):
         if self._buf:
@@ -270,8 +395,11 @@ class Client:
                 time.sleep(0.5)
         return None
 
-    def chat(self, messages, tools, stream=True, on_chunk=None, debug_tag=None):
-        payload = build_payload(self.model, messages, tools, self.opts, stream=stream)
+    def chat(self, messages, tools, stream=True, on_chunk=None, debug_tag=None, opts=None, guard=None):
+        """guard: a zero-arg factory returning a fresh RunawayGuard per attempt (streaming only).
+        A tripped guard ends the request early: the result then carries "guard" (the trip dict)
+        and the partial message, which the caller should discard."""
+        payload = build_payload(self.model, messages, tools, opts or self.opts, stream=stream)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
         if self.debug:
             self.log("[debug] Loop %s payload: %s\n" % (debug_tag, body.decode("utf-8", "replace")))
@@ -280,7 +408,7 @@ class Client:
         local_tries, server_tries = 0, 0
         warned = False
         while True:
-            acc = SSEAccumulator(on_event=on_chunk)
+            acc = SSEAccumulator(on_event=on_chunk, guard=guard() if (guard and stream) else None)
             try:
                 status, err = self._post(body, acc, stream)
             except (OSError, http.client.HTTPException) as e:
@@ -318,6 +446,8 @@ class Client:
                 continue
             res = self._done(acc, stream)
             res["status"] = status
+            if acc.tripped:
+                res["guard"] = dict(acc.tripped)
             if status >= 400:
                 res["error"] = err or ("HTTP %d" % status)
             if self.debug:
@@ -351,7 +481,7 @@ class Client:
                     if not chunk:
                         break
                     acc.feed(chunk)
-                    if self._interrupted:
+                    if self._interrupted or acc.tripped:
                         break
             else:
                 data = r.read()

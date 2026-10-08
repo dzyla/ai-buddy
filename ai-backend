@@ -352,7 +352,9 @@ def apply_model_path(model_path):
         sys.exit(1)
 
     kill_llama_server()
-    
+    # before the restart below, so the server starts with the profile's penalties
+    apply_sampling_profile(model_path, auto_restart=False)
+
     if SYSTEMD_SERVICE.exists():
         try:
             content = SYSTEMD_SERVICE.read_text()
@@ -1041,6 +1043,173 @@ def persist_env_changes(changes, auto_restart=True):
     write_env(url, model, llama_path, env_vars, authoritative=True)
     if auto_restart:
         restart_systemd_service()
+
+# ── per-model sampling profiles ──────────────────────────────────────────────
+# `use` applies the model family's recommended sampling to the env file, but only to keys the
+# user has not customised. Ownership is tracked in PROFILE_FILE (a sidecar JSON next to the env
+# file): "written" = the value the profile last wrote per key, "previous" = the value before the
+# profile first took the key (None = absent), "disabled" = set by `profile off`.
+# A key is profile-managed (may be written) when it is absent, still holds exactly what the profile
+# last wrote, already equals the target, or -- with no record -- holds ai-backend's own neutral
+# default (write_env always writes LLAMA_PRESENCE_PENALTY="0.0", so that value is not a choice).
+# Any other value is user-owned and never touched, by `use`, `profile apply` or `profile off`.
+PROFILE_FILE = DATA_DIR / "profile.json"
+SAMPLING_PROFILES = {
+    # Qwen3.5-family thinking recipe (Qwen3.6/3.8, Ornith fine-tunes): the client values (INFER_*,
+    # sent per request by both engines) and the server default agree on the presence penalty.
+    "qwen35-thinking": {
+        "archs": ("qwen35", "qwen35moe"),
+        "name_re": r"qwen3[._-]?[5-9]|ornith",
+        "values": {"INFER_TEMPERATURE": "1.0", "INFER_TOP_P": "0.95", "INFER_TOP_K": "20",
+                   "INFER_MIN_P": "0.0", "INFER_PRESENCE_PENALTY": "1.5", "LLAMA_PRESENCE_PENALTY": "1.5"},
+    },
+}
+PROFILE_NEUTRAL = {"LLAMA_PRESENCE_PENALTY": "0.0", "LLAMA_FREQUENCY_PENALTY": "0.0",
+                   "LLAMA_REPEAT_PENALTY": "1.0"}
+
+
+def _same_value(a, b):
+    if a is None or b is None:
+        return a is b
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a) == str(b)
+
+
+def load_profile_state():
+    try:
+        st = json.loads(PROFILE_FILE.read_text())
+        if isinstance(st, dict):
+            st.setdefault("written", {})
+            st.setdefault("previous", {})
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"profile": None, "disabled": False, "written": {}, "previous": {}}
+
+
+def save_profile_state(st):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILE_FILE.write_text(json.dumps(st, indent=2, sort_keys=True) + "\n")
+
+
+def detect_sampling_profile(model_path):
+    """Profile name for a GGUF (by general.architecture, else by file name), or None."""
+    if not model_path:
+        return None
+    resolved = str(Path(model_path).expanduser().resolve())
+    info = read_gguf_arch(resolved)
+    arch = (info or {}).get("arch")
+    for name, prof in SAMPLING_PROFILES.items():
+        if arch:
+            if arch in prof["archs"]:
+                return name
+        elif re.search(prof["name_re"], os.path.basename(resolved).lower()):
+            return name
+    return None
+
+
+def profile_key_owner(key, env_vars, st, target=None):
+    """'unset' | 'profile' | 'user' for one key (see the ownership rule above)."""
+    cur = env_vars.get(key)
+    if cur is None:
+        return "unset"
+    if key in st.get("written", {}):
+        return "profile" if _same_value(cur, st["written"][key]) else "user"
+    if target is not None and _same_value(cur, target):
+        return "profile"
+    if key in PROFILE_NEUTRAL and _same_value(cur, PROFILE_NEUTRAL[key]):
+        return "profile"
+    return "user"
+
+
+def apply_sampling_profile(model_path, auto_restart=False, force=False, verbose=True):
+    """Write the model family's sampling to the env file for keys the user has not customised.
+    Returns the {key: value} changes made. Unknown model -> nothing changes. `force` (profile
+    apply) also clears a previous `profile off`."""
+    st = load_profile_state()
+    if st.get("disabled") and not force:
+        return {}
+    name = detect_sampling_profile(model_path)
+    if not name:
+        if verbose and st.get("written"):
+            print(f"[ai-backend] no sampling profile for this model; the '{st.get('profile')}' values stay "
+                  "(`ai-backend profile off` restores the previous ones)")
+        return {}
+    env_vars = load_env()
+    changes, kept = {}, []
+    for key, val in SAMPLING_PROFILES[name]["values"].items():
+        if profile_key_owner(key, env_vars, st, val) == "user":
+            kept.append(key)
+            continue
+        if key not in st["written"]:
+            st["previous"][key] = env_vars.get(key)
+        st["written"][key] = val
+        if env_vars.get(key) != val:
+            changes[key] = val
+    st.update({"profile": name, "model": str(model_path), "disabled": False})
+    if changes:
+        persist_env_changes(changes, auto_restart=auto_restart)
+    save_profile_state(st)
+    if verbose:
+        if changes:
+            print(f"[ai-backend] sampling profile '{name}': " + ", ".join(f"{k}={v}" for k, v in changes.items()))
+        if kept:
+            print("[ai-backend] kept your own values for: " + ", ".join(kept))
+    return changes
+
+
+def profile_off(auto_restart=True):
+    """Restore the pre-profile values of keys that still hold the profile's value; disable the
+    profile for future `use` until `profile apply`."""
+    st = load_profile_state()
+    env_vars = load_env()
+    changes = {}
+    for key, val in st.get("written", {}).items():
+        if _same_value(env_vars.get(key), val):
+            prev = st.get("previous", {}).get(key)
+            if prev != env_vars.get(key):
+                changes[key] = prev
+    if changes:
+        persist_env_changes(changes, auto_restart=auto_restart and any(k.startswith("LLAMA_") for k in changes))
+    save_profile_state({"profile": None, "disabled": True, "written": {}, "previous": {}})
+    return changes
+
+
+def cmd_profile(sub=None):
+    sub = (sub or "show").lower()
+    if sub == "show":
+        st = load_profile_state()
+        env_vars = load_env()
+        model = env_vars.get("LLAMA_MODEL_PATH")
+        detected = detect_sampling_profile(model) if model else None
+        print(f"Sampling profile: {st.get('profile') or '(none applied)'}"
+              + ("  [disabled by `profile off`]" if st.get("disabled") else ""))
+        print(f"Active model:     {model or '(none)'} -> {detected or 'no known profile'}")
+        prof = SAMPLING_PROFILES.get(detected or st.get("profile") or "")
+        if prof:
+            for key, val in prof["values"].items():
+                owner = profile_key_owner(key, env_vars, st, val)
+                print(f"  {key:<24} = {env_vars.get(key, '(unset)'):<8} recipe {val:<6} [{owner}]")
+        print("\nUsage: ai-backend profile [show|apply|off]")
+    elif sub in ("apply", "on"):
+        model = load_env().get("LLAMA_MODEL_PATH")
+        changes = apply_sampling_profile(model, auto_restart=False, force=True)
+        if changes and any(k.startswith("LLAMA_") for k in changes):
+            restart_systemd_service()
+        if not detect_sampling_profile(model):
+            print("No sampling profile for the active model; nothing changed.")
+        elif not changes:
+            print("Sampling profile already in effect.")
+    elif sub in ("off", "disable", "reset"):
+        changes = profile_off()
+        print("Sampling profile off" + (": restored " + ", ".join(
+            f"{k}={'(unset)' if v is None else v}" for k, v in changes.items()) if changes else "; nothing to restore."))
+    else:
+        print(f"Unknown profile command '{sub}'. Use show|apply|off.", file=sys.stderr)
+        sys.exit(1)
+
 
 def sync_gpu_to_systemd(cuda_dev):
     """Keep the systemd unit's CUDA_VISIBLE_DEVICES in sync with the env file.
@@ -2666,6 +2835,7 @@ Usage:
   ai-backend ctx <size|auto>            Set or clear explicit context size
   ai-backend cache <q4_0|q8_0|f16|auto> Configure KV cache quantization (q4_0 saves 4x VRAM)
   ai-backend mode <thinking|normal|low|instruct>   Apply Qwen3.8 recommended sampling settings
+  ai-backend profile [show|apply|off]   Per-model sampling profile (applied by `use`; never overrides your own values)
   ai-backend yarn <on|off|<scale>>      Enable YaRN RoPE scaling to extend context (on -> ~1M for Qwen3.8)
   ai-backend reasoning <xhigh|med|none> Set reasoning depth for hybrid thinking models
   ai-backend budget <tokens|off> [msg]  Set server-side reasoning token budget (e.g. 4096)
@@ -2750,6 +2920,8 @@ def main():
         cmd_tune(args[1] if len(args) > 1 else None)
     elif cmd in ("probe", "speed", "benchmark"):
         cmd_probe(args[1] if len(args) > 1 else None)
+    elif cmd in ("profile", "profiles", "sampling"):
+        cmd_profile(args[1] if len(args) > 1 else None)
     elif cmd in ("mode", "preset"):
         cmd_mode(args[1] if len(args) > 1 else None)
     elif cmd in ("yarn", "rope"):
